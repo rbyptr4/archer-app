@@ -1,23 +1,50 @@
-// routes/employeeRoutes.js
 const express = require('express');
 const router = express.Router();
 
 const validateToken = require('../../utils/tokenHandler');
 const requireRole = require('../../utils/requireRole');
+const requirePageAccess = require('../../utils/requirePageAccess');
 const emp = require('../../controllers/owner/employeeController');
 
 const validate = require('../../middlewares/validate');
 const {
-  registerSchema
+  registerSchema,
+  updateEmployeeSchema
 } = require('../../middlewares/validators/userValidation');
 
-router.use(validateToken, requireRole('owner'));
+router.use(validateToken);
 
-router.post('/create-employee', validate(registerSchema), emp.createEmployee);
-router.get('/all-employee', emp.listEmployees);
-router.get('/:id', emp.getEmployee);
-router.patch('/update/:id', emp.updateEmployee);
-router.patch('/:id/pages', emp.setEmployeePages);
-router.delete('/remove/:id', emp.deleteEmployee);
+router.post(
+  '/create-employee',
+  requireRole('owner', 'employee'),
+  requirePageAccess('employees'),
+  validate(registerSchema),
+  emp.createEmployee
+);
+
+router.get(
+  '/all-employee',
+  requireRole('owner', 'employee'),
+  requirePageAccess('employees'),
+  emp.listEmployees
+);
+
+router.get(
+  '/:id',
+  requireRole('owner', 'employee'),
+  requirePageAccess('employees'),
+  emp.getEmployee
+);
+
+router.patch(
+  '/update/:id',
+  requireRole('owner', 'employee'),
+  requirePageAccess('employees'),
+  validate(updateEmployeeSchema),
+  emp.updateEmployee
+);
+
+router.patch('/:id/pages', requireRole('owner'), emp.setEmployeePages);
+router.delete('/remove/:id', requireRole('owner'), emp.deleteEmployee);
 
 module.exports = router;

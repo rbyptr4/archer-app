@@ -12,6 +12,7 @@ const validateToken = require('./utils/tokenHandler');
 const authRoutes = require('./routers/authRoutes');
 const employeeRoutes = require('./routers/owner/employeeRoutes');
 const menuRoutes = require('./routers/owner/menuRoutes');
+const memberRoutes = require('./routers/owner/userManagementRoutes');
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -55,6 +56,8 @@ app.use((req, res, next) => {
 app.use('/auth', authRoutes); // public + /me (protected di route)
 app.use('/employees', employeeRoutes); // protected (owner) di router level
 app.use('/menu', menuRoutes);
+app.use('/members', memberRoutes);
+app.use('/google', require('./routers/googleAuthRoutes'));
 
 app.use(validateToken);
 

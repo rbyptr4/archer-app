@@ -22,7 +22,7 @@ const UserSchema = new mongoose.Schema(
     },
 
     password: { type: String, required: true, select: false },
-    phones: { type: Number },
+    phone: { type: String, unique: true, sparse: true },
     pages: {
       type: Map,
       of: Boolean,
@@ -36,6 +36,11 @@ const UserSchema = new mongoose.Schema(
     toJSON: {
       transform: (_, ret) => {
         delete ret.password;
+        delete ret.refreshToken;
+        delete ret.prevRefreshToken;
+        if (ret.pages instanceof Map) {
+          ret.pages = Object.fromEntries(ret.pages);
+        }
         return ret;
       }
     }

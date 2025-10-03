@@ -1,10 +1,12 @@
 const asyncHandler = require('express-async-handler');
+const mongoose = require('mongoose');
 const Menu = require('../../models/menuModel');
 const throwError = require('../../utils/throwError');
 const { uploadBuffer, deleteFile } = require('../../utils/googleDrive');
 const { getDriveFolder } = require('../../utils/driveFolders');
+const { buildMenuFileName } = require('../../utils/makeFileName');
+const { extractDriveFileId } = require('../../utils/driveFileId');
 
-/* CREATE MENU + Upload Gambar */
 exports.createMenu = asyncHandler(async (req, res) => {
   const {
     menu_code,
@@ -14,96 +16,186 @@ exports.createMenu = asyncHandler(async (req, res) => {
     addons = [],
     isActive = true
   } = req.body;
-  console.log('[DEBUG] req.file:', req.file);
-  console.log('[DEBUG] MENU FOLDER ID:', process.env.MENU);
-  console.log('[DEBUG] req.body:', req.body);
-  // cek duplikat kode
-  const exists = await Menu.findOne({
-    menu_code: menu_code.toUpperCase()
-  }).lean();
-  if (exists) throwError('Kode menu sudah digunakan', 409, 'menu_code');
 
+  let newFileId = null;
   let imageUrl = '';
+
+  // 1) Upload dulu (di luar txn)
   if (req.file) {
     const folderId = getDriveFolder('menu');
-    const result = await uploadBuffer(
-      req.file.buffer,
+    const desiredName = buildMenuFileName(
+      menu_code,
+      name,
       req.file.originalname,
+      req.file.mimetype
+    );
+    const uploaded = await uploadBuffer(
+      req.file.buffer,
+      desiredName,
       req.file.mimetype,
       folderId
     );
-    imageUrl = `https://drive.google.com/uc?export=view&id=${result.id}`;
+    newFileId = uploaded.id;
+    imageUrl = `https://drive.google.com/uc?export=view&id=${newFileId}`;
   }
 
-  const doc = await Menu.create({
-    menu_code: menu_code.toUpperCase(),
-    name,
-    price,
-    description,
-    imageUrl,
-    addons,
-    isActive
-  });
+  const session = await mongoose.startSession();
+  let createdDoc;
+  try {
+    // 2) Tulis DB di dalam transaction
+    await session.withTransaction(async () => {
+      const exists = await Menu.findOne({ menu_code: menu_code.toUpperCase() })
+        .session(session)
+        .lean();
+      if (exists) throwError('Kode menu sudah digunakan', 409, 'menu_code');
 
-  res.status(201).json({ message: 'Menu berhasil dibuat', menu: doc });
+      const payload = {
+        menu_code: menu_code.toUpperCase(),
+        name,
+        price,
+        description,
+        imageUrl,
+        addons,
+        isActive
+      };
+
+      const [doc] = await Menu.create([payload], { session });
+      createdDoc = doc;
+    });
+
+    // 3) Sukses → kirim respons
+    res.status(201).json({ message: 'Menu berhasil dibuat', menu: createdDoc });
+  } catch (err) {
+    // 4) Rollback file di Drive kalau DB gagal
+    if (newFileId) {
+      try {
+        await deleteFile(newFileId);
+      } catch (e2) {
+        console.warn(
+          '[menu][rollback] gagal hapus file baru:',
+          e2?.message || e2
+        );
+      }
+    }
+    throw err;
+  } finally {
+    session.endSession();
+  }
 });
 
-/* UPDATE MENU (optional update gambar) */
 exports.updateMenu = asyncHandler(async (req, res) => {
   const { id } = req.params;
+
+  const current = await Menu.findById(id).lean();
+  if (!current) throwError('Menu tidak ditemukan', 404);
+
   const payload = { ...req.body };
 
-  if (payload.menu_code) {
-    payload.menu_code = payload.menu_code.toUpperCase();
-    const dup = await Menu.findOne({
-      menu_code: payload.menu_code,
-      _id: { $ne: id }
-    }).lean();
-    if (dup) throwError('Kode menu sudah digunakan', 409, 'menu_code');
-  }
-
+  let newFileId = null;
   if (req.file) {
     const folderId = getDriveFolder('menu');
-    const result = await uploadBuffer(
-      req.file.buffer,
+    const finalCode = (
+      payload.menu_code ||
+      current.menu_code ||
+      ''
+    ).toUpperCase();
+    const finalName = payload.name || current.name || '';
+    const desiredName = buildMenuFileName(
+      finalCode,
+      finalName,
       req.file.originalname,
+      req.file.mimetype
+    );
+
+    const uploaded = await uploadBuffer(
+      req.file.buffer,
+      desiredName,
       req.file.mimetype,
       folderId
     );
-    payload.imageUrl = `https://drive.google.com/uc?export=view&id=${result.id}`;
+    newFileId = uploaded.id;
+    payload.imageUrl = `https://drive.google.com/uc?export=view&id=${newFileId}`;
   }
 
-  const updated = await Menu.findByIdAndUpdate(id, payload, {
-    new: true,
-    runValidators: true
-  });
-  if (!updated) throwError('Menu tidak ditemukan', 404);
+  const session = await mongoose.startSession();
+  let updated;
+  try {
+    await session.withTransaction(async () => {
+      if (payload.menu_code) {
+        payload.menu_code = payload.menu_code.toUpperCase();
+        const dup = await Menu.findOne({
+          menu_code: payload.menu_code,
+          _id: { $ne: id }
+        })
+          .session(session)
+          .lean();
+        if (dup) throwError('Kode menu sudah digunakan', 409, 'menu_code');
+      }
+
+      updated = await Menu.findByIdAndUpdate(id, payload, {
+        new: true,
+        runValidators: true,
+        session
+      });
+      if (!updated) throwError('Menu tidak ditemukan', 404);
+    });
+  } catch (err) {
+    // DB gagal → hapus file baru (rollback)
+    if (newFileId) {
+      try {
+        await deleteFile(newFileId);
+      } catch (e2) {
+        console.warn(
+          '[menu][rollback] gagal hapus file baru:',
+          e2?.message || e2
+        );
+      }
+    }
+    throw err;
+  } finally {
+    session.endSession();
+  }
+
+  // Commit sukses → hapus file lama (best effort)
+  if (newFileId) {
+    const oldId = extractDriveFileId(current.imageUrl);
+    if (oldId) {
+      deleteFile(oldId).catch((e) =>
+        console.warn('[menu] gagal hapus file lama:', e?.message || e)
+      );
+    }
+  }
 
   res.json({ message: 'Menu diperbarui', menu: updated });
 });
 
-/* DELETE MENU + hapus file GDrive kalau ada */
 exports.deleteMenu = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const menu = await Menu.findById(id);
-  if (!menu) throwError('Menu tidak ditemukan', 404);
 
-  if (menu.imageUrl) {
-    const fileId = menu.imageUrl.split('id=')[1];
-    if (fileId) {
-      try {
-        await deleteFile(fileId);
-      } catch (e) {
-        console.warn('[deleteMenu] gagal hapus file di GDrive:', e.message);
-      }
-    }
+  const session = await mongoose.startSession();
+  let oldFileId = null;
+  try {
+    await session.withTransaction(async () => {
+      const doc = await Menu.findById(id).session(session);
+      if (!doc) throwError('Menu tidak ditemukan', 404);
+
+      oldFileId = extractDriveFileId(doc.imageUrl);
+      await Menu.deleteOne({ _id: id }, { session });
+    });
+  } finally {
+    session.endSession();
   }
 
-  await menu.deleteOne();
+  // Setelah commit, hapus file di Drive (best effort)
+  if (oldFileId) {
+    deleteFile(oldFileId).catch((e) =>
+      console.warn('[menu] gagal hapus file di GDrive:', e?.message || e)
+    );
+  }
+
   res.json({ message: 'Menu dihapus' });
 });
 
-/* LIST MENU */
 exports.listMenus = asyncHandler(async (req, res) => {
   const page = Math.max(parseInt(req.query.page || '1', 10), 1);
   const limit = Math.min(
@@ -140,14 +232,12 @@ exports.listMenus = asyncHandler(async (req, res) => {
   });
 });
 
-/* GET DETAIL */
 exports.getMenuById = asyncHandler(async (req, res) => {
   const menu = await Menu.findById(req.params.id).lean();
   if (!menu) throwError('Menu tidak ditemukan', 404);
   res.json({ menu });
 });
 
-/* ACTIVATE / DEACTIVATE */
 exports.activateMenu = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const updated = await Menu.findByIdAndUpdate(

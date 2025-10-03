@@ -1,10 +1,22 @@
-// controllers/employeeController.js
 const asyncHandler = require('express-async-handler');
 const bcrypt = require('bcrypt');
 const User = require('../../models/userModel');
 const throwError = require('../../utils/throwError');
 
-// POST /employees  (owner only) - registrasi karyawan
+const ALLOWED_PAGES = ['menu', 'employees', 'members'];
+const isPlainObject = (v) => v && typeof v === 'object' && !Array.isArray(v);
+const normalizePagesOut = (pages) =>
+  pages instanceof Map ? Object.fromEntries(pages) : pages || {};
+
+const validatePages = (pagesObj) => {
+  for (const [k, v] of Object.entries(pagesObj || {})) {
+    if (!ALLOWED_PAGES.includes(k))
+      throwError(`Halaman "${k}" tidak diizinkan`, 400);
+    if (typeof v !== 'boolean')
+      throwError(`Nilai halaman "${k}" harus boolean`, 400);
+  }
+};
+
 exports.createEmployee = asyncHandler(async (req, res) => {
   const { name, email, password, phone, pages } = req.body || {};
   if (!name || !email || !password)
@@ -20,6 +32,12 @@ exports.createEmployee = asyncHandler(async (req, res) => {
     if (phoneUsed) throwError('Nomor telepon sudah terpakai', 409);
   }
 
+  let initialPages = {};
+  if (isPlainObject(pages)) {
+    validatePages(pages);
+    initialPages = pages;
+  }
+
   const hash = await bcrypt.hash(password, 10);
 
   const emp = await User.create({
@@ -28,12 +46,8 @@ exports.createEmployee = asyncHandler(async (req, res) => {
     role: 'employee',
     password: hash,
     phone: phone || undefined,
-    pages: pages && typeof pages === 'object' ? pages : {} // boleh kosong
+    pages: initialPages // boleh kosong
   });
-
-  // Normalisasi Map → object
-  let outPages = emp.pages;
-  if (outPages instanceof Map) outPages = Object.fromEntries(outPages);
 
   res.status(201).json({
     message: 'Karyawan dibuat',
@@ -43,49 +57,75 @@ exports.createEmployee = asyncHandler(async (req, res) => {
       email: emp.email,
       phone: emp.phone,
       role: emp.role,
-      pages: outPages,
+      pages: normalizePagesOut(emp.pages),
       createdAt: emp.createdAt
     }
   });
 });
 
-// GET /employees  (owner only) - list karyawan
-exports.listEmployees = asyncHandler(async (_req, res) => {
-  const items = await User.find({ role: 'employee' })
+exports.listEmployees = asyncHandler(async (req, res) => {
+  let {
+    page = 1,
+    limit = 10,
+    search = '',
+    sortBy = 'createdAt',
+    sortDir = 'desc'
+  } = req.query;
+
+  page = Math.max(1, parseInt(page) || 1);
+  limit = Math.min(100, Math.max(1, parseInt(limit) || 10));
+
+  const filter = { role: 'employee' };
+  if (search) {
+    const re = new RegExp(String(search), 'i');
+    filter.$or = [{ name: re }, { email: re }, { phone: re }];
+  }
+
+  const total = await User.countDocuments(filter);
+  const sort = { [sortBy]: String(sortDir).toLowerCase() === 'asc' ? 1 : -1 };
+
+  const items = await User.find(filter)
     .select('name email phone role pages createdAt updatedAt')
+    .sort(sort)
+    .skip((page - 1) * limit)
+    .limit(limit)
     .lean();
 
   const normalized = items.map((u) => ({
     ...u,
-    pages: u.pages instanceof Map ? Object.fromEntries(u.pages) : u.pages || {}
+    pages: normalizePagesOut(u.pages)
   }));
 
-  res.json({ items: normalized });
+  res.json({
+    message: 'Daftar karyawan',
+    total,
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit),
+    items: normalized
+  });
 });
 
-// GET /employees/:id  (owner only)
 exports.getEmployee = asyncHandler(async (req, res) => {
   const emp = await User.findOne({ _id: req.params.id, role: 'employee' })
     .select('name email phone role pages createdAt updatedAt')
     .lean();
   if (!emp) throwError('Karyawan tidak ditemukan', 404);
 
-  emp.pages =
-    emp.pages instanceof Map ? Object.fromEntries(emp.pages) : emp.pages || {};
+  emp.pages = normalizePagesOut(emp.pages);
   res.json({ employee: emp });
 });
 
-// PATCH /employees/:id  (owner only) - update profil &/atau password &/atau pages
 exports.updateEmployee = asyncHandler(async (req, res) => {
-  const { name, email, phone, newPassword, pages, mergePages } = req.body || {};
+  const { name, email, phone, newPassword } = req.body || {};
 
   const emp = await User.findOne({
     _id: req.params.id,
     role: 'employee'
   }).select('+password');
+
   if (!emp) throwError('Karyawan tidak ditemukan', 404);
 
-  // email
   if (email && email.toLowerCase() !== emp.email) {
     const lower = String(email).toLowerCase();
     const used = await User.exists({ email: lower, _id: { $ne: emp._id } });
@@ -94,6 +134,7 @@ exports.updateEmployee = asyncHandler(async (req, res) => {
   }
 
   if (name) emp.name = name;
+
   if (phone !== undefined) {
     if (phone) {
       const usedPhone = await User.exists({ phone, _id: { $ne: emp._id } });
@@ -109,55 +150,48 @@ exports.updateEmployee = asyncHandler(async (req, res) => {
     emp.password = hash;
   }
 
-  // pages: replace atau merge
-  if (pages && typeof pages === 'object') {
-    if (mergePages) {
-      const cur =
-        emp.pages instanceof Map
-          ? Object.fromEntries(emp.pages)
-          : emp.pages || {};
-      emp.pages = { ...cur, ...pages };
-    } else {
-      emp.pages = pages;
-    }
-  }
-
   await emp.save();
 
   const out = emp.toObject();
-  out.pages =
-    out.pages instanceof Map ? Object.fromEntries(out.pages) : out.pages || {};
-  delete out.password;
-  res.json({ message: 'Karyawan diperbarui', employee: out });
+  delete out.password; // jangan expose password
+
+  res.json({ message: 'Profil karyawan diperbarui', employee: out });
 });
 
-// PATCH /employees/:id/pages  (owner only) - set izin halaman saja
 exports.setEmployeePages = asyncHandler(async (req, res) => {
   const { pages, merge = true } = req.body || {};
-  if (!pages || typeof pages !== 'object')
+  if (!isPlainObject(pages))
     throwError('pages wajib berupa object boolean', 400);
+  validatePages(pages);
 
   const emp = await User.findOne({ _id: req.params.id, role: 'employee' });
   if (!emp) throwError('Karyawan tidak ditemukan', 404);
 
   if (merge) {
-    const cur =
-      emp.pages instanceof Map
-        ? Object.fromEntries(emp.pages)
-        : emp.pages || {};
-    emp.pages = { ...cur, ...pages };
+    const setOps = {};
+    for (const [k, v] of Object.entries(pages)) setOps[`pages.${k}`] = v;
+    await User.updateOne({ _id: emp._id }, { $set: setOps });
   } else {
-    emp.pages = pages;
+    const cur = normalizePagesOut(emp.pages);
+    const unsetOps = {};
+    for (const k of Object.keys(cur)) unsetOps[`pages.${k}`] = '';
+    const setOps = {};
+    for (const [k, v] of Object.entries(pages)) setOps[`pages.${k}`] = v;
+
+    const ops = {};
+    if (Object.keys(unsetOps).length) ops.$unset = unsetOps;
+    if (Object.keys(setOps).length) ops.$set = setOps;
+
+    await User.updateOne({ _id: emp._id }, ops);
   }
 
-  await emp.save();
-
-  const outPages =
-    emp.pages instanceof Map ? Object.fromEntries(emp.pages) : emp.pages || {};
-  res.json({ message: 'Halaman karyawan diperbarui', pages: outPages });
+  const fresh = await User.findById(emp._id).lean();
+  res.json({
+    message: 'Halaman karyawan diperbarui',
+    pages: normalizePagesOut(fresh.pages)
+  });
 });
 
-// DELETE /employees/:id  (owner only)
 exports.deleteEmployee = asyncHandler(async (req, res) => {
   const emp = await User.findOne({ _id: req.params.id, role: 'employee' });
   if (!emp) throwError('Karyawan tidak ditemukan', 404);
