@@ -1,3 +1,4 @@
+// app.js
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
@@ -6,6 +7,11 @@ require('dotenv').config();
 const connectDb = require('./config/dbConnection');
 const errorHandler = require('./utils/errorHandler');
 const validateToken = require('./utils/tokenHandler');
+
+// Routers
+const authRoutes = require('./routers/authRoutes');
+const employeeRoutes = require('./routers/owner/employeeRoutes');
+const menuRoutes = require('./routers/owner/menuRoutes');
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -42,21 +48,16 @@ app.use(
 );
 
 app.use((req, res, next) => {
-  if (req.method === 'OPTIONS') {
-    // header CORS sudah dipasang oleh cors() di atas
-    return res.sendStatus(204); // No Content
-  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// ---------------- PROTECTED ROUTES (global) ----------------
-app.use((req, res, next) => {
-  if (req.method === 'OPTIONS') return next();
-  next();
-});
+app.use('/auth', authRoutes); // public + /me (protected di route)
+app.use('/employees', employeeRoutes); // protected (owner) di router level
+app.use('/menu', menuRoutes);
 
-// ---------------- PROTECTED ROUTES (global) ----------------
 app.use(validateToken);
+
 app.use(errorHandler);
 
 app.listen(port, () => {
