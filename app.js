@@ -38,7 +38,7 @@ app.use(cookieParser());
 
 // CORS
 const allowedOrigins = [
-  process.env.FRONTEND_URL || 'http://localhost:5173',
+  process.env.APP_URL || 'https://archer-app.vercel.app/',
   'http://localhost:5173'
 ];
 app.use(

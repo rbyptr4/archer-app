@@ -1,11 +1,14 @@
 // controllers/onlineController.js
 const asyncHandler = require('express-async-handler');
+const crypto = require('crypto');
+
 const Cart = require('../models/cartModel');
 const Menu = require('../models/menuModel');
 const Member = require('../models/memberModel');
 const Order = require('../models/orderModel');
+const MemberSession = require('../models/memberSessionModel');
+
 const throwError = require('../utils/throwError');
-const generateMemberToken = require('../utils/generateMemberToken');
 const { baseCookie } = require('../utils/authCookies');
 const { uploadBuffer } = require('../utils/googleDrive');
 const { getDriveFolder } = require('../utils/driveFolders');
@@ -18,10 +21,26 @@ const {
 } = require('../config/onlineConfig');
 const { haversineKm } = require('../utils/distance');
 
-// === Utils umum ===
+const {
+  ACCESS_COOKIE,
+  REFRESH_COOKIE,
+  DEVICE_COOKIE,
+  REFRESH_TTL_MS,
+  signAccessToken,
+  generateOpaqueToken,
+  hashToken
+} = require('../utils/memberToken');
+
+const { nextDailyTxCode } = require('../utils/txCode');
+
+/* =============== Cookie presets (member session) =============== */
+const cookieAccess = { ...baseCookie, httpOnly: true, maxAge: 15 * 60 * 1000 }; // 15 menit
+const cookieRefresh = { ...baseCookie, httpOnly: true, maxAge: REFRESH_TTL_MS }; // 1 tahun
+const cookieDevice = { ...baseCookie, httpOnly: false, maxAge: REFRESH_TTL_MS }; // 1 tahun (dibaca FE)
+
+/* ===================== Utils umum ===================== */
 const asInt = (v, def = 0) => (Number.isFinite(+v) ? +v : def);
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
-
 const normalizePhone = (phone = '') =>
   phone.replace(/\s+/g, '').replace(/^(\+62|62|0)/, '0');
 
@@ -65,11 +84,11 @@ const recomputeTotals = (cart) => {
   return cart;
 };
 
-// === Fee helper (pakai harga per km dari config) ===
+/* ===================== Delivery fee helper ===================== */
 const calcDeliveryFee = (distanceKm) =>
   Math.ceil(distanceKm) * Number(DELIVERY_PRICE_PER_KM || 0);
 
-// === Identity ONLINE (tanpa meja) ===
+/* ===================== Identity ONLINE (tanpa meja) ===================== */
 const getOnlineIdentity = (req) => {
   const memberId = req.member?.id || null;
   const sessionId =
@@ -102,13 +121,14 @@ const findOrCreateOnlineCart = async ({ memberId, sessionId }) => {
   return created.toObject();
 };
 
-// === Member helper (auto-register) ===
+/* ===================== Member helper (auto-register + start session) ===================== */
 const ensureOnlineMember = async (req, res) => {
   if (req.member?.id) {
     const m = await Member.findById(req.member.id).lean();
     if (!m) throwError('Member tidak ditemukan', 404);
     return m;
   }
+
   const { name, phone } = req.body || {};
   if (!name || !phone) throwError('Nama & nomor HP wajib', 400);
 
@@ -132,15 +152,54 @@ const ensureOnlineMember = async (req, res) => {
     await member.save();
   }
 
-  const memberToken = generateMemberToken(member);
-  res.cookie('memberToken', memberToken, {
-    ...baseCookie,
-    httpOnly: true,
-    maxAge: 60 * 60 * 1000
+  // Start sesi device-bound (tanpa OTP, pake device_id + refresh token 1 tahun)
+  const incomingDev = req.cookies?.[DEVICE_COOKIE] || req.header('x-device-id');
+  const device_id =
+    incomingDev && String(incomingDev).trim()
+      ? String(incomingDev).trim()
+      : crypto.randomUUID();
+
+  const accessToken = signAccessToken(member); // 15 menit
+  const refreshToken = generateOpaqueToken(); // random 256-bit base64url
+  const refreshHash = hashToken(refreshToken);
+
+  await MemberSession.create({
+    member: member._id,
+    device_id,
+    refresh_hash: refreshHash,
+    user_agent: req.get('user-agent') || '',
+    ip: req.ip,
+    expires_at: new Date(Date.now() + REFRESH_TTL_MS)
   });
+
+  res.cookie(ACCESS_COOKIE, accessToken, cookieAccess);
+  res.cookie(REFRESH_COOKIE, refreshToken, cookieRefresh);
+  res.cookie(DEVICE_COOKIE, device_id, cookieDevice);
 
   return member.toObject ? member.toObject() : member;
 };
+
+/* ============ Helper: create order dengan transaction_code (daily sequence + retry) ============ */
+async function createOrderWithTxCode(
+  payload,
+  { prefix = 'ARCH', maxRetry = 5 } = {}
+) {
+  let lastErr;
+  for (let i = 0; i < maxRetry; i++) {
+    try {
+      const code = await nextDailyTxCode(prefix);
+      const doc = await Order.create({ ...payload, transaction_code: code });
+      return doc;
+    } catch (e) {
+      if (e && e.code === 11000 && /transaction_code/.test(String(e.message))) {
+        lastErr = e; // duplicate, retry
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr || new Error('Gagal generate transaction_code unik');
+}
 
 /* ===================== CART ONLINE ===================== */
 exports.getCart = asyncHandler(async (req, res) => {
@@ -334,15 +393,15 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
     throwError('fulfillment_type tidak valid', 400);
   }
 
-  // Bukti bayar wajib
+  // Wajib ada bukti bayar untuk order online
   if (!req.file?.buffer || !req.file?.mimetype) {
     throwError('Bukti pembayaran (payment_proof) wajib', 400);
   }
 
-  // Pastikan member ada (auto-register kalau belum)
+  // Pastikan member (auto-register + mulai sesi device)
   const member = await ensureOnlineMember(req, res);
 
-  // Ambil cart ONLINE
+  // Ambil cart ONLINE (utamakan yang terikat member)
   const iden = getOnlineIdentity(req);
   let cart =
     (await Cart.findOne({
@@ -425,8 +484,8 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
   cart.total_quantity = totalQty;
   await cart.save();
 
-  // Buat ORDER (schema akan hitung items_total & grand_total otomatis)
-  const order = await Order.create({
+  // Buat ORDER (pakai daily sequence transaction_code)
+  const order = await createOrderWithTxCode({
     member: cart.member,
     table_number: null, // online tanpa meja
     source: 'online',
@@ -478,6 +537,7 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
   // Emit realtime
   const payload = {
     id: String(order._id),
+    transaction_code: order.transaction_code,
     member: { id: String(member._id), name: member.name, phone: member.phone },
     items_total: order.items_total,
     grand_total: order.grand_total,
@@ -486,6 +546,7 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
     fulfillment_type: order.fulfillment_type,
     status: order.status,
     payment_status: order.payment_status,
+    payment_method: order.payment_method,
     placed_at: order.placed_at,
     payment_proof_url: order.payment_proof_url || '',
     delivery: order.delivery || null
@@ -493,5 +554,11 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
   emitToStaff('order:new', payload);
   emitToMember(member._id, 'order:new', payload);
 
-  res.status(201).json({ order, message: 'Checkout berhasil' });
+  res.status(201).json({
+    order: {
+      ...order.toObject(),
+      transaction_code: order.transaction_code
+    },
+    message: 'Checkout berhasil'
+  });
 });

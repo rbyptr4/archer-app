@@ -1,11 +1,15 @@
 // controllers/orderController.js
 const asyncHandler = require('express-async-handler');
+const crypto = require('crypto');
+
 const Order = require('../models/orderModel');
 const Cart = require('../models/cartModel');
 const Menu = require('../models/menuModel');
 const Member = require('../models/memberModel');
+const MemberSession = require('../models/memberSessionModel');
+
+const { nextDailyTxCode } = require('../utils/txCode');
 const throwError = require('../utils/throwError');
-const generateMemberToken = require('../utils/generateMemberToken');
 const { baseCookie } = require('../utils/authCookies');
 const { uploadBuffer } = require('../utils/googleDrive');
 const { getDriveFolder } = require('../utils/driveFolders');
@@ -14,6 +18,21 @@ const {
   emitToStaff,
   emitToTable
 } = require('./socket/socketBus');
+
+const {
+  ACCESS_COOKIE,
+  REFRESH_COOKIE,
+  DEVICE_COOKIE,
+  REFRESH_TTL_MS,
+  signAccessToken,
+  generateOpaqueToken,
+  hashToken
+} = require('../utils/memberToken');
+
+/* =============== Cookie presets (member session) =============== */
+const cookieAccess = { ...baseCookie, httpOnly: true, maxAge: 15 * 60 * 1000 }; // 15m
+const cookieRefresh = { ...baseCookie, httpOnly: true, maxAge: REFRESH_TTL_MS }; // 1y
+const cookieDevice = { ...baseCookie, httpOnly: false, maxAge: REFRESH_TTL_MS }; // 1y (readable by FE)
 
 /* ================== Konstanta & Helper ================== */
 const ALLOWED_STATUSES = [
@@ -33,6 +52,28 @@ const DELIVERY_ALLOWED = [
   'delivered',
   'failed'
 ];
+
+async function createOrderWithTxCode(
+  payload,
+  { prefix = 'ARCH', maxRetry = 5 } = {}
+) {
+  let lastErr;
+  for (let i = 0; i < maxRetry; i++) {
+    try {
+      const code = await nextDailyTxCode(prefix);
+      const doc = await Order.create({ ...payload, transaction_code: code });
+      return doc;
+    } catch (e) {
+      // Duplicate key on unique index
+      if (e && e.code === 11000 && /transaction_code/.test(String(e.message))) {
+        lastErr = e;
+        continue; // retry ambil sequence berikutnya
+      }
+      throw e;
+    }
+  }
+  throw lastErr || new Error('Gagal generate transaction_code unik');
+}
 
 const canTransit = (from, to) => {
   const flow = {
@@ -138,7 +179,7 @@ const findOrCreateActiveCart = async ({ memberId, sessionId, tableNumber }) => {
   return created.toObject();
 };
 
-// ensure member (auto-register saat checkout QR)
+// ensure member (auto-register + start session saat checkout QR)
 const ensureMemberForCheckout = async (req, res) => {
   if (req.member?.id) {
     const m = await Member.findById(req.member.id).lean();
@@ -173,12 +214,30 @@ const ensureMemberForCheckout = async (req, res) => {
     await member.save();
   }
 
-  const memberToken = generateMemberToken(member);
-  res.cookie('memberToken', memberToken, {
-    ...baseCookie,
-    httpOnly: true,
-    maxAge: 60 * 60 * 1000
+  // start session (device-bound)
+  const incomingDev = req.cookies?.[DEVICE_COOKIE] || req.header('x-device-id');
+  const device_id =
+    incomingDev && String(incomingDev).trim()
+      ? String(incomingDev).trim()
+      : crypto.randomUUID();
+
+  const accessToken = signAccessToken(member);
+  const refreshToken = generateOpaqueToken();
+  const refreshHash = hashToken(refreshToken);
+
+  await MemberSession.create({
+    member: member._id,
+    device_id,
+    refresh_hash: refreshHash,
+    user_agent: req.get('user-agent') || '',
+    ip: req.ip,
+    expires_at: new Date(Date.now() + REFRESH_TTL_MS)
   });
+
+  res.cookie(ACCESS_COOKIE, accessToken, cookieAccess);
+  res.cookie(REFRESH_COOKIE, refreshToken, cookieRefresh);
+  res.cookie(DEVICE_COOKIE, device_id, cookieDevice);
+
   return member.toObject ? member.toObject() : member;
 };
 
@@ -193,7 +252,6 @@ exports.listMyOrders = asyncHandler(async (req, res) => {
     limit = 20,
     cursor
   } = req.query || {};
-
   const q = { member: req.member.id };
   if (status && ALLOWED_STATUSES.includes(status)) q.status = status;
   if (source) q.source = source; // 'qr' | 'pos' | 'online'
@@ -295,12 +353,10 @@ exports.updateStatus = asyncHandler(async (req, res) => {
       400
     );
 
-  // Guard: paid dulu untuk masuk kitchen
   if (isKitchenStatus(status) && !order.canMoveToKitchen()) {
     throwError('Order belum paid. Tidak bisa masuk accepted/preparing.', 409);
   }
 
-  // Guard: delivery completed hanya bila sudah delivered
   if (
     status === 'completed' &&
     order.fulfillment_type === 'delivery' &&
@@ -314,7 +370,6 @@ exports.updateStatus = asyncHandler(async (req, res) => {
   if (status === 'cancelled') {
     order.cancellation_reason = String(reason || '').trim();
     order.cancelled_at = new Date();
-    // aturan ringan
     if (order.payment_status === 'paid') {
       order.payment_status = 'refunded';
     } else if (order.payment_status === 'unpaid') {
@@ -325,6 +380,7 @@ exports.updateStatus = asyncHandler(async (req, res) => {
 
   const payload = {
     id: String(order._id),
+    transaction_code: orderDoc.transaction_code,
     member: String(order.member),
     table_number: order.table_number || null,
     from_status: fromStatus,
@@ -367,6 +423,7 @@ exports.cancelOrder = asyncHandler(async (req, res) => {
 
   const payload = {
     id: String(order._id),
+    transaction_code: orderDoc.transaction_code,
     member: String(order.member),
     table_number: order.table_number || null,
     from_status: fromStatus,
@@ -382,7 +439,7 @@ exports.cancelOrder = asyncHandler(async (req, res) => {
   res.status(200).json(order.toObject());
 });
 
-/* ================== CART QR (tanpa meja? → di QR wajib meja) ================== */
+/* ================== CART QR (wajib meja) ================== */
 exports.getCart = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
   const cart = await findOrCreateActiveCart(iden);
@@ -528,6 +585,7 @@ exports.clearCart = asyncHandler(async (req, res) => {
       ? { member: iden.memberId }
       : { session_id: iden.sessionId })
   };
+
   const cart = await Cart.findOne(filter);
   if (!cart) throwError('Cart tidak ditemukan', 404);
 
@@ -595,12 +653,11 @@ exports.checkout = asyncHandler(async (req, res) => {
     payment_proof_url = `https://drive.google.com/uc?export=view&id=${uploaded.id}`;
   }
 
-  // BUAT ORDER — match schema baru
-  const orderDoc = await Order.create({
+  const orderDoc = await createOrderWithTxCode({
     member: cart.member,
     table_number: cart.table_number,
     source: 'qr',
-    fulfillment_type: 'dine_in', // Wajib sesuai schema
+    fulfillment_type: 'dine_in',
     items: cart.items.map((it) => ({
       menu: it.menu,
       menu_code: it.menu_code,
@@ -612,9 +669,9 @@ exports.checkout = asyncHandler(async (req, res) => {
       notes: it.notes,
       line_subtotal: it.line_subtotal
     })),
-    total_quantity: cart.total_quantity, // schema juga akan validasi/overwrite di pre('validate')
-    payment_method, // default 'manual' utk QR dine-in
-    payment_proof_url, // boleh kosong utk QR (schema enforce wajibnya hanya utk 'online')
+    total_quantity: cart.total_quantity,
+    payment_method, // default 'manual'
+    payment_proof_url, // opsional untuk QR
     status: 'created',
     payment_status: 'unpaid',
     placed_at: new Date()
@@ -671,6 +728,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   res.status(201).json({
     order: {
       _id: orderDoc._id,
+      transaction_code: orderDoc.transaction_code,
       table_number: orderDoc.table_number,
       items_total: orderDoc.items_total,
       grand_total: orderDoc.grand_total,
@@ -707,7 +765,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     member = await Member.findById(member_id).lean();
     if (!member) throwError('Member tidak ditemukan', 404);
   } else if (name && phone) {
-    // Cari-by phone, kalau tak ada → buat, tapi TIDAK set cookie (ini POS)
     const normalizedPhone = String(phone)
       .replace(/\s+/g, '')
       .replace(/^(\+62|62|0)/, '0');
@@ -725,7 +782,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     }
   }
 
-  // Bangun line items dari master Menu
+  // Bangun line items
   const orderItems = [];
   let totalQty = 0;
   for (const it of items) {
@@ -749,15 +806,14 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     totalQty += qty;
   }
 
-  // Buat ORDER (source 'pos' + dine_in + meja)
   const now = new Date();
-  const order = await Order.create({
+  const order = await createOrderWithTxCode({
     member: member ? member._id : null,
     table_number: tableNo,
     source: 'pos',
     fulfillment_type: 'dine_in',
     items: orderItems,
-    total_quantity: totalQty, // schema kamu juga re-validate & hitung items_total/grand_total
+    total_quantity: totalQty,
     payment_method,
     payment_status: mark_paid ? 'paid' : 'unpaid',
     paid_at: mark_paid ? now : null,
@@ -767,9 +823,9 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     placed_at: now
   });
 
-  // Emit realtime
   const payload = {
     id: String(order._id),
+    transaction_code: order.transaction_code,
     member: member
       ? { id: String(member._id), name: member.name, phone: member.phone }
       : null,
@@ -777,15 +833,27 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     items_total: order.items_total,
     grand_total: order.grand_total,
     total_quantity: order.total_quantity,
+    line_count: order.items?.length || 0,
     source: order.source,
     fulfillment_type: order.fulfillment_type,
     status: order.status,
     payment_status: order.payment_status,
-    placed_at: order.placed_at
+    payment_method: order.payment_method,
+    paid_at: order.paid_at || null,
+    payment_proof_url: order.payment_proof_url || '',
+    placed_at: order.placed_at,
+    cashier: req.user ? { id: String(req.user.id), name: req.user.name } : null
   };
+
   emitToStaff('order:new', payload);
   if (order.table_number) emitToTable(order.table_number, 'order:new', payload);
   if (member) emitToMember(member._id, 'order:new', payload);
 
-  res.status(201).json({ order, message: 'Order POS dine-in dibuat' });
+  res.status(201).json({
+    order: {
+      ...order.toObject(),
+      transaction_code: order.transaction_code
+    },
+    message: 'Order POS dine-in dibuat'
+  });
 });

@@ -70,6 +70,7 @@ const orderItemSchema = new mongoose.Schema(
 /* ================= Main: Order ================= */
 const orderSchema = new mongoose.Schema(
   {
+    transaction_code: { type: String, trim: true },
     member: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Member',
@@ -235,6 +236,7 @@ orderSchema.methods.canAssignCourier = function () {
 orderSchema.index({ member: 1, createdAt: -1 });
 orderSchema.index({ source: 1, fulfillment_type: 1, createdAt: -1 });
 orderSchema.index({ payment_status: 1, createdAt: -1 });
+orderSchema.index({ transaction_code: 1 }, { unique: true, sparse: true });
 orderSchema.index({ 'delivery.status': 1, createdAt: -1 });
 
 module.exports = mongoose.models.Order || mongoose.model('Order', orderSchema);

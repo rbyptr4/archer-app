@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+
 module.exports = function authMemberRequired(req, res, next) {
   try {
     const token = req.cookies?.memberToken || null;

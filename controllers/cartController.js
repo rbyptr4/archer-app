@@ -4,8 +4,23 @@ const Cart = require('../models/cartModel');
 const Menu = require('../models/menuModel');
 const Member = require('../models/memberModel');
 const throwError = require('../utils/throwError');
-const generateMemberToken = require('../utils/generateMemberToken');
+const crypto = require('crypto');
+const MemberSession = require('../models/memberSessionModel');
+const {
+  ACCESS_COOKIE,
+  REFRESH_COOKIE,
+  DEVICE_COOKIE,
+  REFRESH_TTL_MS,
+  signAccessToken,
+  generateOpaqueToken,
+  hashToken
+} = require('../utils/memberToken');
+
 const { baseCookie } = require('../utils/authCookies');
+const cookieAccess = { ...baseCookie, httpOnly: true, maxAge: 15 * 60 * 1000 }; // 15 menit
+const cookieRefresh = { ...baseCookie, httpOnly: true, maxAge: REFRESH_TTL_MS }; // 1 tahun
+const cookieDevice = { ...baseCookie, httpOnly: false, maxAge: REFRESH_TTL_MS }; // 1 tahun (non-HttpOnly)
+
 const { uploadBuffer } = require('../utils/googleDrive');
 const { getDriveFolder } = require('../utils/driveFolders');
 const {
@@ -92,19 +107,20 @@ const findOrCreateActiveCart = async ({ memberId, sessionId, tableNumber }) => {
   return created.toObject();
 };
 
-// ensure member
 const ensureMemberForCheckout = async (req, res) => {
   if (req.member?.id) {
     const m = await Member.findById(req.member.id).lean();
     if (!m) throwError('Member tidak ditemukan', 404);
     return m;
   }
+
   const { name, phone } = req.body || {};
-  if (!name || !phone)
+  if (!name || !phone) {
     throwError(
       'Checkout membutuhkan akun member. Sertakan name & phone untuk daftar otomatis.',
       401
     );
+  }
 
   const normalizedPhone = normalizePhone(phone);
   let member = await Member.findOne({
@@ -127,12 +143,31 @@ const ensureMemberForCheckout = async (req, res) => {
     await member.save();
   }
 
-  const memberToken = generateMemberToken(member);
-  res.cookie('memberToken', memberToken, {
-    ...baseCookie,
-    httpOnly: true,
-    maxAge: 60 * 60 * 1000
+  // --- mulai sesi device ---
+  const incomingDev = req.cookies?.[DEVICE_COOKIE] || req.header('x-device-id');
+  const device_id =
+    incomingDev && String(incomingDev).trim()
+      ? String(incomingDev).trim()
+      : crypto.randomUUID();
+
+  const accessToken = signAccessToken(member);
+  const refreshToken = generateOpaqueToken();
+  const refreshHash = hashToken(refreshToken);
+
+  await MemberSession.create({
+    member: member._id,
+    device_id,
+    refresh_hash: refreshHash,
+    user_agent: req.get('user-agent') || '',
+    ip: req.ip,
+    expires_at: new Date(Date.now() + REFRESH_TTL_MS)
   });
+
+  // set cookies
+  res.cookie(ACCESS_COOKIE, accessToken, cookieAccess);
+  res.cookie(REFRESH_COOKIE, refreshToken, cookieRefresh);
+  res.cookie(DEVICE_COOKIE, device_id, cookieDevice);
+
   return member.toObject ? member.toObject() : member;
 };
 
