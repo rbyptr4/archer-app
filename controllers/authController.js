@@ -1,52 +1,13 @@
-// controllers/authController.js
 const asyncHandler = require('express-async-handler');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
 const User = require('../models/userModel');
-const throwError = require('../utils/throwError');
 
+const throwError = require('../utils/throwError');
 const generateTokens = require('../utils/generateToken');
 const parseRemember = require('../utils/parseRemember');
 const { baseCookie } = require('../utils/authCookies');
-
-exports.registerMember = asyncHandler(async (req, res) => {
-  const { name, email, password, phone } = req.body || {};
-  if (!name || !email || !password)
-    throwError('nama, email, password wajib diisi', 400);
-
-  const lower = String(email).toLowerCase();
-  const emailUsed = await User.exists({ email: lower });
-  if (emailUsed) throwError('Email tidak tersedia', 409);
-
-  if (phone) {
-    const phoneUsed = await User.exists({ phone });
-    if (phoneUsed) throwError('Nomor telepon tidak tersedia', 409);
-  }
-
-  const hash = await bcrypt.hash(password, 10);
-  const member = await User.create({
-    name,
-    email: lower,
-    role: 'member',
-    password: hash,
-    phone: phone || undefined,
-    pages: { menu: true }
-  });
-
-  const { accessToken, refreshToken } = await generateTokens(member);
-  res
-    .cookie('accessToken', accessToken, {
-      ...baseCookie,
-      maxAge: 30 * 60 * 1000
-    })
-    .cookie('refreshToken', refreshToken, {
-      ...baseCookie,
-      maxAge: 7 * 24 * 60 * 60 * 1000
-    })
-    .status(201)
-    .json({ message: 'Member terdaftar', role: member.role });
-});
 
 exports.login = asyncHandler(async (req, res) => {
   const { email, password } = req.body || {};

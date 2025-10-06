@@ -12,7 +12,7 @@ const baseCookie = {
   httpOnly: true,
   secure, // https-only kalau true
   sameSite, // 'none' untuk cross-site
-  path: '/' // global
+  path: '/'
 };
 
 module.exports = { baseCookie, isProd };

@@ -1,4 +1,4 @@
-// app.js
+const http = require('http');
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
@@ -6,31 +6,41 @@ require('dotenv').config();
 
 const connectDb = require('./config/dbConnection');
 const errorHandler = require('./utils/errorHandler');
-const validateToken = require('./utils/tokenHandler');
 
-// Routers
+// Routes (existing)
 const authRoutes = require('./routers/authRoutes');
+const authMemberRoutes = require('./routers/member/authMemberRoutes');
 const employeeRoutes = require('./routers/owner/employeeRoutes');
 const menuRoutes = require('./routers/owner/menuRoutes');
-const memberRoutes = require('./routers/owner/userManagementRoutes');
+const memberManagementRoutes = require('./routers/owner/memberManagementRoutes');
+const selfOrderRoutes = require('./routers/selfOrderRoutes'); // QR dine-in (punyamu)
+
+// Routes (baru)
+const orderRoutes = require('./routers/orderRoutes'); // order list/detail/kitchen/pay/status/cancel (punyamu yg sudah dirapikan)
+const orderOpsRoutes = require('./routers/orderOpsRoutes'); // payment & delivery ops (baru kita buat)
+const onlineRoutes = require('./routers/onlineRoutes'); // cart online + checkout online (baru kita buat)
+
+// Models (load sekali di awal)
+require('./models/orderModel');
+require('./models/menuModel');
+require('./models/memberModel');
+require('./models/cartModel');
 
 const app = express();
 const port = process.env.PORT || 3001;
 
-// ---------- DB ----------
 connectDb();
 
-// ---------- App setup ----------
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true })); // biar form non-file juga kebaca
 app.use(cookieParser());
 
-// ---------- CORS ----------
+// CORS
 const allowedOrigins = [
-  process.env.FRONTEND_URL || 'https://soilab-app.vercel.app',
+  process.env.FRONTEND_URL || 'http://localhost:5173',
   'http://localhost:5173'
 ];
-
 app.use(
   cors({
     origin(origin, cb) {
@@ -42,27 +52,38 @@ app.use(
       'Content-Type',
       'Authorization',
       'X-Requested-With',
-      'requiresAuth'
+      'requiresAuth',
+      'X-QR-Session',
+      'X-Online-Session',
+      'X-Table-Number'
     ],
     credentials: true
   })
 );
-
 app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-app.use('/auth', authRoutes); // public + /me (protected di route)
-app.use('/employees', employeeRoutes); // protected (owner) di router level
+/* ==== Public/Auth/Owner ==== */
+app.use('/auth', authRoutes);
+app.use('/employees', employeeRoutes);
 app.use('/menu', menuRoutes);
-app.use('/members', memberRoutes);
-app.use('/google', require('./routers/googleAuthRoutes'));
+app.use('/member-management', memberManagementRoutes);
+app.use('/member', authMemberRoutes);
+app.use('/self-order', selfOrderRoutes);
+app.use('/online', onlineRoutes);
 
-app.use(validateToken);
+app.use('/orders', orderOpsRoutes);
+app.use('/orders', orderRoutes);
 
 app.use(errorHandler);
 
-app.listen(port, () => {
-  console.log(`Server is running at port : ${port}`);
-});
+const server = http.createServer(app);
+const { initSocket } = require('./controllers/socket/socketInit');
+initSocket(server);
+
+const { startJobs } = require('./jobs/index');
+startJobs();
+
+server.listen(port, () => console.log(`Server running on : ${port}`));

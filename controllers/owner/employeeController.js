@@ -3,7 +3,16 @@ const bcrypt = require('bcrypt');
 const User = require('../../models/userModel');
 const throwError = require('../../utils/throwError');
 
-const ALLOWED_PAGES = ['menu', 'employees', 'members'];
+const ALLOWED_PAGES = [
+  'menu',
+  'employees',
+  'members',
+  'orders',
+  'kitchen',
+  'reports',
+  'delivery'
+];
+
 const isPlainObject = (v) => v && typeof v === 'object' && !Array.isArray(v);
 const normalizePagesOut = (pages) =>
   pages instanceof Map ? Object.fromEntries(pages) : pages || {};

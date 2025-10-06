@@ -1,7 +1,7 @@
 // models/userModel.js
 const mongoose = require('mongoose');
 
-const ROLES = ['owner', 'employee', 'member'];
+const ROLES = ['owner', 'employee'];
 
 const UserSchema = new mongoose.Schema(
   {

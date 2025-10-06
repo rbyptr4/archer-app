@@ -1,34 +1,11 @@
-const User = require('../models/userModel');
-
-function requirePageAccess(pageKey) {
-  return async (req, res, next) => {
-    const role = req.user?.role;
-    if (!role) {
-      return res.status(401).json({ message: 'Unauthorized' });
-    }
-
-    if (role === 'owner') {
-      return next();
-    }
-
-    if (role === 'employee') {
-      const user = await User.findById(req.user._id).lean();
-      if (!user) return res.status(401).json({ message: 'User not found' });
-
-      const pages =
-        user.pages instanceof Map
-          ? Object.fromEntries(user.pages)
-          : user.pages || {};
-
-      if (pages[pageKey]) return next();
-
-      return res
-        .status(403)
-        .json({ message: `Forbidden: no access to ${pageKey}` });
-    }
-
-    return res.status(403).json({ message: 'Forbidden' });
+module.exports = function requirePageAccess(pageKey) {
+  return (req, res, next) => {
+    const u = req.user;
+    if (!u) return res.status(401).json({ message: 'Unauthorized' });
+    if (u.role === 'owner') return next(); // owner bypass
+    if (u.pages && u.pages[pageKey] === true) return next();
+    return res
+      .status(403)
+      .json({ message: `Tidak punya akses ke halaman ${pageKey}` });
   };
-}
-
-module.exports = requirePageAccess;
+};
