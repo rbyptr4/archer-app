@@ -7,15 +7,14 @@ require('dotenv').config();
 const connectDb = require('./config/dbConnection');
 const errorHandler = require('./utils/errorHandler');
 
-// Routes (existing)
 const authRoutes = require('./routers/authRoutes');
 const authMemberRoutes = require('./routers/member/authMemberRoutes');
+const menuMemberRoutes = require('./routers/member/menuMemberRoutes');
 const employeeRoutes = require('./routers/owner/employeeRoutes');
 const menuRoutes = require('./routers/owner/menuRoutes');
 const memberManagementRoutes = require('./routers/owner/memberManagementRoutes');
 const selfOrderRoutes = require('./routers/selfOrderRoutes'); // QR dine-in (punyamu)
-
-// Routes (baru)
+const expenseRoutes = require('./routers/expenseRoutes');
 const orderRoutes = require('./routers/orderRoutes'); // order list/detail/kitchen/pay/status/cancel (punyamu yg sudah dirapikan)
 const orderOpsRoutes = require('./routers/orderOpsRoutes'); // payment & delivery ops (baru kita buat)
 const onlineRoutes = require('./routers/onlineRoutes'); // cart online + checkout online (baru kita buat)
@@ -38,7 +37,7 @@ app.use(cookieParser());
 
 // CORS
 const allowedOrigins = [
-  process.env.APP_URL || 'https://archer-app.vercel.app/',
+  process.env.APP_URL || 'https://archer-app.vercel.app',
   'http://localhost:5173'
 ];
 app.use(
@@ -69,8 +68,10 @@ app.use((req, res, next) => {
 app.use('/auth', authRoutes);
 app.use('/employees', employeeRoutes);
 app.use('/menu', menuRoutes);
+app.use('/expense', expenseRoutes);
 app.use('/member-management', memberManagementRoutes);
 app.use('/member', authMemberRoutes);
+app.use('/member/menu', menuMemberRoutes);
 app.use('/self-order', selfOrderRoutes);
 app.use('/online', onlineRoutes);
 

@@ -10,7 +10,8 @@ const ALLOWED_PAGES = [
   'orders',
   'kitchen',
   'reports',
-  'delivery'
+  'delivery',
+  'expense'
 ];
 
 const isPlainObject = (v) => v && typeof v === 'object' && !Array.isArray(v);
