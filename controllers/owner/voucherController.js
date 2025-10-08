@@ -319,15 +319,6 @@ exports.deactivateVoucher = asyncHandler(async (req, res) => {
 exports.removeVoucher = asyncHandler(async (req, res) => {
   const v = await Voucher.findById(req.params.id);
   if (!v) throwError('Voucher tidak ditemukan', 404);
-  v.isDeleted = true;
-  v.isActive = false;
-  await v.save();
-  res.json({ ok: true });
-});
-
-exports.permanentRemoveVoucher = asyncHandler(async (req, res) => {
-  const v = await Voucher.findById(req.params.id);
-  if (!v) throwError('Voucher tidak ditemukan', 404);
   await v.deleteOne(); // ← hapus permanen
   res.json({ ok: true, deleted: true });
 });

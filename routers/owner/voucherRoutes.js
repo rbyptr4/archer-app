@@ -13,6 +13,5 @@ router.patch('/update/:id', ctrl.updateVoucher);
 router.patch('/:id/activate', ctrl.activateVoucher);
 router.patch('/:id/deactivate', ctrl.deactivateVoucher);
 router.delete('/remove/:id', ctrl.removeVoucher);
-router.delete('/remove/:id/permanent', ctrl.permanentRemoveVoucher);
 
 module.exports = router;
