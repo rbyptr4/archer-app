@@ -11,12 +11,16 @@ const orderCtrl = require('../controllers/orderController');
 
 /* ===== Member ===== */
 router.get('/my-order', authMemberRequired, orderCtrl.listMyOrders);
+router.post('/price-preview', authMemberRequired, orderCtrl.previewPrice); // <— NEW
 
+// POS dine-in (tanpa voucher jika tidak ada member)
 router.post(
   '/dine-in/cashier',
   requireRole(['owner', 'employee']),
   orderCtrl.createPosDineIn
 );
+
+/* ===== Staff: list/kitchen/detail/status ===== */
 router.get(
   '/list-order',
   validateToken,
@@ -32,6 +36,7 @@ router.get(
   orderCtrl.listKitchenOrders
 );
 
+// Member cancel sendiri (created+unpaid)
 router.post('/:id/cancel', authMemberRequired, orderCtrl.cancelOrder);
 
 router.get(
@@ -50,7 +55,7 @@ router.patch(
   orderCtrl.updateStatus
 );
 
-/* ===== Member detail (diletakkan PALING BAWAH agar tidak menangkap route lain) ===== */
+/* ===== Member detail (paling bawah biar gak ketimpa) ===== */
 router.get('/member/my-order/:id', authMemberRequired, orderCtrl.getMyOrder);
 
 module.exports = router;

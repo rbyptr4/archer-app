@@ -1,12 +1,16 @@
 // controllers/orderController.js
 const asyncHandler = require('express-async-handler');
 const crypto = require('crypto');
+const { awardPointsIfEligible } = require('../utils/loyalty');
 
 const Order = require('../models/orderModel');
 const Cart = require('../models/cartModel');
 const Menu = require('../models/menuModel');
 const Member = require('../models/memberModel');
 const MemberSession = require('../models/memberSessionModel');
+
+const VoucherClaim = require('../models/voucherClaimModel');
+const { validateAndPrice } = require('../utils/voucherEngine');
 
 const { nextDailyTxCode } = require('../utils/txCode');
 const throwError = require('../utils/throwError');
@@ -30,9 +34,9 @@ const {
 } = require('../utils/memberToken');
 
 /* =============== Cookie presets (member session) =============== */
-const cookieAccess = { ...baseCookie, httpOnly: true, maxAge: 15 * 60 * 1000 }; // 15m
-const cookieRefresh = { ...baseCookie, httpOnly: true, maxAge: REFRESH_TTL_MS }; // 1y
-const cookieDevice = { ...baseCookie, httpOnly: false, maxAge: REFRESH_TTL_MS }; // 1y (readable by FE)
+const cookieAccess = { ...baseCookie, httpOnly: true, maxAge: 15 * 60 * 1000 };
+const cookieRefresh = { ...baseCookie, httpOnly: true, maxAge: REFRESH_TTL_MS };
+const cookieDevice = { ...baseCookie, httpOnly: false, maxAge: REFRESH_TTL_MS };
 
 /* ================== Konstanta & Helper ================== */
 const ALLOWED_STATUSES = [
@@ -44,36 +48,6 @@ const ALLOWED_STATUSES = [
   'cancelled'
 ];
 const ALLOWED_PAY_STATUS = ['unpaid', 'paid', 'refunded', 'void'];
-const DELIVERY_ALLOWED = [
-  'pending',
-  'assigned',
-  'picked_up',
-  'on_the_way',
-  'delivered',
-  'failed'
-];
-
-async function createOrderWithTxCode(
-  payload,
-  { prefix = 'ARCH', maxRetry = 5 } = {}
-) {
-  let lastErr;
-  for (let i = 0; i < maxRetry; i++) {
-    try {
-      const code = await nextDailyTxCode(prefix);
-      const doc = await Order.create({ ...payload, transaction_code: code });
-      return doc;
-    } catch (e) {
-      // Duplicate key on unique index
-      if (e && e.code === 11000 && /transaction_code/.test(String(e.message))) {
-        lastErr = e;
-        continue; // retry ambil sequence berikutnya
-      }
-      throw e;
-    }
-  }
-  throw lastErr || new Error('Gagal generate transaction_code unik');
-}
 
 const canTransit = (from, to) => {
   const flow = {
@@ -87,18 +61,6 @@ const canTransit = (from, to) => {
   return (flow[from] || []).includes(to);
 };
 const isKitchenStatus = (s) => s === 'accepted' || s === 'preparing';
-
-const canTransitDelivery = (from, to) => {
-  const flow = {
-    pending: ['assigned'],
-    assigned: ['picked_up'],
-    picked_up: ['on_the_way'],
-    on_the_way: ['delivered', 'failed'],
-    delivered: [],
-    failed: []
-  };
-  return (flow[from] || []).includes(to);
-};
 
 // ===== utils cart =====
 const asInt = (v, def = 0) => (Number.isFinite(+v) ? +v : def);
@@ -339,6 +301,22 @@ exports.listKitchenOrders = asyncHandler(async (_req, res) => {
   res.status(200).json({ items });
 });
 
+/* ================== PREVIEW HARGA (voucher) ================== */
+exports.previewPrice = asyncHandler(async (req, res) => {
+  if (!req.member?.id) throwError('Harus login sebagai member', 401);
+  const { cart, deliveryFee = 0, voucherClaimIds = [] } = req.body || {};
+  if (!cart?.items?.length) throwError('Cart kosong', 400);
+
+  const result = await validateAndPrice({
+    memberId: req.member.id,
+    cart,
+    deliveryFee,
+    voucherClaimIds
+  });
+  res.status(200).json(result);
+});
+
+/* ================== STATUS & CANCEL ================== */
 exports.updateStatus = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
   const { status, reason } = req.body || {};
@@ -372,15 +350,18 @@ exports.updateStatus = asyncHandler(async (req, res) => {
     order.cancelled_at = new Date();
     if (order.payment_status === 'paid') {
       order.payment_status = 'refunded';
+      // kebijakan voucher saat cancel+paid ditangani di orderOps (updatePaymentStatus) juga
     } else if (order.payment_status === 'unpaid') {
       order.payment_status = 'void';
     }
   }
   await order.save();
-
+  if (order.payment_status === 'paid' && !order.loyalty_awarded_at) {
+    await awardPointsIfEligible(order, Member);
+  }
   const payload = {
     id: String(order._id),
-    transaction_code: orderDoc.transaction_code,
+    transaction_code: order.transaction_code,
     member: String(order.member),
     table_number: order.table_number || null,
     from_status: fromStatus,
@@ -423,7 +404,7 @@ exports.cancelOrder = asyncHandler(async (req, res) => {
 
   const payload = {
     id: String(order._id),
-    transaction_code: orderDoc.transaction_code,
+    transaction_code: order.transaction_code,
     member: String(order.member),
     table_number: order.table_number || null,
     from_status: fromStatus,
@@ -595,9 +576,14 @@ exports.clearCart = asyncHandler(async (req, res) => {
   res.status(200).json(cart.toObject());
 });
 
-// POST /cart/checkout (QR dine-in). Bisa kirim file payment_proof (opsional).
+// POST /cart/checkout (QR dine-in). Body: { idempotency_key?, payment_method?, voucherClaimIds? [], ... }
+// file payment_proof opsional (multer -> req.file)
 exports.checkout = asyncHandler(async (req, res) => {
-  const { idempotency_key, payment_method = 'manual' } = req.body || {};
+  const {
+    idempotency_key,
+    payment_method = 'manual',
+    voucherClaimIds = []
+  } = req.body || {};
   const tableNumber = asInt(req.query.table ?? req.body?.table_number, 0);
   if (!tableNumber) throwError('table_number wajib diisi', 400);
 
@@ -637,6 +623,14 @@ exports.checkout = asyncHandler(async (req, res) => {
     cart.member = member._id;
     cart.session_id = null;
   }
+  // recompute
+  for (const it of cart.items) {
+    const addonsTotal = (it.addons || []).reduce(
+      (s, a) => s + (a.price || 0) * (a.qty || 1),
+      0
+    );
+    it.line_subtotal = (it.base_price + addonsTotal) * it.quantity;
+  }
   recomputeTotals(cart);
   await cart.save();
 
@@ -653,29 +647,87 @@ exports.checkout = asyncHandler(async (req, res) => {
     payment_proof_url = `https://drive.google.com/uc?export=view&id=${uploaded.id}`;
   }
 
-  const orderDoc = await createOrderWithTxCode({
-    member: cart.member,
-    table_number: cart.table_number,
-    source: 'qr',
-    fulfillment_type: 'dine_in',
-    items: cart.items.map((it) => ({
-      menu: it.menu,
-      menu_code: it.menu_code,
-      name: it.name,
-      imageUrl: it.imageUrl,
-      base_price: it.base_price,
-      quantity: it.quantity,
-      addons: it.addons,
-      notes: it.notes,
-      line_subtotal: it.line_subtotal
-    })),
-    total_quantity: cart.total_quantity,
-    payment_method, // default 'manual'
-    payment_proof_url, // opsional untuk QR
-    status: 'created',
-    payment_status: 'unpaid',
-    placed_at: new Date()
+  // ==== Voucher pricing (delivery=0 untuk dine-in) ====
+  const priced = await validateAndPrice({
+    memberId: member._id,
+    cart: {
+      items: cart.items.map((it) => ({
+        menuId: it.menu,
+        qty: it.quantity,
+        price: it.base_price,
+        category: it.category
+      }))
+    },
+    deliveryFee: 0,
+    voucherClaimIds
   });
+
+  // buat ORDER (pakai tx code & simpan breakdown)
+  const order = await (async () => {
+    for (let i = 0; i < 5; i++) {
+      try {
+        const code = await nextDailyTxCode('ARCH');
+        return await Order.create({
+          member: cart.member,
+          table_number: cart.table_number,
+          source: 'qr',
+          fulfillment_type: 'dine_in',
+          transaction_code: code,
+          items: cart.items.map((it) => ({
+            menu: it.menu,
+            menu_code: it.menu_code,
+            name: it.name,
+            imageUrl: it.imageUrl,
+            base_price: it.base_price,
+            quantity: it.quantity,
+            addons: it.addons,
+            notes: it.notes,
+            line_subtotal: it.line_subtotal
+          })),
+          total_quantity: cart.total_quantity,
+          items_subtotal: priced.totals.baseSubtotal,
+          items_discount: priced.totals.itemsDiscount,
+          delivery_fee: 0,
+          shipping_discount: priced.totals.shippingDiscount,
+          discounts: priced.breakdown,
+          grand_total: priced.totals.grandTotal,
+          payment_method,
+          payment_proof_url,
+          status: 'created',
+          payment_status: 'unpaid',
+          placed_at: new Date()
+        });
+      } catch (e) {
+        if (e && e.code === 11000 && /transaction_code/.test(String(e.message)))
+          continue;
+        throw e;
+      }
+    }
+    throw new Error('Gagal generate transaction_code unik');
+  })();
+
+  if (order.payment_status === 'paid') {
+    await awardPointsIfEligible(order, Member);
+  }
+
+  // konsumsi claim
+  for (const claimId of priced.chosenClaimIds) {
+    const c = await VoucherClaim.findById(claimId);
+    if (
+      c &&
+      c.status === 'claimed' &&
+      String(c.member) === String(member._id)
+    ) {
+      c.remainingUse -= 1;
+      if (c.remainingUse <= 0) c.status = 'used';
+      c.history.push({
+        action: 'USE',
+        ref: String(order._id),
+        note: 'dipakai pada order'
+      });
+      await c.save();
+    }
+  }
 
   // Tandai cart sudah checkout
   const upd = await Cart.findOneAndUpdate(
@@ -684,7 +736,7 @@ exports.checkout = asyncHandler(async (req, res) => {
       $set: {
         status: 'checked_out',
         checked_out_at: new Date(),
-        order_id: orderDoc._id,
+        order_id: order._id,
         last_idempotency_key: idempotency_key || null,
         items: [],
         total_items: 0,
@@ -703,40 +755,41 @@ exports.checkout = asyncHandler(async (req, res) => {
 
   // Update statistik member (pakai GRAND TOTAL)
   await Member.findByIdAndUpdate(member._id, {
-    $inc: { total_spend: orderDoc.grand_total || 0 },
+    $inc: { total_spend: order.grand_total || 0 },
     $set: { last_visit_at: new Date() }
   });
 
   // Emit
   const payload = {
-    id: String(orderDoc._id),
-    table_number: orderDoc.table_number,
+    id: String(order._id),
+    transaction_code: order.transaction_code,
+    table_number: order.table_number,
     member: { id: String(member._id), name: member.name, phone: member.phone },
-    items_total: orderDoc.items_total,
-    grand_total: orderDoc.grand_total,
-    total_quantity: orderDoc.total_quantity,
-    status: orderDoc.status,
-    payment_status: orderDoc.payment_status,
-    placed_at: orderDoc.placed_at,
-    payment_proof_url: orderDoc.payment_proof_url || ''
+    items_total: order.items_subtotal,
+    grand_total: order.grand_total,
+    total_quantity: order.total_quantity,
+    status: order.status,
+    payment_status: order.payment_status,
+    placed_at: order.placed_at,
+    payment_proof_url: order.payment_proof_url || ''
   };
   emitToStaff('order:new', payload);
   emitToMember(member._id, 'order:new', payload);
-  if (orderDoc.table_number)
-    emitToTable(orderDoc.table_number, 'order:new', payload);
+  if (order.table_number) emitToTable(order.table_number, 'order:new', payload);
 
   res.status(201).json({
     order: {
-      _id: orderDoc._id,
-      transaction_code: orderDoc.transaction_code,
-      table_number: orderDoc.table_number,
-      items_total: orderDoc.items_total,
-      grand_total: orderDoc.grand_total,
-      total_quantity: orderDoc.total_quantity,
-      status: orderDoc.status,
-      payment_status: orderDoc.payment_status,
-      placed_at: orderDoc.placed_at,
-      payment_proof_url: orderDoc.payment_proof_url || ''
+      _id: order._id,
+      transaction_code: order.transaction_code,
+      table_number: order.table_number,
+      items_subtotal: order.items_subtotal,
+      grand_total: order.grand_total,
+      total_quantity: order.total_quantity,
+      discounts: order.discounts,
+      status: order.status,
+      payment_status: order.payment_status,
+      placed_at: order.placed_at,
+      payment_proof_url: order.payment_proof_url || ''
     },
     message: 'Checkout berhasil'
   });
@@ -748,6 +801,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   const {
     table_number,
     items,
+    as_member = false,
     member_id,
     name,
     phone,
@@ -759,32 +813,53 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   if (!tableNo) throwError('table_number wajib', 400);
   if (!Array.isArray(items) || !items.length) throwError('items wajib', 400);
 
-  // Resolve member (opsional)
   let member = null;
-  if (member_id) {
-    member = await Member.findById(member_id).lean();
-    if (!member) throwError('Member tidak ditemukan', 404);
-  } else if (name && phone) {
-    const normalizedPhone = String(phone)
-      .replace(/\s+/g, '')
-      .replace(/^(\+62|62|0)/, '0');
-    member = await Member.findOne({ phone: normalizedPhone }).lean();
-    if (!member) {
-      const created = await Member.create({
-        name: String(name).trim(),
-        phone: normalizedPhone,
-        join_channel: 'pos',
-        visit_count: 1,
-        last_visit_at: new Date(),
-        is_active: true
-      });
-      member = created.toObject();
+  let customer_name = '';
+  let customer_phone = '';
+
+  if (as_member) {
+    if (!member_id && !(name && phone)) {
+      throwError('as_member=true: sertakan member_id atau name+phone', 400);
+    }
+
+    if (member_id) {
+      member = await Member.findById(member_id).lean();
+      if (!member) throwError('Member tidak ditemukan', 404);
+    } else {
+      const normalizedPhone = String(phone)
+        .replace(/\s+/g, '')
+        .replace(/^(\+62|62|0)/, '0');
+      member = await Member.findOne({ phone: normalizedPhone }).lean();
+      if (!member) {
+        const created = await Member.create({
+          name: String(name).trim(),
+          phone: normalizedPhone,
+          join_channel: 'pos',
+          visit_count: 1,
+          last_visit_at: new Date(),
+          is_active: true
+        });
+        member = created.toObject();
+      }
+    }
+  } else {
+    // TANPA MEMBER (guest) — simpan snapshot agar histori tetap ada
+    customer_name = String(name || '').trim();
+    customer_phone = String(phone || '').trim();
+    if (!customer_name && !customer_phone) {
+      // longgar: minimal salah satu diisi supaya ada jejak
+      throwError(
+        'Tanpa member: isi minimal customer_name atau customer_phone',
+        400
+      );
     }
   }
 
-  // Bangun line items
+  // ====== Build items & totals ======
   const orderItems = [];
   let totalQty = 0;
+  let itemsSubtotal = 0;
+
   for (const it of items) {
     const menu = await Menu.findById(it.menu_id).lean();
     if (!menu || !menu.isActive)
@@ -792,6 +867,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     const qty = clamp(asInt(it.quantity, 1), 1, 999);
     const normAddons = normalizeAddons(it.addons);
 
+    const line_subtotal = computeLineSubtotal(menu.price, normAddons, qty);
     orderItems.push({
       menu: menu._id,
       menu_code: menu.menu_code || '',
@@ -801,36 +877,68 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
       quantity: qty,
       addons: normAddons,
       notes: String(it.notes || '').trim(),
-      line_subtotal: computeLineSubtotal(menu.price, normAddons, qty)
+      line_subtotal
     });
     totalQty += qty;
+    itemsSubtotal += line_subtotal;
   }
 
   const now = new Date();
-  const order = await createOrderWithTxCode({
-    member: member ? member._id : null,
-    table_number: tableNo,
-    source: 'pos',
-    fulfillment_type: 'dine_in',
-    items: orderItems,
-    total_quantity: totalQty,
-    payment_method,
-    payment_status: mark_paid ? 'paid' : 'unpaid',
-    paid_at: mark_paid ? now : null,
-    verified_by: mark_paid ? req.user?.id || null : null,
-    verified_at: mark_paid ? now : null,
-    status: 'created',
-    placed_at: now
-  });
 
+  // ====== Create order ======
+  const order = await (async () => {
+    for (let i = 0; i < 5; i++) {
+      try {
+        const code = await nextDailyTxCode('ARCH');
+        return await Order.create({
+          member: member ? member._id : null,
+          customer_name, // <— NEW
+          customer_phone, // <— NEW
+          table_number: tableNo,
+          source: 'pos',
+          fulfillment_type: 'dine_in',
+          transaction_code: code,
+          items: orderItems,
+          total_quantity: totalQty,
+
+          // sinkron dengan model & voucher engine (POS tanpa voucher)
+          items_subtotal: itemsSubtotal,
+          items_discount: 0,
+          delivery_fee: 0,
+          shipping_discount: 0,
+          discounts: [],
+          grand_total: itemsSubtotal,
+
+          payment_method,
+          payment_status: mark_paid ? 'paid' : 'unpaid',
+          paid_at: mark_paid ? now : null,
+          verified_by: mark_paid ? req.user?.id || null : null,
+          verified_at: mark_paid ? now : null,
+          status: 'created',
+          placed_at: now
+        });
+      } catch (e) {
+        if (e && e.code === 11000 && /transaction_code/.test(String(e.message)))
+          continue;
+        throw e;
+      }
+    }
+    throw new Error('Gagal generate transaction_code unik');
+  })();
+
+  if (order.payment_status === 'paid') {
+    await awardPointsIfEligible(order, Member);
+  }
+  // Emit payload (tetap ada, aman meski member null)
   const payload = {
     id: String(order._id),
     transaction_code: order.transaction_code,
     member: member
       ? { id: String(member._id), name: member.name, phone: member.phone }
       : null,
+    customer: !member ? { name: customer_name, phone: customer_phone } : null, // <— Info guest ke FE kalau perlu
     table_number: order.table_number,
-    items_total: order.items_total,
+    items_total: order.items_subtotal,
     grand_total: order.grand_total,
     total_quantity: order.total_quantity,
     line_count: order.items?.length || 0,
@@ -850,10 +958,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   if (member) emitToMember(member._id, 'order:new', payload);
 
   res.status(201).json({
-    order: {
-      ...order.toObject(),
-      transaction_code: order.transaction_code
-    },
+    order: { ...order.toObject(), transaction_code: order.transaction_code },
     message: 'Order POS dine-in dibuat'
   });
 });

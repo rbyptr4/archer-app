@@ -33,10 +33,13 @@ const {
 
 const { nextDailyTxCode } = require('../utils/txCode');
 
+const VoucherClaim = require('../models/voucherClaimModel');
+const { validateAndPrice } = require('../utils/voucherEngine');
+
 /* =============== Cookie presets (member session) =============== */
-const cookieAccess = { ...baseCookie, httpOnly: true, maxAge: 15 * 60 * 1000 }; // 15 menit
-const cookieRefresh = { ...baseCookie, httpOnly: true, maxAge: REFRESH_TTL_MS }; // 1 tahun
-const cookieDevice = { ...baseCookie, httpOnly: false, maxAge: REFRESH_TTL_MS }; // 1 tahun (dibaca FE)
+const cookieAccess = { ...baseCookie, httpOnly: true, maxAge: 15 * 60 * 1000 };
+const cookieRefresh = { ...baseCookie, httpOnly: true, maxAge: REFRESH_TTL_MS };
+const cookieDevice = { ...baseCookie, httpOnly: false, maxAge: REFRESH_TTL_MS };
 
 /* ===================== Utils umum ===================== */
 const asInt = (v, def = 0) => (Number.isFinite(+v) ? +v : def);
@@ -73,14 +76,17 @@ const computeLineSubtotal = (basePrice, addons, qty) => {
 
 const recomputeTotals = (cart) => {
   let totalQty = 0;
-  let totalPrice = 0;
   for (const it of cart.items) {
+    const addonsTotal = (it.addons || []).reduce(
+      (s, a) => s + (a.price || 0) * (a.qty || 1),
+      0
+    );
+    it.line_subtotal = (it.base_price + addonsTotal) * it.quantity;
     totalQty += it.quantity;
-    totalPrice += it.line_subtotal;
   }
-  cart.total_items = cart.items.length;
   cart.total_quantity = totalQty;
-  cart.total_price = totalPrice;
+  cart.total_items = cart.items.length;
+  cart.total_price = cart.items.reduce((s, it) => s + it.line_subtotal, 0);
   return cart;
 };
 
@@ -110,7 +116,7 @@ const findOrCreateOnlineCart = async ({ memberId, sessionId }) => {
   const created = await Cart.create({
     member: memberId || null,
     session_id: memberId ? null : sessionId,
-    table_number: null, // online tidak pakai meja
+    table_number: null,
     items: [],
     total_items: 0,
     total_quantity: 0,
@@ -121,7 +127,7 @@ const findOrCreateOnlineCart = async ({ memberId, sessionId }) => {
   return created.toObject();
 };
 
-/* ===================== Member helper (auto-register + start session) ===================== */
+/* ===================== Member helper ===================== */
 const ensureOnlineMember = async (req, res) => {
   if (req.member?.id) {
     const m = await Member.findById(req.member.id).lean();
@@ -152,15 +158,15 @@ const ensureOnlineMember = async (req, res) => {
     await member.save();
   }
 
-  // Start sesi device-bound (tanpa OTP, pake device_id + refresh token 1 tahun)
+  // Start sesi device-bound
   const incomingDev = req.cookies?.[DEVICE_COOKIE] || req.header('x-device-id');
   const device_id =
     incomingDev && String(incomingDev).trim()
       ? String(incomingDev).trim()
       : crypto.randomUUID();
 
-  const accessToken = signAccessToken(member); // 15 menit
-  const refreshToken = generateOpaqueToken(); // random 256-bit base64url
+  const accessToken = signAccessToken(member);
+  const refreshToken = generateOpaqueToken();
   const refreshHash = hashToken(refreshToken);
 
   await MemberSession.create({
@@ -179,29 +185,7 @@ const ensureOnlineMember = async (req, res) => {
   return member.toObject ? member.toObject() : member;
 };
 
-/* ============ Helper: create order dengan transaction_code (daily sequence + retry) ============ */
-async function createOrderWithTxCode(
-  payload,
-  { prefix = 'ARCH', maxRetry = 5 } = {}
-) {
-  let lastErr;
-  for (let i = 0; i < maxRetry; i++) {
-    try {
-      const code = await nextDailyTxCode(prefix);
-      const doc = await Order.create({ ...payload, transaction_code: code });
-      return doc;
-    } catch (e) {
-      if (e && e.code === 11000 && /transaction_code/.test(String(e.message))) {
-        lastErr = e; // duplicate, retry
-        continue;
-      }
-      throw e;
-    }
-  }
-  throw lastErr || new Error('Gagal generate transaction_code unik');
-}
-
-/* ===================== CART ONLINE ===================== */
+/* ===================== CART ===================== */
 exports.getCart = asyncHandler(async (req, res) => {
   const iden = getOnlineIdentity(req);
   const cart = await findOrCreateOnlineCart(iden);
@@ -220,7 +204,6 @@ exports.addToCart = asyncHandler(async (req, res) => {
   const qty = clamp(asInt(quantity, 1), 1, 999);
   const normAddons = normalizeAddons(addons);
   const line_key = makeLineKey({ menuId: menu._id, addons: normAddons, notes });
-  const line_subtotal = computeLineSubtotal(menu.price, normAddons, qty);
 
   const filter = {
     status: 'active',
@@ -245,11 +228,6 @@ exports.addToCart = asyncHandler(async (req, res) => {
   if (idx >= 0) {
     const newQty = clamp(cart.items[idx].quantity + qty, 1, 999);
     cart.items[idx].quantity = newQty;
-    cart.items[idx].line_subtotal = computeLineSubtotal(
-      cart.items[idx].base_price,
-      cart.items[idx].addons,
-      newQty
-    );
   } else {
     cart.items.push({
       menu: menu._id,
@@ -260,8 +238,7 @@ exports.addToCart = asyncHandler(async (req, res) => {
       quantity: qty,
       addons: normAddons,
       notes: String(notes || '').trim(),
-      line_key,
-      line_subtotal
+      line_key
     });
   }
 
@@ -301,11 +278,6 @@ exports.updateCartItem = asyncHandler(async (req, res) => {
       addons: cart.items[idx].addons,
       notes: cart.items[idx].notes
     });
-    cart.items[idx].line_subtotal = computeLineSubtotal(
-      cart.items[idx].base_price,
-      cart.items[idx].addons,
-      cart.items[idx].quantity
-    );
   }
 
   recomputeTotals(cart);
@@ -381,12 +353,13 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
   const {
     name,
     phone,
-    fulfillment_type, // 'dine_in' | 'delivery'
+    fulfillment_type,
     address_text,
     lat,
     lng,
     note_to_rider,
-    idempotency_key
+    idempotency_key,
+    voucherClaimIds = []
   } = req.body || {};
 
   if (!['dine_in', 'delivery'].includes(fulfillment_type)) {
@@ -419,7 +392,7 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
   if (!cart) throwError('Cart tidak ditemukan / kosong', 404);
   if (!cart.items?.length) throwError('Cart kosong', 400);
 
-  // Idempotency sederhana via cart
+  // Idempotency via cart
   if (
     idempotency_key &&
     cart.last_idempotency_key === idempotency_key &&
@@ -450,6 +423,7 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
 
   // Siapkan delivery block bila perlu
   let delivery = undefined;
+  let delivery_fee = 0;
   if (fulfillment_type === 'delivery') {
     const latN = Number(lat),
       lngN = Number(lng);
@@ -460,7 +434,7 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
     if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0) + 1e-9) {
       throwError(`Di luar radius ${DELIVERY_MAX_RADIUS_KM}km`, 400);
     }
-    const delivery_fee = calcDeliveryFee(distance_km);
+    delivery_fee = calcDeliveryFee(distance_km);
     delivery = {
       address_text: String(address_text || '').trim(),
       location: { lat: latN, lng: lngN },
@@ -471,44 +445,88 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
     };
   }
 
-  // Recompute cart (pastikan line_subtotal benar)
-  let totalQty = 0;
-  for (const it of cart.items) {
-    const addonsTotal = (it.addons || []).reduce(
-      (s, a) => s + (a.price || 0) * (a.qty || 1),
-      0
-    );
-    it.line_subtotal = (it.base_price + addonsTotal) * it.quantity;
-    totalQty += it.quantity;
-  }
-  cart.total_quantity = totalQty;
+  // Recompute cart
+  recomputeTotals(cart);
   await cart.save();
 
-  // Buat ORDER (pakai daily sequence transaction_code)
-  const order = await createOrderWithTxCode({
-    member: cart.member,
-    table_number: null, // online tanpa meja
-    source: 'online',
-    fulfillment_type,
-    items: cart.items.map((it) => ({
-      menu: it.menu,
-      menu_code: it.menu_code,
-      name: it.name,
-      imageUrl: it.imageUrl,
-      base_price: it.base_price,
-      quantity: it.quantity,
-      addons: it.addons,
-      notes: it.notes,
-      line_subtotal: it.line_subtotal
-    })),
-    total_quantity: cart.total_quantity,
-    delivery,
-    payment_method: 'qr',
-    payment_proof_url,
-    status: 'created',
-    payment_status: 'unpaid',
-    placed_at: new Date()
+  // ======= Voucher pricing =======
+  const priced = await validateAndPrice({
+    memberId: member._id,
+    cart: {
+      items: cart.items.map((it) => ({
+        menuId: it.menu,
+        qty: it.quantity,
+        price: it.base_price,
+        category: it.category
+      }))
+    },
+    deliveryFee: delivery_fee,
+    voucherClaimIds
   });
+
+  // Buat ORDER (pakai daily sequence transaction_code)
+  const order = await (async () => {
+    for (let i = 0; i < 5; i++) {
+      try {
+        const code = await nextDailyTxCode('ARCH');
+        return await Order.create({
+          member: cart.member,
+          table_number: null,
+          source: 'online',
+          fulfillment_type,
+          transaction_code: code,
+          items: cart.items.map((it) => ({
+            menu: it.menu,
+            menu_code: it.menu_code,
+            name: it.name,
+            imageUrl: it.imageUrl,
+            base_price: it.base_price,
+            quantity: it.quantity,
+            addons: it.addons,
+            notes: it.notes,
+            line_subtotal: it.line_subtotal
+          })),
+          total_quantity: cart.total_quantity,
+          delivery,
+          items_subtotal: priced.totals.baseSubtotal,
+          items_discount: priced.totals.itemsDiscount,
+          delivery_fee: priced.totals.deliveryFee,
+          shipping_discount: priced.totals.shippingDiscount,
+          discounts: priced.breakdown,
+          grand_total: priced.totals.grandTotal,
+          payment_method: 'qr',
+          payment_proof_url,
+          status: 'created',
+          payment_status: 'unpaid',
+          placed_at: new Date()
+        });
+      } catch (e) {
+        if (e && e.code === 11000 && /transaction_code/.test(String(e.message)))
+          continue;
+        throw e;
+      }
+    }
+    throw new Error('Gagal generate transaction_code unik');
+  })();
+
+  // konsumsi claim
+  for (const claimId of priced.chosenClaimIds) {
+    const c = await VoucherClaim.findById(claimId);
+    if (
+      c &&
+      c.status === 'claimed' &&
+      String(c.member) === String(member._id)
+    ) {
+      c.remainingUse -= 1;
+      if (c.remainingUse <= 0) c.status = 'used';
+      c.history.push({
+        action: 'USE',
+        ref: String(order._id),
+        note: 'dipakai pada order'
+      });
+      await c.save();
+    }
+  }
 
   // Tandai cart telah checkout & kosongkan
   await Cart.findByIdAndUpdate(
@@ -539,7 +557,7 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
     id: String(order._id),
     transaction_code: order.transaction_code,
     member: { id: String(member._id), name: member.name, phone: member.phone },
-    items_total: order.items_total,
+    items_total: order.items_subtotal,
     grand_total: order.grand_total,
     total_quantity: order.total_quantity,
     source: order.source,

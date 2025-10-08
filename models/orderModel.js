@@ -16,8 +16,12 @@ const DeliverySchema = new mongoose.Schema(
     delivery_fee: { type: Number, min: 0, default: 0, set: int, get: int },
     note_to_rider: { type: String, trim: true, default: '' },
     assignee: {
-      user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-      name: { type: String, trim: true }
+      user: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+        default: null
+      },
+      name: { type: String, trim: true, default: '' }
     },
     status: {
       type: String,
@@ -42,6 +46,7 @@ const DeliverySchema = new mongoose.Schema(
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
 );
 
+/* ================= Subdoc: Addon & Item ================= */
 const addonSchema = new mongoose.Schema(
   {
     name: { type: String, trim: true, required: true },
@@ -67,15 +72,33 @@ const orderItemSchema = new mongoose.Schema(
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
 );
 
+/* ================= Subdoc: Voucher Discount Breakdown ================= */
+const discountBreakdownSchema = new mongoose.Schema(
+  {
+    claimId: { type: mongoose.Schema.Types.ObjectId, ref: 'VoucherClaim' },
+    voucherId: { type: mongoose.Schema.Types.ObjectId, ref: 'Voucher' },
+    name: { type: String, trim: true }, // nama/label voucher saat rilis
+    itemsDiscount: { type: Number, default: 0, set: int, get: int }, // potongan ke barang
+    shippingDiscount: { type: Number, default: 0, set: int, get: int }, // potongan ongkir
+    note: { type: String, trim: true, default: '' }
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
+);
+
 /* ================= Main: Order ================= */
 const orderSchema = new mongoose.Schema(
   {
     transaction_code: { type: String, trim: true },
+
     member: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Member',
-      required: true
+      default: null
     },
+
+    customer_name: { type: String, trim: true, default: '' },
+    customer_phone: { type: String, trim: true, default: '' },
+    loyalty_awarded_at: { type: Date, default: null },
 
     source: {
       type: String,
@@ -106,7 +129,7 @@ const orderSchema = new mongoose.Schema(
       }
     },
 
-    // Barang
+    // Items
     items: {
       type: [orderItemSchema],
       default: [],
@@ -115,10 +138,32 @@ const orderSchema = new mongoose.Schema(
         message: 'Order harus memiliki item.'
       }
     },
-
     total_quantity: { type: Number, min: 1, required: true },
-    items_total: { type: Number, min: 0, required: true, set: int, get: int }, // total dari semua line_subtotal
-    grand_total: { type: Number, min: 0, required: true, set: int, get: int }, // items_total + (delivery_fee kalau ada)
+
+    // ======= Totals with Voucher Engine =======
+    // subtotal barang sebelum diskon
+    items_subtotal: {
+      type: Number,
+      min: 0,
+      required: true,
+      set: int,
+      get: int
+    },
+
+    // total diskon ke barang (gabungan semua voucher non-ongkir)
+    items_discount: { type: Number, min: 0, default: 0, set: int, get: int },
+
+    // ongkir (mirror dari delivery.delivery_fee supaya gampang dihitung)
+    delivery_fee: { type: Number, min: 0, default: 0, set: int, get: int },
+
+    // total diskon ongkir (free/discount shipping)
+    shipping_discount: { type: Number, min: 0, default: 0, set: int, get: int },
+
+    // rincian per voucher yang dipakai
+    discounts: { type: [discountBreakdownSchema], default: [] },
+
+    // grand total akhir = items_subtotal - items_discount + delivery_fee - shipping_discount
+    grand_total: { type: Number, min: 0, required: true, set: int, get: int },
 
     // Pembayaran
     payment_method: {
@@ -174,10 +219,17 @@ const orderSchema = new mongoose.Schema(
   }
 );
 
+/* =============== Derived & Back-compat =============== */
+// Backward compatibility: expose items_total seperti sebelumnya (alias ke items_subtotal)
+orderSchema.virtual('items_total').get(function () {
+  return this.items_subtotal;
+});
+
+/* =============== Hooks =============== */
 orderSchema.pre('validate', function (next) {
   const items = this.items || [];
   let totalQty = 0;
-  let itemsTotal = 0;
+  let itemsSubtotal = 0;
 
   for (const it of items) {
     const addonsSum = (it.addons || []).reduce(
@@ -187,21 +239,36 @@ orderSchema.pre('validate', function (next) {
     const line = (int(it.base_price) + addonsSum) * int(it.quantity || 1);
     it.line_subtotal = int(line);
     totalQty += int(it.quantity || 0);
-    itemsTotal += int(line);
+    itemsSubtotal += int(line);
   }
 
   this.total_quantity = totalQty;
-  this.items_total = int(itemsTotal);
+  this.items_subtotal = int(itemsSubtotal);
 
+  // mirror delivery_fee dari block delivery (kalau ada)
   const deliveryFee = this.delivery?.delivery_fee
     ? int(this.delivery.delivery_fee)
     : 0;
-  this.grand_total = int(this.items_total + deliveryFee);
+  this.delivery_fee = int(deliveryFee);
 
+  // pastikan diskon non-negatif
+  this.items_discount = int(Math.max(0, this.items_discount || 0));
+  this.shipping_discount = int(Math.max(0, this.shipping_discount || 0));
+
+  // grand total = items_subtotal - items_discount + delivery_fee - shipping_discount
+  const gt =
+    this.items_subtotal -
+    this.items_discount +
+    this.delivery_fee -
+    this.shipping_discount;
+  this.grand_total = int(Math.max(0, gt));
+
+  // aturan table_number
   if (this.fulfillment_type === 'dine_in' && this.source === 'online') {
     this.table_number = null;
   }
 
+  // aturan source online: wajib payment proof + method qr
   if (this.source === 'online') {
     if (!this.payment_proof_url || !String(this.payment_proof_url).trim()) {
       return next(new Error('Bukti pembayaran wajib untuk order online.'));
@@ -209,6 +276,7 @@ orderSchema.pre('validate', function (next) {
     this.payment_method = 'qr';
   }
 
+  // aturan delivery: data wajib
   if (this.fulfillment_type === 'delivery') {
     const ok =
       this.delivery &&
@@ -222,9 +290,21 @@ orderSchema.pre('validate', function (next) {
     }
   }
 
+  if (!this.member) {
+    const hasGuest =
+      (this.customer_name && this.customer_name.trim().length > 0) ||
+      (this.customer_phone && this.customer_phone.trim().length > 0);
+    if (!hasGuest) {
+      return next(
+        new Error('Order butuh identitas: member atau customer_name/phone.')
+      );
+    }
+  }
+
   next();
 });
 
+/* =============== Methods =============== */
 orderSchema.methods.canMoveToKitchen = function () {
   return this.payment_status === 'paid';
 };
@@ -233,6 +313,7 @@ orderSchema.methods.canAssignCourier = function () {
   return this.payment_status === 'paid' && this.fulfillment_type === 'delivery';
 };
 
+/* =============== Indexes =============== */
 orderSchema.index({ member: 1, createdAt: -1 });
 orderSchema.index({ source: 1, fulfillment_type: 1, createdAt: -1 });
 orderSchema.index({ payment_status: 1, createdAt: -1 });
