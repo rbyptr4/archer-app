@@ -962,3 +962,103 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     message: 'Order POS dine-in dibuat'
   });
 });
+
+// POST /orders/:id/verify-payment
+// body: { payment_method?: 'cash'|'qr'|'transfer'|..., note?: string }
+exports.verifyPayment = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const { payment_method = 'qr', note } = req.body || {};
+  const order = await Order.findById(req.params.id);
+  if (!order) throwError('Order tidak ditemukan', 404);
+
+  if (order.payment_status === 'paid') {
+    return res.status(200).json({ message: 'Sudah paid', order });
+  }
+  if (order.status === 'cancelled') {
+    throwError('Order sudah dibatalkan, tidak dapat diverifikasi', 400);
+  }
+
+  const now = new Date();
+  order.payment_method = payment_method || order.payment_method || 'qr';
+  order.payment_status = 'paid';
+  order.paid_at = now;
+  order.verified_by = req.user._id;
+  order.verified_at = now;
+  if (!order.placed_at) order.placed_at = now; // jaga-jaga
+
+  await order.save();
+
+  // (opsional) loyalty poin bila belum diberikan
+  const Member = require('../models/memberModel');
+  const { awardPointsIfEligible } = require('../utils/loyalty');
+  if (!order.loyalty_awarded_at) {
+    await awardPointsIfEligible(order, Member);
+  }
+
+  // Emit update
+  const {
+    emitToMember,
+    emitToStaff,
+    emitToTable
+  } = require('./socket/socketBus');
+  const payload = {
+    id: String(order._id),
+    transaction_code: order.transaction_code,
+    status: order.status,
+    payment_status: order.payment_status,
+    paid_at: order.paid_at,
+    verified_by: { id: String(req.user._id), name: req.user.name }
+  };
+  emitToStaff('order:payment_verified', payload);
+  if (order.member)
+    emitToMember(order.member, 'order:payment_verified', payload);
+  if (order.table_number)
+    emitToTable(order.table_number, 'order:payment_verified', payload);
+
+  res.status(200).json({ message: 'Pembayaran diverifikasi', order });
+});
+
+// POST /orders/:id/refund
+// body: { reason?: string }
+exports.refundPayment = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const { reason } = req.body || {};
+  const order = await Order.findById(req.params.id);
+  if (!order) throwError('Order tidak ditemukan', 404);
+
+  if (order.payment_status !== 'paid') {
+    return res
+      .status(400)
+      .json({ message: 'Order belum paid / sudah direfund', order });
+  }
+
+  const now = new Date();
+  order.payment_status = 'refunded';
+  order.status = 'cancelled'; // sesuai kebijakanmu: refund dianggap cancelled
+  order.cancelled_at = now;
+  order.cancellation_reason = String(reason || 'Refund by staff').trim();
+
+  await order.save();
+
+  const {
+    emitToMember,
+    emitToStaff,
+    emitToTable
+  } = require('./socket/socketBus');
+  const payload = {
+    id: String(order._id),
+    transaction_code: order.transaction_code,
+    status: order.status,
+    payment_status: order.payment_status,
+    cancelled_at: order.cancelled_at,
+    reason: order.cancellation_reason
+  };
+  emitToStaff('order:refunded', payload);
+  if (order.member) emitToMember(order.member, 'order:refunded', payload);
+  if (order.table_number)
+    emitToTable(order.table_number, 'order:refunded', payload);
+
+  res.status(200).json({ message: 'Order direfund & dibatalkan', order });
+});

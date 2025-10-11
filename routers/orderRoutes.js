@@ -39,6 +39,22 @@ router.get(
 // Member cancel sendiri (created+unpaid)
 router.post('/:id/cancel', authMemberRequired, orderCtrl.cancelOrder);
 
+router.post(
+  '/:id/verify-payment',
+  validateToken,
+  requireRole(['owner', 'employee']),
+  requirePageAccess('orders'),
+  orderCtrl.verifyPayment
+);
+
+router.post(
+  '/:id/refund',
+  validateToken,
+  requireRole(['owner', 'employee']),
+  requirePageAccess('orders'),
+  orderCtrl.refundPayment
+);
+
 router.get(
   '/:id',
   validateToken,

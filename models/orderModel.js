@@ -173,7 +173,7 @@ const orderSchema = new mongoose.Schema(
         return this.source === 'online' ? 'qr' : 'manual';
       }
     },
-    payment_proof_url: { type: String, trim: true, default: '' }, // ONLINE wajib (divalidasi di hook)
+    payment_proof_url: { type: String, trim: true }, // ONLINE wajib (divalidasi di hook)
     payment_status: {
       type: String,
       enum: ['unpaid', 'paid', 'refunded', 'void'],

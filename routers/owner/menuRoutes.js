@@ -19,7 +19,7 @@ router.use(validateToken);
 
 router.post(
   '/create-menu',
-  requireRole(['owner', 'employee']), // role check dulu
+  requireRole('owner', 'employee'), // role check dulu
   requirePageAccess('menu'), // baru cek pages.menu
   imageUploader.single('menu-image'),
   parseFormData,
@@ -29,7 +29,7 @@ router.post(
 
 router.get(
   '/list',
-  requireRole(['owner', 'employee']), // misal member juga bisa lihat
+  requireRole('owner', 'employee'), // misal member juga bisa lihat
   requirePageAccess('menu'),
   menu.listMenus
 );
@@ -38,7 +38,7 @@ router.get('/:id', requirePageAccess('menu'), menu.getMenuById);
 
 router.patch(
   '/update/:id',
-  requireRole(['owner', 'employee']),
+  requireRole('owner', 'employee'),
   requirePageAccess('menu'),
   imageUploader.single('menu-image'),
   parseFormData,
@@ -48,7 +48,7 @@ router.patch(
 
 router.delete(
   '/remove/:id',
-  requireRole(['owner']),
+  requireRole('owner'),
   requirePageAccess('menu'),
   menu.deleteMenu
 );
