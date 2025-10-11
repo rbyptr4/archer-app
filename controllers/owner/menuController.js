@@ -1,27 +1,21 @@
-// controllers/menuController.js
 const asyncHandler = require('express-async-handler');
 const mongoose = require('mongoose');
 const Menu = require('../../models/menuModel');
+const {
+  MenuSubcategory,
+  BIG_CATEGORIES
+} = require('../../models/menuSubcategoryModel.js');
 const throwError = require('../../utils/throwError');
 const { uploadBuffer, deleteFile } = require('../../utils/googleDrive');
 const { getDriveFolder } = require('../../utils/driveFolders');
 const { buildMenuFileName } = require('../../utils/makeFileName');
 const { extractDriveFileId } = require('../../utils/driveFileId');
 
-/* ====================== Utils ====================== */
 const asId = (x) => new mongoose.Types.ObjectId(String(x));
 const isValidId = (v) => mongoose.Types.ObjectId.isValid(String(v));
-const toInt = (v, d = 0) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.trunc(n) : d;
-};
-const truthy = (v) =>
-  ['1', 'true', 'yes', 'on'].includes(String(v).toLowerCase());
+const toInt = (v, d = 0) => (Number.isFinite(+v) ? Math.trunc(+v) : d);
 
-/**
- * Build snapshot packageItems dari array { menuId, qty }
- * - Menggunakan Menu.makePackageItemFromMenu (final price snapshot)
- */
+/* ---------- Helper: build package snapshot ---------- */
 async function buildPackageItemsFromIds(items = []) {
   const cleaned = (items || [])
     .map((it) => ({
@@ -29,7 +23,6 @@ async function buildPackageItemsFromIds(items = []) {
       qty: toInt(it.qty, 1) || 1
     }))
     .filter((it) => isValidId(it.menuId));
-
   if (!cleaned.length) return [];
 
   const ids = cleaned.map((it) => asId(it.menuId));
@@ -47,16 +40,14 @@ async function buildPackageItemsFromIds(items = []) {
 
 /* ====================== CREATE ====================== */
 // POST /menu/create-menu
-// Body fields utama:
-//  - menu_code, name, category, description, price{original,discountMode,discountPercent,manualPromoPrice}, addons[]
-//  - packageItems[] (snapshots langsung) ATAU packageBuilder: [{menuId, qty}]
-//  - isActive (default true)
-//  - file image: req.file (opsional, tapi disarankan diisi untuk gambar menu/paket)
 exports.createMenu = asyncHandler(async (req, res) => {
   const {
     menu_code,
     name,
-    category,
+    bigCategory,
+    subcategoryId, // optional
+    isRecommended = false,
+
     description = '',
     price = {},
     addons = [],
@@ -65,11 +56,26 @@ exports.createMenu = asyncHandler(async (req, res) => {
     isActive = true
   } = req.body || {};
 
-  if (!menu_code || !name || !category) {
-    throwError('menu_code, name, dan category wajib diisi', 400);
+  if (!menu_code || !name || !bigCategory) {
+    throwError('menu_code, name, dan bigCategory wajib diisi', 400);
+  }
+  if (!BIG_CATEGORIES.includes(String(bigCategory))) {
+    throwError('bigCategory tidak valid', 400);
   }
 
-  // ==== Upload image terlebih dahulu (di luar transaksi) ====
+  // Validasi subcategory opsional & konsistensi bigCategory
+  let subRef = null;
+  if (subcategoryId) {
+    if (!isValidId(subcategoryId)) throwError('subcategoryId tidak valid', 400);
+    const sub = await MenuSubcategory.findById(subcategoryId).lean();
+    if (!sub) throwError('Subcategory tidak ditemukan', 404);
+    if (String(sub.bigCategory) !== String(bigCategory)) {
+      throwError('subcategory tidak sesuai dengan bigCategory', 400);
+    }
+    subRef = sub._id;
+  }
+
+  // Upload image (opsional)
   let newFileId = null;
   let imageUrl = '';
   if (req.file) {
@@ -94,7 +100,6 @@ exports.createMenu = asyncHandler(async (req, res) => {
   let createdDoc;
   try {
     await session.withTransaction(async () => {
-      // Cek duplikat kode
       const exists = await Menu.findOne({
         menu_code: String(menu_code).toUpperCase()
       })
@@ -105,40 +110,38 @@ exports.createMenu = asyncHandler(async (req, res) => {
       const payload = {
         menu_code: String(menu_code).toUpperCase(),
         name: String(name).trim(),
-        category: String(category),
+        bigCategory: String(bigCategory),
+        subcategory: subRef,
+        isRecommended: Boolean(isRecommended),
         description: String(description || ''),
-        imageUrl: imageUrl || '', // boleh kosong, tapi sebaiknya diisi
+        imageUrl: imageUrl || '',
         price: {
           original: Number(price.original || 0),
           discountMode: price.discountMode || 'none',
           discountPercent: Number(price.discountPercent || 0),
           manualPromoPrice: Number(price.manualPromoPrice || 0)
         },
-        // Guard: addons hanya untuk non-package
         addons:
-          String(category) === 'package'
+          String(bigCategory) === 'package'
             ? []
             : Array.isArray(addons)
             ? addons
             : [],
-        // packageItems hanya untuk package
         packageItems:
-          String(category) === 'package' && Array.isArray(packageItems)
+          String(bigCategory) === 'package' && Array.isArray(packageItems)
             ? packageItems
             : [],
         isActive: typeof isActive === 'boolean' ? isActive : true
       };
 
-      // Jika kategori package dan ada packageBuilder → build snapshot
       if (
-        String(category) === 'package' &&
+        String(bigCategory) === 'package' &&
         Array.isArray(packageBuilder) &&
         packageBuilder.length
       ) {
         payload.packageItems = await buildPackageItemsFromIds(packageBuilder);
       }
 
-      // NOTE: Auto-set price.original utk package bila 0 dilakukan juga di pre('validate') model
       const [doc] = await Menu.create([payload], { session });
       createdDoc = doc;
     });
@@ -149,16 +152,10 @@ exports.createMenu = asyncHandler(async (req, res) => {
       menu: createdDoc
     });
   } catch (err) {
-    // Rollback file baru jika DB gagal
     if (newFileId) {
       try {
         await deleteFile(newFileId);
-      } catch (e2) {
-        console.warn(
-          '[menu][rollback] gagal hapus file baru:',
-          e2?.message || e2
-        );
-      }
+      } catch {}
     }
     throw err;
   } finally {
@@ -166,16 +163,19 @@ exports.createMenu = asyncHandler(async (req, res) => {
   }
 });
 
+/* ====================== UPDATE ====================== */
+// PATCH /menu/update/:id
 exports.updateMenu = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  if (!isValidId(id)) throwError('ID tidak valid', 400);
 
   const current = await Menu.findById(id);
   if (!current) throwError('Menu tidak ditemukan', 404);
 
-  // ==== Upload gambar baru (opsional) sebelum transaksi ====
   let newFileId = null;
   const payload = { ...req.body };
 
+  // handle image (opsional)
   if (req.file) {
     const folderId = getDriveFolder('menu');
     const finalCode = String(
@@ -198,105 +198,85 @@ exports.updateMenu = asyncHandler(async (req, res) => {
     payload.imageUrl = `https://drive.google.com/uc?export=view&id=${newFileId}`;
   }
 
-  const session = await mongoose.startSession();
-  let updated;
-  try {
-    await session.withTransaction(async () => {
-      // Normalisasi & validasi dasar
-      if (payload.menu_code) {
-        payload.menu_code = String(payload.menu_code).toUpperCase();
-        const dup = await Menu.findOne({
-          menu_code: payload.menu_code,
-          _id: { $ne: id }
-        })
-          .session(session)
-          .lean();
-        if (dup) throwError('Kode menu sudah digunakan', 409, 'menu_code');
-      }
-      const newCategory = payload.category
-        ? String(payload.category)
-        : String(current.category);
-
-      if (newCategory === 'package') {
-        if (Array.isArray(payload.addons)) {
-          payload.addons = []; // enforce
-        }
-        // packageItems via body
-        if (!Array.isArray(payload.packageItems)) {
-          // kalau tidak dikirim, jangan overwrite; biarkan seperti sebelumnya
-          payload.packageItems = current.packageItems;
-        }
-        // atau packageBuilder → rebuild snapshot
-        if (
-          Array.isArray(payload.packageBuilder) &&
-          payload.packageBuilder.length
-        ) {
-          payload.packageItems = await buildPackageItemsFromIds(
-            payload.packageBuilder
-          );
-        }
-      } else {
-        // non-package
-        if (Array.isArray(payload.packageItems)) {
-          payload.packageItems = []; // enforce
-        }
-        // addons body boleh
-        if (!Array.isArray(payload.addons)) {
-          payload.addons = current.addons; // keep old if not provided
-        }
-      }
-
-      // price: rebuild secara eksplisit bila dikirim
-      if (payload.price) {
-        payload.price = {
-          original: Number(
-            payload.price.original ?? current.price?.original ?? 0
-          ),
-          discountMode:
-            payload.price.discountMode ?? current.price?.discountMode ?? 'none',
-          discountPercent: Number(
-            payload.price.discountPercent ?? current.price?.discountPercent ?? 0
-          ),
-          manualPromoPrice: Number(
-            payload.price.manualPromoPrice ??
-              current.price?.manualPromoPrice ??
-              0
-          )
-        };
-      }
-
-      updated = await Menu.findByIdAndUpdate(id, payload, {
-        new: true,
-        runValidators: true,
-        session
-      });
-      if (!updated) throwError('Menu tidak ditemukan', 404);
-    });
-  } catch (err) {
-    // DB gagal → hapus file baru (rollback)
-    if (newFileId) {
-      try {
-        await deleteFile(newFileId);
-      } catch (e2) {
-        console.warn(
-          '[menu][rollback] gagal hapus file baru:',
-          e2?.message || e2
-        );
-      }
-    }
-    throw err;
-  } finally {
-    session.endSession();
+  // normalize & guards
+  if (payload.menu_code)
+    payload.menu_code = String(payload.menu_code).toUpperCase();
+  if (
+    payload.bigCategory &&
+    !BIG_CATEGORIES.includes(String(payload.bigCategory))
+  ) {
+    throwError('bigCategory tidak valid', 400);
   }
 
-  // Commit sukses → hapus file lama (best effort)
-  if (newFileId) {
-    const oldId = extractDriveFileId(current.imageUrl);
-    if (oldId) {
-      deleteFile(oldId).catch((e) =>
-        console.warn('[menu] gagal hapus file lama:', e?.message || e)
+  // Resolve subcategory jika dikirim
+  let nextBig = String(payload.bigCategory || current.bigCategory);
+  if (payload.subcategoryId) {
+    if (!isValidId(payload.subcategoryId))
+      throwError('subcategoryId tidak valid', 400);
+    const sub = await MenuSubcategory.findById(payload.subcategoryId).lean();
+    if (!sub) throwError('Subcategory tidak ditemukan', 404);
+    if (String(sub.bigCategory) !== nextBig) {
+      throwError('subcategory tidak sesuai dengan bigCategory', 400);
+    }
+    payload.subcategory = sub._id;
+  } else if (payload.bigCategory && nextBig !== String(current.bigCategory)) {
+    // Jika bigCategory berubah dan subcategory tidak dikirim ulang → kosongkan agar aman
+    payload.subcategory = null;
+  }
+
+  // price rebuild bila dikirim
+  if (payload.price) {
+    payload.price = {
+      original: Number(payload.price.original ?? current.price?.original ?? 0),
+      discountMode:
+        payload.price.discountMode ?? current.price?.discountMode ?? 'none',
+      discountPercent: Number(
+        payload.price.discountPercent ?? current.price?.discountPercent ?? 0
+      ),
+      manualPromoPrice: Number(
+        payload.price.manualPromoPrice ?? current.price?.manualPromoPrice ?? 0
+      )
+    };
+  }
+
+  // enforce addons/packageItems by bigCategory
+  nextBig = String(payload.bigCategory || current.bigCategory);
+  if (nextBig === 'package') {
+    if (Array.isArray(payload.addons)) payload.addons = [];
+    if (!Array.isArray(payload.packageItems))
+      payload.packageItems = current.packageItems;
+    if (
+      Array.isArray(payload.packageBuilder) &&
+      payload.packageBuilder.length
+    ) {
+      payload.packageItems = await buildPackageItemsFromIds(
+        payload.packageBuilder
       );
     }
+  } else {
+    if (Array.isArray(payload.packageItems)) payload.packageItems = [];
+    if (!Array.isArray(payload.addons)) payload.addons = current.addons;
+  }
+
+  // unique menu_code
+  if (payload.menu_code) {
+    const dup = await Menu.findOne({
+      menu_code: payload.menu_code,
+      _id: { $ne: id }
+    }).lean();
+    if (dup) throwError('Kode menu sudah digunakan', 409, 'menu_code');
+  }
+
+  const updated = await Menu.findByIdAndUpdate(id, payload, {
+    new: true,
+    runValidators: true
+  });
+  if (!updated) throwError('Menu tidak ditemukan', 404);
+
+  // cleanup file lama
+  if (newFileId) {
+    const oldId = extractDriveFileId(current.imageUrl);
+    if (oldId) deleteFile(oldId).catch(() => {});
   }
 
   res.json({ success: true, message: 'Menu diperbarui', menu: updated });
@@ -306,6 +286,7 @@ exports.updateMenu = asyncHandler(async (req, res) => {
 // DELETE /menu/remove/:id
 exports.deleteMenu = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  if (!isValidId(id)) throwError('ID tidak valid', 400);
 
   const session = await mongoose.startSession();
   let oldFileId = null;
@@ -320,24 +301,21 @@ exports.deleteMenu = asyncHandler(async (req, res) => {
     session.endSession();
   }
 
-  // Setelah commit, hapus file di Drive (best effort)
-  if (oldFileId) {
-    deleteFile(oldFileId).catch((e) =>
-      console.warn('[menu] gagal hapus file di GDrive:', e?.message || e)
-    );
-  }
-
+  if (oldFileId) deleteFile(oldFileId).catch(() => {});
   res.json({ success: true, message: 'Menu dihapus' });
 });
 
 /* ====================== LIST ====================== */
 // GET /menu/list
 // Query:
-//  - q: text search (name/menu_code/description via $text kalau mau), fallback regex
-//  - category: filter kategori
-//  - isActive: true/false
+//  - q
+//  - big: kategori besar (fixed)
+//  - subId: ObjectId subcategory
+//  - subName: nama subcategory (case-insensitive)
+//  - recommended: true|false
+//  - isActive: true|false (dipaksa true untuk publik)
 //  - page, limit
-//  - sortBy: name | createdAt | price.final | price.original
+//  - sortBy: name | createdAt | price.final | price.original | isRecommended
 //  - sortDir: asc|desc
 exports.listMenus = asyncHandler(async (req, res) => {
   const page = Math.max(parseInt(req.query.page || '1', 10), 1);
@@ -345,14 +323,18 @@ exports.listMenus = asyncHandler(async (req, res) => {
     Math.max(parseInt(req.query.limit || '20', 10), 1),
     100
   );
+
   const isBackoffice =
     !!req.user && ['owner', 'employee'].includes(req.user.role);
-  if (!isBackoffice) {
-    req.query.isActive = 'true'; // paksa filter hanya aktif
-  }
+  if (!isBackoffice) req.query.isActive = 'true';
+
   const skip = (page - 1) * limit;
   const q = (req.query.q || '').trim();
-  const category = (req.query.category || '').trim();
+  const big = (req.query.big || '').trim().toLowerCase();
+  const subId = (req.query.subId || '').trim();
+  const subName = (req.query.subName || '').trim();
+  const recommendedParam = (req.query.recommended || '').toLowerCase();
+
   const sortBy = String(req.query.sortBy || 'name');
   const sortDir =
     String(req.query.sortDir || 'asc').toLowerCase() === 'desc' ? -1 : 1;
@@ -361,7 +343,6 @@ exports.listMenus = asyncHandler(async (req, res) => {
   const filter = {};
 
   if (q) {
-    // gunakan $text jika ada index text, fallback regex
     filter.$or = [
       { name: { $regex: q, $options: 'i' } },
       { menu_code: { $regex: q, $options: 'i' } },
@@ -369,12 +350,36 @@ exports.listMenus = asyncHandler(async (req, res) => {
     ];
   }
 
-  if (category) filter.category = category;
+  if (big) {
+    if (!BIG_CATEGORIES.includes(big)) throwError('big tidak valid', 400);
+    filter.bigCategory = big;
+  }
+
+  if (recommendedParam === 'true') filter.isRecommended = true;
+  else if (recommendedParam === 'false') filter.isRecommended = false;
 
   if (isActiveParam === 'true') filter.isActive = true;
   else if (isActiveParam === 'false') filter.isActive = false;
 
-  // Sorting by price.final perlu aggregation
+  // subcategory filter
+  if (subId) {
+    if (!isValidId(subId)) throwError('subId tidak valid', 400);
+    filter.subcategory = asId(subId);
+  } else if (subName) {
+    const cond = { nameLower: subName.toLowerCase() };
+    if (filter.bigCategory) cond.bigCategory = filter.bigCategory;
+    const sub = await MenuSubcategory.findOne(cond).select('_id').lean();
+    if (!sub) {
+      return res.json({
+        success: true,
+        data: [],
+        paging: { page, limit, total: 0, pages: 1 }
+      });
+    }
+    filter.subcategory = sub._id;
+  }
+
+  // sort by price.final via aggregation
   if (sortBy === 'price.final') {
     const pipeline = [
       { $match: filter },
@@ -419,7 +424,7 @@ exports.listMenus = asyncHandler(async (req, res) => {
           }
         }
       },
-      { $sort: { price_final: sortDir, name: 1, _id: 1 } },
+      { $sort: { price_final: sortDir, isRecommended: -1, name: 1, _id: 1 } },
       { $skip: skip },
       { $limit: limit }
     ];
@@ -432,25 +437,27 @@ exports.listMenus = asyncHandler(async (req, res) => {
     return res.json({
       success: true,
       data: items,
-      paging: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit) || 1
-      }
+      paging: { page, limit, total, pages: Math.ceil(total / limit) || 1 }
     });
   }
 
-  // Sorting biasa
+  // sorting biasa
   const sort = {};
-  if (['name', 'createdAt', 'updatedAt', 'price.original'].includes(sortBy)) {
+  if (
+    [
+      'name',
+      'createdAt',
+      'updatedAt',
+      'price.original',
+      'isRecommended'
+    ].includes(sortBy)
+  ) {
     sort[sortBy] = sortDir;
   } else {
     sort['name'] = 1;
   }
 
   const [items, total] = await Promise.all([
-    // gunakan lean({ virtuals: true }) bila mongoose >= 7 agar price.final ikut
     Menu.find(filter)
       .sort(sort)
       .skip(skip)
@@ -462,12 +469,7 @@ exports.listMenus = asyncHandler(async (req, res) => {
   res.json({
     success: true,
     data: items,
-    paging: {
-      page,
-      limit,
-      total,
-      pages: Math.ceil(total / limit) || 1
-    }
+    paging: { page, limit, total, pages: Math.ceil(total / limit) || 1 }
   });
 });
 
@@ -478,18 +480,18 @@ exports.getMenuById = asyncHandler(async (req, res) => {
   if (!isValidId(id)) throwError('ID tidak valid', 400);
   const menu = await Menu.findById(id).lean({ virtuals: true });
   if (!menu) throwError('Menu tidak ditemukan', 404);
+
   const isBackoffice =
     !!req.user && ['owner', 'employee'].includes(req.user.role);
-  if (!isBackoffice && !menu.isActive) {
-    return throwError('Menu tidak ditemukan', 404);
-  }
+  if (!isBackoffice && !menu.isActive) throwError('Menu tidak ditemukan', 404);
+
   res.json({ success: true, data: menu });
 });
 
 /* ====================== ACTIVATE/DEACTIVATE ====================== */
-// PATCH /menu/:id/activate-menu
 exports.activateMenu = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  if (!isValidId(id)) throwError('ID tidak valid', 400);
   const updated = await Menu.findByIdAndUpdate(
     id,
     { $set: { isActive: true } },
@@ -499,9 +501,9 @@ exports.activateMenu = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'Menu diaktifkan', menu: updated });
 });
 
-// PATCH /menu/:id/deactivate-menu
 exports.deactivateMenu = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  if (!isValidId(id)) throwError('ID tidak valid', 400);
   const updated = await Menu.findByIdAndUpdate(
     id,
     { $set: { isActive: false } },

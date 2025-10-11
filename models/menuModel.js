@@ -1,5 +1,5 @@
-// models/menuModel.js
 const mongoose = require('mongoose');
+const { BIG_CATEGORIES } = require('./menuSubcategoryModel.js');
 
 /* ========= SubSchemas ========= */
 const AddonSchema = new mongoose.Schema(
@@ -16,10 +16,6 @@ const AddonSchema = new mongoose.Schema(
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
 );
 
-/**
- * Item di dalam paket. Disimpan sebagai SNAPSHOT agar histori aman.
- * Tidak ada addons untuk package (custom via notes di cart/order).
- */
 const PackageItemSchema = new mongoose.Schema(
   {
     menu: { type: mongoose.Schema.Types.ObjectId, ref: 'Menu', required: true },
@@ -51,7 +47,6 @@ const PriceSchema = new mongoose.Schema(
       set: (v) => Math.round(Number(v || 0)),
       get: (v) => Math.round(Number(v || 0))
     },
-    // 'none' | 'percent' | 'manual'
     discountMode: {
       type: String,
       enum: ['none', 'percent', 'manual'],
@@ -88,33 +83,37 @@ const MenuSchema = new mongoose.Schema(
     },
     name: { type: String, trim: true, required: true },
 
-    category: {
+    // Kategori besar (fixed)
+    bigCategory: {
       type: String,
-      enum: [
-        'food',
-        'drink',
-        'dessert',
-        'package',
-        'special',
-        'snack',
-        'merchandise'
-      ],
+      enum: BIG_CATEGORIES,
       required: true,
       index: true
     },
+
+    // Kategori spesifik (CRUD) — opsional
+    subcategory: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'MenuSubcategory',
+      default: null,
+      index: true
+    },
+
+    // Rekomendasi (admin)
+    isRecommended: { type: Boolean, default: false, index: true },
 
     description: { type: String, trim: true, default: '' },
     imageUrl: { type: String, trim: true, required: true },
 
     price: { type: PriceSchema, required: true },
 
-    // Addon HANYA untuk non-package
+    // Addon hanya untuk non-package
     addons: { type: [AddonSchema], default: [] },
 
-    // Isi paket (snapshot). Tidak ada addons untuk paket.
+    // Isi paket (snapshot) — hanya untuk package
     packageItems: { type: [PackageItemSchema], default: [] },
 
-    isActive: { type: Boolean, default: true }
+    isActive: { type: Boolean, default: true, index: true }
   },
   {
     timestamps: true,
@@ -127,11 +126,10 @@ const MenuSchema = new mongoose.Schema(
 /* ========= Index ========= */
 MenuSchema.index({ name: 1 });
 MenuSchema.index({ isActive: 1, name: 1 });
-MenuSchema.index({ category: 1, isActive: 1 });
+MenuSchema.index({ bigCategory: 1, isActive: 1 });
 MenuSchema.index({ name: 'text', description: 'text' });
 
 /* ========= Validators & Guards ========= */
-// Unik nama addon per menu
 MenuSchema.path('addons').validate(function (arr) {
   if (!Array.isArray(arr)) return true;
   const names = arr
@@ -144,27 +142,26 @@ MenuSchema.path('addons').validate(function (arr) {
   return names.length === new Set(names).size;
 }, 'Duplikat nama addon pada menu ini');
 
-// Guard addons vs packageItems + auto original utk package
 MenuSchema.pre('validate', function () {
-  const isPackage = this.category === 'package';
+  const isPackage = this.bigCategory === 'package';
 
-  // addons hanya untuk non-package
-  if (isPackage && this.addons && this.addons.length > 0) {
+  if (isPackage && Array.isArray(this.addons) && this.addons.length > 0) {
     this.invalidate(
       'addons',
       'Menu kategori package tidak boleh memiliki addons'
     );
   }
-
-  // packageItems hanya untuk package
-  if (!isPackage && this.packageItems && this.packageItems.length > 0) {
+  if (
+    !isPackage &&
+    Array.isArray(this.packageItems) &&
+    this.packageItems.length > 0
+  ) {
     this.invalidate(
       'packageItems',
       'Hanya menu kategori package yang boleh memiliki isi paket'
     );
   }
 
-  // aturan diskon
   const { discountMode, discountPercent, manualPromoPrice, original } =
     this.price || {};
   if (
@@ -180,7 +177,6 @@ MenuSchema.pre('validate', function () {
     );
   }
 
-  // jika package & original belum diisi → auto dari sum snapshot
   if (isPackage) {
     const sum = (this.packageItems || []).reduce(
       (acc, it) => acc + Number(it.priceSnapshot || 0) * Number(it.qty || 0),
@@ -193,7 +189,7 @@ MenuSchema.pre('validate', function () {
   }
 });
 
-/* ========= Virtual final price ========= */
+/* ========= Virtual: price.final ========= */
 MenuSchema.virtual('price.final').get(function () {
   if (!this.price) return 0;
   const { original, discountMode, discountPercent, manualPromoPrice } =
@@ -207,9 +203,8 @@ MenuSchema.virtual('price.final').get(function () {
   return Math.round(Number(this.price.original || 0));
 });
 
-/* ========= Helper static: bikin snapshot item paket ========= */
+/* ========= Helper: snapshot item paket ========= */
 MenuSchema.statics.makePackageItemFromMenu = function (menuDoc, qty = 1) {
-  // ambil final price saat ini sebagai snapshot (boleh diganti original kalau mau)
   const finalPrice =
     (menuDoc.price &&
       (menuDoc.price.discountMode === 'manual'

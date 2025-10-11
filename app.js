@@ -13,7 +13,9 @@ const menuMemberRoutes = require('./routers/member/menuMemberRoutes');
 const voucherMemberRoutes = require('./routers/member/voucherMemberRoutes');
 const voucherRoutes = require('./routers/owner/voucherRoutes');
 const employeeRoutes = require('./routers/owner/employeeRoutes');
+const reportRoutes = require('./routers/owner/reportRoutes');
 const menuRoutes = require('./routers/owner/menuRoutes');
+const categoryRoutes = require('./routers/owner/menuCategoryRoutes');
 const memberManagementRoutes = require('./routers/owner/memberManagementRoutes');
 const selfOrderRoutes = require('./routers/selfOrderRoutes'); // QR dine-in (punyamu)
 const expenseRoutes = require('./routers/expenseRoutes');
@@ -70,6 +72,7 @@ app.use((req, res, next) => {
 app.use('/auth', authRoutes);
 app.use('/employees', employeeRoutes);
 app.use('/menu', menuRoutes);
+app.use('/menu/category', categoryRoutes);
 app.use('/expense', expenseRoutes);
 app.use('/member-management', memberManagementRoutes);
 app.use('/member', authMemberRoutes);
@@ -78,6 +81,7 @@ app.use('/member/voucher', voucherMemberRoutes);
 app.use('/self-order', selfOrderRoutes);
 app.use('/online', onlineRoutes);
 app.use('/voucher', voucherRoutes);
+app.use('/reports', reportRoutes);
 
 app.use('/orders', orderOpsRoutes);
 app.use('/orders', orderRoutes);

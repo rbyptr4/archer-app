@@ -5,7 +5,7 @@ const requireRole = require('../../utils/requireRole');
 const requirePageAccess = require('../../utils/requirePageAccess');
 const rpt = require('../../controllers/owner/reportController');
 
-app.use(
+router.use(
   validateToken,
   requireRole('owner', 'employee'),
   requirePageAccess('report')
