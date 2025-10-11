@@ -34,6 +34,13 @@ router.get(
   menu.listMenus
 );
 
+router.get(
+  '/sub-options',
+  requireRole('owner', 'employee'), // misal member juga bisa lihat
+  requirePageAccess('menu'),
+  menu.subcategoryOptions
+);
+
 router.get('/:id', requirePageAccess('menu'), menu.getMenuById);
 
 router.patch(

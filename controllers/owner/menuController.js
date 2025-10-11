@@ -512,3 +512,27 @@ exports.deactivateMenu = asyncHandler(async (req, res) => {
   if (!updated) throwError('Menu tidak ditemukan', 404);
   res.json({ success: true, message: 'Menu dinonaktifkan', menu: updated });
 });
+
+exports.subcategoryOptions = asyncHandler(async (req, res) => {
+  const cat = String(req.query.cat || '')
+    .trim()
+    .toLowerCase();
+  if (!cat) throwError('Parameter cat wajib diisi', 400);
+  if (!BIG_CATEGORIES.includes(cat)) throwError('Kategori tidak valid', 400);
+
+  const q = (req.query.q || '').trim();
+  const sortDir =
+    String(req.query.sortDir || 'asc').toLowerCase() === 'desc' ? -1 : 1;
+
+  const filter = { bigCategory: cat };
+  if (q) {
+    filter.nameLower = { $regex: q.toLowerCase(), $options: 'i' };
+  }
+
+  const items = await MenuSubcategory.find(filter)
+    .select('_id name sortOrder')
+    .sort({ sortOrder: sortDir, name: 1, _id: 1 })
+    .lean();
+
+  res.json({ success: true, data: items });
+});

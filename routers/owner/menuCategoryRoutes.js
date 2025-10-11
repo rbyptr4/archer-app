@@ -18,13 +18,6 @@ router.post(
   category.createSubcategory
 );
 
-router.get(
-  '/:id',
-  requireRole('owner', 'employee'),
-  requirePageAccess('menu'),
-  category.getSubcategory
-);
-
 router.patch(
   '/update/:id',
   requireRole('owner'),

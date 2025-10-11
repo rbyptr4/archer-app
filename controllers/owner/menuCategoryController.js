@@ -50,15 +50,6 @@ exports.listSubcategories = asyncHandler(async (req, res) => {
   res.json({ success: true, data: items });
 });
 
-/* GET: GET /menu-categories/:id */
-exports.getSubcategory = asyncHandler(async (req, res) => {
-  const { id } = req.params;
-  if (!isValidId(id)) throwError('ID tidak valid', 400);
-  const doc = await MenuSubcategory.findById(id).lean();
-  if (!doc) throwError('Subcategory tidak ditemukan', 404);
-  res.json({ success: true, data: doc });
-});
-
 /* UPDATE: PATCH /menu-categories/update/:id */
 exports.updateSubcategory = asyncHandler(async (req, res) => {
   const { id } = req.params;
