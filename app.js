@@ -17,11 +17,8 @@ const reportRoutes = require('./routers/owner/reportRoutes');
 const menuRoutes = require('./routers/owner/menuRoutes');
 const categoryRoutes = require('./routers/owner/menuCategoryRoutes');
 const memberManagementRoutes = require('./routers/owner/memberManagementRoutes');
-const selfOrderRoutes = require('./routers/selfOrderRoutes'); // QR dine-in (punyamu)
 const expenseRoutes = require('./routers/expenseRoutes');
 const orderRoutes = require('./routers/orderRoutes'); // order list/detail/kitchen/pay/status/cancel (punyamu yg sudah dirapikan)
-const orderOpsRoutes = require('./routers/orderOpsRoutes'); // payment & delivery ops (baru kita buat)
-const onlineRoutes = require('./routers/onlineRoutes'); // cart online + checkout online (baru kita buat)
 
 // Models (load sekali di awal)
 require('./models/orderModel');
@@ -58,7 +55,9 @@ app.use(
       'requiresAuth',
       'X-QR-Session',
       'X-Online-Session',
-      'X-Table-Number'
+      'X-Table-Number',
+      'X-Order-Source',
+      'X-Device-Id'
     ],
     credentials: true
   })
@@ -78,12 +77,8 @@ app.use('/member-management', memberManagementRoutes);
 app.use('/member', authMemberRoutes);
 app.use('/member/menu', menuMemberRoutes);
 app.use('/member/voucher', voucherMemberRoutes);
-app.use('/self-order', selfOrderRoutes);
-app.use('/online', onlineRoutes);
 app.use('/voucher', voucherRoutes);
 app.use('/reports', reportRoutes);
-
-app.use('/orders', orderOpsRoutes);
 app.use('/orders', orderRoutes);
 
 app.use(errorHandler);

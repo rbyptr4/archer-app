@@ -1,4 +1,3 @@
-// routers/orderRoutes.js
 const express = require('express');
 const router = express.Router();
 
@@ -7,71 +6,121 @@ const requireRole = require('../utils/requireRole');
 const requirePageAccess = require('../utils/requirePageAccess');
 
 const authMemberRequired = require('../middlewares/authMember');
-const orderCtrl = require('../controllers/orderController');
 
-/* ===== Member ===== */
-router.get('/my-order', authMemberRequired, orderCtrl.listMyOrders);
-router.post('/price-preview', authMemberRequired, orderCtrl.previewPrice); // <— NEW
+const fileUploader = require('../utils/fileUploader');
 
-// POS dine-in (tanpa voucher jika tidak ada member)
+let parseFormData;
+try {
+  parseFormData = require('../middlewares/parseFormData');
+} catch {
+  parseFormData = (_req, _res, next) => next();
+}
+
+const order = require('../controllers/orderController');
+
+router.use(order.modeResolver);
+
+router.get('/get-cart', order.getCart);
+router.post('/new-items', order.addItem);
+router.patch('/update/:itemId', order.updateItem);
+router.delete('/remove/:itemId', order.removeItem);
+router.delete('/clear', order.clearCart);
+router.patch('/table', order.assignTable); // hanya efektif untuk self-order (QR)
+
+router.get('/delivery/estimate', order.estimateDelivery);
+
 router.post(
-  '/dine-in/cashier',
-  requireRole(['owner', 'employee']),
-  orderCtrl.createPosDineIn
+  '/checkout',
+  fileUploader.single('payment_proof'),
+  parseFormData,
+  order.checkout
 );
 
-/* ===== Staff: list/kitchen/detail/status ===== */
+router.get('/my-order', authMemberRequired, order.listMyOrders);
+router.get('/member/my-order/:id', authMemberRequired, order.getMyOrder);
+router.post('/price-preview', authMemberRequired, order.previewPrice);
+
+router.post(
+  '/dine-in/cashier',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
+  order.createPosDineIn
+);
+
 router.get(
   '/list-order',
   validateToken,
-  requireRole(['owner', 'employee']),
+  requireRole('owner', 'employee'),
   requirePageAccess('orders'),
-  orderCtrl.listOrders
+  order.listOrders
 );
+
 router.get(
   '/kitchen',
   validateToken,
-  requireRole(['owner', 'employee']),
+  requireRole('owner', 'employee'),
   requirePageAccess('kitchen'),
-  orderCtrl.listKitchenOrders
-);
-
-// Member cancel sendiri (created+unpaid)
-router.post('/:id/cancel', authMemberRequired, orderCtrl.cancelOrder);
-
-router.post(
-  '/:id/verify-payment',
-  validateToken,
-  requireRole(['owner', 'employee']),
-  requirePageAccess('orders'),
-  orderCtrl.verifyPayment
-);
-
-router.post(
-  '/:id/refund',
-  validateToken,
-  requireRole(['owner', 'employee']),
-  requirePageAccess('orders'),
-  orderCtrl.refundPayment
+  order.listKitchenOrders
 );
 
 router.get(
   '/:id',
   validateToken,
-  requireRole(['owner', 'employee']),
+  requireRole('owner', 'employee'),
   requirePageAccess('orders'),
-  orderCtrl.getDetailOrder
+  order.getDetailOrder
 );
 
 router.patch(
   '/:id/status',
   validateToken,
-  requireRole(['owner', 'employee']),
+  requireRole('owner', 'employee'),
   requirePageAccess('orders'),
-  orderCtrl.updateStatus
+  order.updateStatus
 );
 
-/* ===== Member detail (paling bawah biar gak ketimpa) ===== */
-router.get('/member/my-order/:id', authMemberRequired, orderCtrl.getMyOrder);
+router.post(
+  '/:id/verify-payment',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
+  order.verifyPayment
+);
+
+router.post(
+  '/:id/refund',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
+  order.refundPayment
+);
+
+// Delivery APIs
+router.get(
+  '/delivery-board',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
+  order.deliveryBoard
+);
+
+router.patch(
+  '/:id/delivery/assign',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
+  order.assignDelivery
+);
+
+router.patch(
+  '/:id/delivery/status',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
+  order.updateDeliveryStatus
+);
+
+router.post('/:id/cancel', authMemberRequired, order.cancelOrder);
 
 module.exports = router;
