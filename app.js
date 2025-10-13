@@ -15,6 +15,7 @@ const voucherRoutes = require('./routers/owner/voucherRoutes');
 const employeeRoutes = require('./routers/owner/employeeRoutes');
 const reportRoutes = require('./routers/owner/reportRoutes');
 const menuRoutes = require('./routers/owner/menuRoutes');
+const menuPackagesRoutes = require('./routers/owner/packageMenuRoutes');
 const categoryRoutes = require('./routers/owner/menuCategoryRoutes');
 const memberManagementRoutes = require('./routers/owner/memberManagementRoutes');
 const expenseRoutes = require('./routers/expenseRoutes');
@@ -71,6 +72,7 @@ app.use((req, res, next) => {
 app.use('/auth', authRoutes);
 app.use('/employees', employeeRoutes);
 app.use('/menu', menuRoutes);
+app.use('/menu/packages', menuPackagesRoutes);
 app.use('/menu/category', categoryRoutes);
 app.use('/expense', expenseRoutes);
 app.use('/member-management', memberManagementRoutes);

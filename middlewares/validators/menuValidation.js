@@ -1,14 +1,24 @@
 // validators/menu.validation.js
 const Joi = require('joi');
 
-// ===== Utils =====
+/* ====================== Utils ====================== */
 const objectId = () =>
   Joi.string()
     .trim()
     .regex(/^[0-9a-fA-F]{24}$/)
     .message('ID tidak valid');
 
-// ===== Subschemas =====
+const CATEGORY_ENUM = [
+  'food',
+  'drink',
+  'dessert',
+  'package',
+  'special',
+  'snack',
+  'merchandise'
+];
+
+/* =================== Subschemas ==================== */
 const addonSchema = Joi.object({
   name: Joi.string().min(1).max(100).required().messages({
     'string.base': 'Nama add-on harus berupa teks',
@@ -23,7 +33,8 @@ const addonSchema = Joi.object({
   })
 });
 
-const packageItemSchema = Joi.object({
+// Snapshot item paket (dipakai di level DB/response, BUKAN input create)
+const packageItemSnapshotSchema = Joi.object({
   menu: objectId().required().messages({
     'any.required': 'Menu item paket wajib diisi'
   }),
@@ -40,7 +51,24 @@ const packageItemSchema = Joi.object({
   })
 });
 
-const priceSchema = Joi.object({
+// Input item paket saat CREATE/UPDATE paket (simple): menuId ATAU name + qty
+const packageItemInputSchema = Joi.object({
+  menu: objectId(), // opsional; kalau ada -> prioritas pakai ini
+  name: Joi.string().trim().min(1).max(200), // fallback kalau tidak ada menu
+  qty: Joi.number().integer().min(1).default(1).messages({
+    'number.base': 'Qty harus berupa angka',
+    'number.min': 'Qty minimal {#limit}'
+  })
+}).custom((v, h) => {
+  if (!v.menu && !v.name) {
+    return h.error('any.custom', {
+      message: 'Item paket harus berisi "menu" (ObjectId) atau "name"'
+    });
+  }
+  return v;
+}, 'Guard item paket minimal menu atau name');
+
+const priceSchemaBase = Joi.object({
   original: Joi.number().min(0).messages({
     'number.base': 'Harga asli harus berupa angka',
     'number.min': 'Harga asli minimal {#limit}'
@@ -94,18 +122,12 @@ const priceSchema = Joi.object({
     return value;
   }, 'Guard diskon');
 
-// ===== Enums =====
-const CATEGORY_ENUM = [
-  'food',
-  'drink',
-  'dessert',
-  'package',
-  'special',
-  'snack',
-  'merchandise'
-];
+/* ====================================================
+   SKEMA MENU BIASA (NON-PACKAGE)
+   Endpoint: /menus/create, /menus/update/:id
+   ==================================================== */
 
-// ===== Create Schema =====
+// CREATE non-package
 const createMenuSchema = Joi.object({
   menu_code: Joi.string()
     .trim()
@@ -129,62 +151,45 @@ const createMenuSchema = Joi.object({
     'any.required': 'Nama menu wajib diisi'
   }),
 
-  category: Joi.string()
-    .valid(...CATEGORY_ENUM)
+  bigCategory: Joi.string()
+    .valid(...CATEGORY_ENUM.filter((c) => c !== 'package'))
     .required()
     .messages({
-      'any.only': `Kategori harus salah satu dari: ${CATEGORY_ENUM.join(', ')}`,
+      'any.only': `Kategori harus salah satu dari: ${CATEGORY_ENUM.filter(
+        (c) => c !== 'package'
+      ).join(', ')}`,
       'any.required': 'Kategori wajib diisi'
     }),
+
+  subcategoryId: objectId(), // opsional
 
   description: Joi.string().allow('').max(1000).messages({
     'string.max': 'Deskripsi maksimal {#limit} karakter'
   }),
 
-  imageUrl: Joi.string().uri().required().messages({
-    'string.uri': 'imageUrl harus berupa URL yang valid',
-    'any.required': 'imageUrl wajib diisi'
+  // imageUrl tidak diwajibkan karena biasanya upload via req.file
+  imageUrl: Joi.string().uri().messages({
+    'string.uri': 'imageUrl harus berupa URL yang valid'
   }),
 
-  // price.original wajib untuk non-package; opsional untuk package (akan auto dari snapshot)
-  price: priceSchema.when('category', {
-    is: 'package',
-    then: priceSchema.keys({
-      original: priceSchema.extract('original').optional()
-    }),
-    otherwise: priceSchema.keys({
-      original: priceSchema.extract('original').required()
-    })
+  price: priceSchemaBase.keys({
+    // untuk non-package original WAJIB
+    original: priceSchemaBase.extract('original').required()
   }),
 
-  // Addons hanya untuk non-package
-  addons: Joi.alternatives().conditional('category', {
-    is: 'package',
-    then: Joi.forbidden().messages({
-      'any.unknown': 'Menu kategori package tidak boleh memiliki addons'
-    }),
-    otherwise: Joi.array().items(addonSchema).default([])
+  addons: Joi.array().items(addonSchema).default([]),
+
+  // larang packageItems pada non-package
+  packageItems: Joi.forbidden().messages({
+    'any.unknown':
+      'Hanya menu kategori package yang boleh memiliki isi paket (packageItems)'
   }),
 
-  // packageItems hanya untuk package
-  packageItems: Joi.alternatives().conditional('category', {
-    is: 'package',
-    then: Joi.array().items(packageItemSchema).min(1).messages({
-      'array.min': 'Menu package minimal memiliki 1 item'
-    }),
-    otherwise: Joi.forbidden().messages({
-      'any.unknown': 'Hanya menu kategori package yang boleh memiliki isi paket'
-    })
-  }),
+  isActive: Joi.boolean().default(true),
+  isRecommended: Joi.boolean().default(false)
+}).prefs({ abortEarly: false, stripUnknown: true });
 
-  isActive: Joi.boolean().default(true)
-})
-  .prefs({ abortEarly: false, stripUnknown: true })
-  .messages({
-    'object.unknown': 'Field "{#label}" tidak dikenali'
-  });
-
-// ===== Update Schema =====
+// UPDATE non-package
 const updateMenuSchema = Joi.object({
   menu_code: Joi.string()
     .trim()
@@ -204,11 +209,16 @@ const updateMenuSchema = Joi.object({
     'string.max': 'Nama menu maksimal {#limit} karakter'
   }),
 
-  category: Joi.string()
-    .valid(...CATEGORY_ENUM)
+  // tidak boleh ganti jadi 'package'
+  bigCategory: Joi.string()
+    .valid(...CATEGORY_ENUM.filter((c) => c !== 'package'))
     .messages({
-      'any.only': `Kategori harus salah satu dari: ${CATEGORY_ENUM.join(', ')}`
+      'any.only': `Kategori harus salah satu dari: ${CATEGORY_ENUM.filter(
+        (c) => c !== 'package'
+      ).join(', ')}`
     }),
+
+  subcategoryId: objectId(), // opsional
 
   description: Joi.string().allow('').max(1000).messages({
     'string.max': 'Deskripsi maksimal {#limit} karakter'
@@ -218,47 +228,146 @@ const updateMenuSchema = Joi.object({
     'string.uri': 'imageUrl harus berupa URL yang valid'
   }),
 
-  // Boleh mengubah struktur price parsial, tetap kena guard
-  price: priceSchema,
+  price: priceSchemaBase, // partial OK
 
-  // Addons / packageItems mengikuti kategori (pakai when ke category atau context)
   addons: Joi.array().items(addonSchema),
 
-  packageItems: Joi.array().items(packageItemSchema),
+  // tetap dilarang
+  packageItems: Joi.forbidden().messages({
+    'any.unknown':
+      'Hanya menu kategori package yang boleh memiliki isi paket (packageItems)'
+  }),
 
-  isActive: Joi.boolean()
+  isActive: Joi.boolean(),
+  isRecommended: Joi.boolean()
 })
-  .custom((value, helpers) => {
-    // Evaluasi kondisi addons vs packageItems berdasarkan category "baru" (jika diubah) atau "lama" via context.
-    // Pasang category di context saat validate (opts.context.categoryCurrent).
-    const cat =
-      value.category ||
-      (helpers?.prefs?.context && helpers.prefs.context.categoryCurrent);
-
-    if (cat === 'package') {
-      if (Array.isArray(value.addons)) {
-        return helpers.error('any.custom', {
-          message: 'Menu kategori package tidak boleh memiliki addons'
-        });
-      }
-      // package: packageItems boleh kosong (server bisa auto dari util), tapi tetap valid array jika dikirim
-    } else if (cat && cat !== 'package') {
-      if (Array.isArray(value.packageItems)) {
-        return helpers.error('any.custom', {
-          message:
-            'Hanya menu kategori package yang boleh memiliki isi paket (packageItems)'
-        });
-      }
-    }
-    return value;
-  }, 'Guard addons vs packageItems')
   .min(1)
   .prefs({ abortEarly: false, stripUnknown: true })
-  .messages({
-    'object.min': 'Isi setidaknya satu field untuk diperbarui'
-  });
+  .messages({ 'object.min': 'Isi setidaknya satu field untuk diperbarui' });
+
+const createPackageMenuSchema = Joi.object({
+  menu_code: Joi.string()
+    .trim()
+    .uppercase()
+    .pattern(/^[A-Z0-9\-_.]+$/)
+    .min(2)
+    .max(32)
+    .required()
+    .messages({
+      'string.empty': 'Kode menu tidak boleh kosong',
+      'string.pattern.base':
+        'Kode hanya boleh huruf besar, angka, titik, strip, atau underscore',
+      'string.min': 'Kode minimal {#limit} karakter',
+      'string.max': 'Kode maksimal {#limit} karakter',
+      'any.required': 'Kode menu wajib diisi'
+    }),
+
+  name: Joi.string().trim().min(3).max(120).required().messages({
+    'string.min': 'Nama menu minimal {#limit} karakter',
+    'string.max': 'Nama menu maksimal {#limit} karakter',
+    'any.required': 'Nama menu wajib diisi'
+  }),
+
+  // bigCategory dipaksa 'package' oleh controller; boleh diabaikan di payload
+  bigCategory: Joi.string().valid('package').messages({
+    'any.only': 'Kategori paket harus "package"'
+  }),
+
+  subcategoryId: objectId(), // opsional
+
+  description: Joi.string().allow('').max(1000).messages({
+    'string.max': 'Deskripsi maksimal {#limit} karakter'
+  }),
+
+  imageUrl: Joi.string().uri().messages({
+    'string.uri': 'imageUrl harus berupa URL yang valid'
+  }),
+
+  // Untuk paket: original opsional (server bisa auto dari snapshot); diskon rules tetap berlaku
+  price: priceSchemaBase.keys({
+    original: priceSchemaBase.extract('original').optional()
+  }),
+
+  // input sederhana items (akan dinormalisasi server → packageItems snapshot)
+  items: Joi.array().items(packageItemInputSchema).min(1).required().messages({
+    'array.min': 'Menu package minimal memiliki 1 item',
+    'any.required': 'Daftar items paket wajib diisi'
+  }),
+
+  // addons dilarang pada paket
+  addons: Joi.forbidden().messages({
+    'any.unknown': 'Menu kategori package tidak boleh memiliki addons'
+  }),
+
+  // packageItems snapshot TIDAK dikirim saat create
+  packageItems: Joi.forbidden().messages({
+    'any.unknown': 'Isi paket (snapshot) akan dibuat otomatis oleh server'
+  }),
+
+  isActive: Joi.boolean().default(true),
+  isRecommended: Joi.boolean().default(false)
+}).prefs({ abortEarly: false, stripUnknown: true });
+
+// UPDATE package
+const updatePackageMenuSchema = Joi.object({
+  menu_code: Joi.string()
+    .trim()
+    .uppercase()
+    .pattern(/^[A-Z0-9\-_.]+$/)
+    .min(2)
+    .max(32)
+    .messages({
+      'string.pattern.base':
+        'Kode hanya boleh huruf besar, angka, titik, strip, atau underscore',
+      'string.min': 'Kode minimal {#limit} karakter',
+      'string.max': 'Kode maksimal {#limit} karakter'
+    }),
+
+  name: Joi.string().trim().min(3).max(120).messages({
+    'string.min': 'Nama menu minimal {#limit} karakter',
+    'string.max': 'Nama menu maksimal {#limit} karakter'
+  }),
+
+  // tetap paket
+  bigCategory: Joi.string().valid('package').messages({
+    'any.only': 'Kategori paket harus "package"'
+  }),
+
+  subcategoryId: objectId(),
+
+  description: Joi.string().allow('').max(1000).messages({
+    'string.max': 'Deskripsi maksimal {#limit} karakter'
+  }),
+
+  imageUrl: Joi.string().uri().messages({
+    'string.uri': 'imageUrl harus berupa URL yang valid'
+  }),
+
+  price: priceSchemaBase, // partial OK
+
+  // update items sederhana → server akan re-build snapshot
+  items: Joi.array().items(packageItemInputSchema),
+
+  // tetap dilarang di payload update (dibuat server)
+  packageItems: Joi.forbidden().messages({
+    'any.unknown': 'Isi paket (snapshot) tidak boleh diedit langsung'
+  }),
+
+  // addons tetap dilarang
+  addons: Joi.forbidden().messages({
+    'any.unknown': 'Menu kategori package tidak boleh memiliki addons'
+  }),
+
+  isActive: Joi.boolean(),
+  isRecommended: Joi.boolean()
+})
+  .min(1)
+  .prefs({ abortEarly: false, stripUnknown: true })
+  .messages({ 'object.min': 'Isi setidaknya satu field untuk diperbarui' });
 
 module.exports = {
   createMenuSchema,
-  updateMenuSchema
+  updateMenuSchema,
+  createPackageMenuSchema,
+  updatePackageMenuSchema
 };

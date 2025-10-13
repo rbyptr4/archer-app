@@ -45,14 +45,11 @@ exports.createMenu = asyncHandler(async (req, res) => {
     menu_code,
     name,
     bigCategory,
-    subcategoryId, // optional
+    subcategoryId,
     isRecommended = false,
-
     description = '',
     price = {},
     addons = [],
-    packageItems = [],
-    packageBuilder = [],
     isActive = true
   } = req.body || {};
 
@@ -61,6 +58,9 @@ exports.createMenu = asyncHandler(async (req, res) => {
   }
   if (!BIG_CATEGORIES.includes(String(bigCategory))) {
     throwError('bigCategory tidak valid', 400);
+  }
+  if (String(bigCategory) === 'package') {
+    throwError('Endpoint ini hanya untuk menu non-package', 400, 'bigCategory');
   }
 
   // Validasi subcategory opsional & konsistensi bigCategory
@@ -100,15 +100,14 @@ exports.createMenu = asyncHandler(async (req, res) => {
   let createdDoc;
   try {
     await session.withTransaction(async () => {
-      const exists = await Menu.findOne({
-        menu_code: String(menu_code).toUpperCase()
-      })
+      const code = String(menu_code).toUpperCase();
+      const exists = await Menu.findOne({ menu_code: code })
         .session(session)
         .lean();
       if (exists) throwError('Kode menu sudah digunakan', 409, 'menu_code');
 
       const payload = {
-        menu_code: String(menu_code).toUpperCase(),
+        menu_code: code,
         name: String(name).trim(),
         bigCategory: String(bigCategory),
         subcategory: subRef,
@@ -121,26 +120,10 @@ exports.createMenu = asyncHandler(async (req, res) => {
           discountPercent: Number(price.discountPercent || 0),
           manualPromoPrice: Number(price.manualPromoPrice || 0)
         },
-        addons:
-          String(bigCategory) === 'package'
-            ? []
-            : Array.isArray(addons)
-            ? addons
-            : [],
-        packageItems:
-          String(bigCategory) === 'package' && Array.isArray(packageItems)
-            ? packageItems
-            : [],
+        addons: Array.isArray(addons) ? addons : [],
+        packageItems: [],
         isActive: typeof isActive === 'boolean' ? isActive : true
       };
-
-      if (
-        String(bigCategory) === 'package' &&
-        Array.isArray(packageBuilder) &&
-        packageBuilder.length
-      ) {
-        payload.packageItems = await buildPackageItemsFromIds(packageBuilder);
-      }
 
       const [doc] = await Menu.create([payload], { session });
       createdDoc = doc;
@@ -152,11 +135,7 @@ exports.createMenu = asyncHandler(async (req, res) => {
       menu: createdDoc
     });
   } catch (err) {
-    if (newFileId) {
-      try {
-        await deleteFile(newFileId);
-      } catch {}
-    }
+    if (newFileId) deleteFile(newFileId).catch(() => {});
     throw err;
   } finally {
     session.endSession();
@@ -164,18 +143,23 @@ exports.createMenu = asyncHandler(async (req, res) => {
 });
 
 /* ====================== UPDATE ====================== */
-// PATCH /menu/update/:id
 exports.updateMenu = asyncHandler(async (req, res) => {
   const { id } = req.params;
   if (!isValidId(id)) throwError('ID tidak valid', 400);
 
   const current = await Menu.findById(id);
   if (!current) throwError('Menu tidak ditemukan', 404);
+  if (String(current.bigCategory) === 'package') {
+    throwError('Menu ini bertipe package. Gunakan endpoint paket.', 400);
+  }
 
   let newFileId = null;
   const payload = { ...req.body };
 
-  // handle image (opsional)
+  if (payload.bigCategory && String(payload.bigCategory) === 'package') {
+    throwError('Endpoint ini hanya untuk menu non-package', 400, 'bigCategory');
+  }
+
   if (req.file) {
     const folderId = getDriveFolder('menu');
     const finalCode = String(
@@ -208,8 +192,7 @@ exports.updateMenu = asyncHandler(async (req, res) => {
     throwError('bigCategory tidak valid', 400);
   }
 
-  // Resolve subcategory jika dikirim
-  let nextBig = String(payload.bigCategory || current.bigCategory);
+  const nextBig = String(payload.bigCategory || current.bigCategory);
   if (payload.subcategoryId) {
     if (!isValidId(payload.subcategoryId))
       throwError('subcategoryId tidak valid', 400);
@@ -239,24 +222,10 @@ exports.updateMenu = asyncHandler(async (req, res) => {
     };
   }
 
-  // enforce addons/packageItems by bigCategory
-  nextBig = String(payload.bigCategory || current.bigCategory);
-  if (nextBig === 'package') {
-    if (Array.isArray(payload.addons)) payload.addons = [];
-    if (!Array.isArray(payload.packageItems))
-      payload.packageItems = current.packageItems;
-    if (
-      Array.isArray(payload.packageBuilder) &&
-      payload.packageBuilder.length
-    ) {
-      payload.packageItems = await buildPackageItemsFromIds(
-        payload.packageBuilder
-      );
-    }
-  } else {
-    if (Array.isArray(payload.packageItems)) payload.packageItems = [];
-    if (!Array.isArray(payload.addons)) payload.addons = current.addons;
-  }
+  // enforce non-package: packageItems harus kosong; addons tetap dipakai
+  if (Array.isArray(payload.packageItems)) payload.packageItems = [];
+  if (!Array.isArray(payload.addons)) payload.addons = current.addons;
+  delete payload.packageBuilder; // kalau ada kiriman liar, dibuang
 
   // unique menu_code
   if (payload.menu_code) {
@@ -305,18 +274,6 @@ exports.deleteMenu = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'Menu dihapus' });
 });
 
-/* ====================== LIST ====================== */
-// GET /menu/list
-// Query:
-//  - q
-//  - big: kategori besar (fixed)
-//  - subId: ObjectId subcategory
-//  - subName: nama subcategory (case-insensitive)
-//  - recommended: true|false
-//  - isActive: true|false (dipaksa true untuk publik)
-//  - page, limit
-//  - sortBy: name | createdAt | price.final | price.original | isRecommended
-//  - sortDir: asc|desc
 exports.listMenus = asyncHandler(async (req, res) => {
   const page = Math.max(parseInt(req.query.page || '1', 10), 1);
   const limit = Math.min(
