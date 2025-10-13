@@ -16,7 +16,7 @@ router.post('/price-preview', authMemberRequired, orderCtrl.previewPrice); // <â
 // POS dine-in (tanpa voucher jika tidak ada member)
 router.post(
   '/dine-in/cashier',
-  requireRole(['owner', 'employee']),
+  requireRole('owner', 'employee'),
   orderCtrl.createPosDineIn
 );
 
@@ -24,14 +24,14 @@ router.post(
 router.get(
   '/list-order',
   validateToken,
-  requireRole(['owner', 'employee']),
+  requireRole('owner', 'employee'),
   requirePageAccess('orders'),
   orderCtrl.listOrders
 );
 router.get(
   '/kitchen',
   validateToken,
-  requireRole(['owner', 'employee']),
+  requireRole('owner', 'employee'),
   requirePageAccess('kitchen'),
   orderCtrl.listKitchenOrders
 );
@@ -41,7 +41,7 @@ router.post('/:id/cancel', authMemberRequired, orderCtrl.cancelOrder);
 router.get(
   '/:id',
   validateToken,
-  requireRole(['owner', 'employee']),
+  requireRole('owner', 'employee'),
   requirePageAccess('orders'),
   orderCtrl.getDetailOrder
 );
@@ -49,7 +49,7 @@ router.get(
 router.patch(
   '/:id/status',
   validateToken,
-  requireRole(['owner', 'employee']),
+  requireRole('owner', 'employee'),
   requirePageAccess('orders'),
   orderCtrl.updateStatus
 );

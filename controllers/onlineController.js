@@ -1,4 +1,3 @@
-// controllers/onlineController.js
 const asyncHandler = require('express-async-handler');
 const crypto = require('crypto');
 
@@ -15,9 +14,9 @@ const { getDriveFolder } = require('../utils/driveFolders');
 const { emitToMember, emitToStaff } = require('./socket/socketBus');
 
 const {
-  DELIVERY_PRICE_PER_KM,
   DELIVERY_MAX_RADIUS_KM,
-  CAFE_COORD
+  CAFE_COORD,
+  DELIVERY_FLAT_FEE
 } = require('../config/onlineConfig');
 const { haversineKm } = require('../utils/distance');
 
@@ -65,34 +64,31 @@ const makeLineKey = ({ menuId, addons = [], notes = '' }) => {
   return `${menuId}__${keyAddons}__${notesPart}`;
 };
 
-const computeLineSubtotal = (basePrice, addons, qty) => {
-  const addonsTotal = normalizeAddons(addons).reduce(
-    (sum, a) => sum + a.price * a.qty,
-    0
-  );
-  const unit = asInt(basePrice, 0) + addonsTotal;
-  return unit * clamp(asInt(qty, 1), 1, 999);
-};
-
 const recomputeTotals = (cart) => {
   let totalQty = 0;
   for (const it of cart.items) {
     const addonsTotal = (it.addons || []).reduce(
-      (s, a) => s + (a.price || 0) * (a.qty || 1),
+      (s, a) => s + asInt(a.price) * asInt(a.qty, 1),
       0
     );
-    it.line_subtotal = (it.base_price + addonsTotal) * it.quantity;
+    it.line_subtotal =
+      (asInt(it.base_price, 0) + addonsTotal) *
+      clamp(asInt(it.quantity, 1), 1, 999);
     totalQty += it.quantity;
   }
   cart.total_quantity = totalQty;
   cart.total_items = cart.items.length;
-  cart.total_price = cart.items.reduce((s, it) => s + it.line_subtotal, 0);
+  cart.total_price = cart.items.reduce(
+    (s, it) => s + asInt(it.line_subtotal, 0),
+    0
+  );
   return cart;
 };
 
 /* ===================== Delivery fee helper ===================== */
-const calcDeliveryFee = (distanceKm) =>
-  Math.ceil(distanceKm) * Number(DELIVERY_PRICE_PER_KM || 0);
+// Flat fee 5k (bisa override via env DELIVERY_FLAT_FEE)
+const calcDeliveryFee = () =>
+  Number(DELIVERY_FLAT_FEE ?? process.env.DELIVERY_FLAT_FEE ?? 5000);
 
 /* ===================== Identity ONLINE (tanpa meja) ===================== */
 const getOnlineIdentity = (req) => {
@@ -234,11 +230,13 @@ exports.addToCart = asyncHandler(async (req, res) => {
       menu_code: menu.menu_code || '',
       name: menu.name,
       imageUrl: menu.imageUrl || '',
-      base_price: menu.price,
+      base_price: asInt(menu.price, 0),
       quantity: qty,
       addons: normAddons,
       notes: String(notes || '').trim(),
-      line_key
+      line_key,
+      // ikutkan kategori untuk voucherEngine (kalau ada)
+      category: menu.category || menu.bigCategory || null
     });
   }
 
@@ -335,10 +333,13 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
     throwError('lat & lng wajib', 400);
   }
 
+  // tetap hitung jarak untuk guard radius
   const distance_km = haversineKm(CAFE_COORD, { lat, lng });
   const within_radius =
     distance_km <= Number(DELIVERY_MAX_RADIUS_KM || 0) + 1e-9;
-  const delivery_fee = within_radius ? calcDeliveryFee(distance_km) : null;
+
+  // fee flat 5k (atau sesuai config/env)
+  const delivery_fee = within_radius ? calcDeliveryFee() : null;
 
   res.status(200).json({
     distance_km: Number(distance_km.toFixed(2)),
@@ -421,7 +422,6 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
   );
   const payment_proof_url = `https://drive.google.com/uc?export=view&id=${uploaded.id}`;
 
-  // Siapkan delivery block bila perlu
   let delivery = undefined;
   let delivery_fee = 0;
   if (fulfillment_type === 'delivery') {
@@ -434,7 +434,7 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
     if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0) + 1e-9) {
       throwError(`Di luar radius ${DELIVERY_MAX_RADIUS_KM}km`, 400);
     }
-    delivery_fee = calcDeliveryFee(distance_km);
+    delivery_fee = calcDeliveryFee();
     delivery = {
       address_text: String(address_text || '').trim(),
       location: { lat: latN, lng: lngN },
@@ -457,7 +457,7 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
         menuId: it.menu,
         qty: it.quantity,
         price: it.base_price,
-        category: it.category
+        category: it.category || null
       }))
     },
     deliveryFee: delivery_fee,
@@ -484,7 +484,8 @@ exports.checkoutOnline = asyncHandler(async (req, res) => {
             quantity: it.quantity,
             addons: it.addons,
             notes: it.notes,
-            line_subtotal: it.line_subtotal
+            line_subtotal: it.line_subtotal,
+            category: it.category || null
           })),
           total_quantity: cart.total_quantity,
           delivery,
