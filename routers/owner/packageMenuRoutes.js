@@ -6,6 +6,7 @@ const requirePageAccess = require('../../utils/requirePageAccess');
 const validateToken = require('../../utils/tokenHandler');
 const fileUploader = require('../../utils/fileUploader');
 
+const parseFormData = require('../../middlewares/parseFormData');
 const validate = require('../../middlewares/validate');
 const {
   createPackageMenuSchema,
@@ -23,6 +24,7 @@ router.use(
 router.post(
   '/create-package',
   fileUploader.single('menu-image'),
+  parseFormData,
   validate(createPackageMenuSchema),
   pkg.createPackageMenu
 );
@@ -30,6 +32,7 @@ router.get('/list', pkg.listPackageMenus);
 router.patch(
   '/update/:id',
   fileUploader.single('menu-image'),
+  parseFormData,
   validate(updatePackageMenuSchema),
   pkg.updatePackageMenu
 );
