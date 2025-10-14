@@ -4,7 +4,7 @@ const authMember = require('../../middlewares/authMember');
 
 const router = express.Router();
 
-router.get('/list', authMember, menu.listMenus);
-router.get('/:id', authMember, menu.getMenuById);
+router.get('/list', menu.listMenus);
+router.get('/:id', menu.getMenuById);
 
 module.exports = router;
