@@ -21,6 +21,6 @@ router.get('/finance/profit-loss', guard, ctrl.profitLoss); // laba/rugi
 
 // ===== Detail & Delete =====
 router.get('/:id', guard, ctrl.getHistoryDetail);
-router.delete('/:id', requireRole('owner'), ctrl.deleteHistory);
+router.delete('remove/:id', requireRole('owner'), ctrl.deleteHistory);
 
 module.exports = router;
