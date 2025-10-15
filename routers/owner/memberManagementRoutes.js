@@ -1,17 +1,21 @@
+// routes/owner/memberReportRoutes.js
 const express = require('express');
-const {
-  getMembers,
-  deleteMember
-} = require('../../controllers/owner/memberManagementController');
 const router = express.Router();
 
-const validateToken = require('../../utils/tokenHandler');
+const ctrl = require('../../controllers/owner/memberManagementController');
 const requireRole = require('../../utils/requireRole');
+const requirePageAccess = require('../../utils/requirePageAccess');
+const guard = requireRole('owner', 'employee');
+router.use(requirePageAccess('members'));
 
-router.use(validateToken, requireRole('owner'));
+router.get('/summary', guard, ctrl.listMemberSummary);
 
-router.get('/all-member', getMembers);
+router.get('/customer-growth', guard, ctrl.newCustomers);
 
-router.delete('/remove/:id', deleteMember);
+router.get('/:id', guard, ctrl.getMemberDetail);
+
+router.get('/top-spenders', guard, ctrl.topSpenders);
+
+router.delete('remove/:id', requireRole('owner'), ctrl.deleteMemberAccount);
 
 module.exports = router;

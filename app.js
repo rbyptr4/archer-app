@@ -13,7 +13,7 @@ const menuMemberRoutes = require('./routers/member/menuMemberRoutes');
 const voucherMemberRoutes = require('./routers/member/voucherMemberRoutes');
 const voucherRoutes = require('./routers/owner/voucherRoutes');
 const employeeRoutes = require('./routers/owner/employeeRoutes');
-const reportRoutes = require('./routers/owner/reportRoutes');
+const orderHistoryRoutes = require('./routers/owner/orderHistoryRoutes');
 const menuRoutes = require('./routers/owner/menuRoutes');
 const menuPackagesRoutes = require('./routers/owner/packageMenuRoutes');
 const categoryRoutes = require('./routers/owner/menuCategoryRoutes');
@@ -81,7 +81,7 @@ app.use('/member', authMemberRoutes);
 app.use('/member/menu', menuMemberRoutes);
 app.use('/member/voucher', voucherMemberRoutes);
 app.use('/voucher', voucherRoutes);
-app.use('/reports', reportRoutes);
+app.use('/history', orderHistoryRoutes);
 app.use('/orders', orderRoutes);
 
 app.use(errorHandler);

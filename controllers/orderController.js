@@ -1,3 +1,4 @@
+// controllers/onlineController.js
 const asyncHandler = require('express-async-handler');
 const crypto = require('crypto');
 
@@ -22,6 +23,9 @@ const { haversineKm } = require('../utils/distance');
 const { nextDailyTxCode } = require('../utils/txCode');
 const { validateAndPrice } = require('../utils/voucherEngine');
 const { awardPointsIfEligible } = require('../utils/loyalty');
+
+// === NEW: logger history ===
+const { logPaidHistory, logRefundHistory } = require('../utils/historyLoggers');
 
 const {
   ACCESS_COOKIE,
@@ -886,7 +890,6 @@ exports.updateStatus = asyncHandler(async (req, res) => {
     );
 
   if (isKitchenStatus(status) && !order.canMoveToKitchen?.()) {
-    // Jika model belum ada canMoveToKitchen, hapus check ini atau sesuaikan
     throwError('Order belum paid. Tidak bisa masuk accepted/preparing.', 409);
   }
 
@@ -914,6 +917,11 @@ exports.updateStatus = asyncHandler(async (req, res) => {
   // Award poin jika sudah paid tapi belum award
   if (order.payment_status === 'paid' && !order.loyalty_awarded_at) {
     await awardPointsIfEligible(order, Member);
+  }
+
+  // === NEW: log refund history jika hasil akhirnya refunded ===
+  if (fromStatus !== 'cancelled' && order.payment_status === 'refunded') {
+    await logRefundHistory(order);
   }
 
   const payload = {
@@ -958,6 +966,11 @@ exports.cancelOrder = asyncHandler(async (req, res) => {
   order.cancellation_reason = String(reason || '').trim();
   order.cancelled_at = new Date();
   await order.save();
+
+  // === NEW: log refund history jika memang jadi refunded ===
+  if (order.payment_status === 'refunded') {
+    await logRefundHistory(order);
+  }
 
   const payload = {
     id: String(order._id),
@@ -1106,6 +1119,8 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
 
   if (order.payment_status === 'paid') {
     await awardPointsIfEligible(order, Member);
+    // === NEW: log paid history saat dibuat paid ===
+    await logPaidHistory(order, req.user);
   }
 
   const payload = {
@@ -1170,6 +1185,9 @@ exports.verifyPayment = asyncHandler(async (req, res) => {
     await awardPointsIfEligible(order, Member);
   }
 
+  // === NEW: log paid history ===
+  await logPaidHistory(order, req.user);
+
   const payload = {
     id: String(order._id),
     transaction_code: order.transaction_code,
@@ -1209,6 +1227,9 @@ exports.refundPayment = asyncHandler(async (req, res) => {
   order.cancellation_reason = String(reason || 'Refund by staff').trim();
 
   await order.save();
+
+  // === NEW: log refund history ===
+  await logRefundHistory(order);
 
   const payload = {
     id: String(order._id),
