@@ -58,7 +58,8 @@ app.use(
       'X-Online-Session',
       'X-Table-Number',
       'X-Order-Source',
-      'X-Device-Id'
+      'X-Device-Id',
+      'X-Fullfilment-Type'
     ],
     credentials: true
   })
