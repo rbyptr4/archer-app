@@ -6,9 +6,11 @@ const ctrl = require('../../controllers/owner/orderHistoryController');
 // Ganti middleware sesuai proyekmu
 const requireRole = require('../../utils/requireRole');
 const requirePageAccess = require('../../utils/requirePageAccess');
+const validateToken = require('../utils/tokenHandler'); // staff token middleware
+
 const guard = requireRole('owner', 'employee');
 
-router.use(requirePageAccess('reports'));
+router.use(validateToken, requirePageAccess('reports'));
 // ===== Laporan Order / Transaksi =====
 router.get('/summary', guard, ctrl.summaryByPeriod);
 router.get('/transactions/paid', guard, ctrl.totalPaidTransactions);
