@@ -59,7 +59,7 @@ app.use(
       'X-Table-Number',
       'X-Order-Source',
       'X-Device-Id',
-      'X-Fullfilment-Type'
+      'X-Fulfillment-Type'
     ],
     credentials: true
   })

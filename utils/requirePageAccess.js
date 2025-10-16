@@ -1,6 +1,6 @@
 module.exports = function requirePageAccess(pageKey) {
   return (req, res, next) => {
-    console.log(req.user);
+    // console.log(req.user);
     const u = req.user;
     if (!u)
       return res
