@@ -731,7 +731,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   });
 });
 
-/* ===================== ASSIGN TABLE (self-order) ===================== */
 exports.assignTable = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
   if (iden.mode !== 'self_order') throwError('Hanya untuk self-order', 400);
@@ -739,19 +738,25 @@ exports.assignTable = asyncHandler(async (req, res) => {
   const table_number = asInt(req.body?.table_number, 0);
   if (!table_number) throwError('table_number wajib', 400);
 
-  // cari cart aktif dulu
   let cart = await Cart.findOne({
     status: 'active',
     source: 'qr',
+    table_number,
     $or: [{ member: iden.memberId }, { session_id: iden.session_id }]
   });
 
-  // kalau belum ada (QR generic, user baru masuk), bikin cart kosong dulu
   if (!cart) {
+    await Cart.deleteMany({
+      status: 'active',
+      source: 'qr',
+      table_number: null,
+      $or: [{ member: iden.memberId }, { session_id: iden.session_id }]
+    });
+
     cart = await Cart.create({
       member: iden.memberId || null,
       session_id: iden.memberId ? null : iden.session_id || crypto.randomUUID(),
-      table_number: null, // nanti di-set di bawah
+      table_number,
       items: [],
       total_items: 0,
       total_quantity: 0,
@@ -759,10 +764,10 @@ exports.assignTable = asyncHandler(async (req, res) => {
       status: 'active',
       source: 'qr'
     });
+  } else {
+    cart.table_number = table_number;
+    await cart.save();
   }
-
-  cart.table_number = table_number;
-  await cart.save();
 
   emitToStaff('cart:table_assigned', {
     cart_id: String(cart._id),
