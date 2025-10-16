@@ -120,6 +120,17 @@ const makeLineKey = ({ menuId, addons = [], notes = '' }) => {
   return `${menuId}__${keyAddons}__${notesPart}`;
 };
 
+const priceFinal = (p = {}) => {
+  const original = Number(p?.original || 0);
+  const mode = String(p?.discountMode || 'none');
+  if (mode === 'percent') {
+    const pct = Math.min(100, Math.max(0, Number(p?.discountPercent || 0)));
+    return Math.max(0, Math.round(original * (1 - pct / 100)));
+  }
+  if (mode === 'manual') return Math.max(0, Number(p?.manualPromoPrice || 0));
+  return original;
+};
+
 const recomputeTotals = (cart) => {
   let totalQty = 0;
   for (const it of cart.items) {
@@ -376,12 +387,13 @@ exports.addItem = asyncHandler(async (req, res) => {
     const newQty = clamp(cart.items[idx].quantity + qty, 1, 999);
     cart.items[idx].quantity = newQty;
   } else {
+    const unit = priceFinal(menu.price);
     cart.items.push({
       menu: menu._id,
       menu_code: menu.menu_code || '',
       name: menu.name,
       imageUrl: menu.imageUrl || '',
-      base_price: asInt(menu.price, 0),
+      base_price: unit,
       quantity: qty,
       addons: normAddons,
       notes: String(notes || '').trim(),
@@ -1149,14 +1161,15 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
       (s, a) => s + (a.price || 0) * (a.qty || 1),
       0
     );
-    const line_subtotal = (asInt(menu.price, 0) + addonsTotal) * qty;
+    const unit = priceFinal(menu.price); // <-- hitung dari objek price
+    const line_subtotal = (unit + addonsTotal) * qty;
 
     orderItems.push({
       menu: menu._id,
       menu_code: menu.menu_code || '',
       name: menu.name,
       imageUrl: menu.imageUrl || '',
-      base_price: asInt(menu.price, 0),
+      base_price: unit,
       quantity: qty,
       addons: normAddons,
       notes: String(it.notes || '').trim(),
