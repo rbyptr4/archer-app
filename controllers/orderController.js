@@ -148,24 +148,23 @@ const calcDeliveryFee = () =>
 exports.modeResolver = asyncHandler(async (req, _res, next) => {
   const ft = req.body?.fulfillment_type || req.query?.fulfillment_type;
   const headerSrc = String(req.headers['x-order-source'] || '').toLowerCase();
-  const tableNumber = asInt(req.query.table ?? req.body?.table_number, 0);
+  const querySrc = String(req.query?.source || '').toLowerCase();
 
   let mode = 'online';
   let source = 'online';
+
   if (String(ft) === 'delivery') {
     mode = 'online';
     source = 'online';
-  } else if (tableNumber) {
-    mode = 'self_order';
-    source = 'qr';
-  } else if (headerSrc === 'qr') {
+  } else if (headerSrc === 'qr' || querySrc === 'qr') {
     mode = 'self_order';
     source = 'qr';
   }
 
   const sessionHeader =
-    req.headers['x-online-session'] ||
-    req.headers['x-qr-session'] ||
+    req.get('x-online-session') ||
+    req.get('x-qr-session') ||
+    req.get('x-device-id') ||
     req.body?.online_session_id ||
     req.body?.session_id ||
     null;
@@ -173,7 +172,6 @@ exports.modeResolver = asyncHandler(async (req, _res, next) => {
   req.orderMode = mode; // 'self_order' | 'online'
   req.orderSource = source; // 'qr' | 'online'
   req.session_id = sessionHeader ? String(sessionHeader).trim() : null;
-  req.table_number = tableNumber || null;
 
   next();
 });
@@ -286,10 +284,60 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
 /* ===================== CART ENDPOINTS (unified) ===================== */
 exports.getCart = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
-  if (iden.mode === 'self_order' && !iden.table_number) {
-    throwError('Nomor meja belum diisi.', 400);
+  const source = (req.orderSource || 'online') === 'qr' ? 'qr' : 'online';
+
+  const identityFilter = iden.memberId
+    ? { member: iden.memberId }
+    : { session_id: iden.session_id || req.cookies?.[DEVICE_COOKIE] };
+
+  // Ambil satu cart aktif milik identitas ini untuk source tsb
+  let carts = await Cart.find({
+    status: 'active',
+    source,
+    ...identityFilter
+  })
+    .sort([
+      // utamakan yang sudah punya table_number (self-order)
+      ['table_number', -1],
+      ['updatedAt', -1]
+    ])
+    .lean();
+
+  let cart = carts[0] || null;
+
+  if (!cart) {
+    if (source === 'qr') {
+      // Self-order tapi belum pernah assign -> jangan create
+      throwError(
+        'Belum ada cart self-order. Silakan assign nomor meja dahulu.',
+        400
+      );
+    }
+    // Online: boleh create
+    const created = await Cart.create({
+      member: iden.memberId || null,
+      session_id: iden.memberId ? null : iden.session_id || crypto.randomUUID(),
+      table_number: null,
+      items: [],
+      total_items: 0,
+      total_quantity: 0,
+      total_price: 0,
+      status: 'active',
+      source: 'online'
+    });
+    cart = created.toObject();
   }
-  const cart = await findOrCreateCart(iden);
+
+  // Cleanup duplikat bila ada (sisakan cart terpilih)
+  if (carts.length > 1) {
+    await Cart.deleteMany({
+      _id: { $in: carts.slice(1).map((c) => c._id) },
+      status: 'active',
+      source,
+      ...identityFilter
+    }).catch(() => {});
+  }
+
   res.status(200).json(cart);
 });
 
@@ -740,24 +788,31 @@ exports.assignTable = asyncHandler(async (req, res) => {
   const table_number = asInt(req.body?.table_number, 0);
   if (!table_number) throwError('table_number wajib', 400);
 
+  let sessionId = iden.session_id || req.cookies?.[DEVICE_COOKIE];
+  if (!sessionId && !iden.memberId) {
+    sessionId = crypto.randomUUID();
+    res.cookie(DEVICE_COOKIE, sessionId, {
+      ...baseCookie,
+      httpOnly: false,
+      maxAge: REFRESH_TTL_MS
+    });
+  }
+
+  const identityFilter = iden.memberId
+    ? { member: iden.memberId }
+    : { session_id: sessionId };
+
+  // Cari cart aktif source=qr milik identitas ini (apapun meja-nya)
   let cart = await Cart.findOne({
     status: 'active',
     source: 'qr',
-    table_number,
-    $or: [{ member: iden.memberId }, { session_id: iden.session_id }]
+    ...identityFilter
   });
 
   if (!cart) {
-    await Cart.deleteMany({
-      status: 'active',
-      source: 'qr',
-      table_number: null,
-      $or: [{ member: iden.memberId }, { session_id: iden.session_id }]
-    });
-
     cart = await Cart.create({
       member: iden.memberId || null,
-      session_id: iden.memberId ? null : iden.session_id || crypto.randomUUID(),
+      session_id: iden.memberId ? null : sessionId,
       table_number,
       items: [],
       total_items: 0,
@@ -770,6 +825,14 @@ exports.assignTable = asyncHandler(async (req, res) => {
     cart.table_number = table_number;
     await cart.save();
   }
+
+  // Bersihkan cart aktif lain yang masih tersisa (kalau ada)
+  await Cart.deleteMany({
+    _id: { $ne: cart._id },
+    status: 'active',
+    source: 'qr',
+    ...identityFilter
+  }).catch(() => {});
 
   emitToStaff('cart:table_assigned', {
     cart_id: String(cart._id),
