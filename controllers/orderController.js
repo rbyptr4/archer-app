@@ -299,7 +299,9 @@ exports.addItem = asyncHandler(async (req, res) => {
   const menu = await Menu.findById(menu_id).lean();
   if (!menu || !menu.isActive)
     throwError('Menu tidak ditemukan / tidak aktif', 404);
-
+  if (req.orderMode === 'self_order' && !req.table_number) {
+    throwError('Nomor meja wajib diisi sebelum menambah item', 400);
+  }
   const qty = clamp(asInt(quantity, 1), 1, 999);
   const normAddons = normalizeAddons(addons);
   const line_key = makeLineKey({ menuId: menu._id, addons: normAddons, notes });
@@ -465,12 +467,6 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
   });
 });
 
-/* ===================== CHECKOUT (unified) ===================== */
-/**
- * - Self-order (QR, dine_in): payment proof opsional (boleh kirim).
- * - Online (delivery): payment proof WAJIB.
- * Multer (single 'file') harus dipasang di router sebelum handler ini.
- */
 exports.checkout = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
   const {
@@ -743,12 +739,27 @@ exports.assignTable = asyncHandler(async (req, res) => {
   const table_number = asInt(req.body?.table_number, 0);
   if (!table_number) throwError('table_number wajib', 400);
 
-  const cart = await Cart.findOne({
+  // cari cart aktif dulu
+  let cart = await Cart.findOne({
     status: 'active',
     source: 'qr',
     $or: [{ member: iden.memberId }, { session_id: iden.session_id }]
   });
-  if (!cart) throwError('Cart tidak ditemukan', 404);
+
+  // kalau belum ada (QR generic, user baru masuk), bikin cart kosong dulu
+  if (!cart) {
+    cart = await Cart.create({
+      member: iden.memberId || null,
+      session_id: iden.memberId ? null : iden.session_id || crypto.randomUUID(),
+      table_number: null, // nanti di-set di bawah
+      items: [],
+      total_items: 0,
+      total_quantity: 0,
+      total_price: 0,
+      status: 'active',
+      source: 'qr'
+    });
+  }
 
   cart.table_number = table_number;
   await cart.save();

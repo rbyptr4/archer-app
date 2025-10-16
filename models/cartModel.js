@@ -34,7 +34,7 @@ const cartSchema = new mongoose.Schema(
       default: null
     },
     session_id: { type: String, default: null },
-    table_number: { type: Number, required: true, min: 1 },
+    table_number: { type: Number, default: null, min: 1 },
 
     items: { type: [itemSchema], default: [] },
 
