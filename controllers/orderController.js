@@ -286,7 +286,9 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
 /* ===================== CART ENDPOINTS (unified) ===================== */
 exports.getCart = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
-  console.log(iden);
+  if (iden.mode === 'self_order' && !iden.table_number) {
+    throwError('Nomor meja belum diisi.', 400);
+  }
   const cart = await findOrCreateCart(iden);
   res.status(200).json(cart);
 });
