@@ -145,6 +145,11 @@ const recomputeTotals = (cart) => {
 const calcDeliveryFee = () =>
   Number(DELIVERY_FLAT_FEE ?? process.env.DELIVERY_FLAT_FEE ?? 5000);
 
+/*
+ * MODE RESOLVER TANPA TABLE NUMBER
+ * - Menentukan mode (self_order/online) & source (qr/online) dari header/query
+ * - Tidak membaca/menyetel nomor meja di req
+ */
 exports.modeResolver = asyncHandler(async (req, _res, next) => {
   const ft = req.body?.fulfillment_type || req.query?.fulfillment_type;
   const headerSrc = String(req.headers['x-order-source'] || '').toLowerCase();
@@ -176,6 +181,7 @@ exports.modeResolver = asyncHandler(async (req, _res, next) => {
   next();
 });
 
+/* Ambil identitas caller (member/session) + mode/source */
 const getIdentity = (req) => {
   const memberId = req.member?.id || null;
   const session_id =
@@ -189,34 +195,83 @@ const getIdentity = (req) => {
     source: req.orderSource,
     memberId,
     session_id,
-    table_number: req.table_number || null
+    table_number: req.table_number || null // tidak dipakai lagi sebagai input utama
   };
 };
 
-const findOrCreateCart = async (iden) => {
-  const filter = {
-    status: 'active',
-    source: iden.source,
-    ...(iden.mode === 'self_order' ? { table_number: iden.table_number } : {}),
-    ...(iden.memberId
-      ? { member: iden.memberId }
-      : { session_id: iden.session_id })
-  };
-  let cart = await Cart.findOne(filter).lean();
-  if (cart) return cart;
+/* Helper: ambil 1 cart aktif by identity + source; opsi membuat baru utk online */
+const getActiveCartForIdentity = async (
+  iden,
+  { allowCreateOnline = false }
+) => {
+  const requestedSource = iden.source || '';
+  const identityFilter = iden.memberId
+    ? { member: iden.memberId }
+    : { session_id: iden.session_id };
 
-  const created = await Cart.create({
-    member: iden.memberId || null,
-    session_id: iden.memberId ? null : iden.session_id || crypto.randomUUID(),
-    table_number: iden.mode === 'self_order' ? iden.table_number : null,
-    items: [],
-    total_items: 0,
-    total_quantity: 0,
-    total_price: 0,
-    status: 'active',
-    source: iden.source
-  });
-  return created.toObject();
+  // Try QR first (so FE doesn't need to send x-order-source)
+  const sourcesToCheck = requestedSource === 'qr' ? ['qr'] : ['qr', 'online'];
+  let cart = null;
+  let cartsQueried = [];
+  let foundSource = null;
+
+  for (const src of sourcesToCheck) {
+    const carts = await Cart.find({
+      status: 'active',
+      source: src,
+      ...identityFilter
+    })
+      .sort([
+        ['table_number', -1],
+        ['updatedAt', -1]
+      ])
+      .limit(2)
+      .lean();
+    if (carts.length) {
+      cart = carts[0];
+      cartsQueried = carts;
+      foundSource = src;
+      break;
+    }
+  }
+
+  if (!cart) {
+    // No active carts found for either source
+    if (requestedSource === 'qr') {
+      throwError(
+        'Belum ada cart self-order. Silakan assign nomor meja dahulu.',
+        400
+      );
+    } else if (allowCreateOnline) {
+      const created = await Cart.create({
+        member: iden.memberId || null,
+        session_id: iden.memberId
+          ? null
+          : iden.session_id || crypto.randomUUID(),
+        table_number: null,
+        items: [],
+        total_items: 0,
+        total_quantity: 0,
+        total_price: 0,
+        status: 'active',
+        source: 'online'
+      });
+      cart = created.toObject();
+      foundSource = 'online';
+    }
+  }
+
+  // Cleanup duplicates on the found source (if any)
+  if (cart && cartsQueried.length > 1) {
+    await Cart.deleteMany({
+      _id: { $in: cartsQueried.slice(1).map((c) => c._id) },
+      status: 'active',
+      source: foundSource,
+      ...identityFilter
+    }).catch(() => {});
+  }
+
+  return cart;
 };
 
 /* =============== Member helper (unified) =============== */
@@ -284,60 +339,8 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
 /* ===================== CART ENDPOINTS (unified) ===================== */
 exports.getCart = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
-  const source = (req.orderSource || 'online') === 'qr' ? 'qr' : 'online';
-
-  const identityFilter = iden.memberId
-    ? { member: iden.memberId }
-    : { session_id: iden.session_id || req.cookies?.[DEVICE_COOKIE] };
-
-  // Ambil satu cart aktif milik identitas ini untuk source tsb
-  let carts = await Cart.find({
-    status: 'active',
-    source,
-    ...identityFilter
-  })
-    .sort([
-      // utamakan yang sudah punya table_number (self-order)
-      ['table_number', -1],
-      ['updatedAt', -1]
-    ])
-    .lean();
-
-  let cart = carts[0] || null;
-
-  if (!cart) {
-    if (source === 'qr') {
-      // Self-order tapi belum pernah assign -> jangan create
-      throwError(
-        'Belum ada cart self-order. Silakan assign nomor meja dahulu.',
-        400
-      );
-    }
-    // Online: boleh create
-    const created = await Cart.create({
-      member: iden.memberId || null,
-      session_id: iden.memberId ? null : iden.session_id || crypto.randomUUID(),
-      table_number: null,
-      items: [],
-      total_items: 0,
-      total_quantity: 0,
-      total_price: 0,
-      status: 'active',
-      source: 'online'
-    });
-    cart = created.toObject();
-  }
-
-  // Cleanup duplikat bila ada (sisakan cart terpilih)
-  if (carts.length > 1) {
-    await Cart.deleteMany({
-      _id: { $in: carts.slice(1).map((c) => c._id) },
-      status: 'active',
-      source,
-      ...identityFilter
-    }).catch(() => {});
-  }
-
+  const allowCreateOnline = (iden.source || 'online') !== 'qr';
+  const cart = await getActiveCartForIdentity(iden, { allowCreateOnline });
   res.status(200).json(cart);
 });
 
@@ -349,31 +352,23 @@ exports.addItem = asyncHandler(async (req, res) => {
   const menu = await Menu.findById(menu_id).lean();
   if (!menu || !menu.isActive)
     throwError('Menu tidak ditemukan / tidak aktif', 404);
-  if (req.orderMode === 'self_order' && !req.table_number) {
-    throwError('Nomor meja wajib diisi sebelum menambah item', 400);
+
+  // Ambil cart aktif (QR harus sudah assign, Online boleh auto-create)
+  const allowCreateOnline = (iden.source || 'online') !== 'qr';
+  let cart = await getActiveCartForIdentity(iden, { allowCreateOnline });
+
+  // Kalau ini self-order (qr) pastikan cart sudah punya table_number
+  if ((iden.source || 'online') === 'qr' && !cart.table_number) {
+    throwError('Nomor meja belum di-assign.', 400);
   }
+
   const qty = clamp(asInt(quantity, 1), 1, 999);
   const normAddons = normalizeAddons(addons);
   const line_key = makeLineKey({ menuId: menu._id, addons: normAddons, notes });
 
-  const filter = {
-    status: 'active',
-    source: iden.source,
-    ...(iden.mode === 'self_order' ? { table_number: iden.table_number } : {}),
-    ...(iden.memberId
-      ? { member: iden.memberId }
-      : { session_id: iden.session_id })
-  };
-  let cart = await Cart.findOne(filter);
-  if (!cart) {
-    cart = await Cart.create({
-      member: iden.memberId || null,
-      session_id: iden.memberId ? null : iden.session_id || crypto.randomUUID(),
-      table_number: iden.mode === 'self_order' ? iden.table_number : null,
-      items: [],
-      status: 'active',
-      source: iden.source
-    });
+  // pastikan doc cart sebagai Mongoose document
+  if (!cart.save) {
+    cart = await Cart.findById(cart._id);
   }
 
   const idx = cart.items.findIndex((it) => it.line_key === line_key);
@@ -405,15 +400,11 @@ exports.updateItem = asyncHandler(async (req, res) => {
   const { quantity, addons, notes } = req.body || {};
   const iden = getIdentity(req);
 
-  const filter = {
-    status: 'active',
-    source: iden.source,
-    ...(iden.mode === 'self_order' ? { table_number: iden.table_number } : {}),
-    ...(iden.memberId
-      ? { member: iden.memberId }
-      : { session_id: iden.session_id })
-  };
-  const cart = await Cart.findOne(filter);
+  // Ambil cart aktif (QR harus sudah assign, Online boleh auto-create = false untuk safety)
+  const cartObj = await getActiveCartForIdentity(iden, {
+    allowCreateOnline: false
+  });
+  const cart = await Cart.findById(cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan', 404);
 
   const idx = cart.items.findIndex((it) => String(it._id) === String(itemId));
@@ -443,15 +434,10 @@ exports.removeItem = asyncHandler(async (req, res) => {
   const { itemId } = req.params;
   const iden = getIdentity(req);
 
-  const filter = {
-    status: 'active',
-    source: iden.source,
-    ...(iden.mode === 'self_order' ? { table_number: iden.table_number } : {}),
-    ...(iden.memberId
-      ? { member: iden.memberId }
-      : { session_id: iden.session_id })
-  };
-  const cart = await Cart.findOne(filter);
+  const cartObj = await getActiveCartForIdentity(iden, {
+    allowCreateOnline: false
+  });
+  const cart = await Cart.findById(cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan', 404);
 
   const before = cart.items.length;
@@ -466,15 +452,10 @@ exports.removeItem = asyncHandler(async (req, res) => {
 
 exports.clearCart = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
-  const filter = {
-    status: 'active',
-    source: iden.source,
-    ...(iden.mode === 'self_order' ? { table_number: iden.table_number } : {}),
-    ...(iden.memberId
-      ? { member: iden.memberId }
-      : { session_id: iden.session_id })
-  };
-  const cart = await Cart.findOne(filter);
+  const cartObj = await getActiveCartForIdentity(iden, {
+    allowCreateOnline: false
+  });
+  const cart = await Cart.findById(cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan', 404);
 
   cart.items = [];
@@ -547,15 +528,18 @@ exports.checkout = asyncHandler(async (req, res) => {
   const joinChannel = iden.mode === 'self_order' ? 'self_order' : 'online';
   const member = await ensureMemberForCheckout(req, res, joinChannel);
 
-  let cart = await Cart.findOne({
-    status: 'active',
-    source: iden.source,
-    ...(iden.mode === 'self_order' ? { table_number: iden.table_number } : {}),
-    $or: [{ member: member._id }, { session_id: iden.session_id }]
+  // Ambil cart aktif milik member/session pada source saat ini
+  const cartObj = await getActiveCartForIdentity(iden, {
+    allowCreateOnline: false
   });
-
+  const cart = await Cart.findById(cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan / kosong', 404);
   if (!cart.items?.length) throwError('Cart kosong', 400);
+
+  // Self-order wajib sudah punya nomor meja (tapi tidak baca dari request)
+  if ((iden.source || 'online') === 'qr' && !cart.table_number) {
+    throwError('Silakan assign nomor meja terlebih dahulu', 400);
+  }
 
   // Idempotency via cart
   if (
@@ -648,18 +632,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     });
   }
 
-  // Self-order wajib punya nomor meja (jika belum, beri dari body)
-  if (iden.mode === 'self_order') {
-    const incomingTable = asInt(req.body?.table_number, 0);
-    if (!cart.table_number && incomingTable) {
-      cart.table_number = incomingTable;
-      await cart.save();
-    }
-    if (!cart.table_number) {
-      throwError('Silakan isi nomor meja terlebih dahulu', 400);
-    }
-  }
-
   // Buat ORDER dengan kode transaksi harian unik
   const order = await (async () => {
     for (let i = 0; i < 5; i++) {
@@ -667,8 +639,9 @@ exports.checkout = asyncHandler(async (req, res) => {
         const code = await nextDailyTxCode('ARCH');
         return await Order.create({
           member: cart.member,
-          table_number: iden.mode === 'self_order' ? cart.table_number : null,
-          source: iden.source, // 'qr' | 'online'
+          table_number:
+            (iden.source || 'online') === 'qr' ? cart.table_number : null,
+          source: iden.source || 'online',
           fulfillment_type: ft, // 'dine_in' | 'delivery'
           transaction_code: code,
           items: cart.items.map((it) => ({
@@ -691,7 +664,8 @@ exports.checkout = asyncHandler(async (req, res) => {
           shipping_discount: priced.totals.shippingDiscount,
           discounts: priced.breakdown,
           grand_total: priced.totals.grandTotal,
-          payment_method: iden.mode === 'online' ? 'qr' : 'manual',
+          payment_method:
+            (iden.source || 'online') === 'online' ? 'qr' : 'manual',
           payment_proof_url,
           status: 'created',
           payment_status: 'unpaid',
@@ -771,7 +745,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   };
   emitToStaff('order:new', payload);
   emitToMember(member._id, 'order:new', payload);
-  if (iden.mode === 'self_order' && order.table_number) {
+  if ((iden.source || 'online') === 'qr' && order.table_number) {
     emitToTable(order.table_number, 'order:new', payload);
   }
 
@@ -781,9 +755,9 @@ exports.checkout = asyncHandler(async (req, res) => {
   });
 });
 
+/* ===================== ASSIGN / CHANGE TABLE (self-order) ===================== */
 exports.assignTable = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
-  if (iden.mode !== 'self_order') throwError('Hanya untuk self-order', 400);
 
   const table_number = asInt(req.body?.table_number, 0);
   if (!table_number) throwError('table_number wajib', 400);
@@ -802,7 +776,6 @@ exports.assignTable = asyncHandler(async (req, res) => {
     ? { member: iden.memberId }
     : { session_id: sessionId };
 
-  // Cari cart aktif source=qr milik identitas ini (apapun meja-nya)
   let cart = await Cart.findOne({
     status: 'active',
     source: 'qr',
@@ -847,25 +820,23 @@ exports.assignTable = asyncHandler(async (req, res) => {
 
 exports.changeTable = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
-  if (iden.mode !== 'self_order') throwError('Hanya untuk self-order', 400);
+  // Treat this endpoint as self-order regardless of resolver flags
 
   const newNo = asInt(req.body?.new_table_number, 0);
   if (!newNo) throwError('Nomor meja baru wajib', 400);
 
-  const cart = await Cart.findOne({
-    status: 'active',
-    source: 'qr',
-    ...(iden.memberId
-      ? { member: iden.memberId }
-      : { session_id: iden.session_id })
+  const cartObj = await getActiveCartForIdentity(iden, {
+    allowCreateOnline: false
   });
+  const cart = await Cart.findById(cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan', 404);
 
   const oldNo = cart.table_number;
   cart.table_number = newNo;
   await cart.save();
 
-  emitToTable(oldNo, 'cart:unassigned', { cart_id: String(cart._id) });
+  if (oldNo)
+    emitToTable(oldNo, 'cart:unassigned', { cart_id: String(cart._id) });
   emitToTable(newNo, 'cart:reassigned', { cart_id: String(cart._id) });
   emitToStaff('cart:table_changed', {
     oldNo,
@@ -877,7 +848,7 @@ exports.changeTable = asyncHandler(async (req, res) => {
     message: 'Nomor meja diperbarui',
     old_table: oldNo,
     new_table: newNo,
-    cart
+    cart: cart.toObject()
   });
 });
 
