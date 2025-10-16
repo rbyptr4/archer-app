@@ -6,7 +6,7 @@ const ctrl = require('../../controllers/owner/orderHistoryController');
 // Ganti middleware sesuai proyekmu
 const requireRole = require('../../utils/requireRole');
 const requirePageAccess = require('../../utils/requirePageAccess');
-const validateToken = require('../utils/tokenHandler'); // staff token middleware
+const validateToken = require('../../utils/tokenHandler'); // staff token middleware
 
 const guard = requireRole('owner', 'employee');
 

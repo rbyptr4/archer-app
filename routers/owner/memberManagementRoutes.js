@@ -5,7 +5,7 @@ const router = express.Router();
 const ctrl = require('../../controllers/owner/memberManagementController');
 const requireRole = require('../../utils/requireRole');
 const requirePageAccess = require('../../utils/requirePageAccess');
-const validateToken = require('../utils/tokenHandler'); // staff token middleware
+const validateToken = require('../../utils/tokenHandler'); // staff token middleware
 
 const guard = requireRole('owner', 'employee');
 router.use(validateToken, requirePageAccess('members'));
