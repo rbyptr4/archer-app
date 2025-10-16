@@ -782,6 +782,42 @@ exports.assignTable = asyncHandler(async (req, res) => {
   res.json({ message: 'Nomor meja diset', cart: cart.toObject() });
 });
 
+exports.changeTable = asyncHandler(async (req, res) => {
+  const iden = getIdentity(req);
+  if (iden.mode !== 'self_order') throwError('Hanya untuk self-order', 400);
+
+  const newNo = asInt(req.body?.new_table_number, 0);
+  if (!newNo) throwError('Nomor meja baru wajib', 400);
+
+  const cart = await Cart.findOne({
+    status: 'active',
+    source: 'qr',
+    ...(iden.memberId
+      ? { member: iden.memberId }
+      : { session_id: iden.session_id })
+  });
+  if (!cart) throwError('Cart tidak ditemukan', 404);
+
+  const oldNo = cart.table_number;
+  cart.table_number = newNo;
+  await cart.save();
+
+  emitToTable(oldNo, 'cart:unassigned', { cart_id: String(cart._id) });
+  emitToTable(newNo, 'cart:reassigned', { cart_id: String(cart._id) });
+  emitToStaff('cart:table_changed', {
+    oldNo,
+    newNo,
+    cart_id: String(cart._id)
+  });
+
+  res.json({
+    message: 'Nomor meja diperbarui',
+    old_table: oldNo,
+    new_table: newNo,
+    cart
+  });
+});
+
 /* ===================== MEMBER ENDPOINTS ===================== */
 exports.listMyOrders = asyncHandler(async (req, res) => {
   if (!req.member?.id) throwError('Harus login sebagai member', 401);

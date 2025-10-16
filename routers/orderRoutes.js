@@ -25,7 +25,8 @@ router.post('/new-items', order.addItem);
 router.patch('/update/:itemId', order.updateItem);
 router.delete('/remove/:itemId', order.removeItem);
 router.delete('/clear', order.clearCart);
-router.patch('/table', order.assignTable); // hanya efektif untuk self-order (QR)
+router.post('/table', order.assignTable);
+router.patch('/change-table', order.changeTable);
 
 router.get('/delivery/estimate', order.estimateDelivery);
 
