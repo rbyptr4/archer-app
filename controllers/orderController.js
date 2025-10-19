@@ -487,7 +487,10 @@ exports.addItem = asyncHandler(async (req, res) => {
       addons: normAddons,
       notes: String(notes || '').trim(),
       line_key,
-      category: menu.category || menu.bigCategory || null
+      category: {
+        big: menu.bigCategory || null,
+        subId: menu.subcategory || null
+      }
     });
   }
 
@@ -1068,167 +1071,12 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
 
 exports.listKitchenOrders = asyncHandler(async (_req, res) => {
   const items = await Order.find({
-    status: { $in: ['accepted', 'preparing'] },
-    payment_status: 'paid'
+    status: 'accepted',
+    payment_status: 'verified'
   })
     .sort({ placed_at: 1 })
     .lean();
   res.status(200).json({ items });
-});
-
-exports.updateStatus = asyncHandler(async (req, res) => {
-  if (!req.user) throwError('Unauthorized', 401);
-  const { status, reason } = req.body || {};
-  if (!ALLOWED_STATUSES.includes(status)) throwError('Status tidak valid', 400);
-
-  const order = await Order.findById(req.params.id);
-  if (!order) throwError('Order tidak ditemukan', 404);
-  if (order.status === status) return res.status(200).json(order.toObject());
-  if (!canTransit(order.status, status))
-    throwError(
-      `Transisi status dari "${order.status}" ke "${status}" tidak diizinkan`,
-      400
-    );
-
-  if (isKitchenStatus(status) && !order.canMoveToKitchen?.()) {
-    throwError('Order belum paid. Tidak bisa masuk accepted/preparing.', 409);
-  }
-
-  if (
-    status === 'completed' &&
-    order.fulfillment_type === 'delivery' &&
-    order.delivery?.status !== 'delivered'
-  ) {
-    throwError('Order delivery belum delivered. Tidak bisa completed.', 409);
-  }
-
-  const fromStatus = order.status;
-  order.status = status;
-  if (status === 'cancelled') {
-    order.cancellation_reason = String(reason || '').trim();
-    order.cancelled_at = new Date();
-    if (order.payment_status === 'paid') {
-      order.payment_status = 'refunded';
-    } else if (order.payment_status === 'unpaid') {
-      order.payment_status = 'void';
-    }
-  }
-  await order.save();
-
-  // Award poin jika sudah paid tapi belum award
-  if (order.payment_status === 'paid' && !order.loyalty_awarded_at) {
-    await awardPointsIfEligible(order, Member);
-  }
-
-  // === NEW: log refund history jika hasil akhirnya refunded ===
-  if (fromStatus !== 'cancelled' && order.payment_status === 'refunded') {
-    await logRefundHistory(order);
-  }
-
-  const payload = {
-    id: String(order._id),
-    transaction_code: order.transaction_code,
-    member: String(order.member),
-    table_number: order.table_number || null,
-    from_status: fromStatus,
-    status: order.status,
-    reason: order.cancellation_reason || undefined,
-    at: new Date()
-  };
-  emitToMember(order.member, 'order:status', payload);
-  emitToStaff('order:status', payload);
-  if (order.table_number)
-    emitToTable(order.table_number, 'order:status', payload);
-
-  res.status(200).json(order.toObject());
-});
-
-exports.cancelOrder = asyncHandler(async (req, res) => {
-  const { reason } = req.body || {};
-  const order = await Order.findById(req.params.id);
-  if (!order) throwError('Order tidak ditemukan', 404);
-
-  const isStaff = !!req.user;
-  const isMemberOwner =
-    req.member?.id && String(order.member) === String(req.member.id);
-  if (!isStaff && !isMemberOwner) throwError('Unauthorized', 401);
-
-  if (
-    isMemberOwner &&
-    !(order.status === 'created' && order.payment_status === 'unpaid')
-  )
-    throwError('Order tidak bisa dibatalkan oleh member pada status ini', 400);
-  if (isStaff && (order.status === 'completed' || order.status === 'cancelled'))
-    throwError('Order sudah selesai/dibatalkan', 400);
-
-  const fromStatus = order.status;
-  order.status = 'cancelled';
-  order.payment_status = order.payment_status === 'paid' ? 'refunded' : 'void';
-  order.cancellation_reason = String(reason || '').trim();
-  order.cancelled_at = new Date();
-  await order.save();
-
-  // === NEW: log refund history jika memang jadi refunded ===
-  if (order.payment_status === 'refunded') {
-    await logRefundHistory(order);
-  }
-
-  const payload = {
-    id: String(order._id),
-    transaction_code: order.transaction_code,
-    member: String(order.member),
-    table_number: order.table_number || null,
-    from_status: fromStatus,
-    status: order.status,
-    reason: order.cancellation_reason,
-    at: new Date()
-  };
-  emitToMember(order.member, 'order:status', payload);
-  emitToStaff('order:status', payload);
-  if (order.table_number)
-    emitToTable(order.table_number, 'order:status', payload);
-
-  res.status(200).json(order.toObject());
-});
-
-exports.cancelAndRefund = asyncHandler(async (req, res) => {
-  if (!req.user) throwError('Unauthorized', 401);
-
-  const { reason } = req.body || {};
-  const order = await Order.findById(req.params.id);
-  if (!order) throwError('Order tidak ditemukan', 404);
-
-  if (order.payment_status !== 'paid') {
-    return res
-      .status(400)
-      .json({ message: 'Order belum paid / sudah direfund', order });
-  }
-
-  const now = new Date();
-  order.payment_status = 'refunded';
-  order.status = 'cancelled';
-  order.cancelled_at = now;
-  order.cancellation_reason = String(reason || 'Refund by staff').trim();
-
-  await order.save();
-
-  // === NEW: log refund history ===
-  await logRefundHistory(order);
-
-  const payload = {
-    id: String(order._id),
-    transaction_code: order.transaction_code,
-    status: order.status,
-    payment_status: order.payment_status,
-    cancelled_at: order.cancelled_at,
-    reason: order.cancellation_reason
-  };
-  emitToStaff('order:refunded', payload);
-  if (order.member) emitToMember(order.member, 'order:refunded', payload);
-  if (order.table_number)
-    emitToTable(order.table_number, 'order:refunded', payload);
-
-  res.status(200).json({ message: 'Order direfund & dibatalkan', order });
 });
 
 /* ===================== POS DINE-IN (staff) ===================== */
@@ -1313,7 +1161,11 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
       quantity: qty,
       addons: normAddons,
       notes: String(it.notes || '').trim(),
-      line_subtotal
+      line_subtotal,
+      category: {
+        big: menu.bigCategory || null,
+        subId: menu.subcategory || null
+      }
     });
     totalQty += qty;
     itemsSubtotal += line_subtotal;
@@ -1467,8 +1319,6 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
 
   res.status(200).json({ message: 'Pesanan diterima & diverifikasi', order });
 });
-
-/* ===================== REFUND (staff) ===================== */
 
 exports.assignDelivery = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);

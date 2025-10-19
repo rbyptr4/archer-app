@@ -22,23 +22,24 @@ router.use(order.modeResolver);
 
 router.get('/get-cart', order.getCart);
 router.post('/new-items', order.addItem);
-router.patch('/update/:itemId', order.updateItem);
-router.delete('/remove/:itemId', order.removeItem);
 router.delete('/clear', order.clearCart);
 router.post('/table', order.assignTable);
 router.patch('/change-table', order.changeTable);
-
 router.get('/delivery/estimate', order.estimateDelivery);
-
 router.post(
   '/checkout',
   fileUploader.single('payment_proof'),
   parseFormData,
   order.checkout
 );
-
+router.get(
+  '/delivery-board',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
+  order.deliveryBoard
+);
 router.get('/my-order', authMemberRequired, order.listMyOrders);
-router.get('/member/my-order/:id', authMemberRequired, order.getMyOrder);
 router.post('/price-preview', authMemberRequired, order.previewPrice);
 
 router.post(
@@ -73,14 +74,6 @@ router.get(
   order.getDetailOrder
 );
 
-router.patch(
-  '/:id/status',
-  validateToken,
-  requireRole('owner', 'employee'),
-  requirePageAccess('orders'),
-  order.updateStatus
-);
-
 router.post(
   '/:id/verify-payment',
   validateToken,
@@ -90,20 +83,11 @@ router.post(
 );
 
 router.post(
-  '/:id/refund',
+  '/:id/complete-order',
   validateToken,
   requireRole('owner', 'employee'),
   requirePageAccess('orders'),
-  order.cancelAndRefund
-);
-
-// Delivery APIs
-router.get(
-  '/delivery-board',
-  validateToken,
-  requireRole('owner', 'employee'),
-  requirePageAccess('orders'),
-  order.deliveryBoard
+  order.completeOrder
 );
 
 router.patch(
@@ -122,6 +106,9 @@ router.patch(
   order.updateDeliveryStatus
 );
 
-router.post('/:id/cancel', authMemberRequired, order.cancelOrder);
+router.get('/member/my-order/:id', authMemberRequired, order.getMyOrder);
+
+router.patch('/update/:itemId', order.updateItem);
+router.delete('/remove/:itemId', order.removeItem);
 
 module.exports = router;

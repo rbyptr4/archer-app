@@ -176,7 +176,7 @@ const orderSchema = new mongoose.Schema(
     payment_proof_url: { type: String, trim: true }, // ONLINE wajib (divalidasi di hook)
     payment_status: {
       type: String,
-      enum: ['paid', 'verified', 'refunded', 'void'],
+      enum: ['paid', 'verified', 'void'],
       index: true
     },
     // Status utama

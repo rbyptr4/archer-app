@@ -432,3 +432,163 @@ exports.deleteHistory = asyncHandler(async (req, res) => {
   await OrderHistory.deleteOne({ _id: doc._id });
   res.json({ message: 'History dihapus' });
 });
+
+exports.bestSellers = asyncHandler(async (req, res) => {
+  const metric = ['qty', 'revenue'].includes(String(req.query.metric))
+    ? String(req.query.metric)
+    : 'qty';
+  const groupBy = ['menu', 'big_category', 'subcategory'].includes(
+    String(req.query.groupBy)
+  )
+    ? String(req.query.groupBy)
+    : 'menu';
+
+  const limit = Math.min(Number(req.query.limit) || 10, 100);
+  const collapseVariants = String(req.query.collapse_variants) !== 'false'; // default true
+
+  const { start, end } = getRangeFromQuery(req.query);
+  const match = buildCommonMatch({ ...req.query });
+  if (!req.query.payment_status) {
+    match.payment_status = 'verified';
+  }
+  match.paid_at = { $gte: start, $lte: end };
+
+  // === Group key ===
+  let groupId;
+  if (groupBy === 'big_category') {
+    groupId = { big: '$items.category.big' };
+  } else if (groupBy === 'subcategory') {
+    groupId = {
+      subId: '$items.category.subId',
+      subName: '$items.category.subName',
+      big: '$items.category.big'
+    };
+  } else {
+    // groupBy menu (default)
+    if (collapseVariants) {
+      groupId = {
+        menu: '$items.menu',
+        name: '$items.name',
+        code: '$items.menu_code',
+        category_big: '$items.category.big',
+        category_subId: '$items.category.subId',
+        category_subName: '$items.category.subName'
+      };
+    } else {
+      groupId = {
+        menu: '$items.menu',
+        name: '$items.name',
+        code: '$items.menu_code',
+        category_big: '$items.category.big',
+        category_subId: '$items.category.subId',
+        category_subName: '$items.category.subName',
+        line_key: '$items.line_key',
+        notes: '$items.notes',
+        addons_sig: {
+          $map: {
+            input: { $ifNull: ['$items.addons', []] },
+            as: 'a',
+            in: {
+              $concat: [
+                '$$a.name',
+                ':',
+                { $toString: '$$a.price' },
+                'x',
+                { $toString: '$$a.qty' }
+              ]
+            }
+          }
+        }
+      };
+    }
+  }
+
+  const pipeline = [
+    { $match: match },
+    { $unwind: '$items' },
+    {
+      $group: {
+        _id: groupId,
+        qty: { $sum: '$items.quantity' },
+        revenue: { $sum: '$items.line_subtotal' },
+        orders: { $addToSet: '$_id' },
+        first_image: { $first: '$items.imageUrl' }
+      }
+    },
+    { $addFields: { order_count: { $size: '$orders' } } },
+    { $project: { orders: 0 } },
+    {
+      $sort:
+        metric === 'revenue'
+          ? { revenue: -1, qty: -1 }
+          : { qty: -1, revenue: -1 }
+    },
+    { $limit: limit }
+  ];
+
+  const rows = await OrderHistory.aggregate(pipeline);
+
+  // === Normalize output ===
+  const items = rows.map((r) => {
+    if (groupBy === 'big_category') {
+      return {
+        key: r._id.big || 'Uncategorized',
+        type: 'big_category',
+        qty: r.qty || 0,
+        revenue: r.revenue || 0,
+        order_count: r.order_count || 0
+      };
+    }
+    if (groupBy === 'subcategory') {
+      return {
+        key: String(r._id.subId || r._id.subName || 'unknown'),
+        type: 'subcategory',
+        subId: r._id.subId || null,
+        subName: r._id.subName || '',
+        big: r._id.big || null,
+        qty: r.qty || 0,
+        revenue: r.revenue || 0,
+        order_count: r.order_count || 0
+      };
+    }
+    // menu
+    const base = {
+      key: String(r._id.menu || r._id.code || r._id.name),
+      type: 'menu',
+      menu_id: r._id.menu || null,
+      code: r._id.code || '',
+      name: r._id.name || '(no name)',
+      category: {
+        big: r._id.category_big || null,
+        subId: r._id.category_subId || null,
+        subName: r._id.category_subName || ''
+      },
+      imageUrl: r.first_image || '',
+      qty: r.qty || 0,
+      revenue: r.revenue || 0,
+      order_count: r.order_count || 0
+    };
+    if (!collapseVariants) {
+      base.variant =
+        r._id.line_key ||
+        [
+          r._id.notes || '',
+          ...(Array.isArray(r._id.addons_sig) ? r._id.addons_sig : [])
+        ]
+          .filter(Boolean)
+          .join(' | ');
+    }
+    return base;
+  });
+
+  res.json({
+    period: { start, end },
+    metric,
+    groupBy,
+    collapse_variants: collapseVariants,
+    limit,
+    items,
+    total_qty: items.reduce((s, x) => s + (x.qty || 0), 0),
+    total_revenue: items.reduce((s, x) => s + (x.revenue || 0), 0)
+  });
+});

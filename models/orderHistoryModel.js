@@ -19,7 +19,25 @@ const HistoryItemSchema = new Schema(
     base_price: { type: Number, default: 0 }, // harga dasar per unit (tanpa addons)
     addons_total: { type: Number, default: 0 }, // total addons per unit * qty
     line_subtotal: { type: Number, default: 0 }, // final per baris (base + addons) * qty
-    category: { type: Schema.Types.Mixed, default: null } // simpan id/nama kategori bila perlu
+    category: {
+      big: { type: String, default: null }, // ex: "FOOD" | "DRINK"
+      subId: {
+        type: Schema.Types.ObjectId,
+        ref: 'MenuSubcategory',
+        default: null
+      },
+      subName: { type: String, trim: true, default: '' } // opsional (biar gampang render)
+    },
+    imageUrl: { type: String, trim: true }, // buat card di UI
+    notes: { type: String, trim: true }, // varian by notes
+    addons: [
+      {
+        name: { type: String, trim: true },
+        price: { type: Number, default: 0 },
+        qty: { type: Number, default: 1 }
+      }
+    ], // varian by addons
+    line_key: { type: String, trim: true }
   },
   { _id: false }
 );
@@ -78,20 +96,13 @@ const OrderHistorySchema = new Schema(
     // Status order & pembayaran (snapshot saat entry dibuat)
     status: {
       type: String,
-      enum: [
-        'created',
-        'accepted',
-        'preparing',
-        'served',
-        'completed',
-        'cancelled'
-      ],
+      enum: ['created', 'accepted', 'completed', 'cancelled'],
       index: true,
       required: true
     },
     payment_status: {
       type: String,
-      enum: ['unpaid', 'paid', 'refunded', 'void'],
+      enum: ['verified', 'paid', 'refunded', 'void'],
       index: true,
       required: true
     },
@@ -171,6 +182,8 @@ OrderHistorySchema.index({ monthKey: 1, payment_status: 1 });
 OrderHistorySchema.index({ weekKey: 1, payment_status: 1 });
 OrderHistorySchema.index({ year: 1, payment_status: 1 });
 
+OrderHistorySchema.index({ 'items.category.big': 1 });
+OrderHistorySchema.index({ 'items.category.subId': 1 });
 OrderHistorySchema.index({ paid_at: 1, source: 1 });
 OrderHistorySchema.index({ paid_at: 1, fulfillment_type: 1 });
 OrderHistorySchema.index({ paid_at: 1, verified_by: 1 });
@@ -235,7 +248,23 @@ OrderHistorySchema.statics.createFromOrder = async function createFromOrder(
           0
         ),
         line_subtotal: it.line_subtotal || 0,
-        category: it.category || null
+        category: it.category
+          ? {
+              big: it.category.big || null,
+              subId: it.category.subId || null,
+              subName: it.category.subName || opts?.subcategory_name || ''
+            }
+          : { big: null, subId: null, subName: '' },
+        imageUrl: it.imageUrl || '',
+        notes: it.notes || '',
+        addons: Array.isArray(it.addons)
+          ? it.addons.map((a) => ({
+              name: a.name,
+              price: Number(a.price || 0),
+              qty: Number(a.qty || 1)
+            }))
+          : [],
+        line_key: it.line_key || undefined
       }))
     : [];
 
