@@ -49,28 +49,19 @@ const cookieRefresh = { ...baseCookie, httpOnly: true, maxAge: REFRESH_TTL_MS };
 const cookieDevice = { ...baseCookie, httpOnly: false, maxAge: REFRESH_TTL_MS };
 
 /* ================= Konstanta & helper status ================= */
-const ALLOWED_STATUSES = [
-  'created',
-  'accepted',
-  'preparing',
-  'served',
-  'completed',
-  'cancelled'
-];
-const ALLOWED_PAY_STATUS = ['unpaid', 'paid', 'refunded', 'void'];
+const ALLOWED_STATUSES = ['created', 'accepted', 'completed', 'cancelled'];
+const ALLOWED_PAY_STATUS = ['verified', 'paid', 'refunded', 'void'];
 
 const canTransit = (from, to) => {
   const flow = {
     created: ['accepted', 'cancelled'],
-    accepted: ['preparing', 'cancelled'],
-    preparing: ['served', 'cancelled'],
-    served: ['completed', 'cancelled'],
+    accepted: ['completed', 'cancelled'],
     completed: [],
     cancelled: []
   };
   return (flow[from] || []).includes(to);
 };
-const isKitchenStatus = (s) => s === 'accepted' || s === 'preparing';
+const isKitchenStatus = (s) => s === 'accepted';
 
 const DELIVERY_ALLOWED = [
   'pending',
@@ -790,7 +781,7 @@ exports.checkout = asyncHandler(async (req, res) => {
             (iden.source || 'online') === 'online' ? 'qr' : 'manual',
           payment_proof_url,
           status: 'created',
-          payment_status: 'unpaid',
+          payment_status: 'paid',
           placed_at: new Date()
         });
       } catch (e) {
@@ -1200,6 +1191,46 @@ exports.cancelOrder = asyncHandler(async (req, res) => {
   res.status(200).json(order.toObject());
 });
 
+exports.cancelAndRefund = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const { reason } = req.body || {};
+  const order = await Order.findById(req.params.id);
+  if (!order) throwError('Order tidak ditemukan', 404);
+
+  if (order.payment_status !== 'paid') {
+    return res
+      .status(400)
+      .json({ message: 'Order belum paid / sudah direfund', order });
+  }
+
+  const now = new Date();
+  order.payment_status = 'refunded';
+  order.status = 'cancelled';
+  order.cancelled_at = now;
+  order.cancellation_reason = String(reason || 'Refund by staff').trim();
+
+  await order.save();
+
+  // === NEW: log refund history ===
+  await logRefundHistory(order);
+
+  const payload = {
+    id: String(order._id),
+    transaction_code: order.transaction_code,
+    status: order.status,
+    payment_status: order.payment_status,
+    cancelled_at: order.cancelled_at,
+    reason: order.cancellation_reason
+  };
+  emitToStaff('order:refunded', payload);
+  if (order.member) emitToMember(order.member, 'order:refunded', payload);
+  if (order.table_number)
+    emitToTable(order.table_number, 'order:refunded', payload);
+
+  res.status(200).json({ message: 'Order direfund & dibatalkan', order });
+});
+
 /* ===================== POS DINE-IN (staff) ===================== */
 exports.createPosDineIn = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
@@ -1367,96 +1398,77 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   });
 });
 
-/* ===================== VERIFY PAYMENT (staff) ===================== */
-exports.verifyPayment = asyncHandler(async (req, res) => {
+exports.completeOrder = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
-  const { payment_method = 'qr', note } = req.body || {};
   const order = await Order.findById(req.params.id);
   if (!order) throwError('Order tidak ditemukan', 404);
 
-  if (order.payment_status === 'paid') {
-    return res.status(200).json({ message: 'Sudah paid', order });
-  }
-  if (order.status === 'cancelled') {
-    throwError('Order sudah dibatalkan, tidak dapat diverifikasi', 400);
+  if (order.status !== 'accepted') {
+    throwError('Hanya pesanan accepted yang bisa diselesaikan', 409);
   }
 
-  const now = new Date();
-  order.payment_method = payment_method || order.payment_method || 'qr';
-  order.payment_status = 'paid';
-  order.paid_at = now;
-  order.verified_by = req.user._id;
-  order.verified_at = now;
-  if (!order.placed_at) order.placed_at = now;
-
+  order.status = 'completed';
   await order.save();
 
+  const payload = {
+    id: String(order._id),
+    transaction_code: order.transaction_code,
+    status: order.status
+  };
+  emitToStaff('order:completed', payload);
+  if (order.member) emitToMember(order.member, 'order:completed', payload);
+  if (order.table_number)
+    emitToTable(order.table_number, 'order:completed', payload);
+
+  res.status(200).json({ message: 'Pesanan selesai', order });
+});
+
+exports.acceptAndVerify = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const order = await Order.findById(req.params.id);
+  if (!order) throwError('Order tidak ditemukan', 404);
+
+  if (order.status !== 'created') {
+    throwError('Hanya pesanan berstatus created yang bisa diterima', 409);
+  }
+  if (order.payment_status !== 'paid') {
+    throwError('Pembayaran belum paid. Tidak bisa verifikasi.', 409);
+  }
+
+  order.status = 'accepted';
+  order.payment_status = 'verified';
+  order.verified_by = req.user._id;
+  order.verified_at = new Date();
+  if (!order.placed_at) order.placed_at = new Date();
+  await order.save();
+
+  // award poin jika perlu
   if (!order.loyalty_awarded_at) {
     await awardPointsIfEligible(order, Member);
   }
-
-  // === NEW: log paid history ===
-  await logPaidHistory(order, req.user);
+  // log paid history bisa dipanggil di sini jika yang kamu anggap “paid final” adalah 'verified'
+  await logPaidHistory(order, req.user).catch(() => {});
 
   const payload = {
     id: String(order._id),
     transaction_code: order.transaction_code,
     status: order.status,
     payment_status: order.payment_status,
-    paid_at: order.paid_at,
     verified_by: { id: String(req.user._id), name: req.user.name },
-    note: String(note || '')
+    at: order.verified_at
   };
-  emitToStaff('order:payment_verified', payload);
+  emitToStaff('order:accepted_verified', payload);
   if (order.member)
-    emitToMember(order.member, 'order:payment_verified', payload);
+    emitToMember(order.member, 'order:accepted_verified', payload);
   if (order.table_number)
-    emitToTable(order.table_number, 'order:payment_verified', payload);
+    emitToTable(order.table_number, 'order:accepted_verified', payload);
 
-  res.status(200).json({ message: 'Pembayaran diverifikasi', order });
+  res.status(200).json({ message: 'Pesanan diterima & diverifikasi', order });
 });
 
 /* ===================== REFUND (staff) ===================== */
-exports.refundPayment = asyncHandler(async (req, res) => {
-  if (!req.user) throwError('Unauthorized', 401);
-
-  const { reason } = req.body || {};
-  const order = await Order.findById(req.params.id);
-  if (!order) throwError('Order tidak ditemukan', 404);
-
-  if (order.payment_status !== 'paid') {
-    return res
-      .status(400)
-      .json({ message: 'Order belum paid / sudah direfund', order });
-  }
-
-  const now = new Date();
-  order.payment_status = 'refunded';
-  order.status = 'cancelled';
-  order.cancelled_at = now;
-  order.cancellation_reason = String(reason || 'Refund by staff').trim();
-
-  await order.save();
-
-  // === NEW: log refund history ===
-  await logRefundHistory(order);
-
-  const payload = {
-    id: String(order._id),
-    transaction_code: order.transaction_code,
-    status: order.status,
-    payment_status: order.payment_status,
-    cancelled_at: order.cancelled_at,
-    reason: order.cancellation_reason
-  };
-  emitToStaff('order:refunded', payload);
-  if (order.member) emitToMember(order.member, 'order:refunded', payload);
-  if (order.table_number)
-    emitToTable(order.table_number, 'order:refunded', payload);
-
-  res.status(200).json({ message: 'Order direfund & dibatalkan', order });
-});
 
 exports.assignDelivery = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);

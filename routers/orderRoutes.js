@@ -86,7 +86,7 @@ router.post(
   validateToken,
   requireRole('owner', 'employee'),
   requirePageAccess('orders'),
-  order.verifyPayment
+  order.acceptAndVerify
 );
 
 router.post(
@@ -94,7 +94,7 @@ router.post(
   validateToken,
   requireRole('owner', 'employee'),
   requirePageAccess('orders'),
-  order.refundPayment
+  order.cancelAndRefund
 );
 
 // Delivery APIs

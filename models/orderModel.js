@@ -176,8 +176,14 @@ const orderSchema = new mongoose.Schema(
     payment_proof_url: { type: String, trim: true }, // ONLINE wajib (divalidasi di hook)
     payment_status: {
       type: String,
-      enum: ['unpaid', 'paid', 'refunded', 'void'],
-      default: 'unpaid',
+      enum: ['paid', 'verified', 'refunded', 'void'],
+      index: true
+    },
+    // Status utama
+    status: {
+      type: String,
+      enum: ['created', 'accepted', 'completed', 'cancelled'],
+      default: 'created',
       index: true
     },
     verified_by: {
@@ -186,21 +192,6 @@ const orderSchema = new mongoose.Schema(
       default: null
     },
     verified_at: { type: Date },
-
-    // Status utama
-    status: {
-      type: String,
-      enum: [
-        'created',
-        'accepted',
-        'preparing',
-        'served',
-        'completed',
-        'cancelled'
-      ],
-      default: 'created',
-      index: true
-    },
 
     // Tanggal penting
     placed_at: { type: Date, default: Date.now, required: true },
