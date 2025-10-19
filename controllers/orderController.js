@@ -609,7 +609,7 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
 });
 
 exports.checkout = asyncHandler(async (req, res) => {
-  const iden = getIdentity(req);
+  const iden0 = getIdentity(req);
   const {
     name,
     phone,
@@ -623,11 +623,11 @@ exports.checkout = asyncHandler(async (req, res) => {
   } = req.body || {};
 
   const ft =
-    iden.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
+    iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
   if (!['dine_in', 'delivery'].includes(ft)) {
     throwError('fulfillment_type tidak valid', 400);
   }
-  if (iden.mode === 'self_order' && ft !== 'dine_in') {
+  if (iden0.mode === 'self_order' && ft !== 'dine_in') {
     throwError('Self-order hanya mendukung dine_in', 400);
   }
 
@@ -635,13 +635,23 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Bukti pembayaran wajib dikirim', 400);
   }
 
-  const joinChannel = iden.mode === 'self_order' ? 'self_order' : 'online';
+  const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
   const member = await ensureMemberForCheckout(req, res, joinChannel);
-
+  const iden = {
+    ...iden0,
+    memberId: member?._id || iden0.memberId || null,
+    // tetap kirim session_id kalau masih ada, biar helper bisa bereskan sisa merge
+    session_id:
+      iden0.session_id ||
+      req.cookies?.[DEVICE_COOKIE] ||
+      req.header('x-device-id') ||
+      null
+  };
   // Ambil cart aktif milik member/session pada source saat ini
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
+  if (!cartObj) throwError('Cart tidak ditemukan / kosong', 404);
   const cart = await Cart.findById(cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan / kosong', 404);
   if (!cart.items?.length) throwError('Cart kosong', 400);
