@@ -514,6 +514,7 @@ exports.updateItem = asyncHandler(async (req, res) => {
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
+  if (!cartObj) throwError('Cart tidak ditemukan', 404);
   const cart = await Cart.findById(cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan', 404);
 
@@ -565,6 +566,7 @@ exports.clearCart = asyncHandler(async (req, res) => {
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
+  if (!cartObj) throwError('Cart tidak ditemukan', 404);
   const cart = await Cart.findById(cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan', 404);
 
