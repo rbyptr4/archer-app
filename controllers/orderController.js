@@ -254,11 +254,20 @@ const getActiveCartForIdentity = async (
         400
       );
     } else if (allowCreateOnline) {
-      const created = await Cart.create({
+      // === PATCH: upsert atomik & retry bila E11000 (race-condition)
+      const ensureSession = iden.memberId
+        ? null
+        : iden.session_id || crypto.randomUUID();
+      const upsertFilter = {
+        status: 'active',
+        source: 'online',
+        ...(iden.memberId
+          ? { member: iden.memberId }
+          : { session_id: ensureSession })
+      };
+      const setOnInsert = {
         member: iden.memberId || null,
-        session_id: iden.memberId
-          ? null
-          : iden.session_id || crypto.randomUUID(),
+        session_id: iden.memberId ? null : ensureSession,
         table_number: null,
         items: [],
         total_items: 0,
@@ -266,9 +275,30 @@ const getActiveCartForIdentity = async (
         total_price: 0,
         status: 'active',
         source: 'online'
-      });
-      cart = created.toObject();
-      foundSource = 'online';
+      };
+
+      try {
+        const upserted = await Cart.findOneAndUpdate(
+          upsertFilter,
+          { $setOnInsert: setOnInsert },
+          { new: true, upsert: true, lean: true }
+        );
+        cart = upserted;
+        foundSource = 'online';
+      } catch (e) {
+        if (e && e.code === 11000) {
+          // Balapan sangat ketat: ambil ulang yang sudah tercipta
+          const retry = await Cart.findOne(upsertFilter).lean();
+          if (retry) {
+            cart = retry;
+            foundSource = 'online';
+          } else {
+            throw e;
+          }
+        } else {
+          throw e;
+        }
+      }
     }
   }
 
@@ -350,7 +380,8 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
 /* ===================== CART ENDPOINTS (unified) ===================== */
 exports.getCart = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
-  const allowCreateOnline = (iden.source || 'online') !== 'qr';
+  // === PATCH: GET /cart tidak auto-create cart baru
+  const allowCreateOnline = false;
   const cart = await getActiveCartForIdentity(iden, { allowCreateOnline });
   res.status(200).json(cart);
 });
