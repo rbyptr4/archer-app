@@ -210,11 +210,67 @@ const getIdentity = (req) => {
   };
 };
 
-/* Helper: ambil 1 cart aktif by identity + source; opsi membuat baru utk online */
+/* ================= MERGE CARTS: session_id -> member ================= */
+const mergeTwoCarts = (dst, src) => {
+  // dst & src adalah Mongoose document (bukan lean)
+  for (const it of src.items || []) {
+    const idx = dst.items.findIndex((d) => d.line_key === it.line_key);
+    if (idx >= 0) {
+      dst.items[idx].quantity = clamp(
+        asInt(dst.items[idx].quantity, 1) + asInt(it.quantity, 1),
+        1,
+        999
+      );
+    } else {
+      dst.items.push(it.toObject ? it.toObject() : { ...it });
+    }
+  }
+  recomputeTotals(dst);
+};
+
+const attachOrMergeCartsForIdentity = async (iden) => {
+  // Hanya jika sudah login & masih ada session_id
+  if (!iden?.memberId || !iden?.session_id) return;
+
+  // Kita fokus pada kedua source: online & qr
+  const SOURCES = ['online', 'qr'];
+  for (const src of SOURCES) {
+    // Cart session aktif (belum terikat member)
+    const sessionCart = await Cart.findOne({
+      status: 'active',
+      source: src,
+      session_id: iden.session_id,
+      $or: [{ member: null }, { member: { $exists: false } }]
+    });
+    if (!sessionCart) continue;
+
+    // Cart member aktif pada source sama
+    let memberCart = await Cart.findOne({
+      status: 'active',
+      source: src,
+      member: iden.memberId
+    });
+
+    if (memberCart) {
+      // Merge items → simpan → hapus session cart
+      mergeTwoCarts(memberCart, sessionCart);
+      await memberCart.save();
+      await Cart.deleteOne({ _id: sessionCart._id }).catch(() => {});
+    } else {
+      // Konversi cart session menjadi cart member
+      sessionCart.member = iden.memberId;
+      sessionCart.session_id = null;
+      await sessionCart.save();
+    }
+  }
+};
+
 const getActiveCartForIdentity = async (
   iden,
   { allowCreateOnline = false }
 ) => {
+  await attachOrMergeCartsForIdentity(iden);
+
   const requestedSource = iden.source || '';
   const identityFilter = iden.memberId
     ? { member: iden.memberId }
@@ -373,6 +429,17 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
   res.cookie(ACCESS_COOKIE, accessToken, cookieAccess);
   res.cookie(REFRESH_COOKIE, refreshToken, cookieRefresh);
   res.cookie(DEVICE_COOKIE, device_id, cookieDevice);
+
+  // === NEW: saat selesai memastikan member, lakukan merge berbasis session_id cookie/header
+  const iden = {
+    memberId: member._id,
+    session_id:
+      req.session_id ||
+      req.cookies?.[DEVICE_COOKIE] ||
+      req.header('x-device-id') ||
+      null
+  };
+  await attachOrMergeCartsForIdentity(iden);
 
   return member.toObject ? member.toObject() : member;
 };
@@ -865,7 +932,7 @@ exports.changeTable = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
   // Treat this endpoint as self-order regardless of resolver flags
 
-  const newNo = asInt(req.body?.new_table_number, 0);
+  const newNo = asInt(req.body?.table_number, 0);
   if (!newNo) throwError('Nomor meja baru wajib', 400);
 
   const cartObj = await getActiveCartForIdentity(iden, {
@@ -895,7 +962,6 @@ exports.changeTable = asyncHandler(async (req, res) => {
   });
 });
 
-/* ===================== MEMBER ENDPOINTS ===================== */
 exports.listMyOrders = asyncHandler(async (req, res) => {
   if (!req.member?.id) throwError('Harus login sebagai member', 401);
 
