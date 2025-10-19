@@ -363,77 +363,121 @@ const getActiveCartForIdentity = async (
 };
 
 /* =============== Member helper (unified) =============== */
+// utils/auth.ensureMemberForCheckout.js (atau tetap di controller kamu)
 const ensureMemberForCheckout = async (req, res, joinChannel) => {
+  // --- 1) Resolve member (logged-in atau daftar/attach by phone)
+  let memberDoc = null;
   if (req.member?.id) {
-    const m = await Member.findById(req.member.id).lean();
-    if (!m) throwError('Member tidak ditemukan', 404);
-    return m;
-  }
-
-  const { name, phone } = req.body || {};
-  if (!name || !phone) {
-    throwError(
-      'Checkout membutuhkan akun member. Sertakan name & phone untuk daftar otomatis.',
-      401
-    );
-  }
-
-  const normalizedPhone = normalizePhone(phone);
-  let member = await Member.findOne({ phone: normalizedPhone });
-  if (!member) {
-    member = await Member.create({
-      name,
-      phone: normalizedPhone,
-      join_channel: joinChannel, // 'self_order' | 'online' | 'pos'
-      visit_count: 1,
-      last_visit_at: new Date(),
-      is_active: true
-    });
+    memberDoc = await Member.findById(req.member.id).lean();
+    if (!memberDoc) throwError('Member tidak ditemukan', 404);
   } else {
-    if (name && member.name !== name) member.name = name;
-    member.visit_count += 1;
-    member.last_visit_at = new Date();
-    if (!member.is_active) member.is_active = true;
-    await member.save();
+    const { name, phone } = req.body || {};
+    if (!name || !phone) {
+      throwError(
+        'Checkout membutuhkan akun member. Sertakan name & phone untuk daftar otomatis.',
+        401
+      );
+    }
+
+    const normalizedPhone = normalizePhone(phone);
+    let member = await Member.findOne({ phone: normalizedPhone });
+    if (!member) {
+      member = await Member.create({
+        name: String(name).trim(),
+        phone: normalizedPhone,
+        join_channel: joinChannel, // 'self_order' | 'online' | 'pos'
+        visit_count: 1,
+        last_visit_at: new Date(),
+        is_active: true
+      });
+      memberDoc = member.toObject ? member.toObject() : member;
+    } else {
+      if (name && member.name !== name) member.name = String(name).trim();
+      member.visit_count += 1;
+      member.last_visit_at = new Date();
+      if (!member.is_active) member.is_active = true;
+      await member.save();
+      memberDoc = member.toObject ? member.toObject() : member;
+    }
   }
 
-  // Start sesi device-bound
+  // Pastikan punya bentuk plain object
+  if (memberDoc && memberDoc.toObject) memberDoc = memberDoc.toObject();
+
+  // --- 2) Device ID (tetap pakai yang ada, kalau kosong generate baru)
   const incomingDev = req.cookies?.[DEVICE_COOKIE] || req.header('x-device-id');
   const device_id =
     incomingDev && String(incomingDev).trim()
       ? String(incomingDev).trim()
       : crypto.randomUUID();
 
-  const accessToken = signAccessToken(member);
+  // --- 3) Access/Refresh token
+  const accessToken = signAccessToken(memberDoc);
   const refreshToken = generateOpaqueToken();
   const refreshHash = hashToken(refreshToken);
 
-  await MemberSession.create({
-    member: member._id,
+  // --- 4) Reuse / rotate MemberSession (hindari dokumen numpuk)
+  const now = Date.now();
+  const existing = await MemberSession.findOne({
+    member: memberDoc._id,
     device_id,
-    refresh_hash: refreshHash,
-    user_agent: req.get('user-agent') || '',
-    ip: req.ip,
-    expires_at: new Date(Date.now() + REFRESH_TTL_MS)
+    revoked_at: null,
+    expires_at: { $gt: new Date(now) }
   });
 
+  if (existing) {
+    // rotate refresh, perpanjang masa aktif
+    existing.refresh_hash = refreshHash;
+    existing.expires_at = new Date(now + REFRESH_TTL_MS);
+    existing.user_agent = req.get('user-agent') || existing.user_agent || '';
+    existing.ip = req.ip || existing.ip || '';
+    await existing.save();
+  } else {
+    await MemberSession.create({
+      member: memberDoc._id,
+      device_id,
+      refresh_hash: refreshHash,
+      user_agent: req.get('user-agent') || '',
+      ip: req.ip,
+      expires_at: new Date(now + REFRESH_TTL_MS)
+    });
+  }
+
+  // --- 4b) (opsional) batasi 3 sesi terbaru per (member, device)
+  try {
+    const old = await MemberSession.find({ member: memberDoc._id, device_id })
+      .sort({ createdAt: -1 })
+      .skip(3)
+      .select('_id')
+      .lean();
+    if (old?.length) {
+      await MemberSession.deleteMany({ _id: { $in: old.map((x) => x._id) } });
+    }
+  } catch (_) {}
+
+  // --- 5) Set cookies
   res.cookie(ACCESS_COOKIE, accessToken, cookieAccess);
   res.cookie(REFRESH_COOKIE, refreshToken, cookieRefresh);
   res.cookie(DEVICE_COOKIE, device_id, cookieDevice);
 
-  // === NEW: saat selesai memastikan member, lakukan merge berbasis session_id cookie/header
-  const iden = {
-    memberId: member._id,
-    session_id:
-      req.session_id ||
-      req.cookies?.[DEVICE_COOKIE] ||
-      req.header('x-device-id') ||
-      null
-  };
-  await attachOrMergeCartsForIdentity(iden);
+  // --- 6) Merge cart session -> member (aman dipanggil berulang)
+  // Gunakan session_id dari: req.session_id (modeResolver), atau cookie/device header sebagai fallback
+  const session_id =
+    req.session_id ||
+    req.cookies?.[DEVICE_COOKIE] ||
+    req.header('x-device-id') ||
+    null;
 
-  return member.toObject ? member.toObject() : member;
+  // Pastikan attach/merge tetap terjadi juga untuk user yang sudah login
+  try {
+    const iden = { memberId: memberDoc._id, session_id };
+    await attachOrMergeCartsForIdentity(iden);
+  } catch (_) {
+  }
+
+  return memberDoc;
 };
+
 
 /* ===================== CART ENDPOINTS (unified) ===================== */
 exports.getCart = asyncHandler(async (req, res) => {
@@ -653,7 +697,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   if (!cart.items?.length) throwError('Cart kosong', 400);
 
   // Self-order wajib sudah punya nomor meja (tapi tidak baca dari request)
-  if ((iden.source || 'online') === 'qr' && !cart.table_number) {
+  if (ft === 'dine_in' && !cart.table_number) {
     throwError('Silakan assign nomor meja terlebih dahulu', 400);
   }
 
@@ -755,8 +799,7 @@ exports.checkout = asyncHandler(async (req, res) => {
         const code = await nextDailyTxCode('ARCH');
         return await Order.create({
           member: cart.member,
-          table_number:
-            (iden.source || 'online') === 'qr' ? cart.table_number : null,
+          table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
           source: iden.source || 'online',
           fulfillment_type: ft, // 'dine_in' | 'delivery'
           transaction_code: code,

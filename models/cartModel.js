@@ -82,4 +82,5 @@ cartSchema.index(
   }
 );
 
+cartSchema.index({ checked_out_at: 1 }, { expireAfterSeconds: 60 * 60 * 24 });
 module.exports = mongoose.model('Cart', cartSchema);

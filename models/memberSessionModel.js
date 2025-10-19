@@ -12,13 +12,15 @@ const MemberSessionSchema = new mongoose.Schema(
     refresh_hash: { type: String, required: true, unique: true },
     user_agent: { type: String },
     ip: { type: String },
-    expires_at: { type: Date, required: true, index: true },
+    expires_at: { type: Date, required: true },
     revoked_at: { type: Date, default: null },
     rotated_from: { type: String, default: null },
     rotated_to: { type: String, default: null }
   },
   { timestamps: true }
 );
+
+MemberSessionSchema.index({ expires_at: 1 }, { expireAfterSeconds: 0 });
 
 module.exports =
   mongoose.models.MemberSession ||
