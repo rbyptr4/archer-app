@@ -472,12 +472,10 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
   try {
     const iden = { memberId: memberDoc._id, session_id };
     await attachOrMergeCartsForIdentity(iden);
-  } catch (_) {
-  }
+  } catch (_) {}
 
   return memberDoc;
 };
-
 
 /* ===================== CART ENDPOINTS (unified) ===================== */
 exports.getCart = asyncHandler(async (req, res) => {
@@ -1238,7 +1236,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           discounts: [],
           grand_total: itemsSubtotal,
           payment_method,
-          payment_status: mark_paid ? 'paid' : 'unpaid',
+          payment_status: 'verified',
           paid_at: mark_paid ? now : null,
           verified_by: mark_paid ? req.user?.id || null : null,
           verified_at: mark_paid ? now : null,

@@ -4,10 +4,7 @@ const ExpenseTypeSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
     description: { type: String, trim: true, default: '' },
-    isActive: { type: Boolean, default: true },
-    protected: { type: Boolean, default: false },
-    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+    protected: { type: Boolean, default: false }
   },
   { timestamps: true }
 );

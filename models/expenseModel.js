@@ -10,13 +10,11 @@ const ExpenseSchema = new mongoose.Schema(
     },
     amount: { type: Number, required: true, min: 0 },
     note: { type: String, trim: true, default: '' },
-    attachments: { type: [String], default: [] },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: true
-    },
-    createdByRole: { type: String, enum: ['owner', 'employee'], required: true } // buat audit
+    }
   },
   { timestamps: true }
 );

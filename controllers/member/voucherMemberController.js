@@ -15,8 +15,11 @@ function inWindow(v, now = new Date()) {
   return true;
 }
 
+const getMemberId = (req) => String(req?.member || '');
+
 exports.explore = asyncHandler(async (req, res) => {
-  const me = req.user; // dari authMember
+  const me = getMemberId(req);
+  if (!me) throwError('Unauthorized (member)', 401);
   const now = new Date();
   const list = await Voucher.find({ isDeleted: false, isActive: true })
     .sort('-createdAt')
@@ -42,7 +45,8 @@ exports.explore = asyncHandler(async (req, res) => {
 });
 
 exports.claim = asyncHandler(async (req, res) => {
-  const memberId = req.user.id;
+  const member = getMemberId(req);
+  if (!member) throwError('Unauthorized (member)', 401);
   const { voucherId } = req.params;
 
   const session = await mongoose.startSession();
@@ -65,7 +69,7 @@ exports.claim = asyncHandler(async (req, res) => {
     if ((v.visibility?.perMemberLimit || 0) > 0) {
       const count = await VoucherClaim.countDocuments({
         voucher: v._id,
-        member: memberId
+        member: member.id
       }).session(session);
       if (count >= v.visibility.perMemberLimit)
         throwError(400, 'Batas klaim per member tercapai');
@@ -108,8 +112,11 @@ exports.claim = asyncHandler(async (req, res) => {
 });
 
 exports.myWallet = asyncHandler(async (req, res) => {
+  const member = getMemberId(req);
+  if (!member) throwError('Unauthorized (member)', 401);
+
   const data = await VoucherClaim.find({
-    member: req.user.id,
+    member: member.id,
     status: { $in: ['claimed', 'used'] }
   })
     .populate('voucher')
