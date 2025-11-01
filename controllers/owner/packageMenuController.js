@@ -392,6 +392,7 @@ exports.getPackageMenuById = asyncHandler(async (req, res) => {
   const { id } = req.params;
   if (!isValidId(id)) throwError('ID tidak valid', 400);
 
+  // Ambil paket (lean + virtuals untuk kinerja & kemudahan mutasi)
   const doc = await Menu.findOne({ _id: id, bigCategory: 'package' }).lean({
     virtuals: true
   });
@@ -401,7 +402,47 @@ exports.getPackageMenuById = asyncHandler(async (req, res) => {
     !!req.user && ['owner', 'employee'].includes(req.user.role);
   if (!isBackoffice && !doc.isActive) throwError('Paket tidak ditemukan', 404);
 
-  res.json({ success: true, data: doc });
+  // ===== Enrich imageUrl untuk setiap packageItems =====
+  const items = Array.isArray(doc.packageItems) ? doc.packageItems : [];
+  const menuIds = [
+    ...new Set(
+      items
+        .map((it) => (it && it.menu ? String(it.menu) : null))
+        .filter(Boolean)
+    )
+  ];
+
+  let imageMap = new Map();
+  if (menuIds.length > 0) {
+    const menus = await Menu.find(
+      { _id: { $in: menuIds } },
+      { _id: 1, imageUrl: 1, name: 1 } // projection seperlunya
+    ).lean();
+
+    imageMap = new Map(menus.map((m) => [String(m._id), m.imageUrl || null]));
+  }
+
+  const enrichedItems = items.map((it) => {
+    const key = it && it.menu ? String(it.menu) : null;
+    return {
+      ...it,
+      imageUrl: key ? imageMap.get(key) || null : null
+    };
+  });
+
+  // Fallback: jika paket belum punya imageUrl, pakai image item pertama
+  const packageImageUrl =
+    doc.imageUrl && typeof doc.imageUrl === 'string' && doc.imageUrl.trim()
+      ? doc.imageUrl
+      : (enrichedItems[0] && enrichedItems[0].imageUrl) || doc.imageUrl || null;
+
+  const data = {
+    ...doc,
+    imageUrl: packageImageUrl,
+    packageItems: enrichedItems
+  };
+
+  res.json({ success: true, data });
 });
 
 // GET /packages/list
@@ -420,7 +461,6 @@ exports.listPackageMenus = asyncHandler(async (req, res) => {
   if (!isBackoffice) filter.isActive = true;
 
   const q = String(req.query.q || '').trim();
-  const subId = String(req.query.subId || '').trim();
   const isActiveParam = String(req.query.isActive || '').toLowerCase();
   const sortBy = String(req.query.sortBy || 'name');
   const sortDir =
@@ -432,11 +472,6 @@ exports.listPackageMenus = asyncHandler(async (req, res) => {
       { menu_code: { $regex: q, $options: 'i' } },
       { description: { $regex: q, $options: 'i' } }
     ];
-  }
-
-  if (subId) {
-    if (!isValidId(subId)) throwError('subId tidak valid', 400);
-    filter.subcategory = asId(subId);
   }
 
   if (isActiveParam === 'true') filter.isActive = true;
