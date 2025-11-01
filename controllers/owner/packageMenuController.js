@@ -237,6 +237,27 @@ exports.updatePackageMenu = asyncHandler(async (req, res) => {
   let oldFileIdForCleanup = null;
   let updated;
 
+  // util kecil
+  const isEmptyObject = (o) =>
+    o &&
+    typeof o === 'object' &&
+    !Array.isArray(o) &&
+    Object.keys(o).length === 0;
+
+  const hasAnyPriceKey = (o = {}) => {
+    const keys = [
+      'base_price',
+      'original',
+      'final',
+      'discountMode',
+      'discountPercent',
+      'discountValue',
+      'currency',
+      'mode' // jika Anda punya mode 'auto' / 'manual'
+    ];
+    return keys.some((k) => o[k] !== undefined);
+  };
+
   try {
     await session.withTransaction(async () => {
       const current = await Menu.findById(id).session(session);
@@ -270,11 +291,6 @@ exports.updatePackageMenu = asyncHandler(async (req, res) => {
         );
       }
 
-      // rebuild price bila dikirim
-      if (payload.price) {
-        payload.price = buildPrice(payload.price, current.price || {});
-      }
-
       // items normalize bila dikirim
       if (payload.items !== undefined) {
         payload.packageItems = await normalizeItemsHydrate(
@@ -283,6 +299,54 @@ exports.updatePackageMenu = asyncHandler(async (req, res) => {
         );
         delete payload.items;
       }
+
+      // ==== PERBAIKAN INTI: penanganan price ====
+      if ('price' in payload) {
+        // Kalau price tidak dikirim (null/undefined) atau object kosong, JANGAN ubah harga
+        if (!payload.price || isEmptyObject(payload.price)) {
+          delete payload.price;
+        } else {
+          // Merge parsial: pertahankan field lama yang tidak dikirim
+          const prevPrice =
+            current.price && typeof current.price.toObject === 'function'
+              ? current.price.toObject()
+              : current.price || {};
+          const merged = { ...prevPrice, ...payload.price };
+
+          // Jika ingin dukung mode auto dari items → set base_price dari packageItems
+          const wantAuto = merged.mode === 'auto' || merged.auto === true; // sesuaikan dengan skema Anda
+          if (wantAuto && (payload.packageItems || current.packageItems)) {
+            const items = payload.packageItems || current.packageItems || [];
+            const base = items.reduce((acc, it) => {
+              const qty = Number(it.quantity ?? it.qty ?? 1);
+              const p = Number(it.priceSnapshot ?? 0);
+              return acc + qty * p;
+            }, 0);
+            merged.base_price = base;
+          }
+
+          // Normalisasi akhir harga
+          // Catatan: jika buildPrice(prev, curr) → sesuaikan urutan.
+          // Di code Anda semula: buildPrice(payload.price, current.price || {})
+          // Untuk mencegah default 0, kita kirim hasil merge saja.
+          payload.price = buildPrice(merged);
+        }
+      } else if (payload.packageItems) {
+        // Jika price tidak dikirim tetapi packageItems diganti dan kita ingin auto,
+        // Anda bisa aktifkan blok opsional ini:
+        // const prevPrice = current.price && typeof current.price.toObject === 'function'
+        //   ? current.price.toObject()
+        //   : (current.price || {});
+        // if (prevPrice.mode === 'auto' || prevPrice.auto === true) {
+        //   const base = payload.packageItems.reduce((acc, it) => {
+        //     const qty = Number(it.quantity ?? it.qty ?? 1);
+        //     const p = Number(it.priceSnapshot ?? 0);
+        //     return acc + qty * p;
+        //   }, 0);
+        //   payload.price = buildPrice({ ...prevPrice, base_price: base });
+        // }
+      }
+      // ==== END PERBAIKAN INTI ====
 
       // image (opsional)
       if (req.file) {
