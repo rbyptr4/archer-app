@@ -14,19 +14,17 @@ const VoucherClaimSchema = new mongoose.Schema(
       required: true
     },
 
-    // status wallet user
     status: {
       type: String,
       enum: ['claimed', 'used', 'expired', 'revoked'],
-      default: 'claimed'
+      default: 'claimed',
+      index: true // 🔎 membantu query wallet
     },
     remainingUse: { type: Number, min: 0, default: 1 },
 
-    // stok penasihat (snapshot)
     claimedAt: { type: Date, default: Date.now },
-    validUntil: { type: Date }, // kalau voucher.useValidDaysAfterClaim > 0, set di sini
+    validUntil: { type: Date, index: true },
 
-    // audit
     spentPoints: { type: Number, min: 0, default: 0 },
     history: [
       {
@@ -40,7 +38,8 @@ const VoucherClaimSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-VoucherClaimSchema.index({ member: 1, voucher: 1 });
-VoucherClaimSchema.index({ status: 1, validUntil: 1 });
+// Jangan unique pada (member,voucher) kalau kamu mengizinkan claim > 1.
+// Kalau mau cegah duplikat, baru pakai unique:true:
+VoucherClaimSchema.index({ member: 1, voucher: 1 }); // non-unique
 
 module.exports = mongoose.model('VoucherClaim', VoucherClaimSchema);
