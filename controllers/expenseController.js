@@ -25,7 +25,7 @@ exports.createType = asyncHandler(async (req, res) => {
 });
 
 exports.listTypes = asyncHandler(async (req, res) => {
-  const types = await ExpenseType.find(filter).sort({ name: 1 }).lean();
+  const types = await ExpenseType.find({}).sort({ name: 1 }).lean();
   res.json({ data: types });
 });
 

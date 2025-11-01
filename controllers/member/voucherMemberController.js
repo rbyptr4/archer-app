@@ -48,6 +48,7 @@ exports.claim = asyncHandler(async (req, res) => {
   const member = getMemberId(req);
   if (!member) throwError('Unauthorized (member)', 401);
   const { voucherId } = req.params;
+  const memberId = member.id;
 
   const session = await mongoose.startSession();
   await session.withTransaction(async () => {
@@ -69,7 +70,7 @@ exports.claim = asyncHandler(async (req, res) => {
     if ((v.visibility?.perMemberLimit || 0) > 0) {
       const count = await VoucherClaim.countDocuments({
         voucher: v._id,
-        member: member.id
+        member: memberId
       }).session(session);
       if (count >= v.visibility.perMemberLimit)
         throwError(400, 'Batas klaim per member tercapai');

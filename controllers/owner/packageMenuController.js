@@ -1,3 +1,4 @@
+// controllers/packageMenu.controller.js
 const asyncHandler = require('express-async-handler');
 const mongoose = require('mongoose');
 const Menu = require('../../models/menuModel');
@@ -11,12 +12,47 @@ const { getDriveFolder } = require('../../utils/driveFolders');
 const { buildMenuFileName } = require('../../utils/makeFileName');
 const { extractDriveFileId } = require('../../utils/driveFileId');
 
+/* ======================= Helpers kecil ======================= */
 const isValidId = (v) => mongoose.Types.ObjectId.isValid(String(v));
 const asId = (v) => new mongoose.Types.ObjectId(String(v));
 const toInt = (v, d = 1) =>
   Number.isFinite(+v) ? Math.max(1, Math.trunc(+v)) : d;
+const toNum = (v, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
+const toBool = (v, d = false) =>
+  typeof v === 'boolean' ? v : ['true', '1', 1, 'on', 'yes'].includes(v) || d;
 
-/** ======================= Utils ======================= */
+const buildPrice = (raw = {}, fallback = {}) => ({
+  original: toNum(raw.original ?? fallback.original ?? 0),
+  discountMode: String(raw.discountMode ?? fallback.discountMode ?? 'none'),
+  discountPercent: toNum(raw.discountPercent ?? fallback.discountPercent ?? 0),
+  manualPromoPrice: toNum(
+    raw.manualPromoPrice ?? fallback.manualPromoPrice ?? 0
+  )
+});
+
+async function uploadMenuImageFromReqFile(file, code, name) {
+  if (!file) return { fileId: null, imageUrl: '' };
+  const folderId = getDriveFolder('menu');
+  const desiredName = buildMenuFileName(
+    code,
+    name,
+    file.originalname,
+    file.mimetype
+  );
+  const uploaded = await uploadBuffer(
+    file.buffer,
+    desiredName,
+    file.mimetype,
+    folderId
+  );
+  const fileId = uploaded?.id || null;
+  const imageUrl = fileId
+    ? `https://drive.google.com/uc?export=view&id=${fileId}`
+    : '';
+  return { fileId, imageUrl };
+}
+
+/* ======================= Utils ======================= */
 async function resolveSubcategoryId(subcategoryId, bigCategory) {
   if (!subcategoryId) return null;
   if (!isValidId(subcategoryId)) throwError('subcategoryId tidak valid', 400);
@@ -27,19 +63,34 @@ async function resolveSubcategoryId(subcategoryId, bigCategory) {
   return sub._id;
 }
 
-/** items normalizer: [{ menuId? | name, qty }] -> [{ menuId, name, qty }] */
-async function normalizeItems(rawItems = []) {
-  const cleaned = (Array.isArray(rawItems) ? rawItems : [])
+/**
+ * items normalizer & hydrator:
+ * Input:  array/object/string JSON dari FE berisi { menu|menuId|_id, name?, qty? }
+ * Output: [{ menu, qty, nameSnapshot, priceSnapshot }]
+ * - Hanya memperbolehkan komponen dari menu non-paket.
+ * - Bisa matching by ID (prioritas) atau by name (fallback).
+ */
+async function normalizeItemsHydrate(rawItems = [], session = null) {
+  // dukung string JSON
+  let src = rawItems;
+  if (typeof src === 'string') {
+    try {
+      src = JSON.parse(src);
+    } catch {
+      src = [];
+    }
+  }
+  const cleaned = (Array.isArray(src) ? src : [])
     .map((it) => ({
-      menuId: it.menuId || it.menu || null,
-      name: (it.name || '').trim(),
-      qty: toInt(it.qty, 1)
+      menuId: it.menuId || it.menu || it._id || null,
+      name: String(it.name || '').trim(),
+      qty: toInt(it.qty ?? it.quantity ?? 1, 1)
     }))
     .filter((it) => it.menuId || it.name);
 
-  if (!cleaned.length) return [];
+  if (!cleaned.length) throwError('Paket butuh minimal 1 item', 400);
 
-  // Cari berdasarkan ID dulu (cepat & akurat). Sisanya fallback by name (non-package).
+  // match-by-id (valid ObjectId) untuk akurasi
   const byId = cleaned.filter((x) => x.menuId && isValidId(x.menuId));
   const idMap = new Map();
   if (byId.length) {
@@ -48,12 +99,16 @@ async function normalizeItems(rawItems = []) {
       _id: { $in: ids },
       isActive: true,
       bigCategory: { $ne: 'package' } // komponen hanya dari menu non-paket
-    }).select('_id name');
+    })
+      .session(session || null)
+      .select('_id name price nameLower');
     docs.forEach((d) => idMap.set(String(d._id), d));
   }
 
-  // Untuk yang tidak punya ID valid, match by name (case-insensitive).
-  const needByName = cleaned.filter((x) => !(x.menuId && isValidId(x.menuId)));
+  // sisanya fallback by name (case-insensitive) bila tersedia
+  const needByName = cleaned.filter(
+    (x) => !(x.menuId && isValidId(x.menuId)) && x.name
+  );
   const nameMap = new Map();
   if (needByName.length) {
     const names = [
@@ -61,28 +116,45 @@ async function normalizeItems(rawItems = []) {
     ];
     if (names.length) {
       const docs = await Menu.find({
-        nameLower: { $in: names },
         isActive: true,
-        bigCategory: { $ne: 'package' }
-      }).select('_id name nameLower');
-      docs.forEach((d) => nameMap.set(String(d.nameLower), d));
+        bigCategory: { $ne: 'package' },
+        // pakai field nameLower kalau schema kamu punya; fallback regex jika tidak ada
+        $or: [{ nameLower: { $in: names } }, { name: { $in: names } }]
+      })
+        .session(session || null)
+        .select('_id name price nameLower');
+      docs.forEach((d) =>
+        nameMap.set(String(d.nameLower || d.name).toLowerCase(), d)
+      );
     }
   }
 
-  return cleaned.map((x) => {
+  const hydrated = cleaned.map((x) => {
     let base = null;
     if (x.menuId && isValidId(x.menuId)) base = idMap.get(String(x.menuId));
     if (!base && x.name) base = nameMap.get(x.name.toLowerCase());
-    if (!base)
+    if (!base) {
       throwError(
         `Item paket tidak valid/ tidak ditemukan: ${x.name || x.menuId}`,
         400
       );
-    return { menuId: base._id, name: base.name, qty: x.qty };
+    }
+    const priceSnap = toNum(
+      base?.price?.final ?? base?.price?.original ?? 0,
+      0
+    );
+    return {
+      menu: base._id,
+      qty: x.qty,
+      nameSnapshot: base.name,
+      priceSnapshot: priceSnap
+    };
   });
+
+  return hydrated;
 }
 
-/** ======================= CREATE ======================= */
+/* ======================= CREATE ======================= */
 // POST /packages/create
 exports.createPackageMenu = asyncHandler(async (req, res) => {
   const {
@@ -98,61 +170,41 @@ exports.createPackageMenu = asyncHandler(async (req, res) => {
 
   if (!menu_code || !name) throwError('Kode menu dan nama wajib diisi', 400);
 
-  // Upload image (opsional)
-  let newFileId = null;
-  let imageUrl = '';
-  if (req.file) {
-    const folderId = getDriveFolder('menu');
-    const desiredName = buildMenuFileName(
-      menu_code,
-      name,
-      req.file.originalname,
-      req.file.mimetype
-    );
-    const uploaded = await uploadBuffer(
-      req.file.buffer,
-      desiredName,
-      req.file.mimetype,
-      folderId
-    );
-    newFileId = uploaded.id;
-    imageUrl = `https://drive.google.com/uc?export=view&id=${newFileId}`;
-  }
-
   const session = await mongoose.startSession();
   let created;
+  let uploadedFileId = null;
+
   try {
     await session.withTransaction(async () => {
-      // unique code
+      // lock unique code
       const code = String(menu_code).toUpperCase();
       const exists = await Menu.findOne({ menu_code: code })
         .session(session)
         .lean();
       if (exists) throwError('Kode menu sudah digunakan', 409, 'menu_code');
 
-      // subcategory resolve (dikunci ke "package")
+      // upload image (opsional) — dilakukan di dalam tx, cleanup bila gagal
+      const img = await uploadMenuImageFromReqFile(req.file, code, name);
+      uploadedFileId = img.fileId;
+
+      // kunci kategori ke package
       const bigCategory = 'package';
       const subRef = await resolveSubcategoryId(subcategoryId, bigCategory);
 
-      // normalize items
-      const packageItems = await normalizeItems(items);
+      // hydrate items → hasil: {menu, qty, nameSnapshot, priceSnapshot}
+      const packageItems = await normalizeItemsHydrate(items, session);
 
       const payload = {
         menu_code: code,
         name: String(name).trim(),
         bigCategory,
         subcategory: subRef,
-        isRecommended: !!isRecommended,
+        isRecommended: toBool(isRecommended, false),
         description: String(description || ''),
-        imageUrl,
-        price: {
-          original: Number(price.original || 0),
-          discountMode: price.discountMode || 'none',
-          discountPercent: Number(price.discountPercent || 0),
-          manualPromoPrice: Number(price.manualPromoPrice || 0)
-        },
+        imageUrl: img.imageUrl,
+        price: buildPrice(price),
         addons: [], // paket tidak pakai addons
-        packageItems, // << hasil normalize
+        packageItems,
         isActive: typeof isActive === 'boolean' ? isActive : true
       };
 
@@ -160,9 +212,108 @@ exports.createPackageMenu = asyncHandler(async (req, res) => {
       created = doc;
     });
 
-    res
-      .status(201)
-      .json({ success: true, message: 'Paket berhasil dibuat', data: created });
+    res.status(201).json({
+      success: true,
+      message: 'Paket berhasil dibuat',
+      data: created
+    });
+  } catch (err) {
+    // rollback file jika gagal
+    if (uploadedFileId) deleteFile(uploadedFileId).catch(() => {});
+    throw err;
+  } finally {
+    session.endSession();
+  }
+});
+
+/* ======================= UPDATE ======================= */
+// PATCH /packages/update/:id
+exports.updatePackageMenu = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  if (!isValidId(id)) throwError('ID tidak valid', 400);
+
+  const session = await mongoose.startSession();
+  let newFileId = null;
+  let oldFileIdForCleanup = null;
+  let updated;
+
+  try {
+    await session.withTransaction(async () => {
+      const current = await Menu.findById(id).session(session);
+      if (!current) throwError('Paket tidak ditemukan', 404);
+      if (String(current.bigCategory) !== 'package')
+        throwError('Bukan menu paket', 400);
+
+      const payload = { ...req.body };
+
+      // kunci tetap package & kosongkan addons
+      payload.bigCategory = 'package';
+      if (Array.isArray(payload.addons)) payload.addons = [];
+
+      // code uppercase & unique
+      if (payload.menu_code) {
+        payload.menu_code = String(payload.menu_code).toUpperCase();
+        const dup = await Menu.findOne({
+          menu_code: payload.menu_code,
+          _id: { $ne: id }
+        })
+          .session(session)
+          .lean();
+        if (dup) throwError('Kode menu sudah digunakan', 409, 'menu_code');
+      }
+
+      // subcategory guard
+      if (payload.subcategoryId) {
+        payload.subcategory = await resolveSubcategoryId(
+          payload.subcategoryId,
+          'package'
+        );
+      }
+
+      // rebuild price bila dikirim
+      if (payload.price) {
+        payload.price = buildPrice(payload.price, current.price || {});
+      }
+
+      // items normalize bila dikirim
+      if (payload.items !== undefined) {
+        payload.packageItems = await normalizeItemsHydrate(
+          payload.items,
+          session
+        );
+        delete payload.items;
+      }
+
+      // image (opsional)
+      if (req.file) {
+        const finalCode = String(
+          payload.menu_code || current.menu_code || ''
+        ).toUpperCase();
+        const finalName = String(payload.name || current.name || '');
+        const img = await uploadMenuImageFromReqFile(
+          req.file,
+          finalCode,
+          finalName
+        );
+        newFileId = img.fileId;
+        payload.imageUrl = img.imageUrl;
+
+        // tandai file lama untuk dibersihkan setelah commit sukses
+        oldFileIdForCleanup = extractDriveFileId(current.imageUrl);
+      }
+
+      updated = await Menu.findByIdAndUpdate(id, payload, {
+        new: true,
+        runValidators: true,
+        session
+      });
+      if (!updated) throwError('Paket tidak ditemukan', 404);
+    });
+
+    // cleanup file lama di luar transaksi
+    if (oldFileIdForCleanup) deleteFile(oldFileIdForCleanup).catch(() => {});
+
+    res.json({ success: true, message: 'Paket diperbarui', data: updated });
   } catch (err) {
     if (newFileId) deleteFile(newFileId).catch(() => {});
     throw err;
@@ -171,106 +322,12 @@ exports.createPackageMenu = asyncHandler(async (req, res) => {
   }
 });
 
-/** ======================= UPDATE ======================= */
-// PATCH /packages/update/:id
-exports.updatePackageMenu = asyncHandler(async (req, res) => {
-  const { id } = req.params;
-  if (!isValidId(id)) throwError('ID tidak valid', 400);
-
-  const current = await Menu.findById(id);
-  if (!current) throwError('Paket tidak ditemukan', 404);
-  if (String(current.bigCategory) !== 'package')
-    throwError('Bukan menu paket', 400);
-
-  const payload = { ...req.body };
-  let newFileId = null;
-
-  // image (opsional)
-  if (req.file) {
-    const folderId = getDriveFolder('menu');
-    const finalCode = String(
-      payload.menu_code || current.menu_code || ''
-    ).toUpperCase();
-    const finalName = String(payload.name || current.name || '');
-    const desiredName = buildMenuFileName(
-      finalCode,
-      finalName,
-      req.file.originalname,
-      req.file.mimetype
-    );
-    const uploaded = await uploadBuffer(
-      req.file.buffer,
-      desiredName,
-      req.file.mimetype,
-      folderId
-    );
-    newFileId = uploaded.id;
-    payload.imageUrl = `https://drive.google.com/uc?export=view&id=${newFileId}`;
-  }
-
-  // harden: paksa tetap paket & addons kosong
-  payload.bigCategory = 'package';
-  if (Array.isArray(payload.addons)) payload.addons = [];
-
-  // code uppercase & unique
-  if (payload.menu_code) {
-    payload.menu_code = String(payload.menu_code).toUpperCase();
-    const dup = await Menu.findOne({
-      menu_code: payload.menu_code,
-      _id: { $ne: id }
-    }).lean();
-    if (dup) throwError('Kode menu sudah digunakan', 409, 'menu_code');
-  }
-
-  // subcategory guard
-  if (payload.subcategoryId) {
-    payload.subcategory = await resolveSubcategoryId(
-      payload.subcategoryId,
-      'package'
-    );
-  }
-
-  // price rebuild bila dikirim
-  if (payload.price) {
-    payload.price = {
-      original: Number(payload.price.original ?? current.price?.original ?? 0),
-      discountMode:
-        payload.price.discountMode ?? current.price?.discountMode ?? 'none',
-      discountPercent: Number(
-        payload.price.discountPercent ?? current.price?.discountPercent ?? 0
-      ),
-      manualPromoPrice: Number(
-        payload.price.manualPromoPrice ?? current.price?.manualPromoPrice ?? 0
-      )
-    };
-  }
-
-  // items normalize (kalau dikirim)
-  if (Array.isArray(payload.items)) {
-    payload.packageItems = await normalizeItems(payload.items);
-    delete payload.items;
-  }
-
-  const updated = await Menu.findByIdAndUpdate(id, payload, {
-    new: true,
-    runValidators: true
-  });
-  if (!updated) throwError('Paket tidak ditemukan', 404);
-
-  // hapus file lama jika ada upload baru
-  if (newFileId) {
-    const oldId = extractDriveFileId(current.imageUrl);
-    if (oldId) deleteFile(oldId).catch(() => {});
-  }
-
-  res.json({ success: true, message: 'Paket diperbarui', data: updated });
-});
-
-/** ======================= GET/LIST/DELETE ======================= */
+/* ======================= GET/LIST/DELETE ======================= */
 // GET /packages/:id
 exports.getPackageMenuById = asyncHandler(async (req, res) => {
   const { id } = req.params;
   if (!isValidId(id)) throwError('ID tidak valid', 400);
+
   const doc = await Menu.findOne({ _id: id, bigCategory: 'package' }).lean({
     virtuals: true
   });
@@ -298,9 +355,9 @@ exports.listPackageMenus = asyncHandler(async (req, res) => {
   const filter = { bigCategory: 'package' };
   if (!isBackoffice) filter.isActive = true;
 
-  const q = (req.query.q || '').trim();
-  const subId = (req.query.subId || '').trim();
-  const isActiveParam = (req.query.isActive || '').toLowerCase();
+  const q = String(req.query.q || '').trim();
+  const subId = String(req.query.subId || '').trim();
+  const isActiveParam = String(req.query.isActive || '').toLowerCase();
   const sortBy = String(req.query.sortBy || 'name');
   const sortDir =
     String(req.query.sortDir || 'asc').toLowerCase() === 'desc' ? -1 : 1;
@@ -312,10 +369,12 @@ exports.listPackageMenus = asyncHandler(async (req, res) => {
       { description: { $regex: q, $options: 'i' } }
     ];
   }
+
   if (subId) {
     if (!isValidId(subId)) throwError('subId tidak valid', 400);
     filter.subcategory = asId(subId);
   }
+
   if (isActiveParam === 'true') filter.isActive = true;
   else if (isActiveParam === 'false') filter.isActive = false;
 
@@ -357,6 +416,7 @@ exports.deletePackageMenu = asyncHandler(async (req, res) => {
 
   const session = await mongoose.startSession();
   let oldFileId = null;
+
   try {
     await session.withTransaction(async () => {
       const doc = await Menu.findOne({
@@ -379,11 +439,13 @@ exports.deletePackageMenu = asyncHandler(async (req, res) => {
 exports.activatePackageMenu = asyncHandler(async (req, res) => {
   const { id } = req.params;
   if (!isValidId(id)) throwError('ID tidak valid', 400);
+
   const doc = await Menu.findOneAndUpdate(
     { _id: id, bigCategory: 'package' },
     { $set: { isActive: true } },
     { new: true }
   );
+
   if (!doc) throwError('Paket tidak ditemukan', 404);
   res.json({ success: true, message: 'Paket diaktifkan', data: doc });
 });
@@ -392,11 +454,13 @@ exports.activatePackageMenu = asyncHandler(async (req, res) => {
 exports.deactivatePackageMenu = asyncHandler(async (req, res) => {
   const { id } = req.params;
   if (!isValidId(id)) throwError('ID tidak valid', 400);
+
   const doc = await Menu.findOneAndUpdate(
     { _id: id, bigCategory: 'package' },
     { $set: { isActive: false } },
     { new: true }
   );
+
   if (!doc) throwError('Paket tidak ditemukan', 404);
   res.json({ success: true, message: 'Paket dinonaktifkan', data: doc });
 });
