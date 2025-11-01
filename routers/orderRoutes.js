@@ -25,6 +25,7 @@ router.post('/new-items', order.addItem);
 router.delete('/clear', order.clearCart);
 router.post('/table', order.assignTable);
 router.patch('/change-table', order.changeTable);
+router.patch('/change-order-type', order.setFulfillmentType);
 router.get('/delivery/estimate', order.estimateDelivery);
 router.post(
   '/checkout',

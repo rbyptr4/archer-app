@@ -52,17 +52,6 @@ const cookieDevice = { ...baseCookie, httpOnly: false, maxAge: REFRESH_TTL_MS };
 const ALLOWED_STATUSES = ['created', 'accepted', 'completed', 'cancelled'];
 const ALLOWED_PAY_STATUS = ['verified', 'paid', 'refunded', 'void'];
 
-const canTransit = (from, to) => {
-  const flow = {
-    created: ['accepted', 'cancelled'],
-    accepted: ['completed', 'cancelled'],
-    completed: [],
-    cancelled: []
-  };
-  return (flow[from] || []).includes(to);
-};
-const isKitchenStatus = (s) => s === 'accepted';
-
 const DELIVERY_ALLOWED = [
   'pending',
   'assigned',
@@ -147,6 +136,27 @@ const recomputeTotals = (cart) => {
 const calcDeliveryFee = () =>
   Number(DELIVERY_FLAT_FEE ?? process.env.DELIVERY_FLAT_FEE ?? 5000);
 
+/* =============== Payment matrix & helpers =============== */
+// Payment enums
+const PM = { QRIS: 'qris', BCA: 'transfer', CASH: 'cash' };
+
+function isPaymentMethodAllowed(source, fulfillment, method) {
+  if (fulfillment === 'delivery') {
+    // Delivery: tanpa cash
+    return method === PM.QRIS || method === PM.BCA;
+  }
+  // Dine-in:
+  // - self-order QR & POS: boleh semua
+  if (source === 'qr' || source === 'pos')
+    return [PM.QRIS, PM.BCA, PM.CASH].includes(method);
+  // - online dine-in: non-cash (jika ingin izinkan cash, ubah ke includes semua)
+  return method === PM.QRIS || method === PM.BCA;
+}
+
+function needProof(method) {
+  return method === PM.QRIS || method === PM.BCA;
+}
+
 /*
  * MODE RESOLVER TANPA TABLE NUMBER
  * - Menentukan mode (self_order/online) & source (qr/online) dari header/query
@@ -203,7 +213,6 @@ const getIdentity = (req) => {
 
 /* ================= MERGE CARTS: session_id -> member ================= */
 const mergeTwoCarts = (dst, src) => {
-  // dst & src adalah Mongoose document (bukan lean)
   for (const it of src.items || []) {
     const idx = dst.items.findIndex((d) => d.line_key === it.line_key);
     if (idx >= 0) {
@@ -220,13 +229,10 @@ const mergeTwoCarts = (dst, src) => {
 };
 
 const attachOrMergeCartsForIdentity = async (iden) => {
-  // Hanya jika sudah login & masih ada session_id
   if (!iden?.memberId || !iden?.session_id) return;
 
-  // Kita fokus pada kedua source: online & qr
   const SOURCES = ['online', 'qr'];
   for (const src of SOURCES) {
-    // Cart session aktif (belum terikat member)
     const sessionCart = await Cart.findOne({
       status: 'active',
       source: src,
@@ -235,7 +241,6 @@ const attachOrMergeCartsForIdentity = async (iden) => {
     });
     if (!sessionCart) continue;
 
-    // Cart member aktif pada source sama
     let memberCart = await Cart.findOne({
       status: 'active',
       source: src,
@@ -243,12 +248,10 @@ const attachOrMergeCartsForIdentity = async (iden) => {
     });
 
     if (memberCart) {
-      // Merge items → simpan → hapus session cart
       mergeTwoCarts(memberCart, sessionCart);
       await memberCart.save();
       await Cart.deleteOne({ _id: sessionCart._id }).catch(() => {});
     } else {
-      // Konversi cart session menjadi cart member
       sessionCart.member = iden.memberId;
       sessionCart.session_id = null;
       await sessionCart.save();
@@ -267,7 +270,6 @@ const getActiveCartForIdentity = async (
     ? { member: iden.memberId }
     : { session_id: iden.session_id };
 
-  // Try QR first (so FE doesn't need to send x-order-source)
   const sourcesToCheck = requestedSource === 'qr' ? ['qr'] : ['qr', 'online'];
   let cart = null;
   let cartsQueried = [];
@@ -294,14 +296,12 @@ const getActiveCartForIdentity = async (
   }
 
   if (!cart) {
-    // No active carts found for either source
     if (requestedSource === 'qr') {
       throwError(
         'Belum ada cart self-order. Silakan assign nomor meja dahulu.',
         400
       );
     } else if (allowCreateOnline) {
-      // === PATCH: upsert atomik & retry bila E11000 (race-condition)
       const ensureSession = iden.memberId
         ? null
         : iden.session_id || crypto.randomUUID();
@@ -334,7 +334,6 @@ const getActiveCartForIdentity = async (
         foundSource = 'online';
       } catch (e) {
         if (e && e.code === 11000) {
-          // Balapan sangat ketat: ambil ulang yang sudah tercipta
           const retry = await Cart.findOne(upsertFilter).lean();
           if (retry) {
             cart = retry;
@@ -349,7 +348,6 @@ const getActiveCartForIdentity = async (
     }
   }
 
-  // Cleanup duplicates on the found source (if any)
   if (cart && cartsQueried.length > 1) {
     await Cart.deleteMany({
       _id: { $in: cartsQueried.slice(1).map((c) => c._id) },
@@ -363,9 +361,7 @@ const getActiveCartForIdentity = async (
 };
 
 /* =============== Member helper (unified) =============== */
-// utils/auth.ensureMemberForCheckout.js (atau tetap di controller kamu)
 const ensureMemberForCheckout = async (req, res, joinChannel) => {
-  // --- 1) Resolve member (logged-in atau daftar/attach by phone)
   let memberDoc = null;
   if (req.member?.id) {
     memberDoc = await Member.findById(req.member.id).lean();
@@ -401,22 +397,18 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
     }
   }
 
-  // Pastikan punya bentuk plain object
   if (memberDoc && memberDoc.toObject) memberDoc = memberDoc.toObject();
 
-  // --- 2) Device ID (tetap pakai yang ada, kalau kosong generate baru)
   const incomingDev = req.cookies?.[DEVICE_COOKIE] || req.header('x-device-id');
   const device_id =
     incomingDev && String(incomingDev).trim()
       ? String(incomingDev).trim()
       : crypto.randomUUID();
 
-  // --- 3) Access/Refresh token
   const accessToken = signAccessToken(memberDoc);
   const refreshToken = generateOpaqueToken();
   const refreshHash = hashToken(refreshToken);
 
-  // --- 4) Reuse / rotate MemberSession (hindari dokumen numpuk)
   const now = Date.now();
   const existing = await MemberSession.findOne({
     member: memberDoc._id,
@@ -426,7 +418,6 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
   });
 
   if (existing) {
-    // rotate refresh, perpanjang masa aktif
     existing.refresh_hash = refreshHash;
     existing.expires_at = new Date(now + REFRESH_TTL_MS);
     existing.user_agent = req.get('user-agent') || existing.user_agent || '';
@@ -443,7 +434,6 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
     });
   }
 
-  // --- 4b) (opsional) batasi 3 sesi terbaru per (member, device)
   try {
     const old = await MemberSession.find({ member: memberDoc._id, device_id })
       .sort({ createdAt: -1 })
@@ -455,20 +445,16 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
     }
   } catch (_) {}
 
-  // --- 5) Set cookies
   res.cookie(ACCESS_COOKIE, accessToken, cookieAccess);
   res.cookie(REFRESH_COOKIE, refreshToken, cookieRefresh);
   res.cookie(DEVICE_COOKIE, device_id, cookieDevice);
 
-  // --- 6) Merge cart session -> member (aman dipanggil berulang)
-  // Gunakan session_id dari: req.session_id (modeResolver), atau cookie/device header sebagai fallback
   const session_id =
     req.session_id ||
     req.cookies?.[DEVICE_COOKIE] ||
     req.header('x-device-id') ||
     null;
 
-  // Pastikan attach/merge tetap terjadi juga untuk user yang sudah login
   try {
     const iden = { memberId: memberDoc._id, session_id };
     await attachOrMergeCartsForIdentity(iden);
@@ -477,10 +463,9 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
   return memberDoc;
 };
 
-/* ===================== CART ENDPOINTS (unified) ===================== */
+/* ===================== CART ENDPOINTS ===================== */
 exports.getCart = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
-  // === PATCH: GET /cart tidak auto-create cart baru
   const allowCreateOnline = false;
   const cart = await getActiveCartForIdentity(iden, { allowCreateOnline });
   res.status(200).json(cart);
@@ -495,11 +480,9 @@ exports.addItem = asyncHandler(async (req, res) => {
   if (!menu || !menu.isActive)
     throwError('Menu tidak ditemukan / tidak aktif', 404);
 
-  // Ambil cart aktif (QR harus sudah assign, Online boleh auto-create)
   const allowCreateOnline = (iden.source || 'online') !== 'qr';
   let cart = await getActiveCartForIdentity(iden, { allowCreateOnline });
 
-  // Kalau ini self-order (qr) pastikan cart sudah punya table_number
   if ((iden.source || 'online') === 'qr' && !cart.table_number) {
     throwError('Nomor meja belum di-assign.', 400);
   }
@@ -508,7 +491,6 @@ exports.addItem = asyncHandler(async (req, res) => {
   const normAddons = normalizeAddons(addons);
   const line_key = makeLineKey({ menuId: menu._id, addons: normAddons, notes });
 
-  // pastikan doc cart sebagai Mongoose document
   if (!cart.save) {
     cart = await Cart.findById(cart._id);
   }
@@ -546,7 +528,6 @@ exports.updateItem = asyncHandler(async (req, res) => {
   const { quantity, addons, notes } = req.body || {};
   const iden = getIdentity(req);
 
-  // Ambil cart aktif (QR harus sudah assign, Online boleh auto-create = false untuk safety)
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
@@ -612,6 +593,36 @@ exports.clearCart = asyncHandler(async (req, res) => {
   res.status(200).json(cart.toObject());
 });
 
+/* ===== NEW: Toggle fulfillment type dari Cart ===== */
+// PATCH /cart/fulfillment-type  { fulfillment_type: 'dine_in'|'delivery' }
+exports.setFulfillmentType = asyncHandler(async (req, res) => {
+  const iden = getIdentity(req);
+  const ft = String(req.body?.fulfillment_type || '').toLowerCase();
+
+  if (!['dine_in', 'delivery'].includes(ft)) {
+    throwError('fulfillment_type tidak valid', 400);
+  }
+  if ((iden.source || 'online') === 'qr' && ft !== 'dine_in') {
+    throwError('Self-order hanya mendukung dine_in', 400);
+  }
+
+  const cartObj = await getActiveCartForIdentity(iden, {
+    allowCreateOnline: true
+  });
+  if (!cartObj) throwError('Cart tidak ditemukan', 404);
+
+  const cart = await Cart.findById(cartObj._id);
+  if (!cart) throwError('Cart tidak ditemukan', 404);
+
+  cart.fulfillment_type = ft; // simpan pilihan di cart (untuk FE render)
+  if (ft === 'dine_in') {
+    cart.delivery_draft = undefined; // kalau ada draft alamat, hapus (opsional)
+  }
+
+  await cart.save();
+  res.status(200).json(cart.toObject());
+});
+
 /* ===================== DELIVERY ESTIMATE ===================== */
 exports.estimateDelivery = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
@@ -646,12 +657,14 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
   });
 });
 
+/* ===================== CHECKOUT ===================== */
 exports.checkout = asyncHandler(async (req, res) => {
   const iden0 = getIdentity(req);
   const {
     name,
     phone,
     fulfillment_type, // 'dine_in' | 'delivery'
+    payment_method, // 'qris' | 'transfer' | 'cash'
     address_text,
     lat,
     lng,
@@ -660,31 +673,40 @@ exports.checkout = asyncHandler(async (req, res) => {
     voucherClaimIds = []
   } = req.body || {};
 
+  // Resolve FT (self_order/QR selalu dine_in)
   const ft =
     iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
   if (!['dine_in', 'delivery'].includes(ft)) {
     throwError('fulfillment_type tidak valid', 400);
   }
-  if (iden0.mode === 'self_order' && ft !== 'dine_in') {
-    throwError('Self-order hanya mendukung dine_in', 400);
+
+  // Validasi metode bayar sesuai matrix
+  const method = String(payment_method || '').toLowerCase();
+  if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method)) {
+    throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
+  }
+  const needsProof = method === PM.QRIS || method === PM.BCA;
+
+  // Proof hanya wajib untuk QRIS/Transfer
+  if (needsProof && !req.file?.buffer) {
+    throwError('Bukti pembayaran wajib dikirim untuk QRIS/Transfer', 400);
   }
 
-  if (!req.file?.buffer) {
-    throwError('Bukti pembayaran wajib dikirim', 400);
-  }
-
+  // Buat/ambil member (guest auto-register by phone)
   const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
   const member = await ensureMemberForCheckout(req, res, joinChannel);
+
+  // Build identity untuk ambil cart (pastikan merge session→member)
   const iden = {
     ...iden0,
     memberId: member?._id || iden0.memberId || null,
-    // tetap kirim session_id kalau masih ada, biar helper bisa bereskan sisa merge
     session_id:
       iden0.session_id ||
       req.cookies?.[DEVICE_COOKIE] ||
       req.header('x-device-id') ||
       null
   };
+
   // Ambil cart aktif milik member/session pada source saat ini
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
@@ -694,8 +716,12 @@ exports.checkout = asyncHandler(async (req, res) => {
   if (!cart) throwError('Cart tidak ditemukan / kosong', 404);
   if (!cart.items?.length) throwError('Cart kosong', 400);
 
-  // Self-order wajib sudah punya nomor meja (tapi tidak baca dari request)
-  if (ft === 'dine_in' && !cart.table_number) {
+  // Dine-in (self-order QR) wajib sudah ada table_number (backend tidak baca dari req)
+  if (
+    ft === 'dine_in' &&
+    (iden.source || 'online') === 'qr' &&
+    !cart.table_number
+  ) {
     throwError('Silakan assign nomor meja terlebih dahulu', 400);
   }
 
@@ -718,9 +744,9 @@ exports.checkout = asyncHandler(async (req, res) => {
     cart.session_id = null;
   }
 
-  // Upload bukti bayar (kalau ada)
+  // Upload bukti bayar (hanya jika perlu)
   let payment_proof_url = '';
-  if (req.file?.buffer && req.file?.mimetype) {
+  if (needsProof && req.file?.buffer && req.file?.mimetype) {
     const folderId = getDriveFolder('invoice');
     const uploaded = await uploadBuffer(
       req.file.buffer,
@@ -760,7 +786,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   recomputeTotals(cart);
   await cart.save();
 
-  // Voucher pricing
+  // Voucher pricing (aktif untuk delivery)
   let priced = {
     totals: {
       baseSubtotal: cart.total_price,
@@ -773,7 +799,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     chosenClaimIds: []
   };
 
-  // Aktifkan voucher untuk delivery (bisa diaktifkan dine_in kalau mau)
   if (ft === 'delivery') {
     priced = await validateAndPrice({
       memberId: member._id,
@@ -797,10 +822,14 @@ exports.checkout = asyncHandler(async (req, res) => {
         const code = await nextDailyTxCode('ARCH');
         return await Order.create({
           member: cart.member,
+          // untuk guest yang auto-register, customer_name/phone dibiarkan kosong
+          customer_name: '',
+          customer_phone: '',
           table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
           source: iden.source || 'online',
-          fulfillment_type: ft, // 'dine_in' | 'delivery'
+          fulfillment_type: ft,
           transaction_code: code,
+
           items: cart.items.map((it) => ({
             menu: it.menu,
             menu_code: it.menu_code,
@@ -814,6 +843,7 @@ exports.checkout = asyncHandler(async (req, res) => {
             category: it.category || null
           })),
           total_quantity: cart.total_quantity,
+
           delivery,
           items_subtotal: priced.totals.baseSubtotal,
           items_discount: priced.totals.itemsDiscount,
@@ -821,11 +851,12 @@ exports.checkout = asyncHandler(async (req, res) => {
           shipping_discount: priced.totals.shippingDiscount,
           discounts: priced.breakdown,
           grand_total: priced.totals.grandTotal,
-          payment_method:
-            (iden.source || 'online') === 'online' ? 'qr' : 'manual',
-          payment_proof_url,
+
+          // Payment sesuai pilihan user
+          payment_method: method, // 'qris' | 'transfer' | 'cash'
+          payment_proof_url, // kosong jika cash
+          payment_status: 'paid', // staff akan ubah ke 'verified'
           status: 'created',
-          payment_status: 'paid',
           placed_at: new Date()
         });
       } catch (e) {
@@ -837,7 +868,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     throw new Error('Gagal generate transaction_code unik');
   })();
 
-  // Konsumsi voucher claims (kalau ada)
+  // Konsumsi voucher claims (jika ada)
   for (const claimId of priced.chosenClaimIds) {
     try {
       const c = await VoucherClaim.findById(claimId);
@@ -858,7 +889,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     } catch (_) {}
   }
 
-  // Tandai cart selesai
+  // Tandai cart selesai & kosongkan
   await Cart.findByIdAndUpdate(
     cart._id,
     {
@@ -956,7 +987,6 @@ exports.assignTable = asyncHandler(async (req, res) => {
     await cart.save();
   }
 
-  // Bersihkan cart aktif lain yang masih tersisa (kalau ada)
   await Cart.deleteMany({
     _id: { $ne: cart._id },
     status: 'active',
@@ -977,7 +1007,6 @@ exports.assignTable = asyncHandler(async (req, res) => {
 
 exports.changeTable = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
-  // Treat this endpoint as self-order regardless of resolver flags
 
   const newNo = asInt(req.body?.table_number, 0);
   if (!newNo) throwError('Nomor meja baru wajib', 400);
@@ -1132,12 +1161,18 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     name,
     phone,
     mark_paid = false,
-    payment_method = 'cash'
+    payment_method = 'cash' // pos boleh cash/qris/transfer
   } = req.body || {};
 
   const tableNo = asInt(table_number, 0);
   if (!tableNo) throwError('table_number wajib', 400);
   if (!Array.isArray(items) || !items.length) throwError('items wajib', 400);
+
+  // Validasi metode di POS
+  const method = String(payment_method || '').toLowerCase();
+  if (![PM.CASH, PM.QRIS, PM.BCA].includes(method)) {
+    throwError('payment_method POS tidak valid', 400);
+  }
 
   let member = null;
   let customer_name = '';
@@ -1190,7 +1225,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
       (s, a) => s + (a.price || 0) * (a.qty || 1),
       0
     );
-    const unit = priceFinal(menu.price); // <-- hitung dari objek price
+    const unit = priceFinal(menu.price);
     const line_subtotal = (unit + addonsTotal) * qty;
 
     orderItems.push({
@@ -1214,7 +1249,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
 
   const now = new Date();
 
-  // Create order
   const order = await (async () => {
     for (let i = 0; i < 5; i++) {
       try {
@@ -1235,8 +1269,9 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           shipping_discount: 0,
           discounts: [],
           grand_total: itemsSubtotal,
-          payment_method,
-          payment_status: 'verified',
+          payment_method: method,
+          payment_status:
+            method === PM.CASH ? 'verified' : mark_paid ? 'verified' : 'paid',
           paid_at: mark_paid ? now : null,
           verified_by: mark_paid ? req.user?.id || null : null,
           verified_at: mark_paid ? now : null,
@@ -1254,7 +1289,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
 
   if (order.payment_status === 'paid') {
     await awardPointsIfEligible(order, Member);
-    // === NEW: log paid history saat dibuat paid ===
     await logPaidHistory(order, req.user);
   }
 
@@ -1337,11 +1371,9 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
   if (!order.placed_at) order.placed_at = new Date();
   await order.save();
 
-  // award poin jika perlu
   if (!order.loyalty_awarded_at) {
     await awardPointsIfEligible(order, Member);
   }
-  // log paid history bisa dipanggil di sini jika yang kamu anggap “paid final” adalah 'verified'
   await logPaidHistory(order, req.user).catch(() => {});
 
   const payload = {
@@ -1375,7 +1407,6 @@ exports.assignDelivery = asyncHandler(async (req, res) => {
     throwError('Order belum layak dikirim (harus paid & tidak cancelled)', 409);
   }
 
-  // Inisialisasi blok delivery bila belum ada
   if (!order.delivery) {
     order.delivery = {
       status: 'pending',
@@ -1387,7 +1418,6 @@ exports.assignDelivery = asyncHandler(async (req, res) => {
     };
   }
 
-  // Set kurir
   order.delivery.courier = {
     id: courier_id || null,
     name: (courier_name || '').trim(),
@@ -1421,9 +1451,6 @@ exports.assignDelivery = asyncHandler(async (req, res) => {
 /**
  * PATCH /orders/:id/delivery/status
  * Body: { status: 'assigned'|'picked_up'|'on_the_way'|'delivered'|'failed', note?: string }
- * Catatan:
- *  - Transisi harus valid (canTransitDelivery).
- *  - Kalau jadi 'delivered' dan order belum completed, kita auto-complete kalau mau (opsional).
  */
 exports.updateDeliveryStatus = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
@@ -1452,7 +1479,6 @@ exports.updateDeliveryStatus = asyncHandler(async (req, res) => {
     );
   }
 
-  // Update status & timestamp spesifik
   order.delivery.status = status;
   const now = new Date();
   if (status === 'picked_up') order.delivery.picked_up_at = now;
@@ -1463,7 +1489,6 @@ exports.updateDeliveryStatus = asyncHandler(async (req, res) => {
     order.delivery.status_note = String(note).trim();
   }
 
-  // Opsional: auto-complete order saat delivered (kalau sudah paid)
   if (
     status === 'delivered' &&
     order.payment_status === 'paid' &&
@@ -1511,7 +1536,6 @@ exports.deliveryBoard = asyncHandler(async (req, res) => {
     fulfillment_type: 'delivery'
   };
 
-  // Default board: tampilkan yang belum selesai (exclude delivered & failed) kalau status tidak dikirim
   if (status && DELIVERY_ALLOWED.includes(status)) {
     q['delivery.status'] = status;
   } else {

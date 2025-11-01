@@ -66,7 +66,6 @@ const orderItemSchema = new mongoose.Schema(
     quantity: { type: Number, min: 1, max: 999, required: true },
     addons: { type: [addonSchema], default: [] },
     notes: { type: String, trim: true, default: '' },
-    // subtotal = (base_price + sum(addons)) * quantity
     line_subtotal: { type: Number, min: 0, required: true, set: int, get: int }
   },
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
@@ -77,9 +76,9 @@ const discountBreakdownSchema = new mongoose.Schema(
   {
     claimId: { type: mongoose.Schema.Types.ObjectId, ref: 'VoucherClaim' },
     voucherId: { type: mongoose.Schema.Types.ObjectId, ref: 'Voucher' },
-    name: { type: String, trim: true }, // nama/label voucher saat rilis
-    itemsDiscount: { type: Number, default: 0, set: int, get: int }, // potongan ke barang
-    shippingDiscount: { type: Number, default: 0, set: int, get: int }, // potongan ongkir
+    name: { type: String, trim: true },
+    itemsDiscount: { type: Number, default: 0, set: int, get: int },
+    shippingDiscount: { type: Number, default: 0, set: int, get: int },
     note: { type: String, trim: true, default: '' }
   },
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
@@ -129,7 +128,6 @@ const orderSchema = new mongoose.Schema(
       }
     },
 
-    // Items
     items: {
       type: [orderItemSchema],
       default: [],
@@ -140,8 +138,6 @@ const orderSchema = new mongoose.Schema(
     },
     total_quantity: { type: Number, min: 1, required: true },
 
-    // ======= Totals with Voucher Engine =======
-    // subtotal barang sebelum diskon
     items_subtotal: {
       type: Number,
       min: 0,
@@ -149,37 +145,28 @@ const orderSchema = new mongoose.Schema(
       set: int,
       get: int
     },
-
-    // total diskon ke barang (gabungan semua voucher non-ongkir)
     items_discount: { type: Number, min: 0, default: 0, set: int, get: int },
-
-    // ongkir (mirror dari delivery.delivery_fee supaya gampang dihitung)
     delivery_fee: { type: Number, min: 0, default: 0, set: int, get: int },
-
-    // total diskon ongkir (free/discount shipping)
     shipping_discount: { type: Number, min: 0, default: 0, set: int, get: int },
-
-    // rincian per voucher yang dipakai
     discounts: { type: [discountBreakdownSchema], default: [] },
-
-    // grand total akhir = items_subtotal - items_discount + delivery_fee - shipping_discount
     grand_total: { type: Number, min: 0, required: true, set: int, get: int },
 
-    // Pembayaran
+    // ===== Payment (refactor: qris | transfer | cash) =====
     payment_method: {
       type: String,
-      enum: ['qr', 'manual', 'cash'],
+      enum: ['qris', 'transfer', 'cash'],
       default: function () {
-        return this.source === 'online' ? 'qr' : 'manual';
+        // default aman: non-cash untuk non-POS, cash sering dipakai di POS
+        return this.source === 'pos' ? 'cash' : 'qris';
       }
     },
-    payment_proof_url: { type: String, trim: true }, // ONLINE wajib (divalidasi di hook)
+    payment_proof_url: { type: String, trim: true },
     payment_status: {
       type: String,
       enum: ['paid', 'verified', 'void'],
       index: true
     },
-    // Status utama
+
     status: {
       type: String,
       enum: ['created', 'accepted', 'completed', 'cancelled'],
@@ -193,13 +180,11 @@ const orderSchema = new mongoose.Schema(
     },
     verified_at: { type: Date },
 
-    // Tanggal penting
     placed_at: { type: Date, default: Date.now, required: true },
     paid_at: { type: Date },
     cancelled_at: { type: Date },
     cancellation_reason: { type: String, trim: true, default: '' },
 
-    // Delivery block (hanya terisi bila fulfillment = delivery)
     delivery: { type: DeliverySchema, default: undefined }
   },
   {
@@ -210,8 +195,7 @@ const orderSchema = new mongoose.Schema(
   }
 );
 
-/* =============== Derived & Back-compat =============== */
-// Backward compatibility: expose items_total seperti sebelumnya (alias ke items_subtotal)
+/* =============== Derived (back-compat) =============== */
 orderSchema.virtual('items_total').get(function () {
   return this.items_subtotal;
 });
@@ -236,17 +220,14 @@ orderSchema.pre('validate', function (next) {
   this.total_quantity = totalQty;
   this.items_subtotal = int(itemsSubtotal);
 
-  // mirror delivery_fee dari block delivery (kalau ada)
   const deliveryFee = this.delivery?.delivery_fee
     ? int(this.delivery.delivery_fee)
     : 0;
   this.delivery_fee = int(deliveryFee);
 
-  // pastikan diskon non-negatif
   this.items_discount = int(Math.max(0, this.items_discount || 0));
   this.shipping_discount = int(Math.max(0, this.shipping_discount || 0));
 
-  // grand total = items_subtotal - items_discount + delivery_fee - shipping_discount
   const gt =
     this.items_subtotal -
     this.items_discount +
@@ -254,20 +235,30 @@ orderSchema.pre('validate', function (next) {
     this.shipping_discount;
   this.grand_total = int(Math.max(0, gt));
 
-  // aturan table_number
+  // Dine-in via online => hapus table_number
   if (this.fulfillment_type === 'dine_in' && this.source === 'online') {
     this.table_number = null;
   }
 
-  // aturan source online: wajib payment proof + method qr
-  if (this.source === 'online') {
-    if (!this.payment_proof_url || !String(this.payment_proof_url).trim()) {
-      return next(new Error('Bukti pembayaran wajib untuk order online.'));
-    }
-    this.payment_method = 'qr';
+  // ===== Payment rules (baru) =====
+  // 1) Delivery tidak boleh cash
+  if (this.fulfillment_type === 'delivery' && this.payment_method === 'cash') {
+    return next(new Error('Delivery tidak mendukung metode pembayaran cash.'));
   }
 
-  // aturan delivery: data wajib
+  // 2) Bukti pembayaran wajib untuk non-cash (QRIS/Transfer)
+  const nonCash =
+    this.payment_method === 'qris' || this.payment_method === 'transfer';
+  if (nonCash) {
+    if (!this.payment_proof_url || !String(this.payment_proof_url).trim()) {
+      return next(new Error('Bukti pembayaran wajib untuk QRIS/Transfer.'));
+    }
+  } else {
+    // cash: pastikan field kosong agar konsisten
+    this.payment_proof_url = '';
+  }
+
+  // 3) Delivery data wajib
   if (this.fulfillment_type === 'delivery') {
     const ok =
       this.delivery &&
@@ -281,6 +272,7 @@ orderSchema.pre('validate', function (next) {
     }
   }
 
+  // 4) Identitas: member ATAU minimal nama/telp
   if (!this.member) {
     const hasGuest =
       (this.customer_name && this.customer_name.trim().length > 0) ||
