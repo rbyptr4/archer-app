@@ -17,7 +17,7 @@ function inWindow(v, now = new Date()) {
   return true;
 }
 
-// ✅ Kembalikan always string ObjectId (atau null)
+// Selalu kembalikan string ObjectId (atau null)
 const getMemberId = (req) => {
   const m = req?.member;
   if (!m) return null;
@@ -38,7 +38,7 @@ exports.explore = asyncHandler(async (req, res) => {
   const visible = list.filter((v) => {
     if (!inWindow(v, now)) return false;
 
-    // ✅ bandingkan sebagai string
+    // include/exclude
     if (v.target?.excludeMemberIds?.some((id) => String(id) === meId))
       return false;
 
@@ -50,6 +50,7 @@ exports.explore = asyncHandler(async (req, res) => {
         return false;
     }
 
+    // global stock (opsional)
     if (
       v.visibility?.mode === 'global_stock' &&
       (v.visibility?.globalStock || 0) <= 0
@@ -108,12 +109,12 @@ exports.claim = asyncHandler(async (req, res) => {
         await m.save({ session });
       }
 
-      // buat claim wallet (pastikan field member DIISI)
+      // buat claim wallet
       const claimDocs = await VoucherClaim.create(
         [
           {
             voucher: v._id,
-            member: meId, // ⬅️ penting
+            member: meId,
             status: 'claimed',
             remainingUse: v.usage?.maxUsePerClaim || 1,
             validUntil:
@@ -142,7 +143,7 @@ exports.myWallet = asyncHandler(async (req, res) => {
   if (!meId) throwError('Unauthorized (member)', 401);
 
   const data = await VoucherClaim.find({
-    member: meId, // ⬅️ gunakan string id
+    member: meId,
     status: { $in: ['claimed', 'used'] }
   })
     .populate('voucher')
