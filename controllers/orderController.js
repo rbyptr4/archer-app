@@ -236,6 +236,7 @@ const attachOrMergeCartsForIdentity = async (iden) => {
 
   const SOURCES = ['online', 'qr'];
   for (const src of SOURCES) {
+    // Ambil sessionCart yg masih "milik session" (belum ada member)
     const sessionCart = await Cart.findOne({
       status: 'active',
       source: src,
@@ -244,20 +245,61 @@ const attachOrMergeCartsForIdentity = async (iden) => {
     });
     if (!sessionCart) continue;
 
+    // Cek apakah sudah ada cart milik member utk source yg sama
     let memberCart = await Cart.findOne({
       status: 'active',
       source: src,
       member: iden.memberId
     });
 
+    // Jika sudah ada: MERGE lalu hapus sessionCart
     if (memberCart) {
       mergeTwoCarts(memberCart, sessionCart);
       await memberCart.save();
       await Cart.deleteOne({ _id: sessionCart._id }).catch(() => {});
-    } else {
-      sessionCart.member = iden.memberId;
-      sessionCart.session_id = null;
-      await sessionCart.save();
+      continue;
+    }
+
+    // Belum ada cart member ⇒ coba "promote" sessionCart → member
+    try {
+      // Pakai updateOne kondisi ketat untuk menghindari write pada dokumen yg sdh berubah
+      const r = await Cart.updateOne(
+        {
+          _id: sessionCart._id,
+          status: 'active',
+          source: src,
+          session_id: iden.session_id,
+          $or: [{ member: null }, { member: { $exists: false } }]
+        },
+        { $set: { member: iden.memberId, session_id: null } }
+      );
+
+      // Jika tidak ada yg termodifikasi (kemungkinan race), refresh & lanjutkan loop
+      if (!r.matchedCount) continue;
+    } catch (e) {
+      // Jika duplikat (index unik per (member, source, status)), lakukan MERGE rescue
+      if (e && e.code === 11000) {
+        memberCart = await Cart.findOne({
+          status: 'active',
+          source: src,
+          member: iden.memberId
+        });
+
+        if (memberCart) {
+          // Reload sessionCart terbaru (bisa jadi sudah berubah di tengah race)
+          const freshSession = await Cart.findById(sessionCart._id);
+          if (freshSession) {
+            mergeTwoCarts(memberCart, freshSession);
+            await memberCart.save();
+            await Cart.deleteOne({ _id: freshSession._id }).catch(() => {});
+          }
+          continue;
+        }
+        // Jika benar2 anomali, lempar ulang
+        throw e;
+      }
+      // Error lain lempar ulang
+      throw e;
     }
   }
 };

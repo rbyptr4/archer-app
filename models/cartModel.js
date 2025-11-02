@@ -102,51 +102,30 @@ const cartSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-/* ================= Indexes (penting untuk menghindari tabrakan) =================
- * Target: 1 cart ACTIVE per (identity, source).
- * - Identity = member ATAU session_id.
- * - Dipisah per source supaya user bisa punya 2 cart aktif sekaligus:
- *   satu 'qr' (self-order) dan satu 'online' (website).
- */
-
-// Unik: (member, source, status='active')
 cartSchema.index(
   { member: 1, source: 1, status: 1 },
   {
     unique: true,
     partialFilterExpression: {
-      member: { $type: 'objectId' },
+      member: { $exists: true, $ne: null },
+      source: { $exists: true, $ne: null },
       status: 'active'
     }
   }
 );
 
-// Unik: (session_id, source, status='active') untuk guest
 cartSchema.index(
   { session_id: 1, source: 1, status: 1 },
   {
     unique: true,
     partialFilterExpression: {
-      session_id: { $type: 'string' },
+      session_id: { $exists: true, $ne: null },
+      source: { $exists: true, $ne: null },
       status: 'active'
     }
   }
 );
 
-/*
- * Catatan tentang table_number:
- * - Kita sengaja TIDAK membuat unique index di level table_number,
- *   karena controller saat ini resolve cart berdasarkan identity (member/session),
- *   bukan berdasarkan nomor meja. Ini menghindari konflik multi-guest di meja sama.
- *
- * Jika nanti ingin SANGAT strict (1 meja = 1 cart aktif), bisa tambah index unik:
- * cartSchema.index(
- *   { table_number: 1, source: 1, status: 1 },
- *   { unique: true, partialFilterExpression: { table_number: { $type: 'int' }, source: 'qr', status: 'active' } }
- * );
- */
-
-// TTL: hapus cart yang sudah checked_out setelah 24 jam (tidak memengaruhi active)
 cartSchema.index({ checked_out_at: 1 }, { expireAfterSeconds: 60 * 60 * 24 });
 
 // Agar require() ulang tidak bikin OverwriteModelError saat hot-reload
