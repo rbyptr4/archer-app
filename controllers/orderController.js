@@ -61,6 +61,9 @@ const DELIVERY_ALLOWED = [
   'failed'
 ];
 
+const normFt = (v) =>
+  String(v).toLowerCase() === 'delivery' ? 'delivery' : 'dine_in';
+
 const canTransitDelivery = (from, to) => {
   const flow = {
     pending: ['assigned', 'failed'],
@@ -261,7 +264,7 @@ const attachOrMergeCartsForIdentity = async (iden) => {
 
 const getActiveCartForIdentity = async (
   iden,
-  { allowCreateOnline = false }
+  { allowCreateOnline = false, defaultFt = null }
 ) => {
   await attachOrMergeCartsForIdentity(iden);
 
@@ -316,6 +319,7 @@ const getActiveCartForIdentity = async (
         member: iden.memberId || null,
         session_id: iden.memberId ? null : ensureSession,
         table_number: null,
+        fulfillment_type: defaultFt ? normFt(defaultFt) : 'dine_in',
         items: [],
         total_items: 0,
         total_quantity: 0,
@@ -467,7 +471,10 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
 exports.getCart = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
   const allowCreateOnline = false;
-  const cart = await getActiveCartForIdentity(iden, { allowCreateOnline });
+  let cart = await getActiveCartForIdentity(iden, {
+    allowCreateOnline,
+    defaultFt: req.query?.fulfillment_type || null
+  });
   res.status(200).json(cart);
 });
 
@@ -481,7 +488,10 @@ exports.addItem = asyncHandler(async (req, res) => {
     throwError('Menu tidak ditemukan / tidak aktif', 404);
 
   const allowCreateOnline = (iden.source || 'online') !== 'qr';
-  let cart = await getActiveCartForIdentity(iden, { allowCreateOnline });
+  let cart = await getActiveCartForIdentity(iden, {
+    allowCreateOnline,
+    defaultFt: req.query?.fulfillment_type || req.body?.fulfillment_type || null
+  });
 
   if ((iden.source || 'online') === 'qr' && !cart.table_number) {
     throwError('Nomor meja belum di-assign.', 400);
@@ -975,6 +985,7 @@ exports.assignTable = asyncHandler(async (req, res) => {
       member: iden.memberId || null,
       session_id: iden.memberId ? null : sessionId,
       table_number,
+      fulfillment_type: 'dine_in',
       items: [],
       total_items: 0,
       total_quantity: 0,
