@@ -617,16 +617,19 @@ exports.setFulfillmentType = asyncHandler(async (req, res) => {
   }
 
   const cartObj = await getActiveCartForIdentity(iden, {
-    allowCreateOnline: true
+    allowCreateOnline: false
   });
   if (!cartObj) throwError('Cart tidak ditemukan', 404);
 
   const cart = await Cart.findById(cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan', 404);
 
-  cart.fulfillment_type = ft; // simpan pilihan di cart (untuk FE render)
+  cart.fulfillment_type = ft;
   if (ft === 'dine_in') {
-    cart.delivery_draft = undefined; // kalau ada draft alamat, hapus (opsional)
+    cart.delivery_draft = undefined;
+    cart.table_number = cart.table_number || null;
+  } else {
+    cart.table_number = null;
   }
 
   await cart.save();
