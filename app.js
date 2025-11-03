@@ -37,13 +37,19 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true })); // biar form non-file juga kebaca
 app.use(cookieParser());
 
-/* ==================== CORS (Express 5) ==================== */
-const allowedOrigins = [
-  process.env.APP_URL || 'https://archer-app.vercel.app',
-  'http://localhost:5173'
+const STATIC_ALLOWED_ORIGINS = [
+  process.env.APP_URL || 'https://archer-app.vercel.app'
 ];
 
-const ALLOWED_HEADERS = [
+// helper: cek apakah origin boleh
+const isOriginAllowed = (origin) => {
+  if (!origin) return true;
+  if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return true;
+  if (/^http:\/\/192\.168\.\d+\.\d+(:\d+)?$/.test(origin)) return true;
+  return STATIC_ALLOWED_ORIGINS.includes(origin);
+};
+
+const BASE_ALLOWED_HEADERS = [
   'content-type',
   'authorization',
   'x-requested-with',
@@ -56,17 +62,27 @@ const ALLOWED_HEADERS = [
   'x-fulfillment-type'
 ];
 
-const EXPOSE_HEADERS = []; // isi kalau perlu baca header respons tertentu
+const EXPOSE_HEADERS = [];
 
 const corsOptionsDelegate = (req, cb) => {
   const origin = req.header('Origin');
-  const isAllowed = !origin || allowedOrigins.includes(origin);
+  const allowed = isOriginAllowed(origin);
+
+  const requested = (req.header('Access-Control-Request-Headers') || '')
+    .toLowerCase()
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const allowedHeaders = Array.from(
+    new Set([...BASE_ALLOWED_HEADERS, ...requested])
+  );
 
   cb(null, {
-    origin: isAllowed ? origin : false,
+    origin: allowed ? origin : false,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ALLOWED_HEADERS,
+    allowedHeaders,
     exposedHeaders: EXPOSE_HEADERS,
     optionsSuccessStatus: 204,
     preflightContinue: false
@@ -75,6 +91,7 @@ const corsOptionsDelegate = (req, cb) => {
 
 app.use(cors(corsOptionsDelegate));
 app.options(/.*/, cors(corsOptionsDelegate));
+/* =============================================================================== */
 
 /* ==== Public/Auth/Owner ==== */
 app.use('/auth', authRoutes);
