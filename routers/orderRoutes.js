@@ -40,6 +40,13 @@ router.get(
   requirePageAccess('orders'),
   order.deliveryBoard
 );
+router.get(
+  '/list-employee',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
+  order.listEmployeesDropdown
+);
 router.get('/my-order', authMemberRequired, order.listMyOrders);
 router.post('/price-preview', authMemberRequired, order.previewPrice);
 

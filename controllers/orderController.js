@@ -1671,3 +1671,22 @@ exports.deliveryBoard = asyncHandler(async (req, res) => {
     next_cursor: items.length ? items[items.length - 1].createdAt : null
   });
 });
+
+exports.listEmployeesDropdown = asyncHandler(async (req, res) => {
+  const employees = await User.find({
+    role: 'employee',
+    phone: { $exists: true, $ne: '' } // pastikan ada nomor
+  })
+    .select('name phone')
+    .sort({ name: 1 })
+    .lean();
+
+  const items = employees.map((e) => ({
+    name: e.name || '',
+    phone: e.phone || ''
+  }));
+
+  res.json({
+    items
+  });
+});
