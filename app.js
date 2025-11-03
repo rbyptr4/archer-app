@@ -37,61 +37,37 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true })); // biar form non-file juga kebaca
 app.use(cookieParser());
 
-const STATIC_ALLOWED_ORIGINS = [
-  process.env.APP_URL || 'https://archer-app.vercel.app'
+// CORS
+const allowedOrigins = [
+  process.env.APP_URL || 'https://archer-app.vercel.app',
+  'http://localhost:5173'
 ];
-
-// helper: cek apakah origin boleh
-const isOriginAllowed = (origin) => {
-  if (!origin) return true;
-  if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return true;
-  if (/^http:\/\/192\.168\.\d+\.\d+(:\d+)?$/.test(origin)) return true;
-  return STATIC_ALLOWED_ORIGINS.includes(origin);
-};
-
-const BASE_ALLOWED_HEADERS = [
-  'content-type',
-  'authorization',
-  'x-requested-with',
-  'requiresauth',
-  'x-qr-session',
-  'x-online-session',
-  'x-table-number',
-  'x-order-source',
-  'x-device-id',
-  'x-fulfillment-type'
-];
-
-const EXPOSE_HEADERS = [];
-
-const corsOptionsDelegate = (req, cb) => {
-  const origin = req.header('Origin');
-  const allowed = isOriginAllowed(origin);
-
-  const requested = (req.header('Access-Control-Request-Headers') || '')
-    .toLowerCase()
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  const allowedHeaders = Array.from(
-    new Set([...BASE_ALLOWED_HEADERS, ...requested])
-  );
-
-  cb(null, {
-    origin: allowed ? origin : false,
-    credentials: true,
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(new Error('Not allowed by CORS: ' + origin));
+    },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders,
-    exposedHeaders: EXPOSE_HEADERS,
-    optionsSuccessStatus: 204,
-    preflightContinue: false
-  });
-};
-
-app.use(cors(corsOptionsDelegate));
-app.options(/.*/, cors(corsOptionsDelegate));
-/* =============================================================================== */
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'X-Requested-With',
+      'requiresAuth',
+      'X-QR-Session',
+      'X-Online-Session',
+      'X-Table-Number',
+      'X-Order-Source',
+      'X-Device-Id',
+      'X-Fulfillment-Type'
+    ],
+    credentials: true
+  })
+);
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
 /* ==== Public/Auth/Owner ==== */
 app.use('/auth', authRoutes);
