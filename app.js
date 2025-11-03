@@ -37,37 +37,44 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true })); // biar form non-file juga kebaca
 app.use(cookieParser());
 
-// CORS
+/* ==================== CORS (Express 5) ==================== */
 const allowedOrigins = [
   process.env.APP_URL || 'https://archer-app.vercel.app',
   'http://localhost:5173'
 ];
-app.use(
-  cors({
-    origin(origin, cb) {
-      if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-      return cb(new Error('Not allowed by CORS: ' + origin));
-    },
+
+const ALLOWED_HEADERS = [
+  'content-type',
+  'authorization',
+  'x-requested-with',
+  'requiresauth',
+  'x-qr-session',
+  'x-online-session',
+  'x-table-number',
+  'x-order-source',
+  'x-device-id',
+  'x-fulfillment-type'
+];
+
+const EXPOSE_HEADERS = []; // isi kalau perlu baca header respons tertentu
+
+const corsOptionsDelegate = (req, cb) => {
+  const origin = req.header('Origin');
+  const isAllowed = !origin || allowedOrigins.includes(origin);
+
+  cb(null, {
+    origin: isAllowed ? origin : false,
+    credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: [
-      'Content-Type',
-      'Authorization',
-      'X-Requested-With',
-      'requiresAuth',
-      'X-QR-Session',
-      'X-Online-Session',
-      'X-Table-Number',
-      'X-Order-Source',
-      'X-Device-Id',
-      'X-Fulfillment-Type'
-    ],
-    credentials: true
-  })
-);
-app.use((req, res, next) => {
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
+    allowedHeaders: ALLOWED_HEADERS,
+    exposedHeaders: EXPOSE_HEADERS,
+    optionsSuccessStatus: 204,
+    preflightContinue: false
+  });
+};
+
+app.use(cors(corsOptionsDelegate));
+app.options(/.*/, cors(corsOptionsDelegate));
 
 /* ==== Public/Auth/Owner ==== */
 app.use('/auth', authRoutes);
