@@ -187,37 +187,45 @@ exports.sendClosingShiftLockedWa = asyncHandler(async (req, res) => {
 
   const doc = await ClosingShift.findById(id).lean();
   if (!doc) throwError('Laporan closing tidak ditemukan', 404);
-
-  // wajib sudah locked
   if (doc.status !== 'locked') {
     throwError(
       'Laporan belum dikunci. Hanya bisa kirim saat status locked.',
       409
     );
   }
-
-  // pastikan ada data shift-2 supaya pesan bermakna
-  if (!doc.shift2) {
+  if (!doc.shift2)
     throwError('Shift-2 belum diisi. Tidak ada data untuk dikirim.', 409);
-  }
 
-  const ownerRaw = getOwnerPhone();
-  if (!ownerRaw) throwError('OWNER_WA belum di-set di ENV.', 500);
+  const ownersRaw = getOwnerPhone();
+  if (!ownersRaw.length) throwError('OWNER_WA belum di-set atau kosong.', 500);
 
-  const to = toWa62(ownerRaw);
-  const message = buildClosingShiftMessage(doc, 'locked'); // label FINAL
+  // Normalisasi ke format 62
+  const recipients = [
+    ...new Set(ownersRaw.map((p) => toWa62(p || '').trim()).filter(Boolean))
+  ];
+  if (!recipients.length) throwError('Nomor OWNER_WA tidak valid.', 500);
 
-  let gateway;
-  try {
-    gateway = await sendText(to, message);
-  } catch (e) {
-    gateway = { ok: false, error: e?.message || 'wa_send_failed' };
-  }
+  const message = buildClosingShiftMessage(doc, 'locked');
+
+  // Kirim paralel (best-effort)
+  const settled = await Promise.allSettled(
+    recipients.map((phone) => sendText(phone, message))
+  );
+
+  const results = settled.map((r, i) =>
+    r.status === 'fulfilled'
+      ? { phone: recipients[i], ok: true, gateway: r.value }
+      : {
+          phone: recipients[i],
+          ok: false,
+          error: r.reason?.message || String(r.reason)
+        }
+  );
 
   res.json({
     success: true,
-    to,
-    preview: message, // bisa dipakai FE untuk “lihat pesan”
-    gateway
+    recipients,
+    preview: message,
+    results
   });
 });
