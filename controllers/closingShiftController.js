@@ -7,9 +7,21 @@ dayjs.extend(tz);
 
 const ClosingShift = require('../models/closingShiftModel');
 const User = require('../models/userModel');
+
 const throwError = require('../utils/throwError');
+const { sendText, buildClosingShiftMessage } = require('../utils/wablas');
+const { getOwnerPhone } = require('../utils/ownerPhone');
 
 const VALID_TYPES = ['bar', 'kitchen', 'cashier'];
+
+const toWa62 = (phone) => {
+  const s = String(phone ?? '').trim();
+  if (!s) return '';
+  let d = s.replace(/\D+/g, '');
+  if (d.startsWith('0')) return '62' + d.slice(1);
+  if (d.startsWith('+62')) return '62' + d.slice(3);
+  return d;
+};
 
 const startOfDayJakarta = (d) =>
   dayjs(d || new Date())
@@ -167,5 +179,45 @@ exports.listEmployeesDropdown = asyncHandler(async (req, res) => {
 
   res.json({
     items
+  });
+});
+
+exports.sendClosingShiftLockedWa = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  const doc = await ClosingShift.findById(id).lean();
+  if (!doc) throwError('Laporan closing tidak ditemukan', 404);
+
+  // wajib sudah locked
+  if (doc.status !== 'locked') {
+    throwError(
+      'Laporan belum dikunci. Hanya bisa kirim saat status locked.',
+      409
+    );
+  }
+
+  // pastikan ada data shift-2 supaya pesan bermakna
+  if (!doc.shift2) {
+    throwError('Shift-2 belum diisi. Tidak ada data untuk dikirim.', 409);
+  }
+
+  const ownerRaw = getOwnerPhone();
+  if (!ownerRaw) throwError('OWNER_WA belum di-set di ENV.', 500);
+
+  const to = toWa62(ownerRaw);
+  const message = buildClosingShiftMessage(doc, 'locked'); // label FINAL
+
+  let gateway;
+  try {
+    gateway = await sendText(to, message);
+  } catch (e) {
+    gateway = { ok: false, error: e?.message || 'wa_send_failed' };
+  }
+
+  res.json({
+    success: true,
+    to,
+    preview: message, // bisa dipakai FE untuk “lihat pesan”
+    gateway
   });
 });

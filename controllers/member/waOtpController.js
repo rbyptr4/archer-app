@@ -1,26 +1,13 @@
-// controllers/member/waOtpController.js
 const asyncHandler = require('express-async-handler');
 const crypto = require('crypto');
 const Member = require('../../models/memberModel');
 const MemberOtp = require('../../models/memberOtpModel');
-const MemberSession = require('../../models/memberSessionModel');
 const throwError = require('../../utils/throwError');
 
-const {
-  ACCESS_TTL,
-  REFRESH_TTL_MS,
-  ACCESS_COOKIE,
-  REFRESH_COOKIE,
-  DEVICE_COOKIE,
-  signAccessToken,
-  generateOpaqueToken,
-  hashToken
-} = require('../../utils/memberToken');
+const { REFRESH_TTL_MS } = require('../../utils/memberToken');
 
 const { sendOtpText } = require('../../utils/wablas');
 const { generateOtp, hashOtp, expiresAtFromNow } = require('../../utils/otp');
-
-const oneYearMs = REFRESH_TTL_MS;
 
 const RESEND_COOLDOWN_SEC = Number(process.env.OTP_RESEND_COOLDOWN_SEC || 45);
 
@@ -242,5 +229,77 @@ exports.verifyChangeName = asyncHandler(async (req, res) => {
     success: true,
     message: 'Nama berhasil diubah',
     member: { id: member._id, name: member.name, phone: member.phone }
+  });
+});
+
+// ------------------- X) Resend OTP (generic) -------------------
+exports.resendOtp = asyncHandler(async (req, res) => {
+  // body: { phone, purpose }  purpose in: 'login' | 'register' | 'change_phone' | 'change_name'
+  const { phone, purpose } = req.body || {};
+  if (!phone || !purpose) throwError('Phone & purpose wajib diisi', 400);
+
+  const PURPOSES = new Set([
+    'login',
+    'register',
+    'change_phone',
+    'change_name'
+  ]);
+  if (!PURPOSES.has(purpose)) throwError('purpose tidak valid', 400);
+
+  // Normalisasi phone sesuai pola lokal yang kamu pakai
+  const normalized = normalizePhoneLocal(phone);
+
+  // Ambil OTP paling baru untuk kombinasi phone+purpose
+  const last = await MemberOtp.findOne({ phone: normalized, purpose }).sort(
+    '-createdAt'
+  );
+  if (!last) {
+    // sengaja error agar flow FE suruh panggil "request" sesuai konteks
+    const hint =
+      purpose === 'register'
+        ? 'Silakan request OTP registrasi terlebih dahulu.'
+        : purpose === 'login'
+        ? 'Silakan request OTP login terlebih dahulu.'
+        : purpose === 'change_phone'
+        ? 'Silakan mulai dari requestChangePhone terlebih dahulu.'
+        : 'Silakan mulai dari requestChangeName terlebih dahulu.';
+    throwError(`Belum ada permintaan OTP untuk purpose ini. ${hint}`, 404);
+  }
+
+  // Cek cooldown
+  if (
+    last.last_sent_at &&
+    Date.now() - last.last_sent_at.getTime() < RESEND_COOLDOWN_SEC * 1000
+  ) {
+    const wait = Math.ceil(
+      (RESEND_COOLDOWN_SEC * 1000 -
+        (Date.now() - last.last_sent_at.getTime())) /
+        1000
+    );
+    throwError(`Tunggu ${wait} detik untuk kirim ulang OTP`, 429);
+  }
+
+  // (Opsional) Kalau mau batasi total resend per OTP chain, bisa hitung dari waktu window tertentu.
+
+  // Buat kode baru dan dokumen baru (audit trail), bawa meta yang sama
+  const code = generateOtp();
+  const newDoc = await MemberOtp.create({
+    phone: normalized,
+    code_hash: hashOtp(code),
+    expires_at: expiresAtFromNow(),
+    last_sent_at: new Date(),
+    purpose,
+    meta: last.meta || {}
+  });
+
+  // Kirim WA
+  await sendOtpText(toWa62(normalized), code);
+
+  res.json({
+    success: true,
+    message: `OTP dikirim ulang (${OTP_TTL_MIN} menit berlaku).`,
+    otp_id: newDoc._id,
+    purpose,
+    phone: normalized
   });
 });

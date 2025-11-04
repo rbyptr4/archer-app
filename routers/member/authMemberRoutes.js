@@ -13,7 +13,8 @@ const {
   requestChangeName,
   requestChangePhone,
   verifyChangeName,
-  verifyChangePhone
+  verifyChangePhone,
+  resendOtp
 } = require('../../controllers/member/waOtpController');
 const router = express.Router();
 
@@ -28,5 +29,6 @@ router.post('/register/verify', verifyRegisterOtp);
 router.post('/refresh-token', refreshMember);
 router.get('/me', authMember, member);
 router.post('/logout', logoutMember);
+router.post('/resend-otp', resendOtp);
 
 module.exports = router;

@@ -12,6 +12,8 @@ router.get('/open', ctrl.findOpen);
 router.get('/list-employee', ctrl.listEmployeesDropdown);
 
 router.post('/shift-1', ctrl.createShift1);
+
+router.post('/:id/send-wa', ctrl.sendClosingShiftLockedWa);
 router.patch('/:id/shift-2', ctrl.fillShift2);
 router.patch('/:id/lock', ctrl.lockReport);
 

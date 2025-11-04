@@ -229,7 +229,7 @@ exports.registerMember = asyncHandler(async (req, res) => {
     expires_at: expiresAtFromNow(),
     last_sent_at: new Date(),
     purpose: 'register',
-    meta: { name, join_channel }
+    meta: { name }
   });
 
   await sendOtpText(toWa62(normalizedPhone), code);

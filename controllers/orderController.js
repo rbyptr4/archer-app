@@ -11,6 +11,7 @@ const MemberSession = require('../models/memberSessionModel');
 const VoucherClaim = require('../models/voucherClaimModel');
 
 const throwError = require('../utils/throwError');
+const { sendText, buildOrderReceiptMessage } = require('../utils/wablas');
 const { baseCookie } = require('../utils/authCookies');
 const { uploadBuffer } = require('../utils/googleDrive');
 const { getDriveFolder } = require('../utils/driveFolders');
@@ -64,6 +65,15 @@ const DELIVERY_ALLOWED = [
 
 const normFt = (v) =>
   String(v).toLowerCase() === 'delivery' ? 'delivery' : 'dine_in';
+
+const toWa62 = (phone) => {
+  const s = String(phone ?? '').trim();
+  if (!s) return '';
+  let d = s.replace(/\D+/g, '');
+  if (d.startsWith('0')) return '62' + d.slice(1);
+  if (d.startsWith('+62')) return '62' + d.slice(3);
+  return d;
+};
 
 const canTransitDelivery = (from, to) => {
   const flow = {
@@ -1466,7 +1476,7 @@ exports.completeOrder = asyncHandler(async (req, res) => {
 exports.acceptAndVerify = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
-  const order = await Order.findById(req.params.id);
+  const order = await Order.findById(req.params.id).lean(); // pakai lean dulu untuk cek
   if (!order) throwError('Order tidak ditemukan', 404);
 
   if (order.status !== 'created') {
@@ -1476,33 +1486,49 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     throwError('Pembayaran belum paid. Tidak bisa verifikasi.', 409);
   }
 
-  order.status = 'accepted';
-  order.payment_status = 'verified';
-  order.verified_by = req.user._id;
-  order.verified_at = new Date();
-  if (!order.placed_at) order.placed_at = new Date();
-  await order.save();
+  const doc = await Order.findById(req.params.id);
+  doc.status = 'accepted';
+  doc.payment_status = 'verified';
+  doc.verified_by = req.user._id;
+  doc.verified_at = new Date();
+  if (!doc.placed_at) doc.placed_at = new Date();
+  await doc.save();
 
-  if (!order.loyalty_awarded_at) {
-    await awardPointsIfEligible(order, Member);
+  if (!doc.loyalty_awarded_at) {
+    await awardPointsIfEligible(doc, Member);
   }
-  await logPaidHistory(order, req.user).catch(() => {});
+  await logPaidHistory(doc, req.user).catch(() => {});
 
   const payload = {
-    id: String(order._id),
-    transaction_code: order.transaction_code,
-    status: order.status,
-    payment_status: order.payment_status,
+    id: String(doc._id),
+    transaction_code: doc.transaction_code,
+    status: doc.status,
+    payment_status: doc.payment_status,
     verified_by: { id: String(req.user._id), name: req.user.name },
-    at: order.verified_at
+    at: doc.verified_at
   };
   emitToStaff('order:accepted_verified', payload);
-  if (order.member)
-    emitToMember(order.member, 'order:accepted_verified', payload);
-  if (order.table_number)
-    emitToTable(order.table_number, 'order:accepted_verified', payload);
+  if (doc.member) emitToMember(doc.member, 'order:accepted_verified', payload);
+  if (doc.table_number)
+    emitToTable(doc.table_number, 'order:accepted_verified', payload);
 
-  res.status(200).json({ message: 'Pesanan diterima & diverifikasi', order });
+  (async () => {
+    try {
+      const full = await Order.findById(doc._id).lean();
+      const phone = (full.customer_phone || '').trim();
+      if (!phone) return;
+
+      const wa = toWa62(phone);
+      const message = buildOrderReceiptMessage(full);
+      await sendText(wa, message);
+    } catch (e) {
+      console.error('[WA receipt] failed:', e?.message || e);
+    }
+  })();
+
+  res
+    .status(200)
+    .json({ message: 'Pesanan diterima & diverifikasi', order: doc });
 });
 
 exports.assignDelivery = asyncHandler(async (req, res) => {
