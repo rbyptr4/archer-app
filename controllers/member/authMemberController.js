@@ -105,9 +105,9 @@ exports.loginMember = asyncHandler(async (req, res) => {
   await sendOtpText(toWa62(normalizedPhone), code);
 
   res.status(202).json({
+    phone: phone,
     success: true,
-    message: `OTP dikirim ke WhatsApp (${OTP_TTL_MIN} menit berlaku).`,
-    next: '/auth/member/login/verify'
+    message: `OTP dikirim ke WhatsApp (${OTP_TTL_MIN} menit berlaku).`
   });
 });
 
@@ -192,7 +192,7 @@ exports.verifyLoginOtp = asyncHandler(async (req, res) => {
  * body: { name, phone }
  * ========================================================= */
 exports.registerMember = asyncHandler(async (req, res) => {
-  const { name, phone, join_channel = 'cashier' } = req.body || {};
+  const { name, phone } = req.body || {};
   if (!name || !phone) throwError('Nama dan nomor telepon wajib diisi', 400);
 
   const normalizedPhone = normalizePhone(phone);
@@ -235,9 +235,9 @@ exports.registerMember = asyncHandler(async (req, res) => {
   await sendOtpText(toWa62(normalizedPhone), code);
 
   return res.status(202).json({
+    phone: phone,
     success: true,
-    message: `OTP registrasi dikirim (${OTP_TTL_MIN} menit berlaku).`,
-    next: '/auth/member/register/verify'
+    message: `OTP registrasi dikirim (${OTP_TTL_MIN} menit berlaku).`
   });
 });
 

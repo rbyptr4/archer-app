@@ -18,17 +18,9 @@ const {
 } = require('../../utils/memberToken');
 
 const { sendOtpText } = require('../../utils/wablas');
-const {
-  generateOtp,
-  hashOtp,
-  expiresAtFromNow,
-  OTP_TTL_MIN
-} = require('../../utils/otp');
+const { generateOtp, hashOtp, expiresAtFromNow } = require('../../utils/otp');
 
 const oneYearMs = REFRESH_TTL_MS;
-const cookieAccess = { httpOnly: true, maxAge: 15 * 60 * 1000 }; // adjust if you have baseCookie use that
-const cookieRefresh = { httpOnly: true, maxAge: oneYearMs };
-const cookieDevice = { httpOnly: false, maxAge: oneYearMs };
 
 const RESEND_COOLDOWN_SEC = Number(process.env.OTP_RESEND_COOLDOWN_SEC || 45);
 
@@ -101,6 +93,7 @@ exports.requestChangePhone = asyncHandler(async (req, res) => {
   await sendOtpText(toWa62Local(normalizedOld), code);
 
   res.json({
+    phone: member.phone,
     success: true,
     message:
       'OTP dikirim ke nomor lama. Verifikasi untuk menyelesaikan perubahan nomor.',
@@ -201,6 +194,7 @@ exports.requestChangeName = asyncHandler(async (req, res) => {
   await sendOtpText(toWa62Local(normalized), code);
 
   res.json({
+    phone: phone,
     success: true,
     message: 'OTP dikirim ke nomor member. Verifikasi untuk mengganti nama.',
     otp_id: doc._id
