@@ -4,12 +4,12 @@ const {
   registerMember,
   logoutMember,
   member,
-  refreshMember
+  refreshMember,
+  verifyLoginOtp,
+  verifyRegisterOtp
 } = require('../../controllers/member/authMemberController');
 const authMember = require('../../middlewares/authMember');
 const {
-  requestWaOtp,
-  verifyWaOtp,
   requestChangeName,
   requestChangePhone,
   verifyChangeName,
@@ -17,15 +17,15 @@ const {
 } = require('../../controllers/member/waOtpController');
 const router = express.Router();
 
-router.post('/request-otp', requestWaOtp);
-router.post('/verify-otp', verifyWaOtp);
 router.post('/request-change-phone', requestChangePhone);
 router.post('/verify-change-phone', verifyChangePhone);
 router.post('/request-change-name', requestChangeName);
 router.post('/verify-change-name', verifyChangeName);
 router.post('/login', loginMember);
-router.post('/refresh-token', refreshMember);
+router.post('/login/verify', verifyLoginOtp);
 router.post('/register', registerMember);
+router.post('/register/verify', verifyRegisterOtp);
+router.post('/refresh-token', refreshMember);
 router.get('/me', authMember, member);
 router.post('/logout', logoutMember);
 
