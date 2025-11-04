@@ -6,7 +6,6 @@ const MemberSchema = new mongoose.Schema(
     name: { type: String, trim: true, required: true },
     phone: { type: String, trim: true, required: true },
 
-    // Perluasan supaya kompatibel dgn berbagai sumber pendaftaran
     join_channel: {
       type: String,
       enum: ['self_order', 'online', 'pos', 'cashier'],
@@ -14,12 +13,12 @@ const MemberSchema = new mongoose.Schema(
     },
 
     // Loyalty
-    points: { type: Number, default: 0 }, // <-- NEW
+    points: { type: Number, default: 0 },
 
-    // Lifetime metrics (sudah dipakai di controller lain)
     total_spend: { type: Number, default: 0 },
     visit_count: { type: Number, default: 0 },
     last_visit_at: { type: Date },
+    phone_verified_at: { type: Date },
 
     is_active: { type: Boolean, default: true }
   },

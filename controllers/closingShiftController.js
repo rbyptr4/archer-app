@@ -155,17 +155,14 @@ exports.lockReport = asyncHandler(async (req, res) => {
 });
 
 exports.listEmployeesDropdown = asyncHandler(async (req, res) => {
-  const employees = await User.find({
-    role: 'employee',
-    phone: { $exists: true, $ne: '' } // pastikan ada nomor
-  })
-    .select('name phone')
+  const employees = await User.find({ role: 'employee' })
+    .select('name email')
     .sort({ name: 1 })
     .lean();
 
   const items = employees.map((e) => ({
     name: e.name || '',
-    phone: e.phone || ''
+    email: e.email || ''
   }));
 
   res.json({

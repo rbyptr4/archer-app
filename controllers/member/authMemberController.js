@@ -161,13 +161,14 @@ exports.logoutMember = asyncHandler(async (req, res) => {
 // ===== ME =====
 exports.member = asyncHandler(async (req, res) => {
   const m = await Member.findById(req.member.id).select(
-    'name phone total_spend visit_count last_visit_at join_channel is_active updatedAt'
+    'name phone total_spend visit_count last_visit_at join_channel is_active updatedAt points'
   );
   if (!m) throwError('Member tidak ditemukan!', 404);
   res.status(200).json({
     id: m._id,
     name: m.name,
     phone: m.phone,
+    points: m.points,
     total_spend: m.total_spend,
     visit_count: m.visit_count,
     last_visit_at: m.last_visit_at,
