@@ -4,6 +4,7 @@ const crypto = require('crypto');
 
 const Cart = require('../models/cartModel');
 const Menu = require('../models/menuModel');
+const User = require('../models/userModel');
 const Member = require('../models/memberModel');
 const Order = require('../models/orderModel');
 const MemberSession = require('../models/memberSessionModel');

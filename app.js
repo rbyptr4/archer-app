@@ -19,6 +19,7 @@ const menuPackagesRoutes = require('./routers/owner/packageMenuRoutes');
 const categoryRoutes = require('./routers/owner/menuCategoryRoutes');
 const memberManagementRoutes = require('./routers/owner/memberManagementRoutes');
 const expenseRoutes = require('./routers/expenseRoutes');
+const closingShiftRoutes = require('./routers/closingShiftRoutes');
 const orderRoutes = require('./routers/orderRoutes'); // order list/detail/kitchen/pay/status/cancel (punyamu yg sudah dirapikan)
 
 // Models (load sekali di awal)
@@ -72,6 +73,7 @@ app.use((req, res, next) => {
 /* ==== Public/Auth/Owner ==== */
 app.use('/auth', authRoutes);
 app.use('/employees', employeeRoutes);
+app.use('/closing-shift', closingShiftRoutes);
 app.use('/menu', menuRoutes);
 app.use('/menu/packages', menuPackagesRoutes);
 app.use('/menu/category', categoryRoutes);
