@@ -318,6 +318,8 @@ exports.updateMenu = asyncHandler(async (req, res) => {
     }).lean();
     if (dup) throwError('Kode menu sudah digunakan', 409, 'menu_code');
   }
+  console.log('req.body.addons (after middleware):', req.body.addons);
+  console.log('payload.addons (after merge):', payload.addons);
 
   const updated = await Menu.findByIdAndUpdate(id, payload, {
     new: true,
