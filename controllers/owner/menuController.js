@@ -38,15 +38,39 @@ async function buildPackageItemsFromIds(items = []) {
   });
 }
 
+const parseMaybeJson = (v, fallback) => {
+  if (Array.isArray(v) || typeof v === 'object') return v;
+  if (typeof v !== 'string') return fallback;
+  try {
+    const parsed = JSON.parse(v);
+    return parsed;
+  } catch {
+    return fallback;
+  }
+};
+
+const toBool = (v, def = true) => {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') return v !== 0;
+  if (typeof v === 'string') {
+    const s = v.trim().toLowerCase();
+    if (['true', '1', 'yes', 'y', 'on'].includes(s)) return true;
+    if (['false', '0', 'no', 'n', 'off'].includes(s)) return false;
+  }
+  return def;
+};
+
 const normalizeAddons = (addons = []) => {
-  if (!Array.isArray(addons)) return [];
-  return addons
+  const src = Array.isArray(addons) ? addons : parseMaybeJson(addons, []);
+  if (!Array.isArray(src)) return [];
+
+  return src
     .map((a) => ({
       name: String(a?.name || '').trim(),
       price: Math.round(Number(a?.price || 0)),
-      isActive: typeof a?.isActive === 'boolean' ? a.isActive : true
+      isActive: toBool(a?.isActive, true)
     }))
-    .filter((a) => a.name); // kosongin entry tanpa nama
+    .filter((a) => a.name);
 };
 
 /* ====================== CREATE ====================== */
@@ -235,7 +259,7 @@ exports.updateMenu = asyncHandler(async (req, res) => {
 
   if (Array.isArray(payload.packageItems)) payload.packageItems = [];
 
-  if (Array.isArray(payload.addons)) {
+  if (payload.addons !== undefined) {
     payload.addons = normalizeAddons(payload.addons);
   } else {
     payload.addons = current.addons;
