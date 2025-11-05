@@ -9,6 +9,11 @@ router.get('/internal/access/check', auth.checkInternalAccess);
 
 router.post('/internal/login', auth.loginInternal);
 
+router.put(
+  '/internal/access/change-access-code',
+  validateToken,
+  auth.updateInternalAccessCode
+);
 router.post('/login', auth.login);
 router.post('/refresh-token', auth.refreshToken);
 router.post('/logout', auth.logout);

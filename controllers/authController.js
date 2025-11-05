@@ -3,20 +3,24 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
 const User = require('../models/userModel');
+const AppSetting = require('../models/appSettingModel'); // NEW
 
 const throwError = require('../utils/throwError');
 const generateTokens = require('../utils/generateToken');
 const parseRemember = require('../utils/parseRemember');
 const { baseCookie } = require('../utils/authCookies');
 
+/* ====================== CONFIG & CONST ====================== */
 const gateTtlMin = Math.max(
   1,
   parseInt(process.env.INTERNAL_GATE_TTL_MIN || '10', 10)
 );
+const ACCESS_CODE_KEY = 'internal_access_code_hash';
 
+/* ====================== HELPERS ====================== */
 function signGateToken() {
   return jwt.sign(
-    { kind: 'internal_gate' }, // minimal payload
+    { kind: 'internal_gate' }, // payload minimal
     process.env.INTERNAL_GATE_SECRET,
     { expiresIn: `${gateTtlMin}m` }
   );
@@ -30,9 +34,8 @@ function verifyGateToken(token) {
 
 function requireInternalGate(req, res, next) {
   const tok = req.cookies?.internalGate;
-  if (!tok) {
-    return res.status(403).json({ message: 'Access gate required' });
-  }
+  if (!tok) return res.status(403).json({ message: 'Access gate required' });
+
   try {
     verifyGateToken(tok);
     return next();
@@ -42,6 +45,34 @@ function requireInternalGate(req, res, next) {
       .status(403)
       .json({ message: 'Access gate invalid/expired' });
   }
+}
+
+// Guard owner sederhana: pastikan ada req.user & role owner
+function requireOwner(req, res, next) {
+  if (!req.user) return res.status(401).json({ message: 'Unauthorized' });
+  if (req.user.role !== 'owner')
+    return res.status(403).json({ message: 'Owner only' });
+  return next();
+}
+
+/* ====== Ambil hash kode akses dari DB; fallback ke .env sekali pakai ====== */
+async function getAccessCodeHash() {
+  // 1) coba ambil dari DB
+  const fromDb = await AppSetting.get(ACCESS_CODE_KEY);
+  if (fromDb) return fromDb;
+
+  // 2) fallback ke .env (kalau ada), hash on-the-fly (tidak disimpan)
+  const envCode = String(process.env.INTERNAL_ACCESS_CODE || '');
+  if (!envCode) return null;
+
+  const salt = await bcrypt.genSalt(10);
+  return await bcrypt.hash(envCode, salt);
+}
+
+async function checkAccessCodePlain(plainCode) {
+  const hash = await getAccessCodeHash();
+  if (!hash) throwError('Server belum dikonfigurasi kode akses', 500);
+  return bcrypt.compare(String(plainCode || ''), hash);
 }
 
 /* =============== Shared login executor (reusable) =============== */
@@ -78,21 +109,17 @@ async function performLogin(req, res) {
     });
 }
 
-/* ================= Access Gate Endpoints ================= */
+/* ====================== ACCESS GATE ====================== */
 
-// POST /auth/internal/access/verify
-// body: { code: string }
+// POST /auth/internal/access/verify  { code }
 exports.verifyInternalAccess = asyncHandler(async (req, res) => {
   const code = String(req.body?.code || '');
   if (!code) throwError('Kode akses wajib diisi', 400);
 
-  const expected = String(process.env.INTERNAL_ACCESS_CODE || '');
-  if (!expected) throwError('Server belum dikonfigurasi', 500);
-
-  if (code !== expected) throwError('Kode akses salah', 401);
+  const ok = await checkAccessCodePlain(code);
+  if (!ok) throwError('Kode akses salah', 401);
 
   const gateToken = signGateToken();
-
   return res
     .cookie('internalGate', gateToken, {
       ...baseCookie,
@@ -116,22 +143,47 @@ exports.checkInternalAccess = asyncHandler(async (req, res) => {
   }
 });
 
-// POST /auth/internal/access/revoke
+// (opsional) POST /auth/internal/access/revoke
 exports.revokeInternalAccess = asyncHandler(async (req, res) => {
   return res
     .clearCookie('internalGate', { ...baseCookie })
     .json({ message: 'Access gate revoked' });
 });
 
-// POST /auth/internal/login   (protected by gate)
-exports.loginInternal = [
-  requireInternalGate,
+/* =============== Ganti kode akses (OWNER ONLY) =============== */
+// PUT /auth/internal/access/code  { currentCode, newCode }
+exports.updateInternalAccessCode = [
+  requireOwner, // pastikan ada auth middleware sebelum ini untuk set req.user
   asyncHandler(async (req, res) => {
-    // Reuse performLogin
-    return performLogin(req, res);
+    const currentCode = String(req.body?.currentCode || '');
+    const newCode = String(req.body?.newCode || '');
+
+    if (!currentCode || !newCode)
+      throwError('currentCode & newCode wajib diisi', 400);
+    if (newCode.length < 4) throwError('newCode minimal 4 karakter', 400);
+
+    // validasi currentCode terhadap hash (DB atau fallback .env)
+    const ok = await checkAccessCodePlain(currentCode);
+    if (!ok) throwError('currentCode salah', 401);
+
+    const salt = await bcrypt.genSalt(10);
+    const newHash = await bcrypt.hash(newCode, salt);
+
+    await AppSetting.set(ACCESS_CODE_KEY, newHash);
+
+    // Catatan: gate token yang sudah ada tetap valid s/d TTL habis.
+    res.json({ message: 'Kode akses berhasil diperbarui' });
   })
 ];
 
+/* =============== Login internal (harus lewat gate) =============== */
+// POST /auth/internal/login
+exports.loginInternal = [
+  requireInternalGate,
+  asyncHandler(async (req, res) => performLogin(req, res))
+];
+
+/* ====================== AUTH BIASA (jika masih dipakai) ====================== */
 exports.login = asyncHandler(async (req, res) => {
   const { email, password } = req.body || {};
   const remember = parseRemember(req);
@@ -149,8 +201,8 @@ exports.login = asyncHandler(async (req, res) => {
   });
 
   const refreshCookieOpts = remember
-    ? { ...baseCookie, maxAge: 7 * 24 * 60 * 60 * 1000 } // persistent 7d
-    : { ...baseCookie }; // session cookie (tanpa maxAge)
+    ? { ...baseCookie, maxAge: 7 * 24 * 60 * 60 * 1000 }
+    : { ...baseCookie };
 
   res
     .cookie('accessToken', accessToken, {
@@ -186,9 +238,7 @@ exports.me = asyncHandler(async (req, res) => {
 });
 
 exports.refreshToken = asyncHandler(async (req, res) => {
-  const hasCookieHeader = !!req.headers.cookie;
   const token = req.cookies?.refreshToken;
-
   if (!token) {
     return res.status(401).json({ message: 'No refresh token' });
   }
