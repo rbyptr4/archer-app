@@ -65,19 +65,17 @@ module.exports = (req, res, next) => {
     if (Array.isArray(req.body.addons)) {
       req.body.addons = req.body.addons
         .map((a) => {
-          const name = String(a?.name || '').trim();
-          const oldName = String(a?.oldName || '').trim(); // <— penting utk rename
           const shaped = {
-            ...(oldName ? { oldName } : {}),
-            name,
+            ...(a?._id ? { _id: String(a._id) } : {}),
+            name: String(a?.name || '').trim(),
             price: toInt(a?.price, 0)
           };
           if (Object.prototype.hasOwnProperty.call(a, 'isActive')) {
-            shaped.isActive = toBool(a.isActive, true); // keep kalau dikirim
+            shaped.isActive = toBool(a.isActive, true);
           }
           return shaped;
         })
-        .filter((a) => a.name || a.oldName); // minimal satu ada
+        .filter((a) => a.name || a._id); // minimal ada _id atau name
     } else {
       req.body.addons = [];
     }

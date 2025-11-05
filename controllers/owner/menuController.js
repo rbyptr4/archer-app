@@ -11,44 +11,10 @@ const { getDriveFolder } = require('../../utils/driveFolders');
 const { buildMenuFileName } = require('../../utils/makeFileName');
 const { extractDriveFileId } = require('../../utils/driveFileId');
 
+/* ========== Utils dasar ========== */
 const asId = (x) => new mongoose.Types.ObjectId(String(x));
 const isValidId = (v) => mongoose.Types.ObjectId.isValid(String(v));
 const toInt = (v, d = 0) => (Number.isFinite(+v) ? Math.trunc(+v) : d);
-
-/* ---------- Helper: build package snapshot ---------- */
-async function buildPackageItemsFromIds(items = []) {
-  const cleaned = (items || [])
-    .map((it) => ({
-      menuId: String(it.menuId || it.menu || ''),
-      qty: toInt(it.qty, 1) || 1
-    }))
-    .filter((it) => isValidId(it.menuId));
-  if (!cleaned.length) return [];
-
-  const ids = cleaned.map((it) => asId(it.menuId));
-  const docs = await Menu.find({ _id: { $in: ids }, isActive: true }).select(
-    '_id name price'
-  );
-  const mapDoc = new Map(docs.map((d) => [String(d._id), d]));
-
-  return cleaned.map(({ menuId, qty }) => {
-    const base = mapDoc.get(String(menuId));
-    if (!base) throw new Error(`Menu tidak ditemukan / non-aktif: ${menuId}`);
-    return Menu.makePackageItemFromMenu(base, qty);
-  });
-}
-
-const normalizeAddonsCreate = (addons = []) => {
-  const src = Array.isArray(addons) ? addons : parseMaybeJson(addons, []);
-  if (!Array.isArray(src)) return [];
-  return src
-    .map((a) => ({
-      name: String(a?.name || '').trim(),
-      price: Math.round(Number(a?.price || 0)),
-      isActive: toBool(a?.isActive, true) // default true kalau tidak dikirim
-    }))
-    .filter((a) => a.name);
-};
 
 const parseMaybeJson = (v, fallback) => {
   if (Array.isArray(v) || (v && typeof v === 'object')) return v;
@@ -71,47 +37,45 @@ const toBool = (v, def = true) => {
   return def;
 };
 
-const mergeAddonsByName = (current = [], incoming = []) => {
-  const inc = Array.isArray(incoming) ? incoming : parseMaybeJson(incoming, []);
-  if (!Array.isArray(inc)) return current;
+/* ========== Helper addons ========== */
+const sanitizeNewAddon = (a = {}) => ({
+  name: String(a?.name || '').trim(),
+  price: Math.round(Number(a?.price || 0)),
+  isActive: a?.isActive !== undefined ? toBool(a.isActive, true) : true
+});
 
-  const incMap = new Map(
-    inc
-      .map((p) => ({
-        key: String(p?.oldName || p?.name || '')
-          .trim()
-          .toLowerCase(), // pakai oldName kalau ada
-        name: String(p?.name || '').trim(), // nama baru (atau tetap)
-        price: p?.price,
-        isActive: p?.isActive
-      }))
-      .filter((p) => p.key)
-      .map((p) => [p.key, p])
-  );
-
-  return (current || []).map((cur) => {
-    const curName = String(cur?.name || '').trim();
-    const patch = incMap.get(curName.toLowerCase());
-    if (!patch) return cur;
-
-    const out = { ...cur };
-    if (
-      patch.name &&
-      patch.name.trim().toLowerCase() !== curName.toLowerCase()
-    ) {
-      out.name = patch.name.trim(); // rename
-    }
-    if (patch.price !== undefined) {
-      out.price = Math.round(Number(patch.price || 0));
-    }
-    if (patch.isActive !== undefined) {
-      out.isActive = toBool(patch.isActive, cur.isActive);
-    }
-    return out;
-  });
+const sanitizePatchAddon = (a = {}) => {
+  const out = {};
+  if (a.name !== undefined) out.name = String(a.name).trim();
+  if (a.price !== undefined) out.price = Math.round(Number(a.price || 0));
+  if (a.isActive !== undefined) out.isActive = toBool(a.isActive, true);
+  return out;
 };
 
-/* ====================== CREATE ====================== */
+/* ---------- Helper: build package snapshot (dipakai di controller paket) ---------- */
+async function buildPackageItemsFromIds(items = []) {
+  const cleaned = (items || [])
+    .map((it) => ({
+      menuId: String(it.menuId || it.menu || ''),
+      qty: toInt(it.qty, 1) || 1
+    }))
+    .filter((it) => isValidId(it.menuId));
+  if (!cleaned.length) return [];
+
+  const ids = cleaned.map((it) => asId(it.menuId));
+  const docs = await Menu.find({ _id: { $in: ids }, isActive: true }).select(
+    '_id name price'
+  );
+  const mapDoc = new Map(docs.map((d) => [String(d._id), d]));
+
+  return cleaned.map(({ menuId, qty }) => {
+    const base = mapDoc.get(String(menuId));
+    if (!base) throw new Error(`Menu tidak ditemukan / non-aktif: ${menuId}`);
+    return Menu.makePackageItemFromMenu(base, qty);
+  });
+}
+
+/* ========== CREATE (non-package) ========== */
 // POST /menu/create-menu
 exports.createMenu = asyncHandler(async (req, res) => {
   const {
@@ -179,6 +143,13 @@ exports.createMenu = asyncHandler(async (req, res) => {
         .lean();
       if (exists) throwError('Kode menu sudah digunakan', 409, 'menu_code');
 
+      const addonsSrc = Array.isArray(addons)
+        ? addons
+        : parseMaybeJson(addons, []);
+      const addonsNorm = Array.isArray(addonsSrc)
+        ? addonsSrc.map(sanitizeNewAddon).filter((x) => x.name)
+        : [];
+
       const payload = {
         menu_code: code,
         name: String(name).trim(),
@@ -193,9 +164,10 @@ exports.createMenu = asyncHandler(async (req, res) => {
           discountPercent: Number(price.discountPercent || 0),
           manualPromoPrice: Number(price.manualPromoPrice || 0)
         },
-        addons: normalizeAddonsCreate(addons),
+        addons: addonsNorm, // _id akan di-generate otomatis oleh Mongoose
         packageItems: [],
-        isActive: typeof isActive === 'boolean' ? isActive : true
+        isActive:
+          typeof isActive === 'boolean' ? isActive : toBool(isActive, true)
       };
 
       const [doc] = await Menu.create([payload], { session });
@@ -215,7 +187,7 @@ exports.createMenu = asyncHandler(async (req, res) => {
   }
 });
 
-/* ====================== UPDATE ====================== */
+/* ========== UPDATE (non-package) ========== */
 exports.updateMenu = asyncHandler(async (req, res) => {
   const { id } = req.params;
   if (!isValidId(id)) throwError('ID tidak valid', 400);
@@ -233,6 +205,7 @@ exports.updateMenu = asyncHandler(async (req, res) => {
     throwError('Endpoint ini hanya untuk menu non-package', 400, 'bigCategory');
   }
 
+  // Upload image (opsional)
   if (req.file) {
     const folderId = getDriveFolder('menu');
     const finalCode = String(
@@ -295,12 +268,25 @@ exports.updateMenu = asyncHandler(async (req, res) => {
     };
   }
 
+  // Enforce non-package
   if (Array.isArray(payload.packageItems)) payload.packageItems = [];
 
+  /* ====== ADDONS UPDATE BY _id ====== */
+  let addNew = [];
+  let patches = [];
   if (payload.addons !== undefined) {
-    payload.addons = mergeAddonsByName(current.addons, payload.addons);
-  } else {
-    payload.addons = current.addons;
+    const src = Array.isArray(payload.addons)
+      ? payload.addons
+      : parseMaybeJson(payload.addons, []);
+    const list = Array.isArray(src) ? src : [];
+
+    addNew = list.filter((a) => !a._id && a.name).map(sanitizeNewAddon);
+    patches = list
+      .filter((a) => a._id && isValidId(a._id))
+      .map((a) => ({ _id: a._id, patch: sanitizePatchAddon(a) }));
+
+    // Hindari replace total array oleh findByIdAndUpdate
+    delete payload.addons;
   }
 
   // unique menu_code
@@ -311,25 +297,53 @@ exports.updateMenu = asyncHandler(async (req, res) => {
     }).lean();
     if (dup) throwError('Kode menu sudah digunakan', 409, 'menu_code');
   }
-  console.log('req.body.addons (after middleware):', req.body.addons);
-  console.log('payload.addons (after merge):', payload.addons);
 
+  // 1) Update field-field utama
   const updated = await Menu.findByIdAndUpdate(id, payload, {
     new: true,
     runValidators: true
   });
   if (!updated) throwError('Menu tidak ditemukan', 404);
 
-  // cleanup file lama
+  // 2) Patch addons by _id (positional $ via bulkWrite)
+  if (patches.length > 0) {
+    const bulk = patches
+      .filter((p) => Object.keys(p.patch).length > 0)
+      .map(({ _id, patch }) => {
+        const $set = {};
+        if (patch.name !== undefined) $set['addons.$.name'] = patch.name;
+        if (patch.price !== undefined) $set['addons.$.price'] = patch.price;
+        if (patch.isActive !== undefined)
+          $set['addons.$.isActive'] = patch.isActive;
+        return {
+          updateOne: {
+            filter: { _id: id, 'addons._id': _id },
+            update: { $set }
+          }
+        };
+      });
+    if (bulk.length > 0) {
+      await Menu.bulkWrite(bulk);
+    }
+  }
+
+  // 3) Tambah addons baru
+  if (addNew.length > 0) {
+    await Menu.updateOne({ _id: id }, { $push: { addons: { $each: addNew } } });
+  }
+
+  // 4) Cleanup file lama jika upload baru
   if (newFileId) {
     const oldId = extractDriveFileId(current.imageUrl);
     if (oldId) deleteFile(oldId).catch(() => {});
   }
 
-  res.json({ success: true, message: 'Menu diperbarui', menu: updated });
+  // 5) Return final doc
+  const finalDoc = await Menu.findById(id).lean({ virtuals: true });
+  res.json({ success: true, message: 'Menu diperbarui', menu: finalDoc });
 });
 
-/* ====================== DELETE ====================== */
+/* ========== DELETE MENU ========== */
 // DELETE /menu/remove/:id
 exports.deleteMenu = asyncHandler(async (req, res) => {
   const { id } = req.params;
@@ -352,6 +366,7 @@ exports.deleteMenu = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'Menu dihapus' });
 });
 
+/* ========== LIST MENUS ========== */
 exports.listMenus = asyncHandler(async (req, res) => {
   const page = Math.max(parseInt(req.query.page || '1', 10), 1);
   const limit = Math.min(
@@ -508,8 +523,6 @@ exports.listMenus = asyncHandler(async (req, res) => {
   });
 });
 
-/* ====================== GET BY ID ====================== */
-// GET /menu/:id
 exports.getMenuById = asyncHandler(async (req, res) => {
   const { id } = req.params;
   if (!isValidId(id)) throwError('ID tidak valid', 400);
@@ -523,7 +536,6 @@ exports.getMenuById = asyncHandler(async (req, res) => {
   res.json({ success: true, data: menu });
 });
 
-/* ====================== ACTIVATE/DEACTIVATE ====================== */
 exports.activateMenu = asyncHandler(async (req, res) => {
   const { id } = req.params;
   if (!isValidId(id)) throwError('ID tidak valid', 400);

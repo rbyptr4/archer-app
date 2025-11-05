@@ -14,7 +14,7 @@ const AddonSchema = new mongoose.Schema(
     },
     isActive: { type: Boolean, default: true }
   },
-  { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
+  { toJSON: { getters: true }, toObject: { getters: true } }
 );
 
 const PackageItemSchema = new mongoose.Schema(
