@@ -38,6 +38,17 @@ async function buildPackageItemsFromIds(items = []) {
   });
 }
 
+const normalizeAddons = (addons = []) => {
+  if (!Array.isArray(addons)) return [];
+  return addons
+    .map((a) => ({
+      name: String(a?.name || '').trim(),
+      price: Math.round(Number(a?.price || 0)),
+      isActive: typeof a?.isActive === 'boolean' ? a.isActive : true
+    }))
+    .filter((a) => a.name); // kosongin entry tanpa nama
+};
+
 /* ====================== CREATE ====================== */
 // POST /menu/create-menu
 exports.createMenu = asyncHandler(async (req, res) => {
@@ -120,7 +131,7 @@ exports.createMenu = asyncHandler(async (req, res) => {
           discountPercent: Number(price.discountPercent || 0),
           manualPromoPrice: Number(price.manualPromoPrice || 0)
         },
-        addons: Array.isArray(addons) ? addons : [],
+        addons: normalizeAddons(addons),
         packageItems: [],
         isActive: typeof isActive === 'boolean' ? isActive : true
       };
@@ -222,10 +233,13 @@ exports.updateMenu = asyncHandler(async (req, res) => {
     };
   }
 
-  // enforce non-package: packageItems harus kosong; addons tetap dipakai
   if (Array.isArray(payload.packageItems)) payload.packageItems = [];
-  if (!Array.isArray(payload.addons)) payload.addons = current.addons;
-  delete payload.packageBuilder; // kalau ada kiriman liar, dibuang
+
+  if (Array.isArray(payload.addons)) {
+    payload.addons = normalizeAddons(payload.addons);
+  } else {
+    payload.addons = current.addons;
+  }
 
   // unique menu_code
   if (payload.menu_code) {

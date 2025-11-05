@@ -11,7 +11,8 @@ const AddonSchema = new mongoose.Schema(
       default: 0,
       set: (v) => Math.round(Number(v || 0)),
       get: (v) => Math.round(Number(v || 0))
-    }
+    },
+    isActive: { type: Boolean, default: true }
   },
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
 );

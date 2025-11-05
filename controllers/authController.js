@@ -9,6 +9,129 @@ const generateTokens = require('../utils/generateToken');
 const parseRemember = require('../utils/parseRemember');
 const { baseCookie } = require('../utils/authCookies');
 
+const gateTtlMin = Math.max(
+  1,
+  parseInt(process.env.INTERNAL_GATE_TTL_MIN || '10', 10)
+);
+
+function signGateToken() {
+  return jwt.sign(
+    { kind: 'internal_gate' }, // minimal payload
+    process.env.INTERNAL_GATE_SECRET,
+    { expiresIn: `${gateTtlMin}m` }
+  );
+}
+
+function verifyGateToken(token) {
+  const p = jwt.verify(token, process.env.INTERNAL_GATE_SECRET);
+  if (p?.kind !== 'internal_gate') throw new Error('Invalid gate kind');
+  return p;
+}
+
+function requireInternalGate(req, res, next) {
+  const tok = req.cookies?.internalGate;
+  if (!tok) {
+    return res.status(403).json({ message: 'Access gate required' });
+  }
+  try {
+    verifyGateToken(tok);
+    return next();
+  } catch (_) {
+    return res
+      .clearCookie('internalGate', { ...baseCookie })
+      .status(403)
+      .json({ message: 'Access gate invalid/expired' });
+  }
+}
+
+/* =============== Shared login executor (reusable) =============== */
+async function performLogin(req, res) {
+  const { email, password } = req.body || {};
+  const remember = parseRemember(req);
+
+  if (!email || !password) throwError('email & password wajib diisi', 400);
+
+  const user = await User.findOne({ email }).select('+password');
+  if (!user) throwError('Email tidak ditemukan', 401);
+
+  const isValid = await bcrypt.compare(password, user.password);
+  if (!isValid) throwError('Password invalid', 401);
+
+  const { accessToken, refreshToken } = await generateTokens(user, {
+    remember
+  });
+
+  const refreshCookieOpts = remember
+    ? { ...baseCookie, maxAge: 7 * 24 * 60 * 60 * 1000 } // persistent 7d
+    : { ...baseCookie }; // session cookie
+
+  return res
+    .cookie('accessToken', accessToken, {
+      ...baseCookie,
+      maxAge: 30 * 60 * 1000
+    })
+    .cookie('refreshToken', refreshToken, refreshCookieOpts)
+    .json({
+      message: 'Login berhasil',
+      role: user.role,
+      accessExpiresInSec: 1800
+    });
+}
+
+/* ================= Access Gate Endpoints ================= */
+
+// POST /auth/internal/access/verify
+// body: { code: string }
+exports.verifyInternalAccess = asyncHandler(async (req, res) => {
+  const code = String(req.body?.code || '');
+  if (!code) throwError('Kode akses wajib diisi', 400);
+
+  const expected = String(process.env.INTERNAL_ACCESS_CODE || '');
+  if (!expected) throwError('Server belum dikonfigurasi', 500);
+
+  if (code !== expected) throwError('Kode akses salah', 401);
+
+  const gateToken = signGateToken();
+
+  return res
+    .cookie('internalGate', gateToken, {
+      ...baseCookie,
+      maxAge: gateTtlMin * 60 * 1000 // ms
+    })
+    .json({ message: 'Access granted', ttlMin: gateTtlMin });
+});
+
+// GET /auth/internal/access/check
+exports.checkInternalAccess = asyncHandler(async (req, res) => {
+  const tok = req.cookies?.internalGate;
+  if (!tok) return res.status(403).json({ ok: false, message: 'No gate' });
+  try {
+    verifyGateToken(tok);
+    return res.json({ ok: true });
+  } catch (_) {
+    return res
+      .clearCookie('internalGate', { ...baseCookie })
+      .status(403)
+      .json({ ok: false, message: 'Gate invalid/expired' });
+  }
+});
+
+// POST /auth/internal/access/revoke
+exports.revokeInternalAccess = asyncHandler(async (req, res) => {
+  return res
+    .clearCookie('internalGate', { ...baseCookie })
+    .json({ message: 'Access gate revoked' });
+});
+
+// POST /auth/internal/login   (protected by gate)
+exports.loginInternal = [
+  requireInternalGate,
+  asyncHandler(async (req, res) => {
+    // Reuse performLogin
+    return performLogin(req, res);
+  })
+];
+
 exports.login = asyncHandler(async (req, res) => {
   const { email, password } = req.body || {};
   const remember = parseRemember(req);

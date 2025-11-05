@@ -52,7 +52,7 @@ router.post(
   requirePageAccess('orders'),
   order.createPosDineIn
 );
-router.get(
+router.post(
   '/dine-in/cashier/preview',
   validateToken,
   requireRole('owner', 'employee'),
