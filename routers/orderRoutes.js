@@ -52,6 +52,13 @@ router.post(
   requirePageAccess('orders'),
   order.createPosDineIn
 );
+router.get(
+  '/dine-in/cashier/preview',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
+  order.previewPosOrder
+);
 
 router.get(
   '/list-order',

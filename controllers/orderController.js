@@ -1271,20 +1271,23 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     member_id,
     name,
     phone,
-    mark_paid = false,
-    payment_method = 'cash' // pos boleh cash/qris/transfer
+    payment_method
   } = req.body || {};
 
+  // ===== Validasi meja & item =====
   const tableNo = asInt(table_number, 0);
   if (!tableNo) throwError('table_number wajib', 400);
   if (!Array.isArray(items) || !items.length) throwError('items wajib', 400);
 
-  // Validasi metode di POS
+  // ===== Metode bayar POS (khusus) =====
+  const PM_POS = { CASH: 'cash', QRIS: 'qris', CARD: 'card' };
+  const ALLOWED_PM_POS = [PM_POS.CASH, PM_POS.QRIS, PM_POS.CARD];
   const method = String(payment_method || '').toLowerCase();
-  if (![PM.CASH, PM.QRIS, PM.BCA].includes(method)) {
-    throwError('payment_method POS tidak valid', 400);
+  if (!ALLOWED_PM_POS.includes(method)) {
+    throwError('payment_method POS tidak valid (cash|qris|card)', 400);
   }
 
+  // ===== Member / Guest =====
   let member = null;
   let customer_name = '';
   let customer_phone = '';
@@ -1293,14 +1296,13 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     if (!member_id && !(name && phone)) {
       throwError('as_member=true: sertakan member_id atau name+phone', 400);
     }
-
     if (member_id) {
       member = await Member.findById(member_id).lean();
       if (!member) throwError('Member tidak ditemukan', 404);
     } else {
       const normalizedPhone = normalizePhone(phone);
-      member = await Member.findOne({ phone: normalizedPhone }).lean();
-      if (!member) {
+      let existing = await Member.findOne({ phone: normalizedPhone }).lean();
+      if (!existing) {
         const created = await Member.create({
           name: String(name).trim(),
           phone: normalizedPhone,
@@ -1309,8 +1311,9 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           last_visit_at: new Date(),
           is_active: true
         });
-        member = created.toObject();
+        existing = created.toObject();
       }
+      member = existing;
     }
   } else {
     customer_name = String(name || '').trim();
@@ -1320,7 +1323,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     }
   }
 
-  // Build items & totals
+  // ===== Build items & subtotal (tanpa voucher/ongkir) =====
   const orderItems = [];
   let totalQty = 0;
   let itemsSubtotal = 0;
@@ -1329,9 +1332,9 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     const menu = await Menu.findById(it.menu_id).lean();
     if (!menu || !menu.isActive)
       throwError('Menu tidak ditemukan / tidak aktif', 404);
+
     const qty = clamp(asInt(it.quantity, 1), 1, 999);
     const normAddons = normalizeAddons(it.addons);
-
     const addonsTotal = normAddons.reduce(
       (s, a) => s + (a.price || 0) * (a.qty || 1),
       0
@@ -1354,12 +1357,25 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
         subId: menu.subcategory || null
       }
     });
+
     totalQty += qty;
     itemsSubtotal += line_subtotal;
   }
 
+  // ===== Pajak (PPN) & grand total =====
+  const rate = (() => {
+    const raw = Number(process.env.PPN_RATE ?? 0.11);
+    if (!Number.isFinite(raw)) return 0.11;
+    return raw > 1 ? raw / 100 : raw;
+  })();
+  const taxBase = itemsSubtotal; // POS: no voucher, no delivery
+  const taxAmount = Math.round(Math.max(0, taxBase * rate));
+  const taxRatePercent = Math.round(rate * 100 * 100) / 100; // 2 desimal
+  const grandTotal = taxBase + taxAmount;
+
   const now = new Date();
 
+  // ===== Create order (langsung verified) =====
   const order = await (async () => {
     for (let i = 0; i < 5; i++) {
       try {
@@ -1368,24 +1384,34 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           member: member ? member._id : null,
           customer_name,
           customer_phone,
+
           table_number: tableNo,
           source: 'pos',
           fulfillment_type: 'dine_in',
           transaction_code: code,
+
           items: orderItems,
           total_quantity: totalQty,
+
+          // totals (tanpa voucher/ongkir)
           items_subtotal: itemsSubtotal,
           items_discount: 0,
           delivery_fee: 0,
           shipping_discount: 0,
           discounts: [],
-          grand_total: itemsSubtotal,
+          grand_total: grandTotal,
+
+          // pajak
+          tax_rate_percent: taxRatePercent,
+          tax_amount: taxAmount,
+
+          // pembayaran: langsung verified
           payment_method: method,
-          payment_status:
-            method === PM.CASH ? 'verified' : mark_paid ? 'verified' : 'paid',
-          paid_at: mark_paid ? now : null,
-          verified_by: mark_paid ? req.user?.id || null : null,
-          verified_at: mark_paid ? now : null,
+          payment_status: 'verified',
+          paid_at: now,
+          verified_by: req.user?.id || null,
+          verified_at: now,
+
           status: 'created',
           placed_at: now
         });
@@ -1397,11 +1423,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     }
     throw new Error('Gagal generate transaction_code unik');
   })();
-
-  if (order.payment_status === 'paid') {
-    await awardPointsIfEligible(order, Member);
-    await logPaidHistory(order, req.user);
-  }
 
   const payload = {
     id: String(order._id),
@@ -1432,7 +1453,76 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
 
   res.status(201).json({
     order: { ...order.toObject(), transaction_code: order.transaction_code },
-    message: 'Order POS dine-in dibuat'
+    message: 'Order POS dine-in dibuat & langsung verified'
+  });
+});
+
+exports.previewPosOrder = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const { items } = req.body || {};
+  if (!Array.isArray(items) || items.length === 0)
+    throwError('items wajib', 400);
+
+  const orderItems = [];
+  let totalQty = 0;
+  let itemsSubtotal = 0;
+
+  for (const it of items) {
+    const menu = await Menu.findById(it.menu_id).lean();
+    if (!menu || !menu.isActive)
+      throwError('Menu tidak ditemukan / tidak aktif', 404);
+
+    const qty = clamp(asInt(it.quantity, 1), 1, 999);
+    const normAddons = normalizeAddons(it.addons);
+    const addonsTotal = normAddons.reduce(
+      (s, a) => s + (a.price || 0) * (a.qty || 1),
+      0
+    );
+    const unit = priceFinal(menu.price);
+    const line_subtotal = (unit + addonsTotal) * qty;
+
+    orderItems.push({
+      menu: menu._id,
+      menu_code: menu.menu_code || '',
+      name: menu.name,
+      imageUrl: menu.imageUrl || '',
+      base_price: unit,
+      quantity: qty,
+      addons: normAddons,
+      notes: String(it.notes || '').trim(),
+      line_subtotal,
+      category: {
+        big: menu.bigCategory || null,
+        subId: menu.subcategory || null
+      }
+    });
+
+    totalQty += qty;
+    itemsSubtotal += line_subtotal;
+  }
+
+  // Pajak (PPN) — sama rumusnya dengan createPosDineIn
+  const raw = Number(process.env.PPN_RATE ?? 0.11);
+  const rate = Number.isFinite(raw) ? (raw > 1 ? raw / 100 : raw) : 0.11;
+  const taxRatePercent = Math.round(rate * 100 * 100) / 100;
+  const taxBase = itemsSubtotal;
+  const taxAmount = Math.round(Math.max(0, taxBase * rate));
+  const grandTotal = taxBase + taxAmount;
+
+  res.json({
+    success: true,
+    preview: {
+      items: orderItems,
+      total_quantity: totalQty,
+      items_subtotal: itemsSubtotal,
+      items_discount: 0,
+      delivery_fee: 0,
+      shipping_discount: 0,
+      tax_rate_percent: taxRatePercent,
+      tax_amount: taxAmount,
+      grand_total: grandTotal
+    }
   });
 });
 

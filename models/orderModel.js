@@ -166,11 +166,7 @@ const orderSchema = new mongoose.Schema(
 
     payment_method: {
       type: String,
-      enum: ['qris', 'transfer', 'cash'],
-      default: function () {
-        // default aman: non-cash untuk non-POS, cash sering dipakai di POS
-        return this.source === 'pos' ? 'cash' : 'qris';
-      }
+      enum: ['qris', 'va', 'cash', 'card', 'ewallet']
     },
     payment_proof_url: { type: String, trim: true },
     payment_status: {
@@ -260,14 +256,17 @@ orderSchema.pre('validate', function (next) {
   }
 
   // ===== Payment rules (baru) =====
-  // 1) Delivery tidak boleh cash
-  if (this.fulfillment_type === 'delivery' && this.payment_method === 'cash') {
-    return next(new Error('Delivery tidak mendukung metode pembayaran cash.'));
+  if (this.fulfillment_type === 'delivery') {
+    const allowed = ['cash', 'card'];
+    if (!allowed.includes(this.payment_method)) {
+      return next(
+        new Error('Delivery hanya mendukung metode pembayaran cash atau card.')
+      );
+    }
   }
 
-  // 2) Bukti pembayaran TIDAK wajib (in-app pakai gateway + webhook)
-  if (this.payment_method === 'cash') {
-    this.payment_proof_url = ''; // cash tidak perlu bukti
+  if (this.payment_method === 'cash' || this.payment_method === 'card') {
+    this.payment_proof_url = ''; // tidak perlu bukti
   }
 
   // 3) Delivery data wajib
