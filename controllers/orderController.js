@@ -726,26 +726,25 @@ exports.checkout = asyncHandler(async (req, res) => {
     register_decision = 'register' // 'register' | 'skip'
   } = req.body || {};
 
-  // Resolve FT (self_order/QR selalu dine_in)
+  /* ===== Resolve fulfillment type ===== */
   const ft =
     iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
   if (!['dine_in', 'delivery'].includes(ft)) {
     throwError('fulfillment_type tidak valid', 400);
   }
 
-  // Validasi metode bayar
+  /* ===== Validasi metode bayar ===== */
   const method = String(payment_method || '').toLowerCase();
   if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method)) {
     throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
   }
-  const methodIsGateway = method === PM.QRIS || method === PM.BCA; // QRIS / transfer (VA)
-  const useGateway = true; // in-app: selalu pakai gateway utk qris/transfer
-  const needsProof = methodIsGateway && !useGateway; // akan selalu false utk qris/transfer
-  if (needsProof && !req.file?.buffer) {
-    throwError('Bukti pembayaran wajib dikirim untuk metode ini', 400);
-  }
 
-  // Keputusan: member vs guest (skip)
+  // Gateway = Xendit (QRIS / VA)
+  const methodIsGateway = method === PM.QRIS || method === PM.BCA;
+  const useGateway = true;
+  const needsProof = false; // tidak pernah upload bukti lagi
+
+  /* ===== Identitas member / guest ===== */
   const originallyLoggedIn = !!iden0.memberId;
   const wantRegister = String(register_decision || 'register') === 'register';
 
@@ -754,11 +753,9 @@ exports.checkout = asyncHandler(async (req, res) => {
   let customer_phone = '';
 
   if (originallyLoggedIn || wantRegister) {
-    // MEMBER FLOW
     const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
     member = await ensureMemberForCheckout(req, res, joinChannel);
   } else {
-    // GUEST FLOW (SKIP) → voucher dilarang
     customer_name = String(name || '').trim();
     customer_phone = String(phone || '').trim();
     if (!customer_name && !customer_phone) {
@@ -766,7 +763,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // Build identity untuk ambil cart (merge session→member kalau jadi member)
+  /* ===== Ambil cart aktif ===== */
   const iden = {
     ...iden0,
     memberId: member?._id || iden0.memberId || null,
@@ -777,16 +774,16 @@ exports.checkout = asyncHandler(async (req, res) => {
       null
   };
 
-  // Ambil cart aktif milik member/session pada source saat ini
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
   if (!cartObj) throwError('Cart tidak ditemukan / kosong', 404);
+
   const cart = await Cart.findById(cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan / kosong', 404);
   if (!cart.items?.length) throwError('Cart kosong', 400);
 
-  // Dine-in (self-order QR) wajib sudah ada table_number
+  // Dine-in QR wajib punya nomor meja
   if (
     ft === 'dine_in' &&
     (iden.source || 'online') === 'qr' &&
@@ -795,7 +792,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Silakan assign nomor meja terlebih dahulu', 400);
   }
 
-  // Idempotency via cart
+  /* ===== Idempotency (hindari double checkout) ===== */
   if (
     idempotency_key &&
     cart.last_idempotency_key === idempotency_key &&
@@ -808,29 +805,14 @@ exports.checkout = asyncHandler(async (req, res) => {
     });
   }
 
-  // Pastikan cart terikat member bila ada member
   if (member && !cart.member) {
     cart.member = member._id;
     cart.session_id = null;
   }
 
-  // Upload bukti bayar (jika perlu)
-  let payment_proof_url = '';
-  if (needsProof && req.file?.buffer && req.file?.mimetype) {
-    const folderId = getDriveFolder('invoice');
-    const uploaded = await uploadBuffer(
-      req.file.buffer,
-      `payment-${Date.now()}`,
-      req.file.mimetype,
-      folderId
-    );
-    payment_proof_url = `https://drive.google.com/uc?export=view&id=${uploaded.id}`;
-  }
-
-  // Delivery block & fee
+  /* ===== Delivery setup ===== */
   let delivery = undefined;
   let delivery_fee = 0;
-
   if (ft === 'delivery') {
     const latN = Number(lat),
       lngN = Number(lng);
@@ -838,8 +820,8 @@ exports.checkout = asyncHandler(async (req, res) => {
       throwError('Lokasi (lat,lng) wajib untuk delivery', 400);
     }
     const distance_km = haversineKm(CAFE_COORD, { lat: latN, lng: lngN });
-    if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0) + 1e-9) {
-      throwError(`Di luar radius ${DELIVERY_MAX_RADIUS_KM}km`, 400);
+    if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0)) {
+      throwError(`Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`, 400);
     }
     delivery_fee = calcDeliveryFee();
     delivery = {
@@ -852,14 +834,10 @@ exports.checkout = asyncHandler(async (req, res) => {
     };
   }
 
-  // Recompute cart
+  /* ===== Voucher pricing ===== */
   recomputeTotals(cart);
   await cart.save();
 
-  // ===== Voucher pricing (kini untuk dine_in & delivery) =====
-  // Aturan:
-  // - GUEST (skip) → voucher dilarang (paksa kosong).
-  // - MEMBER → cek kepemilikan & kadaluarsa.
   let eligibleClaimIds = [];
   if (member) {
     if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
@@ -873,27 +851,11 @@ exports.checkout = asyncHandler(async (req, res) => {
         .filter((c) => !c.validUntil || c.validUntil > now)
         .map((c) => String(c._id));
     }
-  } else {
-    if (voucherClaimIds?.length) {
-      throwError('Voucher hanya untuk member. Silakan daftar/login.', 400);
-    }
-    eligibleClaimIds = [];
+  } else if (voucherClaimIds?.length) {
+    throwError('Voucher hanya untuk member. Silakan daftar/login.', 400);
   }
 
-  let priced = {
-    totals: {
-      baseSubtotal: cart.total_price,
-      itemsDiscount: 0,
-      deliveryFee: delivery_fee,
-      shippingDiscount: 0,
-      grandTotal: cart.total_price + delivery_fee
-    },
-    breakdown: [],
-    chosenClaimIds: []
-  };
-
-  // Kini panggil engine juga untuk dine_in (deliveryFee=0 sudah di-set)
-  priced = await validateAndPrice({
+  let priced = await validateAndPrice({
     memberId: member ? member._id : null,
     cart: {
       items: cart.items.map((it) => ({
@@ -903,11 +865,12 @@ exports.checkout = asyncHandler(async (req, res) => {
         category: it.category || null
       }))
     },
-    fulfillmentType: ft, // -> jika engine mendukung, kalau tidak, aman diabaikan
+    fulfillmentType: ft,
     deliveryFee: delivery_fee,
     voucherClaimIds: eligibleClaimIds
   });
-  // === PPN (exclusive) ===
+
+  /* ===== PPN ===== */
   const PPN_RATE = Number(process.env.PPN_RATE ?? 0.11);
   const rate = PPN_RATE > 1 ? PPN_RATE / 100 : PPN_RATE;
   const taxBase =
@@ -917,20 +880,11 @@ exports.checkout = asyncHandler(async (req, res) => {
     priced.totals.shippingDiscount;
   const taxAmount = Math.round(Math.max(0, taxBase * rate));
   const taxRatePercent = Math.round(rate * 100 * 100) / 100;
-
-  // Update total akhir (tambahkan pajak)
   priced.totals.taxAmount = taxAmount;
   priced.totals.taxRatePercent = taxRatePercent;
-  priced.totals.grandTotal = Math.max(
-    0,
-    priced.totals.baseSubtotal -
-      priced.totals.itemsDiscount +
-      priced.totals.deliveryFee -
-      priced.totals.shippingDiscount +
-      taxAmount
-  );
+  priced.totals.grandTotal = taxBase + taxAmount;
 
-  // ===== Buat ORDER =====
+  /* ===== Buat Order ===== */
   const order = await (async () => {
     for (let i = 0; i < 5; i++) {
       try {
@@ -943,7 +897,6 @@ exports.checkout = asyncHandler(async (req, res) => {
           source: iden.source || 'online',
           fulfillment_type: ft,
           transaction_code: code,
-
           items: cart.items.map((it) => ({
             menu: it.menu,
             menu_code: it.menu_code,
@@ -957,7 +910,6 @@ exports.checkout = asyncHandler(async (req, res) => {
             category: it.category || null
           })),
           total_quantity: cart.total_quantity,
-
           delivery,
           items_subtotal: priced.totals.baseSubtotal,
           items_discount: priced.totals.itemsDiscount,
@@ -965,19 +917,16 @@ exports.checkout = asyncHandler(async (req, res) => {
           shipping_discount: priced.totals.shippingDiscount,
           discounts: priced.breakdown,
           grand_total: priced.totals.grandTotal,
-
           payment_method: method,
-          payment_status: methodIsGateway ? 'unpaid' : 'paid',
           payment_provider: methodIsGateway ? 'xendit' : null,
-
+          payment_status: methodIsGateway ? 'unpaid' : 'paid',
           tax_rate_percent: taxRatePercent,
           tax_amount: taxAmount,
-          grand_total: priced.totals.grandTotal,
           status: 'created',
           placed_at: new Date()
         });
       } catch (e) {
-        if (e && e.code === 11000 && /transaction_code/.test(String(e.message)))
+        if (e?.code === 11000 && /transaction_code/.test(String(e.message)))
           continue;
         throw e;
       }
@@ -985,7 +934,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     throw new Error('Gagal generate transaction_code unik');
   })();
 
-  // Konsumsi voucher claims (hanya chosenClaimIds)
+  /* ===== Konsumsi voucher ===== */
   if (member) {
     for (const claimId of priced.chosenClaimIds || []) {
       try {
@@ -1008,25 +957,21 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // Tandai cart selesai & kosongkan
-  await Cart.findByIdAndUpdate(
-    cart._id,
-    {
-      $set: {
-        status: 'checked_out',
-        checked_out_at: new Date(),
-        order_id: order._id,
-        last_idempotency_key: idempotency_key || null,
-        items: [],
-        total_items: 0,
-        total_quantity: 0,
-        total_price: 0
-      }
-    },
-    { new: true }
-  );
+  /* ===== Tandai cart selesai ===== */
+  await Cart.findByIdAndUpdate(cart._id, {
+    $set: {
+      status: 'checked_out',
+      checked_out_at: new Date(),
+      order_id: order._id,
+      last_idempotency_key: idempotency_key || null,
+      items: [],
+      total_items: 0,
+      total_quantity: 0,
+      total_price: 0
+    }
+  });
 
-  // Statistik member (jika ada)
+  /* ===== Statistik member ===== */
   if (member) {
     await Member.findByIdAndUpdate(member._id, {
       $inc: { total_spend: order.grand_total || 0 },
@@ -1034,7 +979,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     });
   }
 
-  // Emit realtime
+  /* ===== Emit realtime ===== */
   const payload = {
     id: String(order._id),
     transaction_code: order.transaction_code,
@@ -1059,11 +1004,9 @@ exports.checkout = asyncHandler(async (req, res) => {
     emitToTable(order.table_number, 'order:new', payload);
   }
 
+  /* ===== Response ke FE ===== */
   res.status(201).json({
-    order: {
-      ...order.toObject(),
-      transaction_code: order.transaction_code
-    },
+    order: { ...order.toObject(), transaction_code: order.transaction_code },
     totals: {
       items_subtotal: priced.totals.baseSubtotal,
       items_discount: priced.totals.itemsDiscount,
@@ -1075,11 +1018,10 @@ exports.checkout = asyncHandler(async (req, res) => {
     },
     message: methodIsGateway
       ? 'Checkout berhasil. Silakan lanjutkan pembayaran.'
-      : 'Checkout berhasil'
+      : 'Checkout berhasil (cash)'
   });
 });
 
-/* ===================== ASSIGN / CHANGE TABLE (self-order) ===================== */
 exports.assignTable = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
 

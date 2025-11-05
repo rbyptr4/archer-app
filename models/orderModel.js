@@ -247,7 +247,7 @@ orderSchema.pre('validate', function (next) {
     this.shipping_discount;
 
   const rate = parsePpnRate();
-  this.tax_rate_percent = Math.round(rate * 100 * 100) / 100; 
+  this.tax_rate_percent = Math.round(rate * 100 * 100) / 100;
   this.tax_amount = int(Math.max(0, taxBase * rate));
 
   // Grand total = base + pajak

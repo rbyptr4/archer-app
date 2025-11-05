@@ -200,7 +200,7 @@ exports.createVA = async (req, res, next) => {
  * ========================================================= */
 exports.createEwallet = async (req, res, next) => {
   try {
-    const { orderId, wallet = 'DANA', mobile = false } = req.body || {};
+    const { orderId, wallet, mobile = true } = req.body || {};
     if (!orderId) return res.status(400).json({ message: 'orderId wajib' });
 
     const WL = String(wallet || 'DANA').toUpperCase(); // DANA|OVO|SHOPEEPAY|GOPAY|LINKAJA
