@@ -7,14 +7,14 @@ const requirePageAccess = require('../utils/requirePageAccess');
 
 const authMemberRequired = require('../middlewares/authMember');
 
-const fileUploader = require('../utils/fileUploader');
+// const fileUploader = require('../utils/fileUploader');
 
-let parseFormData;
-try {
-  parseFormData = require('../middlewares/parseFormData');
-} catch {
-  parseFormData = (_req, _res, next) => next();
-}
+// let parseFormData;
+// try {
+//   parseFormData = require('../middlewares/parseFormData');
+// } catch {
+//   parseFormData = (_req, _res, next) => next();
+// }
 
 const order = require('../controllers/orderController');
 
@@ -27,12 +27,7 @@ router.post('/table', order.assignTable);
 router.patch('/change-table', order.changeTable);
 router.patch('/change-order-type', order.setFulfillmentType);
 router.get('/delivery/estimate', order.estimateDelivery);
-router.post(
-  '/checkout',
-  fileUploader.single('payment_proof'),
-  parseFormData,
-  order.checkout
-);
+router.post('/checkout', order.checkout);
 router.get(
   '/delivery-board',
   validateToken,
