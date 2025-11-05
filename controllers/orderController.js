@@ -63,6 +63,12 @@ const DELIVERY_ALLOWED = [
   'failed'
 ];
 
+function parsePpnRate() {
+  const raw = Number(process.env.PPN_RATE ?? 0.11); // default 11%
+  if (!Number.isFinite(raw)) return 0.11;
+  return raw > 1 ? raw / 100 : raw;
+}
+
 const normFt = (v) =>
   String(v).toLowerCase() === 'delivery' ? 'delivery' : 'dine_in';
 
@@ -732,9 +738,11 @@ exports.checkout = asyncHandler(async (req, res) => {
   if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method)) {
     throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
   }
-  const needsProof = method === PM.QRIS || method === PM.BCA;
+  const methodIsGateway = method === PM.QRIS || method === PM.BCA; // QRIS / transfer (VA)
+  const useGateway = true; // in-app: selalu pakai gateway utk qris/transfer
+  const needsProof = methodIsGateway && !useGateway; // akan selalu false utk qris/transfer
   if (needsProof && !req.file?.buffer) {
-    throwError('Bukti pembayaran wajib dikirim untuk QRIS/Transfer', 400);
+    throwError('Bukti pembayaran wajib dikirim untuk metode ini', 400);
   }
 
   // Keputusan: member vs guest (skip)
@@ -899,6 +907,28 @@ exports.checkout = asyncHandler(async (req, res) => {
     deliveryFee: delivery_fee,
     voucherClaimIds: eligibleClaimIds
   });
+  // === PPN (exclusive) ===
+  const PPN_RATE = Number(process.env.PPN_RATE ?? 0.11);
+  const rate = PPN_RATE > 1 ? PPN_RATE / 100 : PPN_RATE;
+  const taxBase =
+    priced.totals.baseSubtotal -
+    priced.totals.itemsDiscount +
+    priced.totals.deliveryFee -
+    priced.totals.shippingDiscount;
+  const taxAmount = Math.round(Math.max(0, taxBase * rate));
+  const taxRatePercent = Math.round(rate * 100 * 100) / 100;
+
+  // Update total akhir (tambahkan pajak)
+  priced.totals.taxAmount = taxAmount;
+  priced.totals.taxRatePercent = taxRatePercent;
+  priced.totals.grandTotal = Math.max(
+    0,
+    priced.totals.baseSubtotal -
+      priced.totals.itemsDiscount +
+      priced.totals.deliveryFee -
+      priced.totals.shippingDiscount +
+      taxAmount
+  );
 
   // ===== Buat ORDER =====
   const order = await (async () => {
@@ -937,8 +967,12 @@ exports.checkout = asyncHandler(async (req, res) => {
           grand_total: priced.totals.grandTotal,
 
           payment_method: method,
-          payment_proof_url,
-          payment_status: 'paid', // staff akan ubah ke 'verified'
+          payment_status: methodIsGateway ? 'unpaid' : 'paid',
+          payment_provider: methodIsGateway ? 'xendit' : null,
+
+          tax_rate_percent: taxRatePercent,
+          tax_amount: taxAmount,
+          grand_total: priced.totals.grandTotal,
           status: 'created',
           placed_at: new Date()
         });
@@ -1016,7 +1050,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     payment_status: order.payment_status,
     payment_method: order.payment_method,
     placed_at: order.placed_at,
-    payment_proof_url: order.payment_proof_url || '',
     delivery: order.delivery || null,
     table_number: order.table_number || null
   };
@@ -1027,8 +1060,22 @@ exports.checkout = asyncHandler(async (req, res) => {
   }
 
   res.status(201).json({
-    order: { ...order.toObject(), transaction_code: order.transaction_code },
-    message: 'Checkout berhasil'
+    order: {
+      ...order.toObject(),
+      transaction_code: order.transaction_code
+    },
+    totals: {
+      items_subtotal: priced.totals.baseSubtotal,
+      items_discount: priced.totals.itemsDiscount,
+      delivery_fee: priced.totals.deliveryFee,
+      shipping_discount: priced.totals.shippingDiscount,
+      tax_rate_percent: taxRatePercent,
+      tax_amount: taxAmount,
+      grand_total: priced.totals.grandTotal
+    },
+    message: methodIsGateway
+      ? 'Checkout berhasil. Silakan lanjutkan pembayaran.'
+      : 'Checkout berhasil'
   });
 });
 

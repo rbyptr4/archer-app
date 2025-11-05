@@ -152,6 +152,18 @@ const orderSchema = new mongoose.Schema(
     grand_total: { type: Number, min: 0, required: true, set: int, get: int },
 
     // ===== Payment (refactor: qris | transfer | cash) =====
+    // ===== Pajak (PPN) =====
+    tax_rate_percent: { type: Number, min: 0, max: 100, default: 0 }, // contoh: 11
+    tax_amount: { type: Number, min: 0, default: 0, set: int, get: int },
+
+    // ===== Payment via gateway (in-app) =====
+    payment_provider: { type: String, trim: true, default: null }, // 'xendit' | null
+    payment_invoice_id: { type: String, trim: true, default: '' }, // id sesi/invoice di gateway
+    payment_invoice_external_id: { type: String, trim: true, default: '' },
+    payment_invoice_url: { type: String, trim: true, default: '' }, // kalau channel butuh URL
+    payment_expires_at: { type: Date, default: null },
+    payment_raw_webhook: { type: mongoose.Schema.Types.Mixed, default: null },
+
     payment_method: {
       type: String,
       enum: ['qris', 'transfer', 'cash'],
@@ -163,7 +175,7 @@ const orderSchema = new mongoose.Schema(
     payment_proof_url: { type: String, trim: true },
     payment_status: {
       type: String,
-      enum: ['paid', 'verified', 'void'],
+      enum: ['unpaid', 'paid', 'verified', 'expired', 'failed', 'void'],
       index: true
     },
 
@@ -228,11 +240,18 @@ orderSchema.pre('validate', function (next) {
   this.items_discount = int(Math.max(0, this.items_discount || 0));
   this.shipping_discount = int(Math.max(0, this.shipping_discount || 0));
 
-  const gt =
+  const taxBase =
     this.items_subtotal -
     this.items_discount +
     this.delivery_fee -
     this.shipping_discount;
+
+  const rate = parsePpnRate();
+  this.tax_rate_percent = Math.round(rate * 100 * 100) / 100; 
+  this.tax_amount = int(Math.max(0, taxBase * rate));
+
+  // Grand total = base + pajak
+  const gt = taxBase + this.tax_amount;
   this.grand_total = int(Math.max(0, gt));
 
   // Dine-in via online => hapus table_number
@@ -246,16 +265,9 @@ orderSchema.pre('validate', function (next) {
     return next(new Error('Delivery tidak mendukung metode pembayaran cash.'));
   }
 
-  // 2) Bukti pembayaran wajib untuk non-cash (QRIS/Transfer)
-  const nonCash =
-    this.payment_method === 'qris' || this.payment_method === 'transfer';
-  if (nonCash) {
-    if (!this.payment_proof_url || !String(this.payment_proof_url).trim()) {
-      return next(new Error('Bukti pembayaran wajib untuk QRIS/Transfer.'));
-    }
-  } else {
-    // cash: pastikan field kosong agar konsisten
-    this.payment_proof_url = '';
+  // 2) Bukti pembayaran TIDAK wajib (in-app pakai gateway + webhook)
+  if (this.payment_method === 'cash') {
+    this.payment_proof_url = ''; // cash tidak perlu bukti
   }
 
   // 3) Delivery data wajib

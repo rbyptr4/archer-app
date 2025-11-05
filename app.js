@@ -21,6 +21,7 @@ const memberManagementRoutes = require('./routers/owner/memberManagementRoutes')
 const expenseRoutes = require('./routers/expenseRoutes');
 const closingShiftRoutes = require('./routers/closingShiftRoutes');
 const orderRoutes = require('./routers/orderRoutes'); // order list/detail/kitchen/pay/status/cancel (punyamu yg sudah dirapikan)
+const paymentRoutes = require('./routers/paymentRoutes');
 
 // Models (load sekali di awal)
 require('./models/orderModel');
@@ -60,7 +61,8 @@ app.use(
       'X-Table-Number',
       'X-Order-Source',
       'X-Device-Id',
-      'X-Fulfillment-Type'
+      'X-Fulfillment-Type',
+      'x-callback-token'
     ],
     credentials: true
   })
@@ -85,7 +87,7 @@ app.use('/member/voucher', voucherMemberRoutes);
 app.use('/voucher', voucherRoutes);
 app.use('/history', orderHistoryRoutes);
 app.use('/orders', orderRoutes);
-
+app.use('/payments', paymentRoutes);
 app.use(errorHandler);
 
 const server = http.createServer(app);
