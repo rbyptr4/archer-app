@@ -75,37 +75,32 @@ const mergeAddonsByName = (current = [], incoming = []) => {
   const inc = Array.isArray(incoming) ? incoming : parseMaybeJson(incoming, []);
   if (!Array.isArray(inc)) return current;
 
-  // Map patch by key: oldName (kalau ada) else name
   const incMap = new Map(
     inc
       .map((p) => ({
         key: String(p?.oldName || p?.name || '')
           .trim()
-          .toLowerCase(),
+          .toLowerCase(), // pakai oldName kalau ada
         name: String(p?.name || '').trim(), // nama baru (atau tetap)
         price: p?.price,
         isActive: p?.isActive
       }))
-      .filter((p) => p.key) // harus ada key referensi
+      .filter((p) => p.key)
       .map((p) => [p.key, p])
   );
 
-  const next = (current || []).map((cur) => {
+  return (current || []).map((cur) => {
     const curName = String(cur?.name || '').trim();
     const patch = incMap.get(curName.toLowerCase());
     if (!patch) return cur;
 
     const out = { ...cur };
-
-    // rename bila name baru ada & beda
     if (
       patch.name &&
-      patch.name.trim() &&
       patch.name.trim().toLowerCase() !== curName.toLowerCase()
     ) {
-      out.name = patch.name.trim();
+      out.name = patch.name.trim(); // rename
     }
-
     if (patch.price !== undefined) {
       out.price = Math.round(Number(patch.price || 0));
     }
@@ -114,8 +109,6 @@ const mergeAddonsByName = (current = [], incoming = []) => {
     }
     return out;
   });
-
-  return next;
 };
 
 /* ====================== CREATE ====================== */

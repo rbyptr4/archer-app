@@ -66,20 +66,18 @@ module.exports = (req, res, next) => {
       req.body.addons = req.body.addons
         .map((a) => {
           const name = String(a?.name || '').trim();
-          const oldName = String(a?.oldName || '').trim(); // opsional, utk rename
+          const oldName = String(a?.oldName || '').trim(); // <— penting utk rename
           const shaped = {
-            // pakai oldName sebagai key referensi kalau ada (rename case)
             ...(oldName ? { oldName } : {}),
-            name, // nama baru (atau tetap)
+            name,
             price: toInt(a?.price, 0)
           };
-          // isActive: hanya set kalau dikirim, supaya tidak menimpa tanpa sengaja
           if (Object.prototype.hasOwnProperty.call(a, 'isActive')) {
-            shaped.isActive = toBool(a.isActive, true);
+            shaped.isActive = toBool(a.isActive, true); // keep kalau dikirim
           }
           return shaped;
         })
-        .filter((a) => a.name || a.oldName); // minimal salah satu ada
+        .filter((a) => a.name || a.oldName); // minimal satu ada
     } else {
       req.body.addons = [];
     }
