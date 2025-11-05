@@ -38,17 +38,6 @@ async function buildPackageItemsFromIds(items = []) {
   });
 }
 
-const parseMaybeJson = (v, fallback) => {
-  if (Array.isArray(v) || typeof v === 'object') return v;
-  if (typeof v !== 'string') return fallback;
-  try {
-    const parsed = JSON.parse(v);
-    return parsed;
-  } catch {
-    return fallback;
-  }
-};
-
 const toBool = (v, def = true) => {
   if (typeof v === 'boolean') return v;
   if (typeof v === 'number') return v !== 0;
@@ -60,17 +49,60 @@ const toBool = (v, def = true) => {
   return def;
 };
 
-const normalizeAddons = (addons = []) => {
+const normalizeAddonsCreate = (addons = []) => {
   const src = Array.isArray(addons) ? addons : parseMaybeJson(addons, []);
   if (!Array.isArray(src)) return [];
-
   return src
     .map((a) => ({
       name: String(a?.name || '').trim(),
       price: Math.round(Number(a?.price || 0)),
-      isActive: toBool(a?.isActive, true)
+      isActive: toBool(a?.isActive, true) // default true kalau tidak dikirim
     }))
     .filter((a) => a.name);
+};
+
+const parseMaybeJson = (v, fallback) => {
+  if (Array.isArray(v) || (v && typeof v === 'object')) return v;
+  if (typeof v !== 'string') return fallback;
+  try {
+    return JSON.parse(v);
+  } catch {
+    return fallback;
+  }
+};
+
+const mergeAddonsByName = (current = [], incoming = []) => {
+  const inc = Array.isArray(incoming) ? incoming : parseMaybeJson(incoming, []);
+  if (!Array.isArray(inc)) return current;
+
+  const incMap = new Map(
+    inc
+      .map((a) => ({
+        name: String(a?.name || '').trim(),
+        price: a?.price,
+        isActive: a?.isActive
+      }))
+      .filter((a) => a.name)
+      .map((a) => [a.name.toLowerCase(), a])
+  );
+
+  return (current || []).map((c) => {
+    const key = String(c?.name || '').toLowerCase();
+    const patch = incMap.get(key);
+    if (!patch) return c;
+
+    return {
+      ...c,
+      price:
+        patch.price !== undefined
+          ? Math.round(Number(patch.price || 0))
+          : c.price,
+      isActive:
+        patch.isActive !== undefined
+          ? toBool(patch.isActive, c.isActive)
+          : c.isActive
+    };
+  });
 };
 
 /* ====================== CREATE ====================== */
@@ -155,7 +187,7 @@ exports.createMenu = asyncHandler(async (req, res) => {
           discountPercent: Number(price.discountPercent || 0),
           manualPromoPrice: Number(price.manualPromoPrice || 0)
         },
-        addons: normalizeAddons(addons),
+        addons: normalizeAddonsCreate(addons),
         packageItems: [],
         isActive: typeof isActive === 'boolean' ? isActive : true
       };
@@ -260,7 +292,7 @@ exports.updateMenu = asyncHandler(async (req, res) => {
   if (Array.isArray(payload.packageItems)) payload.packageItems = [];
 
   if (payload.addons !== undefined) {
-    payload.addons = normalizeAddons(payload.addons);
+    payload.addons = mergeAddonsByName(current.addons, payload.addons);
   } else {
     payload.addons = current.addons;
   }
