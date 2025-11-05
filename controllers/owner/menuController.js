@@ -38,17 +38,6 @@ async function buildPackageItemsFromIds(items = []) {
   });
 }
 
-const toBool = (v, def = true) => {
-  if (typeof v === 'boolean') return v;
-  if (typeof v === 'number') return v !== 0;
-  if (typeof v === 'string') {
-    const s = v.trim().toLowerCase();
-    if (['true', '1', 'yes', 'y', 'on'].includes(s)) return true;
-    if (['false', '0', 'no', 'n', 'off'].includes(s)) return false;
-  }
-  return def;
-};
-
 const normalizeAddonsCreate = (addons = []) => {
   const src = Array.isArray(addons) ? addons : parseMaybeJson(addons, []);
   if (!Array.isArray(src)) return [];
@@ -71,38 +60,62 @@ const parseMaybeJson = (v, fallback) => {
   }
 };
 
+const toBool = (v, def = true) => {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') return v !== 0;
+  if (typeof v === 'string') {
+    const s = v.trim().toLowerCase();
+    if (['true', '1', 'yes', 'y', 'on'].includes(s)) return true;
+    if (['false', '0', 'no', 'n', 'off'].includes(s)) return false;
+  }
+  return def;
+};
+
 const mergeAddonsByName = (current = [], incoming = []) => {
   const inc = Array.isArray(incoming) ? incoming : parseMaybeJson(incoming, []);
   if (!Array.isArray(inc)) return current;
 
+  // Map patch by key: oldName (kalau ada) else name
   const incMap = new Map(
     inc
-      .map((a) => ({
-        name: String(a?.name || '').trim(),
-        price: a?.price,
-        isActive: a?.isActive
+      .map((p) => ({
+        key: String(p?.oldName || p?.name || '')
+          .trim()
+          .toLowerCase(),
+        name: String(p?.name || '').trim(), // nama baru (atau tetap)
+        price: p?.price,
+        isActive: p?.isActive
       }))
-      .filter((a) => a.name)
-      .map((a) => [a.name.toLowerCase(), a])
+      .filter((p) => p.key) // harus ada key referensi
+      .map((p) => [p.key, p])
   );
 
-  return (current || []).map((c) => {
-    const key = String(c?.name || '').toLowerCase();
-    const patch = incMap.get(key);
-    if (!patch) return c;
+  const next = (current || []).map((cur) => {
+    const curName = String(cur?.name || '').trim();
+    const patch = incMap.get(curName.toLowerCase());
+    if (!patch) return cur;
 
-    return {
-      ...c,
-      price:
-        patch.price !== undefined
-          ? Math.round(Number(patch.price || 0))
-          : c.price,
-      isActive:
-        patch.isActive !== undefined
-          ? toBool(patch.isActive, c.isActive)
-          : c.isActive
-    };
+    const out = { ...cur };
+
+    // rename bila name baru ada & beda
+    if (
+      patch.name &&
+      patch.name.trim() &&
+      patch.name.trim().toLowerCase() !== curName.toLowerCase()
+    ) {
+      out.name = patch.name.trim();
+    }
+
+    if (patch.price !== undefined) {
+      out.price = Math.round(Number(patch.price || 0));
+    }
+    if (patch.isActive !== undefined) {
+      out.isActive = toBool(patch.isActive, cur.isActive);
+    }
+    return out;
   });
+
+  return next;
 };
 
 /* ====================== CREATE ====================== */

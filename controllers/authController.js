@@ -150,28 +150,35 @@ exports.revokeInternalAccess = asyncHandler(async (req, res) => {
     .json({ message: 'Access gate revoked' });
 });
 
-/* =============== Ganti kode akses (OWNER ONLY) =============== */
-// PUT /auth/internal/access/code  { currentCode, newCode }
 exports.updateInternalAccessCode = [
-  requireOwner, // pastikan ada auth middleware sebelum ini untuk set req.user
+  requireOwner,
   asyncHandler(async (req, res) => {
     const currentCode = String(req.body?.currentCode || '');
     const newCode = String(req.body?.newCode || '');
 
     if (!currentCode || !newCode)
-      throwError('currentCode & newCode wajib diisi', 400);
-    if (newCode.length < 4) throwError('newCode minimal 4 karakter', 400);
+      throwError('Kode akses & Kode akses baru wajib diisi', 400);
 
-    // validasi currentCode terhadap hash (DB atau fallback .env)
+    if (newCode.length < 4) throwError('Kode akses minimal 4 karakter', 400);
+
+    if (/\s/.test(newCode))
+      throwError('Kode akses tidak boleh mengandung spasi', 400);
+
+    // ✅ validasi currentCode terhadap hash (DB / fallback env)
     const ok = await checkAccessCodePlain(currentCode);
-    if (!ok) throwError('currentCode salah', 401);
+    if (!ok) throwError('Kode akses salah', 401);
 
+    // ❌ kode baru tidak boleh sama dengan kode lama
+    const sameAsOld = await checkAccessCodePlain(newCode);
+    if (sameAsOld)
+      throwError('Kode akses baru tidak boleh sama dengan kode saat ini', 400);
+
+    // simpan hash baru
     const salt = await bcrypt.genSalt(10);
     const newHash = await bcrypt.hash(newCode, salt);
-
     await AppSetting.set(ACCESS_CODE_KEY, newHash);
 
-    // Catatan: gate token yang sudah ada tetap valid s/d TTL habis.
+    // gate token yang sudah terbit tetap valid sampai TTL habis
     res.json({ message: 'Kode akses berhasil diperbarui' });
   })
 ];
