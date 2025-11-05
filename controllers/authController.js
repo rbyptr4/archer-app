@@ -300,11 +300,13 @@ exports.logout = asyncHandler(async (req, res) => {
     }
 
     res
+      .clearCookie('internalGate', { ...baseCookie })
       .clearCookie('accessToken', { ...baseCookie })
       .clearCookie('refreshToken', { ...baseCookie })
       .json({ message: 'Berhasil logout' });
   } catch (_) {
     res
+      .clearCookie('internalGate', { ...baseCookie })
       .clearCookie('accessToken', { ...baseCookie })
       .clearCookie('refreshToken', { ...baseCookie })
       .status(200)
