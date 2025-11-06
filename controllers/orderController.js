@@ -173,7 +173,6 @@ function needProof(method) {
   return method === PM.QRIS || method === PM.BCA;
 }
 
-/* =============== Mode Resolver (tanpa table number) =============== */
 exports.modeResolver = asyncHandler(async (req, _res, next) => {
   const ft = req.body?.fulfillment_type || req.query?.fulfillment_type;
   const headerSrc = String(req.headers['x-order-source'] || '').toLowerCase();
@@ -190,6 +189,12 @@ exports.modeResolver = asyncHandler(async (req, _res, next) => {
     source = 'qr';
   }
 
+  const tn = Number(req.body?.table_number ?? req.query?.table_number);
+  if (!Number.isNaN(tn) && tn > 0) {
+    mode = 'self_order';
+    source = 'qr';
+  }
+
   const sessionHeader =
     req.get('x-online-session') ||
     req.get('x-qr-session') ||
@@ -198,8 +203,8 @@ exports.modeResolver = asyncHandler(async (req, _res, next) => {
     req.body?.session_id ||
     null;
 
-  req.orderMode = mode; // 'self_order' | 'online'
-  req.orderSource = source; // 'qr' | 'online'
+  req.orderMode = mode;
+  req.orderSource = source;
   req.session_id = sessionHeader ? String(sessionHeader).trim() : null;
 
   next();
