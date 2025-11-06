@@ -571,17 +571,27 @@ exports.addAddon = asyncHandler(async (req, res) => {
 exports.batchUpdateAddons = asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  // Normalisasi: terima array atau single object, bahkan { items:[...] }
-  let items = asArray(req.body?.items ?? req.body);
+  // ===== Helpers =====
+  const asArray = (v) =>
+    Array.isArray(v) ? v : v && typeof v === 'object' ? [v] : [];
+  const asInt = (v, def = 0) => {
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) ? n : def;
+  };
+
+  let itemsRaw = req.body?.items ?? req.body?.addons ?? req.body;
+  let items = asArray(itemsRaw);
 
   if (!isValidId(id)) throwError('ID menu tidak valid', 400);
-  if (!items.length)
-    throwError('Payload tidak valid (harus objek addon atau array)', 400);
+  if (!items.length) {
+    throwError(
+      'Payload tidak valid (gunakan array langsung, atau {items:[...]} / {addons:[...]})',
+      400
+    );
+  }
 
-  // Bangun bulk ops per addon
   const ops = [];
   for (const a of items) {
-    // Validasi minimal: harus ada _id addon yang valid
     if (!a || !a._id || !isValidId(a._id)) continue;
 
     const patch = {};
@@ -592,10 +602,8 @@ exports.batchUpdateAddons = asyncHandler(async (req, res) => {
       hasChange = true;
     }
     if (a.price !== undefined) {
-      // Server-side guard: integer >= 0 (tanpa validasi FE)
       let p = asInt(a.price, 0);
       if (p < 0) p = 0;
-
       const MAX_PRICE = 50_000_000;
       if (p > MAX_PRICE) p = MAX_PRICE;
       patch['addons.$.price'] = p;
@@ -606,7 +614,6 @@ exports.batchUpdateAddons = asyncHandler(async (req, res) => {
       hasChange = true;
     }
 
-    // Kalau tidak ada field yang mau diubah, skip agar tidak bikin $set kosong
     if (!hasChange) continue;
 
     ops.push({
