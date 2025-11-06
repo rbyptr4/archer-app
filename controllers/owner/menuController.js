@@ -332,7 +332,7 @@ exports.deleteMenu = asyncHandler(async (req, res) => {
 });
 
 /* ========== LIST MENUS ========== */
-exports.listMenus = asyncHandler(async (req, res) => {
+exports.listMenuForMember = asyncHandler(async (req, res) => {
   const page = Math.max(parseInt(req.query.page || '1', 10), 1);
   const limit = Math.min(
     Math.max(parseInt(req.query.limit || '20', 10), 1),
@@ -457,6 +457,177 @@ exports.listMenus = asyncHandler(async (req, res) => {
   }
 
   // sorting biasa
+  const sort = {};
+  if (
+    [
+      'name',
+      'createdAt',
+      'updatedAt',
+      'price.original',
+      'isRecommended'
+    ].includes(sortBy)
+  ) {
+    sort[sortBy] = sortDir;
+  } else {
+    sort['name'] = 1;
+  }
+
+  const [items, total] = await Promise.all([
+    Menu.find(filter)
+      .sort(sort)
+      .skip(skip)
+      .limit(limit)
+      .lean({ virtuals: true }),
+    Menu.countDocuments(filter)
+  ]);
+
+  res.json({
+    success: true,
+    data: items,
+    paging: { page, limit, total, pages: Math.ceil(total / limit) || 1 }
+  });
+});
+
+exports.listMenus = asyncHandler(async (req, res) => {
+  const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+  const limit = Math.min(
+    Math.max(parseInt(req.query.limit || '20', 10), 1),
+    100
+  );
+
+  const isBackoffice =
+    !!req.user && ['owner', 'employee'].includes(req.user.role);
+  if (!isBackoffice) req.query.isActive = 'true';
+
+  const skip = (page - 1) * limit;
+  const q = (req.query.q || '').trim();
+  const big = (req.query.big || '').trim().toLowerCase();
+  const subId = (req.query.subId || '').trim();
+  const subName = (req.query.subName || '').trim();
+  const recommendedParam = (req.query.recommended || '').toLowerCase();
+
+  const sortBy = String(req.query.sortBy || 'name');
+  const sortDir =
+    String(req.query.sortDir || 'asc').toLowerCase() === 'desc' ? -1 : 1;
+
+  const isActiveParam = (req.query.isActive || '').toLowerCase();
+  const filter = {};
+
+  // ====== SEARCH (q) ======
+  if (q) {
+    filter.$or = [
+      { name: { $regex: q, $options: 'i' } },
+      { menu_code: { $regex: q, $options: 'i' } },
+      { description: { $regex: q, $options: 'i' } }
+    ];
+  }
+
+  // ====== EXCLUDE PACKAGE BY DEFAULT ======
+  // Simpan big yang valid (jika dikirim) di selectedBig agar bisa dipakai untuk lookup subName
+  let selectedBig = '';
+  if (big) {
+    if (!BIG_CATEGORIES.includes(big)) throwError('big tidak valid', 400);
+    if (big === 'package') {
+      // Endpoint ini khusus non-package
+      throwError('Endpoint ini hanya untuk menu non-package', 400, 'big');
+    }
+    selectedBig = big;
+    filter.bigCategory = selectedBig;
+  } else {
+    // Tidak memilih big => exclude package
+    filter.bigCategory = { $ne: 'package' };
+  }
+
+  // ====== FLAG-FLAG LAIN ======
+  if (recommendedParam === 'true') filter.isRecommended = true;
+  else if (recommendedParam === 'false') filter.isRecommended = false;
+
+  if (isActiveParam === 'true') filter.isActive = true;
+  else if (isActiveParam === 'false') filter.isActive = false;
+
+  // ====== SUBCATEGORY FILTER ======
+  if (subId) {
+    if (!isValidId(subId)) throwError('subId tidak valid', 400);
+    filter.subcategory = asId(subId);
+  } else if (subName) {
+    // Hanya batasi ke big tertentu kalau user memang pilih big (string),
+    // bukan saat filter.bigCategory = { $ne: 'package' }
+    const cond = { nameLower: subName.toLowerCase() };
+    if (selectedBig) cond.bigCategory = selectedBig;
+
+    const sub = await MenuSubcategory.findOne(cond).select('_id').lean();
+    if (!sub) {
+      return res.json({
+        success: true,
+        data: [],
+        paging: { page, limit, total: 0, pages: 1 }
+      });
+    }
+    filter.subcategory = sub._id;
+  }
+
+  // ====== SORTING ======
+  if (sortBy === 'price.final') {
+    const pipeline = [
+      { $match: filter },
+      {
+        $addFields: {
+          price_final: {
+            $switch: {
+              branches: [
+                {
+                  case: { $eq: ['$price.discountMode', 'manual'] },
+                  then: { $toInt: { $ifNull: ['$price.manualPromoPrice', 0] } }
+                },
+                {
+                  case: { $eq: ['$price.discountMode', 'percent'] },
+                  then: {
+                    $toInt: {
+                      $round: [
+                        {
+                          $multiply: [
+                            { $ifNull: ['$price.original', 0] },
+                            {
+                              $subtract: [
+                                1,
+                                {
+                                  $divide: [
+                                    { $ifNull: ['$price.discountPercent', 0] },
+                                    100
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        0
+                      ]
+                    }
+                  }
+                }
+              ],
+              default: { $toInt: { $ifNull: ['$price.original', 0] } }
+            }
+          }
+        }
+      },
+      { $sort: { price_final: sortDir, isRecommended: -1, name: 1, _id: 1 } },
+      { $skip: skip },
+      { $limit: limit }
+    ];
+
+    const [items, total] = await Promise.all([
+      Menu.aggregate(pipeline),
+      Menu.countDocuments(filter)
+    ]);
+
+    return res.json({
+      success: true,
+      data: items,
+      paging: { page, limit, total, pages: Math.ceil(total / limit) || 1 }
+    });
+  }
+
   const sort = {};
   if (
     [
