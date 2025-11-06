@@ -1,4 +1,3 @@
-// middlewares/coerceMultipartFields.js
 module.exports = (req, res, next) => {
   const parseMaybeJSON = (v, fallback) => {
     if (v == null) return fallback;
@@ -56,28 +55,6 @@ module.exports = (req, res, next) => {
         p.discountPercent = toInt(p.discountPercent, 0);
       if ('manualPromoPrice' in p)
         p.manualPromoPrice = toInt(p.manualPromoPrice, 0);
-    }
-  }
-
-  /* ===== Addons (JSON string -> array) ===== */
-  if ('addons' in req.body) {
-    req.body.addons = parseMaybeJSON(req.body.addons, []);
-    if (Array.isArray(req.body.addons)) {
-      req.body.addons = req.body.addons
-        .map((a) => {
-          const shaped = {
-            ...(a?._id ? { _id: String(a._id) } : {}),
-            name: String(a?.name || '').trim(),
-            price: toInt(a?.price, 0)
-          };
-          if (Object.prototype.hasOwnProperty.call(a, 'isActive')) {
-            shaped.isActive = toBool(a.isActive, true);
-          }
-          return shaped;
-        })
-        .filter((a) => a.name || a._id); // minimal ada _id atau name
-    } else {
-      req.body.addons = [];
     }
   }
 

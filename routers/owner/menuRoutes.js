@@ -19,8 +19,7 @@ router.use(validateToken);
 
 router.post(
   '/create-menu',
-  requireRole('owner', 'employee'), // role check dulu
-  requirePageAccess('menu'), // baru cek pages.menu
+  requireRole('owner'),
   imageUploader.single('menu-image'),
   parseFormData,
   validate(createMenuSchema),
@@ -29,14 +28,14 @@ router.post(
 
 router.get(
   '/list',
-  requireRole('owner', 'employee'), // misal member juga bisa lihat
+  requireRole('owner', 'employee'),
   requirePageAccess('menu'),
   menu.listMenus
 );
 
 router.get(
   '/sub-options',
-  requireRole('owner', 'employee'), // misal member juga bisa lihat
+  requireRole('owner', 'employee'),
   requirePageAccess('menu'),
   menu.subcategoryOptions
 );
@@ -45,20 +44,14 @@ router.get('/:id', requirePageAccess('menu'), menu.getMenuById);
 
 router.patch(
   '/update/:id',
-  requireRole('owner', 'employee'),
-  requirePageAccess('menu'),
+  requireRole('owner'),
   imageUploader.single('menu-image'),
   parseFormData,
   validate(updateMenuSchema),
   menu.updateMenu
 );
 
-router.delete(
-  '/remove/:id',
-  requireRole('owner'),
-  requirePageAccess('menu'),
-  menu.deleteMenu
-);
+router.delete('/remove/:id', requireRole('owner'), menu.deleteMenu);
 
 router.patch(
   '/:id/deactivate-menu',
@@ -70,5 +63,15 @@ router.patch(
   requirePageAccess('menu'),
   menu.activateMenu
 );
+
+router.post('/:id/create-addons', requireRole('owner'), menu.addAddon);
+router.patch(
+  '/:id/update-addons',
+  requireRole('owner'),
+  menu.batchUpdateAddons
+);
+router.delete('/:id/remove/:addonId', requireRole('owner'), menu.deleteAddon);
+
+// Tetap pertahankan PATCH /menu/:id untuk field non-addon
 
 module.exports = router;

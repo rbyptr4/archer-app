@@ -201,11 +201,12 @@ exports.updateMenu = asyncHandler(async (req, res) => {
   let newFileId = null;
   const payload = { ...req.body };
 
+  // Hanya untuk non-package
   if (payload.bigCategory && String(payload.bigCategory) === 'package') {
     throwError('Endpoint ini hanya untuk menu non-package', 400, 'bigCategory');
   }
 
-  // Upload image (opsional)
+  /* ===== Upload image (opsional) ===== */
   if (req.file) {
     const folderId = getDriveFolder('menu');
     const finalCode = String(
@@ -218,6 +219,7 @@ exports.updateMenu = asyncHandler(async (req, res) => {
       req.file.originalname,
       req.file.mimetype
     );
+
     const uploaded = await uploadBuffer(
       req.file.buffer,
       desiredName,
@@ -228,9 +230,10 @@ exports.updateMenu = asyncHandler(async (req, res) => {
     payload.imageUrl = `https://drive.google.com/uc?export=view&id=${newFileId}`;
   }
 
-  // normalize & guards
+  /* ===== Normalisasi dan validasi dasar ===== */
   if (payload.menu_code)
     payload.menu_code = String(payload.menu_code).toUpperCase();
+
   if (
     payload.bigCategory &&
     !BIG_CATEGORIES.includes(String(payload.bigCategory))
@@ -249,11 +252,10 @@ exports.updateMenu = asyncHandler(async (req, res) => {
     }
     payload.subcategory = sub._id;
   } else if (payload.bigCategory && nextBig !== String(current.bigCategory)) {
-    // Jika bigCategory berubah dan subcategory tidak dikirim ulang → kosongkan agar aman
-    payload.subcategory = null;
+    payload.subcategory = null; // reset jika category berubah
   }
 
-  // price rebuild bila dikirim
+  /* ===== Price rebuild bila dikirim ===== */
   if (payload.price) {
     payload.price = {
       original: Number(payload.price.original ?? current.price?.original ?? 0),
@@ -268,28 +270,13 @@ exports.updateMenu = asyncHandler(async (req, res) => {
     };
   }
 
-  // Enforce non-package
-  if (Array.isArray(payload.packageItems)) payload.packageItems = [];
+  // pastikan packageItems tidak ikut diubah dari endpoint ini
+  if (Array.isArray(payload.packageItems)) delete payload.packageItems;
 
-  /* ====== ADDONS UPDATE BY _id ====== */
-  let addNew = [];
-  let patches = [];
-  if (payload.addons !== undefined) {
-    const src = Array.isArray(payload.addons)
-      ? payload.addons
-      : parseMaybeJson(payload.addons, []);
-    const list = Array.isArray(src) ? src : [];
+  // addons juga diabaikan di endpoint ini
+  if (payload.addons !== undefined) delete payload.addons;
 
-    addNew = list.filter((a) => !a._id && a.name).map(sanitizeNewAddon);
-    patches = list
-      .filter((a) => a._id && isValidId(a._id))
-      .map((a) => ({ _id: a._id, patch: sanitizePatchAddon(a) }));
-
-    // Hindari replace total array oleh findByIdAndUpdate
-    delete payload.addons;
-  }
-
-  // unique menu_code
+  /* ===== Validasi duplikat kode menu ===== */
   if (payload.menu_code) {
     const dup = await Menu.findOne({
       menu_code: payload.menu_code,
@@ -298,47 +285,20 @@ exports.updateMenu = asyncHandler(async (req, res) => {
     if (dup) throwError('Kode menu sudah digunakan', 409, 'menu_code');
   }
 
-  // 1) Update field-field utama
+  /* ===== Update dokumen utama ===== */
   const updated = await Menu.findByIdAndUpdate(id, payload, {
     new: true,
     runValidators: true
   });
   if (!updated) throwError('Menu tidak ditemukan', 404);
 
-  // 2) Patch addons by _id (positional $ via bulkWrite)
-  if (patches.length > 0) {
-    const bulk = patches
-      .filter((p) => Object.keys(p.patch).length > 0)
-      .map(({ _id, patch }) => {
-        const $set = {};
-        if (patch.name !== undefined) $set['addons.$.name'] = patch.name;
-        if (patch.price !== undefined) $set['addons.$.price'] = patch.price;
-        if (patch.isActive !== undefined)
-          $set['addons.$.isActive'] = patch.isActive;
-        return {
-          updateOne: {
-            filter: { _id: id, 'addons._id': _id },
-            update: { $set }
-          }
-        };
-      });
-    if (bulk.length > 0) {
-      await Menu.bulkWrite(bulk);
-    }
-  }
-
-  // 3) Tambah addons baru
-  if (addNew.length > 0) {
-    await Menu.updateOne({ _id: id }, { $push: { addons: { $each: addNew } } });
-  }
-
-  // 4) Cleanup file lama jika upload baru
+  /* ===== Bersihkan file lama jika ada upload baru ===== */
   if (newFileId) {
     const oldId = extractDriveFileId(current.imageUrl);
     if (oldId) deleteFile(oldId).catch(() => {});
   }
 
-  // 5) Return final doc
+  /* ===== Kembalikan dokumen akhir ===== */
   const finalDoc = await Menu.findById(id).lean({ virtuals: true });
   res.json({ success: true, message: 'Menu diperbarui', menu: finalDoc });
 });
@@ -582,4 +542,73 @@ exports.subcategoryOptions = asyncHandler(async (req, res) => {
     .lean();
 
   res.json({ success: true, data: items });
+});
+
+// POST /menu/:id/addons
+exports.addAddon = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { name, price, isActive } = req.body || {};
+  if (!isValidId(id)) throwError('ID tidak valid', 400);
+  const addon = {
+    name: String(name || '').trim(),
+    price: Math.round(Number(price || 0)),
+    isActive: isActive === undefined ? true : toBool(isActive, true)
+  };
+  if (!addon.name) throwError('Nama addon wajib diisi', 400);
+
+  await Menu.updateOne({ _id: id }, { $push: { addons: addon } });
+  const after = await Menu.findById(id).select('addons').lean();
+  res
+    .status(201)
+    .json({ success: true, message: 'Addon ditambahkan', data: after.addons });
+});
+
+// PATCH /menu/:id/addons/batch
+// body: [ { _id, name?, price?, isActive? }, ... ]
+exports.batchUpdateAddons = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const items = Array.isArray(req.body) ? req.body : [];
+  if (!isValidId(id) || items.length === 0)
+    throwError('Payload tidak valid', 400);
+
+  // Build bulk ops per addon
+  const ops = items
+    .filter((a) => a._id && isValidId(a._id))
+    .map((a) => {
+      const patch = {};
+      if (a.name !== undefined) patch['addons.$.name'] = String(a.name).trim();
+      if (a.price !== undefined)
+        patch['addons.$.price'] = Math.round(Number(a.price || 0));
+      if (a.isActive !== undefined)
+        patch['addons.$.isActive'] = toBool(a.isActive, false);
+      return {
+        updateOne: {
+          filter: { _id: id, 'addons._id': a._id },
+          update: { $set: patch }
+        }
+      };
+    });
+
+  if (ops.length === 0) throwError('Tidak ada data valid', 400);
+
+  await Menu.bulkWrite(ops);
+  const menu = await Menu.findById(id).select('addons').lean();
+
+  res.json({
+    success: true,
+    message: 'Beberapa addon berhasil diupdate',
+    data: menu.addons
+  });
+});
+
+// DELETE /menu/:id/addons/:addonId
+exports.deleteAddon = asyncHandler(async (req, res) => {
+  const { id, addonId } = req.params;
+  if (!isValidId(id) || !isValidId(addonId)) throwError('ID tidak valid', 400);
+  const r = await Menu.updateOne(
+    { _id: id },
+    { $pull: { addons: { _id: addonId } } }
+  );
+  if (r.modifiedCount === 0) throwError('Menu/addon tidak ditemukan', 404);
+  res.json({ success: true, message: 'Addon dihapus' });
 });
