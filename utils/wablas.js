@@ -25,7 +25,9 @@ async function sendOtpText(phone, code) {
   🔐 Kode OTP Archers : *${code}*
 
 _Jangan bagikan kode ini ke siapa pun._
-_Berlaku 5 menit._
+_Berlaku 5 menit.
+
+_
 `;
   const res = await axios.get(`${BASE}/send-message`, {
     params: { phone, message, token: AUTH },

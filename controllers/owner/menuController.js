@@ -15,7 +15,12 @@ const { extractDriveFileId } = require('../../utils/driveFileId');
 const asId = (x) => new mongoose.Types.ObjectId(String(x));
 const isValidId = (v) => mongoose.Types.ObjectId.isValid(String(v));
 const toInt = (v, d = 0) => (Number.isFinite(+v) ? Math.trunc(+v) : d);
-
+const asArray = (v) =>
+  Array.isArray(v) ? v : v && typeof v === 'object' ? [v] : [];
+const asInt = (v, def = 0) => {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) ? n : def;
+};
 const parseMaybeJson = (v, fallback) => {
   if (Array.isArray(v) || (v && typeof v === 'object')) return v;
   if (typeof v !== 'string') return fallback;
@@ -563,41 +568,66 @@ exports.addAddon = asyncHandler(async (req, res) => {
     .json({ success: true, message: 'Addon ditambahkan', data: after.addons });
 });
 
-// PATCH /menu/:id/addons/batch
-// body: [ { _id, name?, price?, isActive? }, ... ]
 exports.batchUpdateAddons = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const items = Array.isArray(req.body) ? req.body : [];
-  if (!isValidId(id) || items.length === 0)
-    throwError('Payload tidak valid', 400);
 
-  // Build bulk ops per addon
-  const ops = items
-    .filter((a) => a._id && isValidId(a._id))
-    .map((a) => {
-      const patch = {};
-      if (a.name !== undefined) patch['addons.$.name'] = String(a.name).trim();
-      if (a.price !== undefined)
-        patch['addons.$.price'] = Math.round(Number(a.price || 0));
-      if (a.isActive !== undefined)
-        patch['addons.$.isActive'] = toBool(a.isActive, false);
-      return {
-        updateOne: {
-          filter: { _id: id, 'addons._id': a._id },
-          update: { $set: patch }
-        }
-      };
+  // Normalisasi: terima array atau single object, bahkan { items:[...] }
+  let items = asArray(req.body?.items ?? req.body);
+
+  if (!isValidId(id)) throwError('ID menu tidak valid', 400);
+  if (!items.length)
+    throwError('Payload tidak valid (harus objek addon atau array)', 400);
+
+  // Bangun bulk ops per addon
+  const ops = [];
+  for (const a of items) {
+    // Validasi minimal: harus ada _id addon yang valid
+    if (!a || !a._id || !isValidId(a._id)) continue;
+
+    const patch = {};
+    let hasChange = false;
+
+    if (a.name !== undefined) {
+      patch['addons.$.name'] = String(a.name ?? '').trim();
+      hasChange = true;
+    }
+    if (a.price !== undefined) {
+      // Server-side guard: integer >= 0 (tanpa validasi FE)
+      let p = asInt(a.price, 0);
+      if (p < 0) p = 0;
+
+      const MAX_PRICE = 50_000_000;
+      if (p > MAX_PRICE) p = MAX_PRICE;
+      patch['addons.$.price'] = p;
+      hasChange = true;
+    }
+    if (a.isActive !== undefined) {
+      patch['addons.$.isActive'] = toBool(a.isActive, true);
+      hasChange = true;
+    }
+
+    // Kalau tidak ada field yang mau diubah, skip agar tidak bikin $set kosong
+    if (!hasChange) continue;
+
+    ops.push({
+      updateOne: {
+        filter: { _id: id, 'addons._id': a._id },
+        update: { $set: patch }
+      }
     });
+  }
 
-  if (ops.length === 0) throwError('Tidak ada data valid', 400);
+  if (!ops.length) {
+    throwError('Tidak ada data addon valid untuk diupdate', 400);
+  }
 
   await Menu.bulkWrite(ops);
   const menu = await Menu.findById(id).select('addons').lean();
 
   res.json({
     success: true,
-    message: 'Beberapa addon berhasil diupdate',
-    data: menu.addons
+    message: `Beberapa addon berhasil diupdate (${ops.length} perubahan)`,
+    data: menu?.addons || []
   });
 });
 

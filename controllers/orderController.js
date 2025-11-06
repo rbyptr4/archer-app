@@ -1614,7 +1614,13 @@ exports.assignDelivery = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
   const { courier_id, courier_name, courier_phone, note } = req.body || {};
-  const order = await Order.findById(req.params.id);
+  const id = req.params.id;
+
+  // Ambil minimal field untuk validasi status
+  const order = await Order.findById(
+    id,
+    'fulfillment_type status payment_status member transaction_code'
+  );
   if (!order) throwError('Order tidak ditemukan', 404);
 
   if (order.fulfillment_type !== 'delivery') {
@@ -1624,44 +1630,45 @@ exports.assignDelivery = asyncHandler(async (req, res) => {
     throwError('Order belum layak dikirim (harus paid & tidak cancelled)', 409);
   }
 
-  if (!order.delivery) {
-    order.delivery = {
-      status: 'pending',
-      address_text: order.delivery?.address_text || '',
-      location: order.delivery?.location || null,
-      distance_km: order.delivery?.distance_km || null,
-      delivery_fee: order.delivery?.delivery_fee || 0,
-      note_to_rider: order.delivery?.note_to_rider || ''
-    };
-  }
-
-  order.delivery.courier = {
-    id: courier_id || null,
-    name: (courier_name || '').trim(),
-    phone: (courier_phone || '').trim()
+  const now = new Date();
+  const $set = {
+    'delivery.status': 'assigned',
+    'delivery.courier': {
+      id: courier_id || null,
+      name: String(courier_name || '').trim(),
+      phone: toWa62(courier_phone)
+    },
+    'delivery.assigned_at': now
   };
-  order.delivery.status = 'assigned';
-  order.delivery.assigned_at = new Date();
-  if (note) order.delivery.assign_note = String(note).trim();
+  if (note) $set['delivery.assign_note'] = String(note).trim();
 
-  await order.save();
+  const updated = await Order.findByIdAndUpdate(
+    id,
+    { $set },
+    {
+      new: true,
+      runValidators: false // kita hanya set field delivery; hindari validator global yang mungkin bergantung pada pricing
+    }
+  );
 
+  // Payload notifikasi
   const payload = {
-    id: String(order._id),
-    transaction_code: order.transaction_code,
+    id: String(updated._id),
+    transaction_code: updated.transaction_code,
     delivery: {
-      status: order.delivery.status,
-      courier: order.delivery.courier,
-      assigned_at: order.delivery.assigned_at
+      status: updated.delivery?.status,
+      courier: updated.delivery?.courier,
+      assigned_at: updated.delivery?.assigned_at
     }
   };
+
   emitToStaff('order:delivery_assigned', payload);
-  if (order.member)
-    emitToMember(order.member, 'order:delivery_assigned', payload);
+  if (updated.member)
+    emitToMember(updated.member, 'order:delivery_assigned', payload);
 
   res.status(200).json({
     message: 'Kurir berhasil di-assign',
-    order: order.toObject()
+    order: updated.toObject()
   });
 });
 
