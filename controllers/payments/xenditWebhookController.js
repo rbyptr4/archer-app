@@ -11,33 +11,48 @@ const {
 
 exports.xenditQrisWebhook = async (req, res) => {
   try {
-    const ev = req.body;
+    // === Parser aman ===
+    let ev;
+    if (typeof req.body === 'string') {
+      try {
+        ev = JSON.parse(req.body);
+      } catch {
+        console.warn('[Webhook] gagal parse body string');
+        return res.status(400).json({ message: 'Invalid JSON' });
+      }
+    } else {
+      ev = req.body || {};
+    }
 
-    // Sesuaikan field status dari Xendit QRIS
+    // Kirim dulu response biar Xendit gak retry
+    res.json({ received: true });
+
+    // ====== Logika di bawah ini asinkron ======
     const reference_id = ev?.data?.reference_id || ev?.reference_id;
     const status = ev?.data?.status || ev?.status;
-
-    if (!reference_id) return res.status(400).end();
+    if (!reference_id) {
+      console.warn('[Webhook] Missing reference_id');
+      return;
+    }
 
     const session = await PaymentSession.findOne({
       external_id: reference_id
     });
-    if (!session) return res.status(404).end();
-
-    // Kalau sudah punya order, jangan double create
-    if (session.order) {
-      return res.status(200).end();
+    if (!session) {
+      console.warn('[Webhook] Session not found for', reference_id);
+      return;
     }
 
-    if (status !== 'COMPLETED' && status !== 'SUCCEEDED' && status !== 'PAID') {
-      // Bisa handle expired/failed di sini
-      // session.status = 'failed' / 'expired'; await session.save();
-      return res.status(200).end();
+    // Hindari double order
+    if (session.order) return;
+
+    const paidStatuses = ['COMPLETED', 'SUCCEEDED', 'PAID'];
+    if (!paidStatuses.includes(String(status).toUpperCase())) {
+      return;
     }
 
     // ===== Create Order dari snapshot =====
     const code = await nextDailyTxCode('ARCH');
-
     const order = await Order.create({
       member: session.member || null,
       customer_name: session.customer_name,
@@ -48,7 +63,6 @@ exports.xenditQrisWebhook = async (req, res) => {
       transaction_code: code,
 
       items: session.items,
-      // totals komponen, biar hook pre('validate') hitung lengkap
       items_subtotal: session.items_subtotal,
       delivery_fee: session.delivery_fee,
       service_fee: session.service_fee,
@@ -73,13 +87,8 @@ exports.xenditQrisWebhook = async (req, res) => {
     session.order = order._id;
     await session.save();
 
-    // Konsumsi voucher kalau kamu simpan claimIds di session.discounts metadata
-    // (bisa kamu extend sendiri)
-
-    // Award loyalty poin
     await awardPointsIfEligible(order, require('../models/memberModel'));
 
-    // Emit realtime dsb
     const payload = {
       id: String(order._id),
       transaction_code: order.transaction_code,
@@ -93,10 +102,11 @@ exports.xenditQrisWebhook = async (req, res) => {
     if (order.member) emitToMember(order.member, 'order:new', payload);
     if (order.table_number)
       emitToTable(order.table_number, 'order:new', payload);
-
-    return res.status(200).end();
   } catch (e) {
     console.error('[xendit webhook] error', e);
-    return res.status(500).end();
+    // tetap 200 supaya Xendit tidak retry
+    try {
+      res.status(200).json({ received: true });
+    } catch {}
   }
 };
