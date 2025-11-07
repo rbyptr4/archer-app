@@ -1,0 +1,236 @@
+// controllers/paymentController.js (misah dari orderController biar bersih)
+const axios = require('axios');
+const PaymentSession = require('../models/paymentSessionModel');
+const Cart = require('../models/cartModel');
+
+const { validateAndPrice } = require('../utils/voucherEngine');
+const { haversineKm } = require('../utils/distance');
+const { SERVICE_FEE_RATE, int } = require('../utils/money');
+
+const X_BASE = process.env.XENDIT_BASE_URL;
+const X_KEY = process.env.XENDIT_SECRET_KEY;
+const HDRS = { 'Content-Type': 'application/json' };
+
+const calcDeliveryFee = () =>
+  Number(DELIVERY_FLAT_FEE ?? process.env.DELIVERY_FLAT_FEE ?? 5000);
+
+const getIdentity = (req) => {
+  const memberId = req.member?.id || null;
+  const session_id =
+    req.session_id ||
+    req.cookies?.[DEVICE_COOKIE] ||
+    req.header('x-device-id') ||
+    null;
+
+  return {
+    mode: req.orderMode,
+    source: req.orderSource,
+    memberId,
+    session_id,
+    table_number: req.table_number || null
+  };
+};
+
+exports.createQrisFromCart = async (req, res, next) => {
+  try {
+    const iden0 = getIdentity(req);
+    const {
+      fulfillment_type,
+      address_text,
+      lat,
+      lng,
+      note_to_rider,
+      voucherClaimIds = []
+    } = req.body || {};
+
+    const ft =
+      iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
+    if (!['dine_in', 'delivery'].includes(ft)) {
+      return res.status(400).json({ message: 'fulfillment_type tidak valid' });
+    }
+
+    // 1) Ambil cart aktif
+    const iden = {
+      ...iden0,
+      session_id:
+        iden0.session_id ||
+        req.cookies?.[DEVICE_COOKIE] ||
+        req.header('x-device-id') ||
+        null
+    };
+
+    const cartObj = await getActiveCartForIdentity(iden, {
+      allowCreateOnline: false
+    });
+    if (!cartObj) {
+      return res.status(404).json({ message: 'Cart tidak ditemukan / kosong' });
+    }
+
+    const cart = await Cart.findById(cartObj._id);
+    if (!cart || !cart.items?.length) {
+      return res.status(404).json({ message: 'Cart kosong' });
+    }
+
+    // 2) Setup delivery (kalau perlu)
+    let delivery_fee = 0;
+    let deliverySnapshot = undefined;
+    if (ft === 'delivery') {
+      const latN = Number(lat),
+        lngN = Number(lng);
+      if (!Number.isFinite(latN) || !Number.isFinite(lngN)) {
+        return res
+          .status(400)
+          .json({ message: 'Lokasi (lat,lng) wajib untuk delivery' });
+      }
+      const distance_km = haversineKm(CAFE_COORD, { lat: latN, lng: lngN });
+      if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0)) {
+        return res.status(400).json({
+          message: `Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`
+        });
+      }
+      delivery_fee = calcDeliveryFee();
+      deliverySnapshot = {
+        address_text: String(address_text || '').trim(),
+        location: { lat: latN, lng: lngN },
+        distance_km: Number(distance_km.toFixed(2)),
+        delivery_fee,
+        note_to_rider: String(note_to_rider || ''),
+        status: 'pending'
+      };
+    }
+
+    // 3) Hitung ulang cart
+    recomputeTotals(cart);
+    await cart.save();
+
+    // 4) Voucher (kalau member)
+    let memberId = iden0.memberId || null;
+    let eligibleClaimIds = [];
+    if (memberId && Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
+      const rawClaims = await VoucherClaim.find({
+        _id: { $in: voucherClaimIds },
+        member: memberId,
+        status: 'claimed'
+      }).lean();
+      const now = new Date();
+      eligibleClaimIds = rawClaims
+        .filter((c) => !c.validUntil || c.validUntil > now)
+        .map((c) => String(c._id));
+    }
+
+    const priced = await validateAndPrice({
+      memberId,
+      cart: {
+        items: cart.items.map((it) => ({
+          menuId: it.menu,
+          qty: it.quantity,
+          price: it.base_price,
+          category: it.category || null
+        }))
+      },
+      fulfillmentType: ft,
+      deliveryFee: delivery_fee,
+      voucherClaimIds: eligibleClaimIds
+    });
+
+    const items_subtotal = int(priced.totals.baseSubtotal);
+    const items_discount = int(priced.totals.itemsDiscount);
+    const shipping_discount = int(priced.totals.shippingDiscount);
+    const baseDelivery = int(priced.totals.deliveryFee);
+
+    // Service fee 2% dari (items + delivery)
+    const sfBase = items_subtotal + baseDelivery;
+    const service_fee = int(sfBase * SERVICE_FEE_RATE);
+
+    // Tax base (sebelum pajak & rounding)
+    const taxBase =
+      items_subtotal +
+      baseDelivery +
+      service_fee -
+      items_discount -
+      shipping_discount;
+
+    const safeTaxBase = Math.max(0, taxBase);
+    const rate = parsePpnRate();
+    const taxAmount = int(safeTaxBase * rate);
+
+    const requested_amount = safeTaxBase + taxAmount;
+
+    if (requested_amount <= 0) {
+      return res.status(400).json({ message: 'Total pembayaran tidak valid.' });
+    }
+
+    // 5) Buat PaymentSession
+    const reference_id = `QRIS-${cart._id}-${Date.now()}`;
+
+    const session = await PaymentSession.create({
+      member: memberId || null,
+      customer_name: '', // bisa diisi dari body kalau mau
+      customer_phone: '',
+      source: iden.source || 'online',
+      fulfillment_type: ft,
+      table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
+      items: cart.items.map((it) => ({
+        menu: it.menu,
+        menu_code: it.menu_code,
+        name: it.name,
+        imageUrl: it.imageUrl,
+        base_price: it.base_price,
+        quantity: it.quantity,
+        addons: it.addons,
+        notes: it.notes,
+        category: it.category || null
+      })),
+      items_subtotal,
+      delivery_fee: baseDelivery,
+      service_fee,
+      items_discount,
+      shipping_discount,
+      discounts: priced.breakdown,
+      requested_amount,
+      provider: 'xendit',
+      channel: 'qris',
+      external_id: reference_id
+    });
+
+    // 6) Call Xendit QR
+    const payload = {
+      reference_id,
+      type: 'DYNAMIC',
+      currency: 'IDR',
+      amount: requested_amount,
+      metadata: {
+        payment_session_id: String(session._id)
+      }
+    };
+
+    const resp = await axios.post(`${X_BASE}/qr_codes`, payload, {
+      auth: { username: X_KEY, password: '' },
+      headers: { ...HDRS, 'api-version': '2022-07-31' },
+      timeout: 15000
+    });
+
+    const qr = resp.data;
+
+    session.qr_code_id = qr.id;
+    session.qr_string = qr.qr_string;
+    session.expires_at = qr.expires_at ? new Date(qr.expires_at) : null;
+    await session.save();
+
+    return res.json({
+      success: true,
+      data: {
+        sessionId: String(session._id),
+        channel: 'QRIS',
+        amount: requested_amount,
+        qris: {
+          qr_string: qr.qr_string,
+          expiry_at: qr.expires_at
+        },
+        status: 'pending'
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};

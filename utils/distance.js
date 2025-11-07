@@ -13,9 +13,4 @@ function haversineKm(a, b) {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
-function calcDeliveryFee(distanceKm) {
-  const km = Math.ceil(distanceKm);
-  return km * DELIVERY_PRICE_PER_KM;
-}
-
-module.exports = { haversineKm, calcDeliveryFee };
+module.exports = { haversineKm };

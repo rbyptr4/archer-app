@@ -6,10 +6,12 @@ const wh = require('../controllers/payments/xenditWebhookController');
 
 // in-app start session
 router.post('/qris', ctrl.createQris);
-router.post('/va', ctrl.createVA);
-router.post('/ewallet', ctrl.createEwallet); // opsional
 router.get('/status/:id', ctrl.getPaymentStatus);
 
-router.post('/webhooks/xendit', express.json({ type: '*/*' }), wh.webhook);
+router.post(
+  '/webhooks/xendit',
+  express.json({ type: '*/*' }),
+  wh.xenditQrisWebhook
+);
 
 module.exports = router;

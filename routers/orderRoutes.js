@@ -7,6 +7,7 @@ const requirePageAccess = require('../utils/requirePageAccess');
 const authMemberRequired = require('../middlewares/authMember');
 
 const order = require('../controllers/orderController');
+const qris = require('../controllers/paymentSessionController');
 
 // === Multipart hanya untuk route yang butuh (checkout transfer) ===
 let parseFormData;
@@ -41,6 +42,8 @@ router.post(
   fileUploader.single('payment_proof'),
   order.checkout
 );
+
+router.post('/checkout/qris', qris.createQrisFromCart);
 router.get(
   '/delivery-board',
   validateToken,
