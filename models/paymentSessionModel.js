@@ -64,12 +64,18 @@ const paymentSessionSchema = new mongoose.Schema(
       enum: ['pending', 'paid', 'expired', 'failed'],
       default: 'pending',
       index: true
-    }
+    },
+    expires_at: { type: Date }
   },
   {
     timestamps: true,
     versionKey: false
   }
+);
+
+paymentSessionSchema.index(
+  { expires_at: 1 },
+  { expireAfterSeconds: 3 * 24 * 60 * 60 }
 );
 
 module.exports =

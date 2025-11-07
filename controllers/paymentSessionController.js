@@ -7,6 +7,16 @@ const { validateAndPrice } = require('../utils/voucherEngine');
 const { haversineKm } = require('../utils/distance');
 const { SERVICE_FEE_RATE, int } = require('../utils/money');
 
+const {
+  ACCESS_COOKIE,
+  REFRESH_COOKIE,
+  DEVICE_COOKIE,
+  REFRESH_TTL_MS,
+  signAccessToken,
+  generateOpaqueToken,
+  hashToken
+} = require('../utils/memberToken');
+
 const X_BASE = process.env.XENDIT_BASE_URL;
 const X_KEY = process.env.XENDIT_SECRET_KEY;
 const HDRS = { 'Content-Type': 'application/json' };
