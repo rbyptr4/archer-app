@@ -4,6 +4,11 @@ function int(v) {
   return Math.round(Number(v || 0));
 }
 
+function parsePpnRate() {
+  const raw = Number(process.env.PPN_RATE ?? 0.11); // default 11%
+  if (!Number.isFinite(raw)) return 0.11;
+  return raw > 1 ? raw / 100 : raw;
+}
 /* ================= Subdoc: Delivery ================= */
 const DeliverySchema = new mongoose.Schema(
   {
