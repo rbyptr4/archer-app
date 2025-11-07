@@ -1,22 +1,29 @@
 const express = require('express');
 const router = express.Router();
 
-const validateToken = require('../utils/tokenHandler'); // staff token middleware
+const validateToken = require('../utils/tokenHandler');
 const requireRole = require('../utils/requireRole');
 const requirePageAccess = require('../utils/requirePageAccess');
-
 const authMemberRequired = require('../middlewares/authMember');
 
-// const fileUploader = require('../utils/fileUploader');
-
-// let parseFormData;
-// try {
-//   parseFormData = require('../middlewares/parseFormData');
-// } catch {
-//   parseFormData = (_req, _res, next) => next();
-// }
-
 const order = require('../controllers/orderController');
+
+// === Multipart hanya untuk route yang butuh (checkout transfer) ===
+let parseFormData;
+try {
+  parseFormData = require('../middlewares/parseFormData');
+} catch {
+  parseFormData = (_req, _res, next) => next();
+}
+
+let fileUploader;
+try {
+  fileUploader = require('../utils/fileUploader');
+} catch {
+  fileUploader = {
+    single: () => (_req, _res, next) => next()
+  };
+}
 
 router.use(order.modeResolver);
 
@@ -27,7 +34,13 @@ router.post('/table', order.assignTable);
 router.patch('/change-table', order.changeTable);
 router.patch('/change-order-type', order.setFulfillmentType);
 router.get('/delivery/estimate', order.estimateDelivery);
-router.post('/checkout', order.checkout);
+
+router.post(
+  '/checkout',
+  parseFormData,
+  fileUploader.single('payment_proof'),
+  order.checkout
+);
 router.get(
   '/delivery-board',
   validateToken,

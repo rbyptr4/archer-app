@@ -166,7 +166,7 @@ const orderSchema = new mongoose.Schema(
 
     payment_method: {
       type: String,
-      enum: ['qris', 'va', 'cash', 'card', 'ewallet']
+      enum: ['qris', 'transfer', 'cash', 'card']
     },
     payment_proof_url: { type: String, trim: true },
     payment_status: {
@@ -203,12 +203,10 @@ const orderSchema = new mongoose.Schema(
   }
 );
 
-/* =============== Derived (back-compat) =============== */
 orderSchema.virtual('items_total').get(function () {
   return this.items_subtotal;
 });
 
-/* =============== Hooks =============== */
 orderSchema.pre('validate', function (next) {
   const items = this.items || [];
   let totalQty = 0;
@@ -246,30 +244,28 @@ orderSchema.pre('validate', function (next) {
   this.tax_rate_percent = Math.round(rate * 100 * 100) / 100;
   this.tax_amount = int(Math.max(0, taxBase * rate));
 
-  // Grand total = base + pajak
   const gt = taxBase + this.tax_amount;
   this.grand_total = int(Math.max(0, gt));
 
-  // Dine-in via online => hapus table_number
   if (this.fulfillment_type === 'dine_in' && this.source === 'online') {
-    this.table_number = null;
+    this.table_number = this.table_number || null;
   }
 
-  // ===== Payment rules (baru) =====
   if (this.fulfillment_type === 'delivery') {
-    const allowed = ['cash', 'card'];
+    const allowed = ['qris', 'transfer'];
     if (!allowed.includes(this.payment_method)) {
       return next(
-        new Error('Delivery hanya mendukung metode pembayaran cash atau card.')
+        new Error(
+          'Delivery hanya mendukung metode pembayaran qris atau transfer.'
+        )
       );
     }
   }
 
   if (this.payment_method === 'cash' || this.payment_method === 'card') {
-    this.payment_proof_url = ''; // tidak perlu bukti
+    this.payment_proof_url = '';
   }
 
-  // 3) Delivery data wajib
   if (this.fulfillment_type === 'delivery') {
     const ok =
       this.delivery &&
@@ -283,7 +279,6 @@ orderSchema.pre('validate', function (next) {
     }
   }
 
-  // 4) Identitas: member ATAU minimal nama/telp
   if (!this.member) {
     const hasGuest =
       (this.customer_name && this.customer_name.trim().length > 0) ||

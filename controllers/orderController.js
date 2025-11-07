@@ -721,7 +721,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     name,
     phone,
     fulfillment_type, // 'dine_in' | 'delivery'
-    payment_method, // 'qris' | 'transfer' | 'cash'
+    payment_method, // 'qris' | 'transfer' | 'card' | 'cash'
     address_text,
     lat,
     lng,
@@ -731,25 +731,24 @@ exports.checkout = asyncHandler(async (req, res) => {
     register_decision = 'register' // 'register' | 'skip'
   } = req.body || {};
 
-  /* ===== Resolve fulfillment type ===== */
+  // ===== Resolve fulfillment type =====
   const ft =
     iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
   if (!['dine_in', 'delivery'].includes(ft)) {
     throwError('fulfillment_type tidak valid', 400);
   }
 
-  /* ===== Validasi metode bayar ===== */
+  // ===== Validasi metode bayar =====
   const method = String(payment_method || '').toLowerCase();
   if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method)) {
     throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
   }
 
-  // Gateway = Xendit (QRIS / VA)
-  const methodIsGateway = method === PM.QRIS || method === PM.BCA;
-  const useGateway = true;
-  const needsProof = false; // tidak pernah upload bukti lagi
+  // Flag metode
+  const methodIsGateway = method === PM.QRIS; // hanya QRIS yang ke PG
+  const requiresProof = needProof(method);
 
-  /* ===== Identitas member / guest ===== */
+  // ===== Identitas member / guest (tetap seperti kode kamu) =====
   const originallyLoggedIn = !!iden0.memberId;
   const wantRegister = String(register_decision || 'register') === 'register';
 
@@ -768,7 +767,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  /* ===== Ambil cart aktif ===== */
+  // ===== Ambil cart aktif (kode kamu, tidak diubah) =====
   const iden = {
     ...iden0,
     memberId: member?._id || iden0.memberId || null,
@@ -788,7 +787,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   if (!cart) throwError('Cart tidak ditemukan / kosong', 404);
   if (!cart.items?.length) throwError('Cart kosong', 400);
 
-  // Dine-in QR wajib punya nomor meja
   if (
     ft === 'dine_in' &&
     (iden.source || 'online') === 'qr' &&
@@ -797,7 +795,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Silakan assign nomor meja terlebih dahulu', 400);
   }
 
-  /* ===== Idempotency (hindari double checkout) ===== */
+  // ===== Idempotency (tetap) =====
   if (
     idempotency_key &&
     cart.last_idempotency_key === idempotency_key &&
@@ -815,7 +813,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     cart.session_id = null;
   }
 
-  /* ===== Delivery setup ===== */
+  // ===== Delivery setup (tetap) =====
   let delivery = undefined;
   let delivery_fee = 0;
   if (ft === 'delivery') {
@@ -839,7 +837,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     };
   }
 
-  /* ===== Voucher pricing ===== */
+  // ===== Voucher pricing (tetap) =====
   recomputeTotals(cart);
   await cart.save();
 
@@ -860,7 +858,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Voucher hanya untuk member. Silakan daftar/login.', 400);
   }
 
-  let priced = await validateAndPrice({
+  const priced = await validateAndPrice({
     memberId: member ? member._id : null,
     cart: {
       items: cart.items.map((it) => ({
@@ -875,9 +873,8 @@ exports.checkout = asyncHandler(async (req, res) => {
     voucherClaimIds: eligibleClaimIds
   });
 
-  /* ===== PPN ===== */
-  const PPN_RATE = Number(process.env.PPN_RATE ?? 0.11);
-  const rate = PPN_RATE > 1 ? PPN_RATE / 100 : PPN_RATE;
+  // ===== PPN =====
+  const rate = parsePpnRate();
   const taxBase =
     priced.totals.baseSubtotal -
     priced.totals.itemsDiscount +
@@ -885,11 +882,31 @@ exports.checkout = asyncHandler(async (req, res) => {
     priced.totals.shippingDiscount;
   const taxAmount = Math.round(Math.max(0, taxBase * rate));
   const taxRatePercent = Math.round(rate * 100 * 100) / 100;
+
   priced.totals.taxAmount = taxAmount;
   priced.totals.taxRatePercent = taxRatePercent;
   priced.totals.grandTotal = taxBase + taxAmount;
 
-  /* ===== Buat Order ===== */
+  // ===== Bukti transfer (kalau perlu) =====
+  const payment_proof_url = await handleTransferProofIfAny(req, method);
+
+  // ===== Tentukan payment_status awal =====
+  let payment_status = 'unpaid';
+  let payment_provider = null;
+
+  if (methodIsGateway) {
+    // qris via PG
+    payment_provider = 'xendit';
+    payment_status = 'unpaid';
+  } else if (requiresProof) {
+    // transfer + bukti → dianggap paid, nunggu verify manual
+    payment_status = 'paid';
+  } else {
+    // cash / card di flow online: default unpaid, nanti kasir ubah (atau pakai POS endpoint)
+    payment_status = 'unpaid';
+  }
+
+  // ===== Buat Order =====
   const order = await (async () => {
     for (let i = 0; i < 5; i++) {
       try {
@@ -902,6 +919,7 @@ exports.checkout = asyncHandler(async (req, res) => {
           source: iden.source || 'online',
           fulfillment_type: ft,
           transaction_code: code,
+
           items: cart.items.map((it) => ({
             menu: it.menu,
             menu_code: it.menu_code,
@@ -915,6 +933,7 @@ exports.checkout = asyncHandler(async (req, res) => {
             category: it.category || null
           })),
           total_quantity: cart.total_quantity,
+
           delivery,
           items_subtotal: priced.totals.baseSubtotal,
           items_discount: priced.totals.itemsDiscount,
@@ -922,11 +941,15 @@ exports.checkout = asyncHandler(async (req, res) => {
           shipping_discount: priced.totals.shippingDiscount,
           discounts: priced.breakdown,
           grand_total: priced.totals.grandTotal,
-          payment_method: method,
-          payment_provider: methodIsGateway ? 'xendit' : null,
-          payment_status: methodIsGateway ? 'unpaid' : 'paid',
+
           tax_rate_percent: taxRatePercent,
           tax_amount: taxAmount,
+
+          payment_method: method,
+          payment_provider,
+          payment_status,
+          payment_proof_url,
+
           status: 'created',
           placed_at: new Date()
         });
