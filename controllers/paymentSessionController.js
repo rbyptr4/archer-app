@@ -225,9 +225,6 @@ const getActiveCartForIdentity = async (
   return cart;
 };
 
-const calcDeliveryFee = () =>
-  Number(DELIVERY_FLAT_FEE ?? process.env.DELIVERY_FLAT_FEE ?? 5000);
-
 const getIdentity = (req) => {
   const memberId = req.member?.id || null;
   const session_id =
