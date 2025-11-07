@@ -440,7 +440,7 @@ exports.createQrisFromCart = async (req, res, next) => {
         channel: 'QRIS',
         amount: requested_amount,
         qris: {
-          qr_id: qr.id
+          qr_id: qr.id,
           qr_string: qr.qr_string,
           expiry_at: qr.expires_at
         },
