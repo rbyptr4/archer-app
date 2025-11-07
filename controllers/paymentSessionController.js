@@ -13,6 +13,116 @@ const X_BASE = process.env.XENDIT_BASE_URL;
 const X_KEY = process.env.XENDIT_SECRET_KEY;
 const HDRS = { 'Content-Type': 'application/json' };
 
+function parsePpnRate() {
+  const raw = Number(process.env.PPN_RATE ?? 0.11); // default 11%
+  if (!Number.isFinite(raw)) return 0.11;
+  return raw > 1 ? raw / 100 : raw;
+}
+
+const normFt = (v) =>
+  String(v).toLowerCase() === 'delivery' ? 'delivery' : 'dine_in';
+
+const recomputeTotals = (cart) => {
+  let totalQty = 0;
+  for (const it of cart.items) {
+    const addonsTotal = (it.addons || []).reduce(
+      (s, a) => s + asInt(a.price) * asInt(a.qty, 1),
+      0
+    );
+    it.line_subtotal =
+      (asInt(it.base_price, 0) + addonsTotal) *
+      clamp(asInt(it.quantity, 1), 1, 999);
+    totalQty += it.quantity;
+  }
+  cart.total_quantity = totalQty;
+  cart.total_items = cart.items.length;
+  cart.total_price = cart.items.reduce(
+    (s, it) => s + asInt(it.line_subtotal, 0),
+    0
+  );
+  return cart;
+};
+
+const calcDeliveryFee = () =>
+  Number(DELIVERY_FLAT_FEE ?? process.env.DELIVERY_FLAT_FEE ?? 5000);
+
+const mergeTwoCarts = (dst, src) => {
+  for (const it of src.items || []) {
+    const idx = dst.items.findIndex((d) => d.line_key === it.line_key);
+    if (idx >= 0) {
+      dst.items[idx].quantity = clamp(
+        asInt(dst.items[idx].quantity, 1) + asInt(it.quantity, 1),
+        1,
+        999
+      );
+    } else {
+      dst.items.push(it.toObject ? it.toObject() : { ...it });
+    }
+  }
+  recomputeTotals(dst);
+};
+
+const attachOrMergeCartsForIdentity = async (iden) => {
+  if (!iden?.memberId || !iden?.session_id) return;
+
+  const SOURCES = ['online', 'qr'];
+  for (const src of SOURCES) {
+    const sessionCart = await Cart.findOne({
+      status: 'active',
+      source: src,
+      session_id: iden.session_id,
+      $or: [{ member: null }, { member: { $exists: false } }]
+    });
+    if (!sessionCart) continue;
+
+    let memberCart = await Cart.findOne({
+      status: 'active',
+      source: src,
+      member: iden.memberId
+    });
+
+    if (memberCart) {
+      mergeTwoCarts(memberCart, sessionCart);
+      await memberCart.save();
+      await Cart.deleteOne({ _id: sessionCart._id }).catch(() => {});
+      continue;
+    }
+
+    try {
+      const r = await Cart.updateOne(
+        {
+          _id: sessionCart._id,
+          status: 'active',
+          source: src,
+          session_id: iden.session_id,
+          $or: [{ member: null }, { member: { $exists: false } }]
+        },
+        { $set: { member: iden.memberId, session_id: null } }
+      );
+      if (!r.matchedCount) continue;
+    } catch (e) {
+      if (e && e.code === 11000) {
+        memberCart = await Cart.findOne({
+          status: 'active',
+          source: src,
+          member: iden.memberId
+        });
+        if (memberCart) {
+          const freshSession = await Cart.findById(sessionCart._id);
+          if (freshSession) {
+            mergeTwoCarts(memberCart, freshSession);
+            await memberCart.save();
+            await Cart.deleteOne({ _id: freshSession._id }).catch(() => {});
+          }
+          continue;
+        }
+        throw e;
+      }
+      throw e;
+    }
+  }
+};
+
 const getActiveCartForIdentity = async (
   iden,
   { allowCreateOnline = false, defaultFt = null }
