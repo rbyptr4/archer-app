@@ -426,7 +426,7 @@ exports.createQrisFromCart = async (req, res, next) => {
 
     const qr = resp.data;
     console.log(resp.data);
-    console.log(resp);
+    console.log(resp.data.id);
 
     session.qr_code_id = qr.id;
     session.qr_string = qr.qr_string;
@@ -440,6 +440,7 @@ exports.createQrisFromCart = async (req, res, next) => {
         channel: 'QRIS',
         amount: requested_amount,
         qris: {
+          qr_id: qr.id
           qr_string: qr.qr_string,
           expiry_at: qr.expires_at
         },
