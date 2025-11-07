@@ -1,14 +1,16 @@
 const mongoose = require('mongoose');
 
+const {
+  int,
+  parsePpnRate,
+  SERVICE_FEE_RATE,
+  roundRupiahCustom
+} = require('../utils/money'); // atau pakai fungsi lokal
+
 function int(v) {
   return Math.round(Number(v || 0));
 }
 
-function parsePpnRate() {
-  const raw = Number(process.env.PPN_RATE ?? 0.11); // default 11%
-  if (!Number.isFinite(raw)) return 0.11;
-  return raw > 1 ? raw / 100 : raw;
-}
 /* ================= Subdoc: Delivery ================= */
 const DeliverySchema = new mongoose.Schema(
   {
@@ -143,6 +145,7 @@ const orderSchema = new mongoose.Schema(
     },
     total_quantity: { type: Number, min: 1, required: true },
 
+    // base
     items_subtotal: {
       type: Number,
       min: 0,
@@ -150,30 +153,44 @@ const orderSchema = new mongoose.Schema(
       set: int,
       get: int
     },
-    items_discount: { type: Number, min: 0, default: 0, set: int, get: int },
     delivery_fee: { type: Number, min: 0, default: 0, set: int, get: int },
+
+    // service fee 2% dari (items_subtotal + delivery_fee), sebelum voucher
+    service_fee: { type: Number, min: 0, default: 0, set: int, get: int },
+
+    // diskon voucher
+    items_discount: { type: Number, min: 0, default: 0, set: int, get: int },
     shipping_discount: { type: Number, min: 0, default: 0, set: int, get: int },
     discounts: { type: [discountBreakdownSchema], default: [] },
-    grand_total: { type: Number, min: 0, required: true, set: int, get: int },
 
-    // ===== Payment (refactor: qris | transfer | cash) =====
-    // ===== Pajak (PPN) =====
-    tax_rate_percent: { type: Number, min: 0, max: 100, default: 0 }, // contoh: 11
+    // pajak
+    tax_rate_percent: { type: Number, min: 0, max: 100, default: 0 },
     tax_amount: { type: Number, min: 0, default: 0, set: int, get: int },
 
-    // ===== Payment via gateway (in-app) =====
-    payment_provider: { type: String, trim: true, default: null }, // 'xendit' | null
-    payment_invoice_id: { type: String, trim: true, default: '' }, // id sesi/invoice di gateway
+    // grand total (sudah DIPBULATKAN pake aturan 0/500/1000)
+    grand_total: { type: Number, min: 0, required: true, set: int, get: int },
+    // simpan delta pembulatan (opsional, buat transparansi)
+    rounding_delta: {
+      type: Number,
+      default: 0,
+      set: int,
+      get: int
+    },
+
+    // Payment
+    payment_provider: { type: String, trim: true, default: null },
+    payment_invoice_id: { type: String, trim: true, default: '' },
     payment_invoice_external_id: { type: String, trim: true, default: '' },
-    payment_invoice_url: { type: String, trim: true, default: '' }, // kalau channel butuh URL
+    payment_invoice_url: { type: String, trim: true, default: '' },
     payment_expires_at: { type: Date, default: null },
     payment_raw_webhook: { type: mongoose.Schema.Types.Mixed, default: null },
 
     payment_method: {
       type: String,
-      enum: ['qris', 'transfer', 'cash', 'card']
+      enum: ['transfer', 'qris', 'card', 'cash'],
+      required: true
     },
-    payment_proof_url: { type: String, trim: true },
+    payment_proof_url: { type: String, trim: true, default: '' },
     payment_status: {
       type: String,
       enum: ['unpaid', 'paid', 'verified', 'expired', 'failed', 'void'],
@@ -186,6 +203,7 @@ const orderSchema = new mongoose.Schema(
       default: 'created',
       index: true
     },
+
     verified_by: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
@@ -212,6 +230,9 @@ orderSchema.virtual('items_total').get(function () {
   return this.items_subtotal;
 });
 
+/* ===== Pre-validate: enforce urutan harga =====
+ * Base (items+ongkir) -> service fee -> voucher -> pajak -> pembulatan
+ */
 orderSchema.pre('validate', function (next) {
   const items = this.items || [];
   let totalQty = 0;
@@ -233,44 +254,42 @@ orderSchema.pre('validate', function (next) {
 
   const deliveryFee = this.delivery?.delivery_fee
     ? int(this.delivery.delivery_fee)
-    : 0;
-  this.delivery_fee = int(deliveryFee);
+    : int(this.delivery_fee || 0);
+  this.delivery_fee = deliveryFee;
 
+  // 1) Service fee 2% dari (items_subtotal + delivery_fee)
+  const sfBase = this.items_subtotal + this.delivery_fee;
+  const rawServiceFee = sfBase > 0 ? sfBase * SERVICE_FEE_RATE : 0;
+  this.service_fee = int(rawServiceFee);
+
+  // Normalisasi diskon (tidak boleh negatif)
   this.items_discount = int(Math.max(0, this.items_discount || 0));
   this.shipping_discount = int(Math.max(0, this.shipping_discount || 0));
 
+  // 2) Hitung tax base: base + serviceFee - voucher
   const taxBase =
-    this.items_subtotal -
-    this.items_discount +
-    this.delivery_fee -
+    this.items_subtotal +
+    this.delivery_fee +
+    this.service_fee -
+    this.items_discount -
     this.shipping_discount;
 
+  const safeTaxBase = Math.max(0, taxBase);
+
+  // 3) Pajak
   const rate = parsePpnRate();
   this.tax_rate_percent = Math.round(rate * 100 * 100) / 100;
-  this.tax_amount = int(Math.max(0, taxBase * rate));
+  this.tax_amount = int(safeTaxBase * rate);
 
-  const gt = taxBase + this.tax_amount;
-  this.grand_total = int(Math.max(0, gt));
+  // 4) Raw total sebelum rounding
+  const rawTotal = safeTaxBase + this.tax_amount;
 
-  if (this.fulfillment_type === 'dine_in' && this.source === 'online') {
-    this.table_number = this.table_number || null;
-  }
+  // 5) Pembulatan custom
+  const rounded = roundRupiahCustom(rawTotal);
+  this.grand_total = int(rounded);
+  this.rounding_delta = int(rounded - rawTotal);
 
-  if (this.fulfillment_type === 'delivery') {
-    const allowed = ['qris', 'transfer'];
-    if (!allowed.includes(this.payment_method)) {
-      return next(
-        new Error(
-          'Delivery hanya mendukung metode pembayaran qris atau transfer.'
-        )
-      );
-    }
-  }
-
-  if (this.payment_method === 'cash' || this.payment_method === 'card') {
-    this.payment_proof_url = '';
-  }
-
+  // Delivery wajib data lokasi kalau fulfillment_type = delivery
   if (this.fulfillment_type === 'delivery') {
     const ok =
       this.delivery &&
@@ -298,16 +317,18 @@ orderSchema.pre('validate', function (next) {
   next();
 });
 
-/* =============== Methods =============== */
+/* Methods untuk cek */
 orderSchema.methods.canMoveToKitchen = function () {
-  return this.payment_status === 'paid';
+  return this.payment_status === 'paid' || this.payment_status === 'verified';
 };
 
 orderSchema.methods.canAssignCourier = function () {
-  return this.payment_status === 'paid' && this.fulfillment_type === 'delivery';
+  return (
+    (this.payment_status === 'paid' || this.payment_status === 'verified') &&
+    this.fulfillment_type === 'delivery'
+  );
 };
 
-/* =============== Indexes =============== */
 orderSchema.index({ member: 1, createdAt: -1 });
 orderSchema.index({ source: 1, fulfillment_type: 1, createdAt: -1 });
 orderSchema.index({ payment_status: 1, createdAt: -1 });

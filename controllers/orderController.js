@@ -977,21 +977,13 @@ exports.checkout = asyncHandler(async (req, res) => {
             quantity: it.quantity,
             addons: it.addons,
             notes: it.notes,
-            line_subtotal: it.line_subtotal,
             category: it.category || null
           })),
-          total_quantity: cart.total_quantity,
 
-          delivery,
-          items_subtotal: priced.totals.baseSubtotal,
-          items_discount: priced.totals.itemsDiscount,
           delivery_fee: priced.totals.deliveryFee,
+          items_discount: priced.totals.itemsDiscount,
           shipping_discount: priced.totals.shippingDiscount,
           discounts: priced.breakdown,
-          grand_total: priced.totals.grandTotal,
-
-          tax_rate_percent: taxRatePercent,
-          tax_amount: taxAmount,
 
           payment_method: method,
           payment_provider,
@@ -1080,21 +1072,23 @@ exports.checkout = asyncHandler(async (req, res) => {
     emitToTable(order.table_number, 'order:new', payload);
   }
 
-  /* ===== Response ke FE ===== */
   res.status(201).json({
-    order: { ...order.toObject(), transaction_code: order.transaction_code },
+    order: order.toObject(),
     totals: {
-      items_subtotal: priced.totals.baseSubtotal,
-      items_discount: priced.totals.itemsDiscount,
-      delivery_fee: priced.totals.deliveryFee,
-      shipping_discount: priced.totals.shippingDiscount,
-      tax_rate_percent: taxRatePercent,
-      tax_amount: taxAmount,
-      grand_total: priced.totals.grandTotal
+      items_subtotal: order.items_subtotal,
+      service_fee: order.service_fee,
+      items_discount: order.items_discount,
+      delivery_fee: order.delivery_fee,
+      shipping_discount: order.shipping_discount,
+      tax_rate_percent: order.tax_rate_percent,
+      tax_amount: order.tax_amount,
+      rounding_delta: order.rounding_delta,
+      grand_total: order.grand_total
     },
-    message: methodIsGateway
-      ? 'Checkout berhasil. Silakan lanjutkan pembayaran.'
-      : 'Checkout berhasil (cash)'
+    message:
+      payment_status === 'unpaid'
+        ? 'Checkout berhasil. Silakan lanjutkan pembayaran.'
+        : 'Checkout berhasil.'
   });
 });
 
