@@ -249,23 +249,65 @@ exports.createQrisFromCart = async (req, res, next) => {
   try {
     const iden0 = getIdentity(req);
     const {
+      name,
+      phone,
       fulfillment_type,
       address_text,
       lat,
       lng,
       note_to_rider,
-      voucherClaimIds = []
+      voucherClaimIds = [],
+      register_decision = 'register'
     } = req.body || {};
 
+    /* ===== Resolve fulfillment type ===== */
     const ft =
       iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
     if (!['dine_in', 'delivery'].includes(ft)) {
       return res.status(400).json({ message: 'fulfillment_type tidak valid' });
     }
 
-    // 1) Ambil cart aktif
+    /* ===== Identitas member / guest (mirip checkout) ===== */
+    const originallyLoggedIn = !!iden0.memberId;
+    const wantRegister = String(register_decision || 'register') === 'register';
+
+    let member = null;
+    let customer_name = '';
+    let customer_phone = '';
+
+    if (originallyLoggedIn || wantRegister) {
+      const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
+
+      // Fungsi ini di checkout sudah ada, reuse aja
+      member = await ensureMemberForCheckout(req, res, joinChannel);
+      // asumsi: ensureMemberForCheckout tidak langsung kirim response di sini
+
+      if (member) {
+        customer_name =
+          String(member.name || '').trim() || String(name || '').trim();
+        customer_phone =
+          String(member.phone || '').trim() || String(phone || '').trim();
+      }
+    }
+
+    // Kalau tidak pakai member (skip) → ambil dari body & wajib minimal salah satu
+    if (!member) {
+      customer_name = String(name || '').trim();
+      customer_phone = String(phone || '').trim();
+
+      if (!customer_name && !customer_phone) {
+        return res.status(400).json({
+          message: 'Tanpa member: isi minimal nama atau no. telp'
+        });
+      }
+    }
+
+    const finalMemberId = member ? member._id : null;
+
+    /* ===== Ambil cart aktif (ikat ke member kalau ada) ===== */
     const iden = {
       ...iden0,
+      memberId: finalMemberId || iden0.memberId || null,
       session_id:
         iden0.session_id ||
         req.cookies?.[DEVICE_COOKIE] ||
@@ -285,23 +327,44 @@ exports.createQrisFromCart = async (req, res, next) => {
       return res.status(404).json({ message: 'Cart kosong' });
     }
 
-    // 2) Setup delivery (kalau perlu)
+    // Dine-in QR wajib punya nomor meja (mirip checkout)
+    if (
+      ft === 'dine_in' &&
+      (iden.source || 'online') === 'qr' &&
+      !cart.table_number
+    ) {
+      return res
+        .status(400)
+        .json({ message: 'Silakan assign nomor meja terlebih dahulu' });
+    }
+
+    // Kalau ada member baru tapi cart belum terikat, bisa optional di-set
+    if (finalMemberId && !cart.member) {
+      cart.member = finalMemberId;
+      cart.session_id = null;
+    }
+
+    /* ===== Setup delivery (kalau perlu) ===== */
     let delivery_fee = 0;
     let deliverySnapshot = undefined;
+
     if (ft === 'delivery') {
-      const latN = Number(lat),
-        lngN = Number(lng);
+      const latN = Number(lat);
+      const lngN = Number(lng);
+
       if (!Number.isFinite(latN) || !Number.isFinite(lngN)) {
         return res
           .status(400)
           .json({ message: 'Lokasi (lat,lng) wajib untuk delivery' });
       }
+
       const distance_km = haversineKm(CAFE_COORD, { lat: latN, lng: lngN });
       if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0)) {
         return res.status(400).json({
           message: `Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`
         });
       }
+
       delivery_fee = calcDeliveryFee();
       deliverySnapshot = {
         address_text: String(address_text || '').trim(),
@@ -313,27 +376,35 @@ exports.createQrisFromCart = async (req, res, next) => {
       };
     }
 
-    // 3) Hitung ulang cart
+    /* ===== Hitung ulang cart ===== */
     recomputeTotals(cart);
     await cart.save();
 
-    // 4) Voucher (kalau member)
-    let memberId = iden0.memberId || null;
+    /* ===== Voucher ===== */
     let eligibleClaimIds = [];
-    if (memberId && Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
-      const rawClaims = await VoucherClaim.find({
-        _id: { $in: voucherClaimIds },
-        member: memberId,
-        status: 'claimed'
-      }).lean();
-      const now = new Date();
-      eligibleClaimIds = rawClaims
-        .filter((c) => !c.validUntil || c.validUntil > now)
-        .map((c) => String(c._id));
+
+    if (finalMemberId) {
+      if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
+        const rawClaims = await VoucherClaim.find({
+          _id: { $in: voucherClaimIds },
+          member: finalMemberId,
+          status: 'claimed'
+        }).lean();
+
+        const now = new Date();
+        eligibleClaimIds = rawClaims
+          .filter((c) => !c.validUntil || c.validUntil > now)
+          .map((c) => String(c._id));
+      }
+    } else if (voucherClaimIds?.length) {
+      // Sama seperti checkout: nggak boleh pakai voucher kalau bukan member
+      return res.status(400).json({
+        message: 'Voucher hanya untuk member. Silakan daftar/login.'
+      });
     }
 
     const priced = await validateAndPrice({
-      memberId,
+      memberId: finalMemberId,
       cart: {
         items: cart.items.map((it) => ({
           menuId: it.menu,
@@ -356,7 +427,7 @@ exports.createQrisFromCart = async (req, res, next) => {
     const sfBase = items_subtotal + baseDelivery;
     const service_fee = int(sfBase * SERVICE_FEE_RATE);
 
-    // Tax base (sebelum pajak & rounding)
+    // Tax base
     const taxBase =
       items_subtotal +
       baseDelivery +
@@ -374,13 +445,13 @@ exports.createQrisFromCart = async (req, res, next) => {
       return res.status(400).json({ message: 'Total pembayaran tidak valid.' });
     }
 
-    // 5) Buat PaymentSession
+    /* ===== Buat PaymentSession ===== */
     const reference_id = `QRIS-${cart._id}-${Date.now()}`;
 
     const session = await PaymentSession.create({
-      member: memberId || null,
-      customer_name: '', // bisa diisi dari body kalau mau
-      customer_phone: '',
+      member: finalMemberId || null,
+      customer_name,
+      customer_phone,
       source: iden.source || 'online',
       fulfillment_type: ft,
       table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
@@ -402,12 +473,13 @@ exports.createQrisFromCart = async (req, res, next) => {
       shipping_discount,
       discounts: priced.breakdown,
       requested_amount,
+      delivery_snapshot: deliverySnapshot || undefined,
       provider: 'xendit',
       channel: 'qris',
       external_id: reference_id
     });
 
-    // 6) Call Xendit QR
+    /* ===== Call Xendit QR ===== */
     const payload = {
       reference_id,
       type: 'DYNAMIC',
@@ -425,8 +497,6 @@ exports.createQrisFromCart = async (req, res, next) => {
     });
 
     const qr = resp.data;
-    console.log(resp.data);
-    console.log(resp.data.id);
 
     session.qr_code_id = qr.id;
     session.qr_string = qr.qr_string;
