@@ -7,19 +7,113 @@ const { validateAndPrice } = require('../utils/voucherEngine');
 const { haversineKm } = require('../utils/distance');
 const { SERVICE_FEE_RATE, int } = require('../utils/money');
 
-const {
-  ACCESS_COOKIE,
-  REFRESH_COOKIE,
-  DEVICE_COOKIE,
-  REFRESH_TTL_MS,
-  signAccessToken,
-  generateOpaqueToken,
-  hashToken
-} = require('../utils/memberToken');
+const { DEVICE_COOKIE } = require('../utils/memberToken');
 
 const X_BASE = process.env.XENDIT_BASE_URL;
 const X_KEY = process.env.XENDIT_SECRET_KEY;
 const HDRS = { 'Content-Type': 'application/json' };
+
+const getActiveCartForIdentity = async (
+  iden,
+  { allowCreateOnline = false, defaultFt = null }
+) => {
+  await attachOrMergeCartsForIdentity(iden);
+
+  const requestedSource = iden.source || '';
+  const identityFilter = iden.memberId
+    ? { member: iden.memberId }
+    : { session_id: iden.session_id };
+
+  const sourcesToCheck = requestedSource === 'qr' ? ['qr'] : ['qr', 'online'];
+  let cart = null;
+  let cartsQueried = [];
+  let foundSource = null;
+
+  for (const src of sourcesToCheck) {
+    const carts = await Cart.find({
+      status: 'active',
+      source: src,
+      ...identityFilter
+    })
+      .sort([
+        ['table_number', -1],
+        ['updatedAt', -1]
+      ])
+      .limit(2)
+      .lean();
+    if (carts.length) {
+      cart = carts[0];
+      cartsQueried = carts;
+      foundSource = src;
+      break;
+    }
+  }
+
+  if (!cart) {
+    if (requestedSource === 'qr') {
+      throwError(
+        'Belum ada cart self-order. Silakan assign nomor meja dahulu.',
+        400
+      );
+    } else if (allowCreateOnline) {
+      const ensureSession = iden.memberId
+        ? null
+        : iden.session_id || crypto.randomUUID();
+      const upsertFilter = {
+        status: 'active',
+        source: 'online',
+        ...(iden.memberId
+          ? { member: iden.memberId }
+          : { session_id: ensureSession })
+      };
+      const setOnInsert = {
+        member: iden.memberId || null,
+        session_id: iden.memberId ? null : ensureSession,
+        table_number: null,
+        fulfillment_type: defaultFt ? normFt(defaultFt) : 'dine_in',
+        items: [],
+        total_items: 0,
+        total_quantity: 0,
+        total_price: 0,
+        status: 'active',
+        source: 'online'
+      };
+
+      try {
+        const upserted = await Cart.findOneAndUpdate(
+          upsertFilter,
+          { $setOnInsert: setOnInsert },
+          { new: true, upsert: true, lean: true }
+        );
+        cart = upserted;
+        foundSource = 'online';
+      } catch (e) {
+        if (e && e.code === 11000) {
+          const retry = await Cart.findOne(upsertFilter).lean();
+          if (retry) {
+            cart = retry;
+            foundSource = 'online';
+          } else {
+            throw e;
+          }
+        } else {
+          throw e;
+        }
+      }
+    }
+  }
+
+  if (cart && cartsQueried.length > 1) {
+    await Cart.deleteMany({
+      _id: { $in: cartsQueried.slice(1).map((c) => c._id) },
+      status: 'active',
+      source: foundSource,
+      ...identityFilter
+    }).catch(() => {});
+  }
+
+  return cart;
+};
 
 const calcDeliveryFee = () =>
   Number(DELIVERY_FLAT_FEE ?? process.env.DELIVERY_FLAT_FEE ?? 5000);
