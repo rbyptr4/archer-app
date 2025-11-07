@@ -7,10 +7,6 @@ const {
   roundRupiahCustom
 } = require('../utils/money'); // atau pakai fungsi lokal
 
-function int(v) {
-  return Math.round(Number(v || 0));
-}
-
 /* ================= Subdoc: Delivery ================= */
 const DeliverySchema = new mongoose.Schema(
   {
