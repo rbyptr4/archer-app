@@ -13,6 +13,9 @@ const X_BASE = process.env.XENDIT_BASE_URL;
 const X_KEY = process.env.XENDIT_SECRET_KEY;
 const HDRS = { 'Content-Type': 'application/json' };
 
+const asInt = (v, def = 0) => (Number.isFinite(+v) ? +v : def);
+const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
+
 function parsePpnRate() {
   const raw = Number(process.env.PPN_RATE ?? 0.11); // default 11%
   if (!Number.isFinite(raw)) return 0.11;
