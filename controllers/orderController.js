@@ -1,4 +1,4 @@
-// controllers/onlineController.js
+// controllers/orderController.js
 const asyncHandler = require('express-async-handler');
 const crypto = require('crypto');
 
@@ -157,20 +157,68 @@ const calcDeliveryFee = () =>
   Number(DELIVERY_FLAT_FEE ?? process.env.DELIVERY_FLAT_FEE ?? 5000);
 
 /* =============== Payment matrix & helpers =============== */
-const PM = { QRIS: 'qris', BCA: 'transfer', CASH: 'cash' };
+// Resmi: transfer, qris, card, cash
+const PM = {
+  QRIS: 'qris',
+  TRANSFER: 'transfer',
+  CASH: 'cash',
+  CARD: 'card'
+};
 
 function isPaymentMethodAllowed(source, fulfillment, method) {
+  // Delivery: non-cash, non-card → hanya qris / transfer
   if (fulfillment === 'delivery') {
-    return method === PM.QRIS || method === PM.BCA; // delivery: tanpa cash
+    return method === PM.QRIS || method === PM.TRANSFER;
   }
-  // dine-in
-  if (source === 'qr' || source === 'pos')
-    return [PM.QRIS, PM.BCA, PM.CASH].includes(method); // self-order & POS: semua
-  return method === PM.QRIS || method === PM.BCA; // online dine-in: non-cash (ubah jika mau izinkan cash)
+
+  // Dine-in via QR (self-order di meja)
+  if (source === 'qr') {
+    // umumnya: qris / transfer / cash (card jarang di sini)
+    return [PM.QRIS, PM.TRANSFER, PM.CASH].includes(method);
+  }
+
+  // Dine-in via POS
+  if (source === 'pos') {
+    // kasir bebas pakai semua
+    return [PM.QRIS, PM.TRANSFER, PM.CASH, PM.CARD].includes(method);
+  }
+
+  // Online dine-in (bukan QR): aman non-cash
+  return method === PM.QRIS || method === PM.TRANSFER;
 }
 
+// Bukti hanya untuk transfer
 function needProof(method) {
-  return method === PM.QRIS || method === PM.BCA;
+  return method === PM.TRANSFER;
+}
+
+/* =============== Upload bukti transfer =============== */
+async function handleTransferProofIfAny(req, method) {
+  if (!needProof(method)) return '';
+
+  const file = req.file;
+  if (!file) {
+    throwError('Bukti transfer wajib diunggah untuk metode transfer', 400);
+  }
+
+  const folderId =
+    getDriveFolder('payment_proof') || getDriveFolder('orders') || null;
+  const filename =
+    'TRF_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+
+  const uploaded = await uploadBuffer(
+    file.buffer,
+    filename,
+    file.mimetype || 'image/jpeg',
+    folderId
+  );
+
+  const id = uploaded?.id;
+  if (!id) {
+    throwError('Gagal menyimpan bukti transfer', 500);
+  }
+
+  return `https://drive.google.com/uc?export=view&id=${id}`;
 }
 
 exports.modeResolver = asyncHandler(async (req, _res, next) => {
