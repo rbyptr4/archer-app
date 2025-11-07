@@ -425,6 +425,8 @@ exports.createQrisFromCart = async (req, res, next) => {
     });
 
     const qr = resp.data;
+    console.log(resp.data);
+    console.log(resp);
 
     session.qr_code_id = qr.id;
     session.qr_string = qr.qr_string;
