@@ -1,6 +1,7 @@
 // controllers/paymentWebhookController.js
 const PaymentSession = require('../../models/paymentSessionModel');
 const Order = require('../../models/orderModel');
+const Member = require('../../models/memberModel');
 const { awardPointsIfEligible } = require('../../utils/loyalty');
 const { nextDailyTxCode } = require('../../utils/txCode');
 const {
@@ -143,7 +144,7 @@ exports.xenditQrisWebhook = async (req, res) => {
     await session.save();
 
     // --- Loyalty ---
-    await awardPointsIfEligible(order, require('../models/memberModel'));
+    await awardPointsIfEligible(order, Member);
 
     // --- Emit realtime ---
     const payload = {
