@@ -234,3 +234,34 @@ exports.createQrisFromCart = async (req, res, next) => {
     next(err);
   }
 };
+
+exports.getSessionStatus = async (req, res, next) => {
+  try {
+    const { id } = req.params || {};
+    const s = await PaymentSession.findById(id).lean();
+    if (!s) return res.status(404).json({ message: 'Session tidak ditemukan' });
+
+    // Kalau sudah dibuat order-nya oleh webhook
+    if (s.order) {
+      return res.json({
+        sessionId: String(s._id),
+        status: 'paid',
+        orderId: String(s.order),
+        provider: s.provider || 'xendit',
+        channel: s.channel || 'qris'
+      });
+    }
+
+    // Kalau belum dibayar
+    return res.json({
+      sessionId: String(s._id),
+      status: s.status || 'pending',
+      provider: s.provider || 'xendit',
+      channel: s.channel || 'qris',
+      amount: s.requested_amount || 0,
+      expires_at: s.expires_at || null
+    });
+  } catch (err) {
+    next(err);
+  }
+};
