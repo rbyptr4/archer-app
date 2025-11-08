@@ -4,6 +4,7 @@ const Order = require('../../models/orderModel');
 const Member = require('../../models/memberModel');
 const { awardPointsIfEligible } = require('../../utils/loyalty');
 const { nextDailyTxCode } = require('../../utils/txCode');
+const { int } = require('../../utils/money');
 const {
   emitToMember,
   emitToStaff,
@@ -12,7 +13,7 @@ const {
 
 /* ====== Helper: apply payment success (idempotent) ====== */
 async function applyPaymentSuccess(session, rawEvent) {
-  if (!session) return;
+  if (!session) return null;
   let order = null;
 
   // --- Fallback delivery snapshot untuk DELIVERY ---
@@ -27,8 +28,7 @@ async function applyPaymentSuccess(session, rawEvent) {
       deliverySnap = {
         address_text: String(session.address_text || 'Alamat tidak tersedia'),
         location: {
-          // kalau tidak ada data, pakai 0 agar lolos validator
-          lat: Number(session.lat) || 0,
+          lat: Number(session.lat) || 0, // default supaya lolos validator
           lng: Number(session.lng) || 0
         },
         distance_km: Number(session.distance_km) || 0,
@@ -55,13 +55,16 @@ async function applyPaymentSuccess(session, rawEvent) {
     const code = await nextDailyTxCode('ARCH');
     order = await Order.create({
       member: session.member || null,
+
       customer_name: session.member
         ? ''
         : session.customer_name || 'Guest QRIS',
       customer_phone: session.member ? '' : session.customer_phone || '',
+
       source: session.source || 'online',
       fulfillment_type: session.fulfillment_type,
       table_number: session.table_number || null,
+
       transaction_code: code,
 
       items: session.items || [],
@@ -101,7 +104,7 @@ async function applyPaymentSuccess(session, rawEvent) {
     if (order.status === 'created') order.status = 'accepted'; // opsional auto-accept
     await order.save();
 
-    // Loyalty
+    // Loyalty (best-effort)
     try {
       await awardPointsIfEligible(order, Member);
     } catch (e) {
@@ -132,8 +135,10 @@ async function applyPaymentSuccess(session, rawEvent) {
   return order;
 }
 
+/* ============================ WEBHOOK (QRIS) ============================ */
 exports.xenditQrisWebhook = async (req, res) => {
   try {
+    // Optional: verifikasi callback token
     const token = req.headers['x-callback-token'];
     if (
       process.env.XENDIT_CALLBACK_TOKEN &&
@@ -142,6 +147,7 @@ exports.xenditQrisWebhook = async (req, res) => {
       return res.status(401).json({ message: 'Invalid callback token' });
     }
 
+    // Body bisa text atau object (tergantung parser di router)
     let ev;
     if (typeof req.body === 'string') {
       try {
@@ -154,22 +160,27 @@ exports.xenditQrisWebhook = async (req, res) => {
       ev = req.body || {};
     }
 
+    // Balas cepat agar Xendit tidak retry
     res.json({ received: true });
 
+    // Normalisasi payload
     const data = ev.data || ev;
     const reference_id = data.reference_id || ev.reference_id || null;
     const metadata = data.metadata || ev.metadata || {};
     const rawStatus = data.status || ev.status || '';
     const status = String(rawStatus).toUpperCase();
+
+    // Status-status yang dianggap "paid"
     const PAID_STATUSES = ['PAID', 'SUCCEEDED', 'COMPLETED', 'CAPTURED'];
 
     if (!reference_id && !metadata.payment_session_id) {
       console.warn('[Xendit QRIS] Missing reference_id & payment_session_id');
       return;
     }
+
     if (!PAID_STATUSES.includes(status)) {
       console.log('[Xendit QRIS] Non-paid status:', status);
-      // Optional: update session status expired/failed
+      // Optional: update session status expired/failed (jika ada reference_id)
       if (reference_id) {
         const sess = await PaymentSession.findOne({
           external_id: reference_id
@@ -200,7 +211,7 @@ exports.xenditQrisWebhook = async (req, res) => {
       return;
     }
 
-    // Catat provider ref id / raw
+    // Catat provider ref id / raw event
     session.provider_ref_id = data.id || session.provider_ref_id;
     session.raw = ev;
     await session.save();

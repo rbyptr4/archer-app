@@ -568,7 +568,7 @@ exports.getCart = asyncHandler(async (req, res) => {
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreate: false,
     defaultFt: req.query?.fulfillment_type || null,
-    skipAttach: true // GET jangan merge berat
+    skipAttach: true
   });
 
   if (!cartObj) {
@@ -592,8 +592,30 @@ exports.getCart = asyncHandler(async (req, res) => {
     )
     .lean();
 
-  // Ringkasan untuk UI (tanpa menyimpan di DB)
+  // Ringkasan untuk UI
   const ui = buildUiTotalsFromCart(cart);
+
+  // ==== Patch: pastikan delivery_fee di ui_totals ====
+  const ft =
+    cart?.fulfillment_type ||
+    cartObj?.fulfillment_type ||
+    req.query?.fulfillment_type ||
+    'dine_in';
+
+  if (ft === 'delivery') {
+    const feeFromSnapshot =
+      cart?.delivery && cart.delivery.delivery_fee != null
+        ? Number(cart.delivery.delivery_fee)
+        : null;
+
+    ui.delivery_fee = Number(
+      feeFromSnapshot != null ? feeFromSnapshot : ui.delivery_fee || 0
+    );
+  } else {
+    // non-delivery
+    ui.delivery_fee = Number(ui.delivery_fee || 0);
+  }
+  // ==== end patch ====
 
   // ======= Tambahkan harga per-item (before/after tax) =======
   const items = Array.isArray(cart.items) ? cart.items : [];
@@ -604,6 +626,7 @@ exports.getCart = asyncHandler(async (req, res) => {
   const shipping_discount = Number(ui.shipping_discount || 0);
   const service_fee = Number(ui.service_fee || 0);
   const tax_amount_total = Number(ui.tax_amount || 0);
+
   const taxDenominator =
     items_subtotal -
     items_discount +
@@ -634,9 +657,9 @@ exports.getCart = asyncHandler(async (req, res) => {
 
     return {
       ...it,
-      unit_price: unit_before_tax, // sebelum pajak (per unit)
-      unit_tax, // pajak per unit
-      unit_price_incl_tax: unit_before_tax + unit_tax // sesudah pajak (per unit)
+      unit_price: unit_before_tax,
+      unit_tax,
+      unit_price_incl_tax: unit_before_tax + unit_tax
     };
   });
 
