@@ -365,7 +365,14 @@ const getActiveCartForIdentity = async (
     ? { member: iden.memberId }
     : { session_id: iden.session_id };
 
-  const sourcesToCheck = requestedSource === 'qr' ? ['qr'] : ['qr', 'online'];
+  // 🔧 perbaikan: hormati requestedSource
+  const sourcesToCheck = (() => {
+    if (requestedSource === 'qr') return ['qr'];
+    if (requestedSource === 'online') return ['online'];
+    // fallback kalau gak jelas: prefer online baru qr
+    return ['online', 'qr'];
+  })();
+
   let cart = null;
   let cartsQueried = [];
   let foundSource = null;
@@ -382,6 +389,7 @@ const getActiveCartForIdentity = async (
       ])
       .limit(2)
       .lean();
+
     if (carts.length) {
       cart = carts[0];
       cartsQueried = carts;
@@ -400,6 +408,7 @@ const getActiveCartForIdentity = async (
       const ensureSession = iden.memberId
         ? null
         : iden.session_id || crypto.randomUUID();
+
       const upsertFilter = {
         status: 'active',
         source: 'online',
@@ -407,6 +416,7 @@ const getActiveCartForIdentity = async (
           ? { member: iden.memberId }
           : { session_id: ensureSession })
       };
+
       const setOnInsert = {
         member: iden.memberId || null,
         session_id: iden.memberId ? null : ensureSession,
