@@ -513,7 +513,6 @@ exports.getCart = asyncHandler(async (req, res) => {
       rounding_delta: 0,
       grand_total: 0
     };
-    // Tanpa caching header
     return res.status(200).json({ cart: null, ui_totals: empty });
   }
 
@@ -523,10 +522,55 @@ exports.getCart = asyncHandler(async (req, res) => {
     )
     .lean();
 
-  // Hitung ringkasan untuk UI (tanpa menyimpan di DB)
+  // Ringkasan untuk UI (tanpa menyimpan di DB)
   const ui = buildUiTotalsFromCart(cart);
 
-  return res.status(200).json({ ...cart, ui_totals: ui });
+  // ======= Tambahkan harga per-item (before/after tax) =======
+  const items = Array.isArray(cart.items) ? cart.items : [];
+
+  const items_subtotal = Number(ui.items_subtotal || 0);
+  const items_discount = Number(ui.items_discount || 0);
+  const delivery_fee = Number(ui.delivery_fee || 0);
+  const shipping_discount = Number(ui.shipping_discount || 0);
+  const service_fee = Number(ui.service_fee || 0);
+  const tax_amount_total = Number(ui.tax_amount || 0);
+  const taxDenominator =
+    items_subtotal -
+    items_discount +
+    delivery_fee -
+    shipping_discount +
+    service_fee;
+
+  const mappedItems = items.map((it) => {
+    const qty = Number(it.quantity || 0);
+
+    const unit_base = Number(it.base_price || 0);
+    const addons_unit = (it.addons || []).reduce(
+      (s, a) => s + Number(a.price || 0) * Number(a.qty || 1),
+      0
+    );
+    const unit_before_tax = unit_base + addons_unit;
+
+    const line_before_tax = Number(
+      it.line_subtotal != null ? it.line_subtotal : unit_before_tax * qty
+    );
+
+    const line_tax =
+      taxDenominator > 0
+        ? Math.round((tax_amount_total * line_before_tax) / taxDenominator)
+        : 0;
+
+    const unit_tax = qty > 0 ? Math.round(line_tax / qty) : 0;
+
+    return {
+      ...it,
+      unit_price: unit_before_tax, // sebelum pajak (per unit)
+      unit_tax, // pajak per unit
+      unit_price_incl_tax: unit_before_tax + unit_tax // sesudah pajak (per unit)
+    };
+  });
+
+  return res.status(200).json({ ...cart, items: mappedItems, ui_totals: ui });
 });
 
 exports.addItem = asyncHandler(async (req, res) => {
