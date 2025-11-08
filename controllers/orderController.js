@@ -84,6 +84,77 @@ const DELIVERY_ALLOWED = [
   'failed'
 ];
 
+/* ===== Debug helpers (nyalakan dengan DEBUG_CHECKOUT=1) ===== */
+const DEBUG_CHECKOUT = String(process.env.DEBUG_CHECKOUT || '0') === '1';
+
+const safeJson = (v, fallback = null) => {
+  try {
+    return JSON.stringify(v);
+  } catch (_) {
+    return fallback;
+  }
+};
+
+const short = (arr, n = 3) => (Array.isArray(arr) ? arr.slice(0, n) : arr);
+
+const shape = (v) => {
+  if (Array.isArray(v)) return `Array(${v.length})`;
+  if (v && typeof v === 'object')
+    return `Object(${Object.keys(v).length} keys)`;
+  return typeof v;
+};
+
+const makeCheckoutDebugger = (req) => {
+  const ON = DEBUG_CHECKOUT; // set ke true untuk paksa nyala tanpa env
+  const tag = `[CHK-${Date.now().toString(36)}]`;
+  return (step, extra = {}) => {
+    if (!ON) return;
+    const base = {
+      step,
+      method: req.method,
+      url: req.originalUrl,
+      at: new Date().toISOString()
+    };
+    // Jangan spam log besar — ringkas tapi informatif
+    const summarized = {
+      ...base,
+      ...extra
+    };
+    console.error(tag, safeJson(summarized, `[${step}] <unserializable>`));
+  };
+};
+
+/* ===== Detektor addon bermasalah (hindari 'in' ke undefined) ===== */
+const scanAddonsForIsActiveInUndefined = (items) => {
+  const issues = [];
+  for (let i = 0; i < (items?.length || 0); i++) {
+    const it = items[i];
+    const addons = Array.isArray(it?.addons) ? it.addons : [];
+    for (let j = 0; j < addons.length; j++) {
+      const a = addons[j];
+      // Aman: jangan pakai `'isActive' in a` langsung.
+      const hasIsActive =
+        a &&
+        typeof a === 'object' &&
+        Object.prototype.hasOwnProperty.call(a, 'isActive');
+      // Kalau addon bukan object, laporkan.
+      if (!a || typeof a !== 'object') {
+        issues.push({ itemIndex: i, addonIndex: j, type: typeof a, value: a });
+      }
+      // Bonus: kalau ada properti isActive tapi tipenya aneh, laporkan.
+      if (hasIsActive && typeof a.isActive !== 'boolean') {
+        issues.push({
+          itemIndex: i,
+          addonIndex: j,
+          isActiveType: typeof a.isActive,
+          value: a.isActive
+        });
+      }
+    }
+  }
+  return issues;
+};
+
 const toWa62 = (phone) => {
   const s = String(phone ?? '').trim();
   if (!s) return '';
@@ -914,70 +985,49 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
 
 /* ===================== CHECKOUT ===================== */
 exports.checkout = asyncHandler(async (req, res) => {
+  const dbg = makeCheckoutDebugger(req);
+
+  // ==== STEP: payload masuk ====
+  const rawBodyKeys = Object.keys(req.body || {});
+  const rawFiles = req.file
+    ? { single: req.file?.fieldname }
+    : Array.isArray(req.files)
+    ? { multiple: req.files.map((f) => f.fieldname) }
+    : null;
+  dbg('payload:received', {
+    bodyKeys: rawBodyKeys,
+    hasFile: !!(req.file || (req.files && req.files.length)),
+    files: rawFiles
+  });
+
   const iden0 = getIdentity(req);
   const {
     name,
     phone,
-    fulfillment_type, // 'dine_in' | 'delivery'
-    payment_method, // 'qris' | 'transfer' | 'card' | 'cash'
+    fulfillment_type,
+    payment_method,
     address_text,
     lat,
     lng,
     note_to_rider,
     idempotency_key,
     voucherClaimIds = [],
-    register_decision = 'register' // 'register' | 'skip'
+    register_decision = 'register'
   } = req.body || {};
 
-  // ===== Resolve fulfillment type =====
-  const ft =
-    iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
-  if (!['dine_in', 'delivery'].includes(ft)) {
-    throwError('fulfillment_type tidak valid', 400);
-  }
+  // ==== STEP: header & identity ringkas ====
+  dbg('identity:resolved', {
+    source: iden0?.source,
+    mode: iden0?.mode,
+    memberId: String(iden0?.memberId || ''),
+    fulfillment_type,
+    payment_method,
+    register_decision
+  });
 
-  // ===== Validasi metode bayar =====
-  const method = String(payment_method || '').toLowerCase();
-  if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method)) {
-    throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
-  }
+  // ... (kode validasi ft & method seperti punyamu) ...
 
-  const methodIsGateway = method === PM.QRIS; // hanya QRIS yang ke PG
-  const requiresProof = needProof(method);
-
-  const originallyLoggedIn = !!iden0.memberId;
-  const wantRegister = String(register_decision || 'register') === 'register';
-
-  let member = null;
-  let customer_name = '';
-  let customer_phone = '';
-
-  if (originallyLoggedIn || wantRegister) {
-    const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
-    member = await ensureMemberForCheckout(req, res, joinChannel);
-  } else {
-    customer_name = String(name || '').trim();
-    const rawPhone = String(phone || '').trim();
-
-    // Minimal salah satu terisi
-    if (!customer_name && !rawPhone) {
-      throwError('Tanpa member: isi minimal nama atau no. telp', 400);
-    }
-
-    if (rawPhone) {
-      // cek: hanya digit setelah remove non-digit
-      const digits = rawPhone.replace(/\D+/g, '');
-      if (!digits) {
-        throwError('Nomor telepon harus berupa angka', 400);
-      }
-      // normalisasi ke format "0..." (pakai helper kamu)
-      customer_phone = normalizePhone(rawPhone);
-    } else {
-      customer_phone = ''; // boleh kosong kalau nama ada
-    }
-  }
-
-  // ===== Ambil cart aktif =====
+  // ==== Ambil cart ====
   const iden = {
     ...iden0,
     memberId: member?._id || iden0.memberId || null,
@@ -991,72 +1041,28 @@ exports.checkout = asyncHandler(async (req, res) => {
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
+  dbg('cart:found', { cartId: String(cartObj?._id || ''), hasCart: !!cartObj });
+
   if (!cartObj) throwError('Cart tidak ditemukan / kosong', 404);
 
   const cart = await Cart.findById(cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan / kosong', 404);
   if (!cart.items?.length) throwError('Cart kosong', 400);
 
-  if (
-    ft === 'dine_in' &&
-    (iden.source || 'online') === 'qr' &&
-    !cart.table_number
-  ) {
-    throwError('Silakan assign nomor meja terlebih dahulu', 400);
-  }
-
-  // ===== Idempotency =====
-  if (
-    idempotency_key &&
-    cart.last_idempotency_key === idempotency_key &&
-    cart.order_id
-  ) {
-    return res.status(200).json({
-      order: { _id: cart.order_id },
-      idempotent: true,
-      message: 'Checkout sudah diproses sebelumnya'
-    });
-  }
-
-  if (member && !cart.member) {
-    cart.member = member._id;
-    cart.session_id = null;
-  }
-
-  // ===== Delivery setup =====
-  let delivery = undefined;
-  let delivery_fee = 0;
-  if (ft === 'delivery') {
-    const latN = Number(lat),
-      lngN = Number(lng);
-    if (!Number.isFinite(latN) || !Number.isFinite(lngN)) {
-      throwError('Lokasi (lat,lng) wajib untuk delivery', 400);
-    }
-    const distance_km = haversineKm(CAFE_COORD, { lat: latN, lng: lngN });
-    if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0)) {
-      throwError(`Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`, 400);
-    }
-    delivery_fee = calcDeliveryFee();
-    delivery = {
-      address_text: String(address_text || '').trim(),
-      location: { lat: latN, lng: lngN },
-      distance_km: Number(distance_km.toFixed(2)),
-      delivery_fee,
-      note_to_rider: String(note_to_rider || ''),
-      status: 'pending'
-    };
-  }
-
+  // ==== Normalisasi items & addons ====
   cart.items = (Array.isArray(cart.items) ? cart.items : [])
     .filter(Boolean)
     .map((it) => {
       const rawAddons = Array.isArray(it.addons) ? it.addons : [];
       const safeAddons = rawAddons
-        .filter((a) => a && typeof a === 'object') // buang undefined/null/string
+        .filter((a) => a && typeof a === 'object')
         .map((a) => ({
           name: String(a.name || '').trim(),
           price: int(a.price || 0),
-          qty: clamp(int(a.qty || 1), 1, 999)
+          qty: clamp(int(a.qty || 1), 1, 999),
+          // Penting: kalau sistemmu masih nyimpen isActive di snapshot addon,
+          // jangan cek pakai 'in' — biarkan sebagai data biasa.
+          ...(typeof a.isActive === 'boolean' ? { isActive: !!a.isActive } : {})
         }));
 
       return {
@@ -1066,223 +1072,88 @@ exports.checkout = asyncHandler(async (req, res) => {
       };
     });
 
-  // ===== Voucher pricing =====
-  recomputeTotals(cart);
-  await cart.save();
-
-  let eligibleClaimIds = [];
-  if (member) {
-    if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
-      const rawClaims = await VoucherClaim.find({
-        _id: { $in: voucherClaimIds },
-        member: member._id,
-        status: 'claimed'
-      }).lean();
-      const now = new Date();
-      eligibleClaimIds = rawClaims
-        .filter((c) => !c.validUntil || c.validUntil > now)
-        .map((c) => String(c._id));
-    }
-  } else if (voucherClaimIds?.length) {
-    throwError('Voucher hanya untuk member. Silakan daftar/login.', 400);
-  }
-
-  const priced = await validateAndPrice({
-    memberId: member ? member._id : null,
-    cart: {
-      items: cart.items.map((it) => ({
-        menuId: it.menu,
-        qty: it.quantity,
-        price: it.base_price,
-        category: it.category || null
-      }))
-    },
-    fulfillmentType: ft,
-    deliveryFee: delivery_fee,
-    voucherClaimIds: eligibleClaimIds
+  // ==== STEP: snapshot cart setelah sanitasi ====
+  const cartPreview = short(cart.items).map((it, idx) => ({
+    i: idx,
+    menu: String(it.menu || ''),
+    qty: it.quantity,
+    addonsCount: Array.isArray(it.addons) ? it.addons.length : 0,
+    addonPreview: short(it.addons).map((a) => ({
+      name: a?.name,
+      price: a?.price,
+      qty: a?.qty,
+      hasIsActive: Object.prototype.hasOwnProperty.call(a || {}, 'isActive')
+    }))
+  }));
+  dbg('cart:sanitized', {
+    itemsPreview: cartPreview,
+    totalItems: cart.items.length
   });
 
-  // ===== PPN + Pembulatan =====
-  const rate = parsePpnRate(); // ex: 0.11
-  const taxBase =
-    priced.totals.baseSubtotal -
-    priced.totals.itemsDiscount +
-    priced.totals.deliveryFee -
-    priced.totals.shippingDiscount;
-
-  const taxAmount = int(Math.max(0, taxBase * rate));
-  const taxRatePercent = Math.round(rate * 100 * 100) / 100;
-
-  const beforeRound = int(taxBase + taxAmount);
-  const rounded = int(roundRupiahCustom(beforeRound));
-  const roundingDelta = int(rounded - beforeRound);
-
-  priced.totals.taxAmount = taxAmount;
-  priced.totals.taxRatePercent = taxRatePercent;
-  priced.totals.grandTotal = rounded;
-  priced.totals.roundingDelta = roundingDelta;
-
-  // ===== Bukti transfer (kalau perlu) =====
-  const payment_proof_url = await handleTransferProofIfAny(req, method);
-
-  // ===== Payment status awal =====
-  let payment_status = 'unpaid';
-  let payment_provider = null;
-
-  if (methodIsGateway) {
-    payment_provider = 'xendit';
-    payment_status = 'unpaid';
-  } else if (requiresProof) {
-    payment_status = 'paid';
-  } else {
-    payment_status = 'unpaid';
-  }
-
-  // ===== Buat Order =====
-  const order = await (async () => {
-    for (let i = 0; i < 5; i++) {
-      try {
-        const code = await nextDailyTxCode('ARCH');
-        return await Order.create({
-          member: member ? member._id : null,
-          customer_name: member ? '' : customer_name,
-          customer_phone: member ? '' : customer_phone,
-
-          table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
-          source: iden.source || 'online',
-          fulfillment_type: ft,
-          transaction_code: code,
-
-          items: cart.items.map((it) => ({
-            menu: it.menu,
-            menu_code: it.menu_code,
-            name: it.name,
-            imageUrl: it.imageUrl,
-            base_price: it.base_price,
-            quantity: it.quantity,
-            addons: it.addons, // <- sudah tersanitasi
-            notes: String(it.notes || '').trim(),
-            category: it.category || null
-          })),
-
-          // Totals dari pricing (tanpa service fee di flow ini)
-          items_subtotal: int(priced.totals.baseSubtotal),
-          items_discount: int(priced.totals.itemsDiscount),
-          delivery_fee: int(priced.totals.deliveryFee),
-          shipping_discount: int(priced.totals.shippingDiscount),
-          discounts: priced.breakdown,
-
-          // Pajak & pembulatan
-          tax_rate_percent: taxRatePercent,
-          tax_amount: taxAmount,
-          rounding_delta: roundingDelta,
-          grand_total: rounded,
-
-          payment_method: method,
-          payment_provider,
-          payment_status,
-          payment_proof_url,
-
-          status: 'created',
-          placed_at: new Date()
-        });
-      } catch (e) {
-        if (e?.code === 11000 && /transaction_code/.test(String(e.message)))
-          continue;
-        throw e;
-      }
-    }
-    throw new Error('Gagal generate transaction_code unik');
-  })();
-
-  /* ===== Konsumsi voucher ===== */
-  if (member) {
-    for (const claimId of priced.chosenClaimIds || []) {
-      try {
-        const c = await VoucherClaim.findById(claimId);
-        if (
-          c &&
-          c.status === 'claimed' &&
-          String(c.member) === String(member._id)
-        ) {
-          c.remainingUse -= 1;
-          if (c.remainingUse <= 0) c.status = 'used';
-          c.history.push({
-            action: 'USE',
-            ref: String(order._id),
-            note: 'dipakai pada order'
-          });
-          await c.save();
-        }
-      } catch (_) {}
-    }
-  }
-
-  /* ===== Tandai cart selesai ===== */
-  await Cart.findByIdAndUpdate(cart._id, {
-    $set: {
-      status: 'checked_out',
-      checked_out_at: new Date(),
-      order_id: order._id,
-      last_idempotency_key: idempotency_key || null,
-      items: [],
-      total_items: 0,
-      total_quantity: 0,
-      total_price: 0
-    }
-  });
-
-  /* ===== Statistik member ===== */
-  if (member) {
-    await Member.findByIdAndUpdate(member._id, {
-      $inc: { total_spend: order.grand_total || 0 },
-      $set: { last_visit_at: new Date() }
+  // ==== Deteksi spesifik error 'isActive' in undefined ====
+  const issues = scanAddonsForIsActiveInUndefined(cart.items);
+  if (issues.length) {
+    dbg('cart:addon_issues', {
+      count: issues.length,
+      samples: short(issues, 5)
     });
   }
 
-  /* ===== Emit realtime ===== */
-  const payload = {
-    id: String(order._id),
-    transaction_code: order.transaction_code,
-    member: member
-      ? { id: String(member._id), name: member.name, phone: member.phone }
-      : null,
-    items_total: order.items_subtotal,
-    grand_total: order.grand_total,
-    total_quantity: order.total_quantity,
-    source: order.source,
-    fulfillment_type: order.fulfillment_type,
-    status: order.status,
-    payment_status: order.payment_status,
-    payment_method: order.payment_method,
-    placed_at: order.placed_at,
-    delivery: order.delivery || null,
-    table_number: order.table_number || null
-  };
-  emitToStaff('order:new', payload);
-  if (member) emitToMember(member._id, 'order:new', payload);
-  if ((iden.source || 'online') === 'qr' && order.table_number) {
-    emitToTable(order.table_number, 'order:new', payload);
+  // ==== recomputeTotals (guarded) ====
+  try {
+    dbg('totals:recompute:begin');
+    recomputeTotals(cart);
+    await cart.save();
+    dbg('totals:recompute:done', {
+      total_items: cart.total_items,
+      total_quantity: cart.total_quantity,
+      total_price: cart.total_price
+    });
+  } catch (err) {
+    dbg('totals:recompute:ERROR', { message: err?.message, stack: err?.stack });
+    throw err;
   }
 
-  res.status(201).json({
-    order: order.toObject(),
-    totals: {
-      items_subtotal: order.items_subtotal,
-      service_fee: order.service_fee,
-      items_discount: order.items_discount,
-      delivery_fee: order.delivery_fee,
-      shipping_discount: order.shipping_discount,
-      tax_rate_percent: order.tax_rate_percent,
-      tax_amount: order.tax_amount,
-      rounding_delta: order.rounding_delta,
-      grand_total: order.grand_total
-    },
-    message:
-      payment_status === 'unpaid'
-        ? 'Checkout berhasil. Silakan lanjutkan pembayaran.'
-        : 'Checkout berhasil.'
+  // ==== validateAndPrice (guarded) ====
+  let priced;
+  try {
+    dbg('pricing:begin', {
+      deliveryFee: ft === 'delivery' ? delivery_fee : 0,
+      voucherClaimIds_shape: shape(voucherClaimIds)
+    });
+    priced = await validateAndPrice({
+      memberId: member ? member._id : null,
+      cart: {
+        items: cart.items.map((it) => ({
+          menuId: it.menu,
+          qty: it.quantity,
+          price: it.base_price,
+          category: it.category || null
+        }))
+      },
+      fulfillmentType: ft,
+      deliveryFee: delivery_fee,
+      voucherClaimIds: eligibleClaimIds
+    });
+    dbg('pricing:done', {
+      itemsSubtotal: priced?.totals?.baseSubtotal,
+      itemsDiscount: priced?.totals?.itemsDiscount,
+      deliveryFee: priced?.totals?.deliveryFee
+    });
+  } catch (err) {
+    dbg('pricing:ERROR', { message: err?.message, stack: err?.stack });
+    throw err;
+  }
+
+  // ==== sebelum buat order, ringkas status pembayaran ====
+  dbg('payment:status:init', {
+    method,
+    methodIsGateway,
+    requiresProof
   });
+
+  // ==== sisanya lanjut persis seperti punyamu ====
+  // ... (pembuatan order, konsumsi voucher, mark cart checked_out, emit socket, dll)
 });
 
 exports.assignTable = asyncHandler(async (req, res) => {
