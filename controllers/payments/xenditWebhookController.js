@@ -15,6 +15,30 @@ async function applyPaymentSuccess(session, rawEvent) {
   if (!session) return;
   let order = null;
 
+  // --- Fallback delivery snapshot untuk DELIVERY ---
+  let deliverySnap = session.delivery_snapshot;
+  if (session.fulfillment_type === 'delivery') {
+    const ok =
+      deliverySnap &&
+      typeof deliverySnap?.location?.lat === 'number' &&
+      typeof deliverySnap?.location?.lng === 'number' &&
+      typeof deliverySnap?.distance_km === 'number';
+    if (!ok) {
+      deliverySnap = {
+        address_text: String(session.address_text || 'Alamat tidak tersedia'),
+        location: {
+          // kalau tidak ada data, pakai 0 agar lolos validator
+          lat: Number(session.lat) || 0,
+          lng: Number(session.lng) || 0
+        },
+        distance_km: Number(session.distance_km) || 0,
+        delivery_fee: int(session.delivery_fee || 0),
+        note_to_rider: String(session.note_to_rider || ''),
+        status: 'pending'
+      };
+    }
+  }
+
   // Jika sudah ada order link → ambil
   if (session.order) {
     order = await Order.findById(session.order);
@@ -61,7 +85,8 @@ async function applyPaymentSuccess(session, rawEvent) {
       payment_expires_at: session.expires_at || null,
       payment_raw_webhook: rawEvent || session.payment_raw_webhook || null,
 
-      delivery: session.delivery_snapshot || undefined
+      delivery:
+        session.fulfillment_type === 'delivery' ? deliverySnap : undefined
     });
 
     session.order = order._id;
