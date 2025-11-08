@@ -595,7 +595,7 @@ exports.getCart = asyncHandler(async (req, res) => {
   // Ringkasan UI (tanpa simpan DB)
   const ui = buildUiTotalsFromCart(cart);
 
-  // === PATCH: delivery fee flat dari .env (hanya tampilan) ===
+  // === PATCH: delivery fee flat dari .env + tambahkan ke grand_total (khusus delivery) ===
   const ft =
     cart?.fulfillment_type ||
     cartObj?.fulfillment_type ||
@@ -606,8 +606,10 @@ exports.getCart = asyncHandler(async (req, res) => {
 
   if (ft === 'delivery') {
     ui.delivery_fee = FLAT_DELIV;
+    ui.grand_total = Number(ui.grand_total || 0) + FLAT_DELIV;
   } else {
     ui.delivery_fee = Number(ui.delivery_fee || 0);
+    ui.grand_total = Number(ui.grand_total || 0);
   }
   // === END PATCH ===
 
@@ -652,7 +654,7 @@ exports.getCart = asyncHandler(async (req, res) => {
     return {
       ...it,
       unit_price: unit_before_tax, // sebelum pajak (per unit)
-      unit_tax, // pajak per unit
+      unit_tax, // pajak per unit (alokasi)
       unit_price_incl_tax: unit_before_tax + unit_tax // sesudah pajak (per unit)
     };
   });
