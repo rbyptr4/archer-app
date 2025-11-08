@@ -100,6 +100,8 @@ router.get(
   order.getDetailOrder
 );
 
+router.get('/:id/receipt', order.getOrderReceipt);
+
 router.post(
   '/:id/verify-payment',
   validateToken,

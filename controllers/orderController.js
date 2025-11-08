@@ -1320,6 +1320,90 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
   res.status(200).json(order);
 });
 
+const buildOrderReceipt = (order) => {
+  if (!order) return null;
+
+  // Tentukan nama & phone yang ditampilkan
+  const displayName = order.member?.name || order.customer_name || '';
+  const displayPhone = order.member?.phone || order.customer_phone || '';
+
+  return {
+    id: String(order._id),
+    transaction_code: order.transaction_code || '',
+    status: order.status,
+    payment_status: order.payment_status,
+    payment_method: order.payment_method,
+    // ringkasan harga
+    pricing: {
+      items_subtotal: order.items_subtotal,
+      service_fee: order.service_fee,
+      delivery_fee: order.delivery_fee,
+      items_discount: order.items_discount,
+      shipping_discount: order.shipping_discount,
+      tax_amount: order.tax_amount,
+      rounding_delta: order.rounding_delta,
+      grand_total: order.grand_total
+    },
+    customer: {
+      name: displayName,
+      phone: displayPhone
+    },
+    fulfillment: {
+      type: order.fulfillment_type,
+      table_number:
+        order.fulfillment_type === 'dine_in'
+          ? order.table_number || null
+          : null,
+      delivery:
+        order.fulfillment_type === 'delivery' && order.delivery
+          ? {
+              address_text: order.delivery.address_text || '',
+              distance_km: order.delivery.distance_km || null,
+              note_to_rider: order.delivery.note_to_rider || ''
+            }
+          : null
+    },
+    items: (order.items || []).map((it) => ({
+      name: it.name,
+      menu_code: it.menu_code || '',
+      imageUrl: it.imageUrl || '',
+      quantity: it.quantity,
+      addons: (it.addons || []).map((ad) => ({
+        name: ad.name,
+        price: ad.price,
+        qty: ad.qty
+      })),
+      line_subtotal: it.line_subtotal
+    })),
+    timestamps: {
+      placed_at: order.placed_at,
+      paid_at: order.paid_at || null
+    }
+  };
+};
+
+exports.getOrderReceipt = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  const order = await Order.findById(id)
+    .populate('member', 'name phone') // kalau mau ambil dari member
+    .lean({ virtuals: true });
+
+  if (!order) {
+    return res.status(404).json({
+      success: false,
+      message: 'Order tidak ditemukan'
+    });
+  }
+
+  const data = buildOrderReceipt(order);
+
+  return res.json({
+    success: true,
+    data
+  });
+});
+
 exports.listKitchenOrders = asyncHandler(async (_req, res) => {
   const items = await Order.find({
     status: 'accepted',
