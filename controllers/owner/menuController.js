@@ -763,6 +763,7 @@ exports.listMenus = asyncHandler(async (req, res) => {
 exports.getMenuById = asyncHandler(async (req, res) => {
   const { id } = req.params;
   if (!isValidId(id)) throwError('ID tidak valid', 400);
+
   const menu = await Menu.findById(id).lean({ virtuals: true });
   if (!menu) throwError('Menu tidak ditemukan', 404);
 
@@ -770,7 +771,36 @@ exports.getMenuById = asyncHandler(async (req, res) => {
     !!req.user && ['owner', 'employee'].includes(req.user.role);
   if (!isBackoffice && !menu.isActive) throwError('Menu tidak ditemukan', 404);
 
-  res.json({ success: true, data: menu });
+  // ===== Helper kecil (konsisten dg listMenuForMember) =====
+  const calcFinalPrice = (price = {}) => {
+    const original = Number(price.original || 0);
+    const mode = price.discountMode || 'none';
+    const discPercent = Number(price.discountPercent || 0);
+    const manualPromo = Number(price.manualPromoPrice || 0);
+
+    if (mode === 'manual' && manualPromo > 0) return manualPromo;
+    if (mode === 'percent' && discPercent > 0 && discPercent < 100) {
+      return Math.round(original * (1 - discPercent / 100));
+    }
+    return original;
+  };
+
+  const ppnRateRaw = typeof parsePpnRate === 'function' ? parsePpnRate() : 0.11;
+  const ppnRate =
+    Number.isFinite(ppnRateRaw) && ppnRateRaw >= 0 ? ppnRateRaw : 0.11;
+
+  const price_final = calcFinalPrice(menu.price);
+  const taxAmount = Math.round(Math.max(0, price_final * ppnRate));
+  const price_with_tax = price_final + taxAmount;
+
+  res.json({
+    success: true,
+    data: {
+      ...menu,
+      price_final,
+      price_with_tax
+    }
+  });
 });
 
 exports.activateMenu = asyncHandler(async (req, res) => {
