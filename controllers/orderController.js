@@ -230,41 +230,42 @@ async function handleTransferProofIfAny(req, method) {
 }
 
 exports.modeResolver = asyncHandler(async (req, _res, next) => {
-  // ==== 1) Baca sinyal dari request ====
-  const ft = (req.body?.fulfillment_type || req.query?.fulfillment_type || '')
-    .toString()
-    .toLowerCase();
-  const headerSrc = (req.headers['x-order-source'] || '')
-    .toString()
-    .toLowerCase();
-  const querySrc = (req.query?.source || '').toString().toLowerCase();
-  const tnRaw = req.body?.table_number ?? req.query?.table_number;
-  const tn = Number(tnRaw);
+  const ft = String(
+    req.body?.fulfillment_type || req.query?.fulfillment_type || ''
+  ).toLowerCase();
+  const headerSrc = String(req.headers['x-order-source'] || '').toLowerCase(); // 'online' | 'qr' | ''
+  const querySrc = String(req.query?.source || '').toLowerCase(); // 'online' | 'qr' | ''
+  const wantSrc = headerSrc || querySrc; // kalau ada, ini override eksplisit dari FE
 
-  // ==== 2) Tentukan source/mode ====
   // default
   let source = 'online';
   let mode = 'online';
 
+  // 1) Delivery selalu ONLINE, apapun yang lain
   if (ft === 'delivery') {
     source = 'online';
     mode = 'online';
-  } else if (!Number.isNaN(tn) && tn > 0) {
-    // ada table_number => self order (QR)
+  } else if (wantSrc === 'online') {
+    // 2) FE minta ONLINE eksplisit
+    source = 'online';
+    mode = 'online';
+  } else if (wantSrc === 'qr') {
+    // 3) FE minta QR eksplisit
     source = 'qr';
     mode = 'self_order';
-  } else if (headerSrc === 'qr' || querySrc === 'qr') {
-    source = 'qr';
-    mode = 'self_order';
+  } else {
+    // 4) Tidak ada ft delivery dan tidak ada override source
+    //    Baru lihat table_number sebagai sinyal QR
+    const tnRaw = req.body?.table_number ?? req.query?.table_number;
+    const tn = Number(tnRaw);
+    if (!Number.isNaN(tn) && tn > 0) {
+      source = 'qr';
+      mode = 'self_order';
+      req.table_number = tn; // simpan hanya bila benar2 QR
+    }
   }
-  // selain kondisi di atas, tetap online
 
-  // simpan table_number (kalau ada) untuk downstream
-  if (!Number.isNaN(tn) && tn > 0) {
-    req.table_number = tn;
-  }
-
-  // ==== 3) Prioritaskan cookie sebagai session_id ====
+  // Session id: cookie lebih prioritas
   const cookieDev = req.cookies?.[DEVICE_COOKIE];
   const headerDev =
     req.get('x-online-session') ||
@@ -275,11 +276,10 @@ exports.modeResolver = asyncHandler(async (req, _res, next) => {
     null;
 
   const sessionHeader = cookieDev || headerDev;
-  req.session_id = sessionHeader ? String(sessionHeader).trim() : null;
 
-  // ==== 4) Set hasil ke request ====
   req.orderMode = mode; // 'online' | 'self_order'
   req.orderSource = source; // 'online' | 'qr'
+  req.session_id = sessionHeader ? String(sessionHeader).trim() : null;
 
   next();
 });
@@ -828,9 +828,7 @@ exports.setFulfillmentType = asyncHandler(async (req, res) => {
         await onlineCart.save();
 
         // Kosongkan QR
-        qrCart.items = [];
-        recomputeTotals(qrCart);
-        await qrCart.save();
+        await Cart.deleteOne({ _id: qrCart._id }).catch(() => {});
 
         return res.status(200).json(onlineCart.toObject());
       }
@@ -944,9 +942,7 @@ exports.setFulfillmentType = asyncHandler(async (req, res) => {
     await qrCart.save();
 
     // Kosongkan ONLINE
-    onlineCart.items = [];
-    recomputeTotals(onlineCart);
-    await onlineCart.save();
+    await Cart.deleteOne({ _id: onlineCart._id }).catch(() => {});
 
     return res.status(200).json(qrCart.toObject());
   }
