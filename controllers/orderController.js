@@ -610,33 +610,56 @@ exports.addItem = asyncHandler(async (req, res) => {
   const { menu_id, quantity = 1, addons = [], notes = '' } = req.body || {};
   if (!menu_id) throwError('menu_id wajib', 400);
 
-  const iden = getIdentity(req);
+  // Identitas awal dari modeResolver
+  const iden0 = getIdentity(req);
+
+  // SAFETY NET: kalau body/query bilang delivery, paksa laci ONLINE
+  const ftIncoming = String(
+    req.body?.fulfillment_type || req.query?.fulfillment_type || ''
+  ).toLowerCase();
+
+  const desiredSource =
+    ftIncoming === 'delivery' ? 'online' : iden0.source || 'online';
+
+  // Pakai identitas dengan source final yang sudah “dipaksa” kalau perlu
+  const iden = { ...iden0, source: desiredSource };
+
+  // Ambil menu
   const menu = await Menu.findById(menu_id).lean();
   if (!menu || !menu.isActive)
     throwError('Menu tidak ditemukan / tidak aktif', 404);
 
-  const allowCreateOnline = (iden.source || 'online') !== 'qr';
+  // Boleh create cart baru hanya kalau source = online
+  const allowCreateOnline = desiredSource !== 'qr';
   let cart = await getActiveCartForIdentity(iden, {
     allowCreateOnline,
     defaultFt: req.query?.fulfillment_type || req.body?.fulfillment_type || null
   });
 
-  if ((iden.source || 'online') === 'qr' && !cart.table_number) {
+  // Guard khusus QR: harus sudah ada nomor meja
+  if (desiredSource === 'qr' && !cart.table_number) {
     throwError('Nomor meja belum di-assign.', 400);
   }
 
+  // (Opsional) Guard tambahan: kalau delivery tapi kebetulan cart yang didapat QR, tolak
+  if (ftIncoming === 'delivery' && cart.source === 'qr') {
+    throwError('Context tidak sesuai: delivery harus memakai cart online', 409);
+  }
+
+  // Siapkan item
   const qty = clamp(asInt(quantity, 1), 1, 999);
   const normAddons = normalizeAddons(addons);
   const line_key = makeLineKey({ menuId: menu._id, addons: normAddons, notes });
 
+  // Pastikan kita pegang dokumen Mongoose hidup (bukan plain object)
   if (!cart.save) {
     cart = await Cart.findById(cart._id);
   }
 
+  // Upsert line
   const idx = cart.items.findIndex((it) => it.line_key === line_key);
   if (idx >= 0) {
-    const newQty = clamp(cart.items[idx].quantity + qty, 1, 999);
-    cart.items[idx].quantity = newQty;
+    cart.items[idx].quantity = clamp(cart.items[idx].quantity + qty, 1, 999);
   } else {
     const unit = priceFinal(menu.price);
     cart.items.push({
@@ -656,8 +679,10 @@ exports.addItem = asyncHandler(async (req, res) => {
     });
   }
 
+  // Recompute & simpan
   recomputeTotals(cart);
   await cart.save();
+
   res.status(200).json(cart.toObject());
 });
 
