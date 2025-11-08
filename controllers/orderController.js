@@ -886,6 +886,7 @@ exports.clearCart = asyncHandler(async (req, res) => {
   res.status(200).json(cart.toObject());
 });
 
+// PATCH /cart/fulfillment-type  { fulfillment_type: 'dine_in'|'delivery', table_number?, delivery_draft? }
 exports.setFulfillmentType = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
   const ft = String(req.body?.fulfillment_type || '').toLowerCase();
@@ -899,19 +900,19 @@ exports.setFulfillmentType = asyncHandler(async (req, res) => {
   const cart = await Cart.findOne(filter);
   if (!cart) throwError('Cart tidak ditemukan', 404);
 
-  cart.fulfillment_type = ft;
+  // simpan metadata kanal terakhir (opsional)
+  if (iden.source) cart.source = iden.source;
 
-  if (ft === 'dine_in') {
-    // QR boleh memaksa nomor meja
-    const tableNo = Number(req.body?.table_number) || cart.table_number || null;
-    if ((iden.source || 'online') === 'qr' && !tableNo) {
-      throwError('Nomor meja wajib untuk dine_in (QR).', 400);
+  if (ft === 'delivery') {
+    // Pindah ke delivery → simpan nomor meja terakhir biar bisa auto-restore
+    if (cart.table_number) {
+      cart.dine_in_cache = cart.dine_in_cache || {};
+      cart.dine_in_cache.last_table_number = cart.table_number;
     }
-    cart.table_number = tableNo;
-    cart.delivery_draft = undefined;
-  } else {
-    // delivery: clear meja, simpan draft bila dikirim
     cart.table_number = null;
+    cart.fulfillment_type = 'delivery';
+
+    // simpan draft delivery bila ada
     if (req.body?.delivery_draft) {
       cart.delivery_draft = {
         address_text: String(req.body.delivery_draft.address_text || ''),
@@ -919,14 +920,34 @@ exports.setFulfillmentType = asyncHandler(async (req, res) => {
         note_to_rider: String(req.body.delivery_draft.note_to_rider || '')
       };
     }
-  }
+  } else {
+    // Balik ke dine_in → pakai nomor meja dari body ATAU cache
+    const incomingTable = Number(req.body?.table_number) || 0;
+    let finalTable =
+      incomingTable ||
+      cart.table_number || // (kalau kebetulan sudah ada)
+      cart.dine_in_cache?.last_table_number ||
+      0;
 
-  // simpan metadata kanal terakhir
-  if (iden.source) cart.source = iden.source;
+    // Jika self-order QR, wajib punya nomor meja
+    if ((iden.source || 'online') === 'qr' && !finalTable) {
+      throwError('Nomor meja wajib untuk dine_in (QR).', 400);
+    }
+
+    // Set konteks dine-in
+    cart.fulfillment_type = 'dine_in';
+    cart.table_number = finalTable || null;
+    cart.delivery_draft = undefined;
+
+    // Update cache kalau body kirim nomor baru
+    if (incomingTable) {
+      cart.dine_in_cache = cart.dine_in_cache || {};
+      cart.dine_in_cache.last_table_number = incomingTable;
+    }
+  }
 
   recomputeTotals(cart);
   await cart.save();
-
   res.status(200).json(cart.toObject());
 });
 
@@ -1318,19 +1339,22 @@ exports.assignTable = asyncHandler(async (req, res) => {
     cart = await Cart.create({
       member: iden.memberId || null,
       session_id: iden.memberId ? null : sessionId,
-      source: 'qr', // metadata kanal
+      source: 'qr',
       table_number,
       fulfillment_type: 'dine_in',
       items: [],
       total_items: 0,
       total_quantity: 0,
       total_price: 0,
-      status: 'active'
+      status: 'active',
+      dine_in_cache: { last_table_number: table_number }
     });
   } else {
     cart.source = 'qr';
     cart.fulfillment_type = 'dine_in';
     cart.table_number = table_number;
+    cart.dine_in_cache = cart.dine_in_cache || {};
+    cart.dine_in_cache.last_table_number = table_number;
     await cart.save();
   }
 

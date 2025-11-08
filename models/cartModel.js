@@ -11,6 +11,13 @@ const addonSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const dineInCacheSchema = new mongoose.Schema(
+  {
+    last_table_number: { type: Number, min: 1, default: null }
+  },
+  { _id: false }
+);
+
 const itemSchema = new mongoose.Schema(
   {
     menu: { type: mongoose.Schema.Types.ObjectId, ref: 'Menu', required: true },
@@ -59,7 +66,7 @@ const cartSchema = new mongoose.Schema(
     },
 
     table_number: { type: Number, default: null, min: 1 },
-
+    dine_in_cache: { type: dineInCacheSchema, default: undefined },
     items: { type: [itemSchema], default: [] },
 
     total_items: { type: Number, default: 0, min: 0 },
