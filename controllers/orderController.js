@@ -853,7 +853,9 @@ exports.setFulfillmentType = asyncHandler(async (req, res) => {
         await onlineCart.save();
 
         // Kosongkan QR
-        await Cart.deleteOne({ _id: qrCart._id }).catch(() => {});
+        qrCart.items = [];
+        recomputeTotals(qrCart);
+        await qrCart.save();
 
         return res.status(200).json(onlineCart.toObject());
       }
@@ -967,7 +969,9 @@ exports.setFulfillmentType = asyncHandler(async (req, res) => {
     await qrCart.save();
 
     // Kosongkan ONLINE
-    await Cart.deleteOne({ _id: onlineCart._id }).catch(() => {});
+    onlineCart.items = [];
+    recomputeTotals(onlineCart);
+    await onlineCart.save();
 
     return res.status(200).json(qrCart.toObject());
   }
