@@ -253,8 +253,8 @@ orderSchema.pre('validate', function (next) {
     : int(this.delivery_fee || 0);
   this.delivery_fee = deliveryFee;
 
-  // 1) Service fee 2% dari (items_subtotal + delivery_fee)
-  const sfBase = this.items_subtotal + this.delivery_fee;
+  // 1) Service fee 2% dari ITEMS SAJA (ongkir tidak ikut)
+  const sfBase = this.items_subtotal;
   const rawServiceFee = sfBase > 0 ? sfBase * SERVICE_FEE_RATE : 0;
   this.service_fee = int(rawServiceFee);
 
@@ -262,13 +262,9 @@ orderSchema.pre('validate', function (next) {
   this.items_discount = int(Math.max(0, this.items_discount || 0));
   this.shipping_discount = int(Math.max(0, this.shipping_discount || 0));
 
-  // 2) Hitung tax base: base + serviceFee - voucher
-  const taxBase =
-    this.items_subtotal +
-    this.delivery_fee +
-    this.service_fee -
-    this.items_discount -
-    this.shipping_discount;
+  // 2) Tax base: HANYA DARI MENU (setelah item discount).
+  //   (service fee & ongkir tidak kena PPN)
+  const taxBase = this.items_subtotal - this.items_discount;
 
   const safeTaxBase = Math.max(0, taxBase);
 
@@ -277,8 +273,15 @@ orderSchema.pre('validate', function (next) {
   this.tax_rate_percent = Math.round(rate * 100 * 100) / 100;
   this.tax_amount = int(safeTaxBase * rate);
 
-  // 4) Raw total sebelum rounding
-  const rawTotal = safeTaxBase + this.tax_amount;
+  // 4) Raw total sebelum rounding:
+  //    items + service_fee + delivery - discounts tax (tax dari items saja)
+  const rawTotal =
+    this.items_subtotal +
+    this.service_fee +
+    this.delivery_fee -
+    this.items_discount -
+    this.shipping_discount +
+    this.tax_amount;
 
   // 5) Pembulatan custom
   const rounded = roundRupiahCustom(rawTotal);

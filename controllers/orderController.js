@@ -561,7 +561,6 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
   return memberDoc;
 };
 
-/* ===================== CART ENDPOINTS ===================== */
 exports.getCart = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
 
@@ -593,7 +592,7 @@ exports.getCart = asyncHandler(async (req, res) => {
     )
     .lean();
 
-  // Ringkasan UI (tanpa simpan DB)
+  // Ringkasan UI (tanpa menyimpan ke DB)
   const ui = buildUiTotalsFromCart(cart);
 
   /* ====== grand_total tetap "pure". Tambahkan grand_total_with_delivery khusus delivery ====== */
@@ -605,33 +604,48 @@ exports.getCart = asyncHandler(async (req, res) => {
 
   const FLAT_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
 
-  // simpan nilai pure dari buildUiTotalsFromCart
+  // Ambil komponen dasar dari UI
+  const items_subtotal = Number(ui.items_subtotal || 0);
+  const items_discount = Number(ui.items_discount || 0);
+  const shipping_discount = Number(ui.shipping_discount || 0);
+
+  // grand_total dari buildUiTotalsFromCart dibiarkan pure (tanpa ongkir)
   const pureGrand = Number(ui.grand_total || 0);
-  // jangan ubah ui.grand_total (biarkan pure)
+
   if (ft === 'delivery') {
+    // Service fee 2% DARI ITEMS SAJA (ongkir tidak ikut)
+    const service_fee_on_items = int(items_subtotal * SERVICE_FEE_RATE);
+
+    // Pajak HANYA dari items setelah item_discount (tanpa ongkir & service fee)
+    const rate = parsePpnRate(); // ex: 0.11
+    const taxBaseItems = Math.max(0, items_subtotal - items_discount);
+    const taxAmountOnItems = int(taxBaseItems * rate);
+
+    // Total sebelum pembulatan (ongkir berdiri sendiri, tidak kena pajak / service fee)
+    const beforeRound =
+      items_subtotal +
+      service_fee_on_items +
+      FLAT_DELIV -
+      items_discount -
+      shipping_discount +
+      taxAmountOnItems;
+
+    const gt_with_deliv = int(roundRupiahCustom(beforeRound));
+
+    // Set hasil untuk UI
     ui.delivery_fee = FLAT_DELIV;
-    ui.grand_total_with_delivery = pureGrand + FLAT_DELIV;
+    ui.grand_total_with_delivery = gt_with_deliv;
   } else {
     ui.delivery_fee = Number(ui.delivery_fee || 0);
-    ui.grand_total_with_delivery = pureGrand; // atau null kalau mau
+    ui.grand_total_with_delivery = pureGrand; // non-delivery: samakan saja
   }
 
   /* ======= Tambahkan harga per-item (before/after tax) ======= */
   const items = Array.isArray(cart.items) ? cart.items : [];
 
-  const items_subtotal = Number(ui.items_subtotal || 0);
-  const items_discount = Number(ui.items_discount || 0);
-  const delivery_fee = Number(ui.delivery_fee || 0);
-  const shipping_discount = Number(ui.shipping_discount || 0);
-  const service_fee = Number(ui.service_fee || 0);
-  const tax_amount_total = Number(ui.tax_amount || 0);
-
-  const taxDenominator =
-    items_subtotal -
-    items_discount +
-    delivery_fee -
-    shipping_discount +
-    service_fee;
+  // Untuk alokasi pajak per item: denominator = items_subtotal - items_discount (tanpa ongkir & service fee)
+  const tax_amount_total = Number(ui.tax_amount || 0); // pajak "pure" dari buildUiTotalsFromCart
+  const taxDenominator = Math.max(0, items_subtotal - items_discount);
 
   const mappedItems = items.map((it) => {
     const qty = Number(it.quantity || 0);
@@ -647,6 +661,7 @@ exports.getCart = asyncHandler(async (req, res) => {
       it.line_subtotal != null ? it.line_subtotal : unit_before_tax * qty
     );
 
+    // Alokasikan pajak hanya proporsional ke nilai items (tanpa ongkir & service fee)
     const line_tax =
       taxDenominator > 0
         ? Math.round((tax_amount_total * line_before_tax) / taxDenominator)
@@ -2613,23 +2628,25 @@ exports.createQrisFromCart = async (req, res, next) => {
     const shipping_discount = int(priced.totals.shippingDiscount);
     const baseDelivery = int(priced.totals.deliveryFee);
 
-    // Service fee 2% dari (items + delivery)
-    const sfBase = items_subtotal + baseDelivery;
+    // Service fee 2% dari ITEMS SAJA
+    const sfBase = items_subtotal;
     const service_fee = int(sfBase * SERVICE_FEE_RATE);
 
-    // Tax base
-    const taxBase =
-      items_subtotal +
-      baseDelivery +
-      service_fee -
-      items_discount -
-      shipping_discount;
+    // Tax base: HANYA dari menu (setelah item discount)
+    const taxBase = items_subtotal - items_discount;
     const safeTaxBase = Math.max(0, taxBase);
     const rate = parsePpnRate();
     const taxAmount = int(safeTaxBase * rate);
 
-    // ===== Pembulatan ke 0/500/1000 dengan roundRupiahCustom =====
-    const beforeRound = int(safeTaxBase + taxAmount);
+    // ===== Total sebelum pembulatan (ongkir & service fee berdiri sendiri, tax dari menu)
+    const beforeRound = int(
+      items_subtotal +
+        service_fee +
+        baseDelivery -
+        items_discount -
+        shipping_discount +
+        taxAmount
+    );
     const requested_bvt = int(roundRupiahCustom(beforeRound));
     const rounding_delta = int(requested_bvt - beforeRound);
 
