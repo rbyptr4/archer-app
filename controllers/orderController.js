@@ -1047,21 +1047,28 @@ exports.checkout = asyncHandler(async (req, res) => {
     };
   }
 
+  cart.items = (Array.isArray(cart.items) ? cart.items : [])
+    .filter(Boolean)
+    .map((it) => {
+      const rawAddons = Array.isArray(it.addons) ? it.addons : [];
+      const safeAddons = rawAddons
+        .filter((a) => a && typeof a === 'object') // buang undefined/null/string
+        .map((a) => ({
+          name: String(a.name || '').trim(),
+          price: int(a.price || 0),
+          qty: clamp(int(a.qty || 1), 1, 999)
+        }));
+
+      return {
+        ...it,
+        addons: safeAddons,
+        notes: String(it.notes || '').trim()
+      };
+    });
+
   // ===== Voucher pricing =====
   recomputeTotals(cart);
   await cart.save();
-
-  cart.items = cart.items.map((it) => ({
-    ...it,
-    addons: Array.isArray(it.addons)
-      ? it.addons.filter(Boolean).map((a) => ({
-          name: String(a?.name || ''),
-          price: int(a?.price || 0),
-          qty: int(a?.qty || 1)
-        }))
-      : [],
-    notes: String(it.notes || '').trim()
-  }));
 
   let eligibleClaimIds = [];
   if (member) {
@@ -1153,13 +1160,7 @@ exports.checkout = asyncHandler(async (req, res) => {
             imageUrl: it.imageUrl,
             base_price: it.base_price,
             quantity: it.quantity,
-            addons: Array.isArray(it.addons)
-              ? it.addons.filter(Boolean).map((a) => ({
-                  name: String(a?.name || ''),
-                  price: int(a?.price || 0),
-                  qty: int(a?.qty || 1)
-                }))
-              : [],
+            addons: it.addons, // <- sudah tersanitasi
             notes: String(it.notes || '').trim(),
             category: it.category || null
           })),
