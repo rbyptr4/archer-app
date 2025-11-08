@@ -387,9 +387,15 @@ const getActiveCartForIdentity = async (
   await attachOrMergeCartsForIdentity(iden);
 
   const requestedSource = iden.source || '';
-  const identityFilter = iden.memberId
-    ? { member: iden.memberId }
-    : { session_id: iden.session_id };
+  // Bisa match dengan member atau session_id (atau keduanya)
+  const identityFilter = (() => {
+    const parts = [];
+    if (iden.memberId) parts.push({ member: iden.memberId });
+    if (iden.session_id) parts.push({ session_id: iden.session_id });
+    if (!parts.length) return {}; // fallback: tanpa filter identitas (jarang)
+    if (parts.length === 1) return parts[0];
+    return { $or: parts };
+  })();
 
   // 🔧 perbaikan: hormati requestedSource
   const sourcesToCheck = (() => {
@@ -687,7 +693,7 @@ exports.addItem = asyncHandler(async (req, res) => {
 });
 
 exports.updateItem = asyncHandler(async (req, res) => {
-  const { itemId } = req.params;
+  const { itemId } = req.params; // bisa _id atau line_key
   const { quantity, addons, notes } = req.body || {};
   const iden = getIdentity(req);
 
@@ -695,29 +701,74 @@ exports.updateItem = asyncHandler(async (req, res) => {
     allowCreateOnline: false
   });
   if (!cartObj) throwError('Cart tidak ditemukan', 404);
+
+  // Ambil cart aslinya (bukan .lean()) supaya bisa save
   const cart = await Cart.findById(cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan', 404);
 
-  const idx = cart.items.findIndex((it) => String(it._id) === String(itemId));
+  const ref = String(itemId || '').trim();
+  if (!ref) throwError('Parameter itemId kosong', 400);
+
+  // Cari item pakai _id ATAU line_key (fallback)
+  let idx = cart.items.findIndex(
+    (it) => String(it._id) === ref || String(it.line_key) === ref
+  );
   if (idx < 0) throwError('Item tidak ditemukan di cart', 404);
 
+  // ================== Update field ==================
+  // quantity
   if (quantity !== undefined) {
     const q = clamp(asInt(quantity, 0), 0, 999);
-    if (q === 0) cart.items.splice(idx, 1);
-    else cart.items[idx].quantity = q;
+    if (q === 0) {
+      cart.items.splice(idx, 1);
+      recomputeTotals(cart);
+      await cart.save();
+      return res.status(200).json(cart.toObject());
+    } else {
+      cart.items[idx].quantity = q;
+    }
   }
+
+  // addons & notes
   if (cart.items[idx]) {
-    if (addons !== undefined) cart.items[idx].addons = normalizeAddons(addons);
-    if (notes !== undefined) cart.items[idx].notes = String(notes || '').trim();
+    if (addons !== undefined) {
+      cart.items[idx].addons = normalizeAddons(addons);
+    }
+    if (notes !== undefined) {
+      cart.items[idx].notes = String(notes || '').trim();
+    }
+
+    // Rebuild line_key sesuai kondisi terbaru
     cart.items[idx].line_key = makeLineKey({
       menuId: cart.items[idx].menu,
       addons: cart.items[idx].addons,
       notes: cart.items[idx].notes
     });
+
+    // Jika setelah update line_key bentrok dengan item lain, merge qty
+    const newKey = cart.items[idx].line_key;
+    const dupIdx = cart.items.findIndex(
+      (it, i) => i !== idx && String(it.line_key) === String(newKey)
+    );
+    if (dupIdx >= 0) {
+      // Gabung quantity dan hapus item yang diedit (agar tidak ganda)
+      cart.items[dupIdx].quantity = clamp(
+        asInt(
+          (cart.items[dupIdx].quantity || 0) + (cart.items[idx].quantity || 0),
+          0
+        ),
+        0,
+        999
+      );
+      cart.items.splice(idx, 1);
+      // optional: set idx = dupIdx jika ingin lanjut proses lain
+    }
   }
 
+  // ================== Recompute & Save ==================
   recomputeTotals(cart);
   await cart.save();
+
   res.status(200).json(cart.toObject());
 });
 
@@ -728,13 +779,28 @@ exports.removeItem = asyncHandler(async (req, res) => {
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
+  if (!cartObj) throwError('Cart tidak ditemukan', 404);
+
   const cart = await Cart.findById(cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan', 404);
 
+  const ref = String(itemId || '').trim();
+  if (!ref) throwError('Parameter itemId kosong', 400);
+
   const before = cart.items.length;
-  cart.items = cart.items.filter((it) => String(it._id) !== String(itemId));
-  if (before === cart.items.length)
+
+  // 1) Coba hapus by _id terlebih dulu (paling presisi)
+  let idx = cart.items.findIndex((it) => String(it._id) === ref);
+  if (idx >= 0) {
+    cart.items.splice(idx, 1);
+  } else {
+    // 2) Fallback: hapus semua item dengan line_key yang sama
+    cart.items = cart.items.filter((it) => String(it.line_key) !== ref);
+  }
+
+  if (cart.items.length === before) {
     throwError('Item tidak ditemukan di cart', 404);
+  }
 
   recomputeTotals(cart);
   await cart.save();

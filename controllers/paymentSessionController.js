@@ -465,6 +465,8 @@ exports.createQrisFromCart = async (req, res, next) => {
       source: iden.source || 'online',
       fulfillment_type: ft,
       table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
+      cart: cart._id,
+      session_id: deviceId,
       items: cart.items.map((it) => ({
         menu: it.menu,
         menu_code: it.menu_code,

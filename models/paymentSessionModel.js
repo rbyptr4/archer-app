@@ -65,6 +65,8 @@ const paymentSessionSchema = new mongoose.Schema(
       default: 'pending',
       index: true
     },
+    cart: { type: mongoose.Schema.Types.ObjectId, ref: 'Cart', default: null },
+    session_id: { type: String, default: null },
     expires_at: { type: Date }
   },
   {
