@@ -2,6 +2,8 @@
 const PaymentSession = require('../../models/paymentSessionModel');
 const Order = require('../../models/orderModel');
 const Member = require('../../models/memberModel');
+const Cart = require('../../models/cartModel');
+
 const { awardPointsIfEligible } = require('../../utils/loyalty');
 const { nextDailyTxCode } = require('../../utils/txCode');
 const { int } = require('../../utils/money');
@@ -126,6 +128,26 @@ async function applyPaymentSuccess(session, rawEvent) {
       emitToMember(order.member, 'order:payment_success', payload);
     if (order.table_number)
       emitToTable(order.table_number, 'order:payment_success', payload);
+  }
+
+  // === Clear cart (idempotent) ===
+  try {
+    if (session.cart && !session.cart_cleared) {
+      await Cart.findByIdAndUpdate(session.cart, {
+        $set: {
+          status: 'checked_out',
+          checked_out_at: new Date(),
+          order_id: order._id,
+          items: [],
+          total_items: 0,
+          total_quantity: 0,
+          total_price: 0
+        }
+      });
+      session.cart_cleared = true; // tandai supaya tidak double clear
+    }
+  } catch (e) {
+    console.warn('[Payment] clear cart warn:', e?.message);
   }
 
   // Update session
