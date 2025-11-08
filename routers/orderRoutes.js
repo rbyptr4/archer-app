@@ -38,8 +38,8 @@ router.get('/delivery/estimate', order.estimateDelivery);
 
 router.post(
   '/checkout',
-  parseFormData,
   fileUploader.single('payment_proof'),
+  parseFormData,
   order.checkout
 );
 
