@@ -776,32 +776,33 @@ exports.setFulfillmentType = asyncHandler(async (req, res) => {
 
   /* ================== CASE A: Target DELIVERY (QR -> ONLINE) ================== */
   if (ft === 'delivery') {
-    // Coba existing ONLINE dulu
-    let onlineCartObj = await getActiveCartForIdentity(
-      { ...iden, source: 'online' },
-      { allowCreateOnline: false }
-    );
+    // Filter identitas
+    const identityFilter = iden.memberId
+      ? { member: iden.memberId }
+      : { session_id: iden.session_id };
 
-    if (!onlineCartObj) {
-      const qrCart = await Cart.findOne({
+    // 1) Ambil QR cart (jika ada)
+    const qrCart = await Cart.findOne({
+      status: 'active',
+      source: 'qr',
+      ...identityFilter
+    });
+
+    // 2) Ambil atau buat ONLINE cart (karena targetnya delivery)
+    const ensureSession = iden.memberId
+      ? null
+      : iden.session_id || crypto.randomUUID();
+
+    let onlineCart = await Cart.findOneAndUpdate(
+      {
         status: 'active',
-        source: 'qr',
-        ...identityFilter
-      });
-
-      if (qrCart) {
-        // Buat/ambil ONLINE
-        const ensureSession = iden.memberId
-          ? null
-          : iden.session_id || crypto.randomUUID();
-        const upsertFilter = {
-          status: 'active',
-          source: 'online',
-          ...(iden.memberId
-            ? { member: iden.memberId }
-            : { session_id: ensureSession })
-        };
-        const setOnInsert = {
+        source: 'online',
+        ...(iden.memberId
+          ? { member: iden.memberId }
+          : { session_id: ensureSession })
+      },
+      {
+        $setOnInsert: {
           member: iden.memberId || null,
           session_id: iden.memberId ? null : ensureSession,
           table_number: null,
@@ -812,66 +813,51 @@ exports.setFulfillmentType = asyncHandler(async (req, res) => {
           total_price: 0,
           status: 'active',
           source: 'online'
-        };
-
-        let onlineCart = await Cart.findOneAndUpdate(
-          upsertFilter,
-          { $setOnInsert: setOnInsert },
-          { new: true, upsert: true }
-        );
-
-        // Merge item dari QR -> ONLINE
-        const idxMap = new Map(
-          (onlineCart.items || []).map((it, i) => [String(it.line_key), i])
-        );
-        for (const it of qrCart.items || []) {
-          const key = String(it.line_key);
-          if (idxMap.has(key)) {
-            const i = idxMap.get(key);
-            const q =
-              asInt(onlineCart.items[i].quantity, 1) + asInt(it.quantity, 1);
-            onlineCart.items[i].quantity = clamp(q, 1, 999);
-          } else {
-            onlineCart.items.push({
-              menu: it.menu,
-              menu_code: it.menu_code || '',
-              name: it.name,
-              imageUrl: it.imageUrl || '',
-              base_price: asInt(it.base_price, 0),
-              quantity: clamp(asInt(it.quantity, 1), 1, 999),
-              addons: normalizeAddons(it.addons),
-              notes: String(it.notes || '').trim(),
-              line_key: key,
-              category: it.category || null
-            });
-            idxMap.set(key, onlineCart.items.length - 1);
-          }
         }
-        onlineCart.fulfillment_type = 'delivery';
-        onlineCart.table_number = null;
-        recomputeTotals(onlineCart);
-        await onlineCart.save();
+      },
+      { new: true, upsert: true }
+    );
 
-        // Kosongkan QR
-        qrCart.items = [];
-        recomputeTotals(qrCart);
-        await qrCart.save();
+    // 3) Jika QR ada item, MERGE -> ONLINE lalu kosongkan QR
+    if (qrCart && (qrCart.items?.length || 0) > 0) {
+      const idxMap = new Map(
+        (onlineCart.items || []).map((it, i) => [String(it.line_key), i])
+      );
 
-        return res.status(200).json(onlineCart.toObject());
+      for (const it of qrCart.items || []) {
+        const key = String(it.line_key);
+        if (idxMap.has(key)) {
+          const i = idxMap.get(key);
+          const q =
+            asInt(onlineCart.items[i].quantity, 1) + asInt(it.quantity, 1);
+          onlineCart.items[i].quantity = clamp(q, 1, 999);
+        } else {
+          onlineCart.items.push({
+            menu: it.menu,
+            menu_code: it.menu_code || '',
+            name: it.name,
+            imageUrl: it.imageUrl || '',
+            base_price: asInt(it.base_price, 0),
+            quantity: clamp(asInt(it.quantity, 1), 1, 999),
+            addons: normalizeAddons(it.addons),
+            notes: String(it.notes || '').trim(),
+            line_key: key,
+            category: it.category || null
+          });
+          idxMap.set(key, onlineCart.items.length - 1);
+        }
       }
 
-      // Tidak ada QR: buat ONLINE kosong
-      onlineCartObj = await getActiveCartForIdentity(
-        { ...iden, source: 'online' },
-        { allowCreateOnline: true, defaultFt: 'delivery' }
-      );
+      // Kosongkan QR (bukan hapus dokumen)
+      qrCart.items = [];
+      recomputeTotals(qrCart);
+      await qrCart.save();
     }
 
-    const onlineCart = await Cart.findById(onlineCartObj._id);
-    if (!onlineCart) throwError('Cart tidak ditemukan', 404);
-
+    // 4) Set konteks delivery pada ONLINE dan simpan
     onlineCart.fulfillment_type = 'delivery';
     onlineCart.table_number = null;
+    recomputeTotals(onlineCart);
     await onlineCart.save();
 
     return res.status(200).json(onlineCart.toObject());
