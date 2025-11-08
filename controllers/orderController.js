@@ -693,36 +693,100 @@ exports.addItem = asyncHandler(async (req, res) => {
 });
 
 exports.updateItem = asyncHandler(async (req, res) => {
+  const t0 = Date.now();
+  const dbg = (...a) => console.log('[Cart:updateItem]', ...a);
+
   const { itemId } = req.params; // bisa _id atau line_key
   const { quantity, addons, notes } = req.body || {};
   const iden = getIdentity(req);
 
+  dbg('REQ IN', {
+    itemId: String(itemId || ''),
+    body: {
+      quantity,
+      addons,
+      notes
+    },
+    identity: {
+      mode: iden?.mode,
+      member: iden?.member ? String(iden.member) : null,
+      device: iden?.device ? String(iden.device) : null
+    }
+  });
+
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
-  if (!cartObj) throwError('Cart tidak ditemukan', 404);
+  if (!cartObj) {
+    dbg('NO_CART_FOR_IDENTITY');
+    throwError('Cart tidak ditemukan', 404);
+  }
 
-  // Ambil cart aslinya (bukan .lean()) supaya bisa save
   const cart = await Cart.findById(cartObj._id);
-  if (!cart) throwError('Cart tidak ditemukan', 404);
+  if (!cart) {
+    dbg('CART_DOC_NOT_FOUND', { cartId: String(cartObj._id) });
+    throwError('Cart tidak ditemukan', 404);
+  }
+
+  dbg('CART_FOUND', {
+    cartId: String(cart._id),
+    itemsCount: cart.items.length
+  });
 
   const ref = String(itemId || '').trim();
-  if (!ref) throwError('Parameter itemId kosong', 400);
+  if (!ref) {
+    dbg('EMPTY_ITEMID');
+    throwError('Parameter itemId kosong', 400);
+  }
 
-  // Cari item pakai _id ATAU line_key (fallback)
+  // Inventaris id & key untuk membantu diagnosa
+  const availableIds = cart.items.map((it) => String(it._id));
+  const availableKeys = cart.items.map((it) => String(it.line_key || ''));
+
+  dbg('AVAILABLE', {
+    ids_sample: availableIds.slice(0, 10),
+    keys_sample: availableKeys.slice(0, 10),
+    total: cart.items.length
+  });
+
+  // Cari item pakai _id ATAU line_key
   let idx = cart.items.findIndex(
     (it) => String(it._id) === ref || String(it.line_key) === ref
   );
-  if (idx < 0) throwError('Item tidak ditemukan di cart', 404);
+
+  dbg('FIND_INDEX', { ref, idx });
+
+  if (idx < 0) {
+    // Log lebih detail supaya kelihatan mismatch-nya
+    const shortList = cart.items.slice(0, 5).map((it) => ({
+      _id: String(it._id),
+      line_key: String(it.line_key || ''),
+      menu: String(it.menu || ''),
+      qty: it.quantity
+    }));
+    dbg('NOT_FOUND_DETAIL', {
+      ref,
+      shortList,
+      note: 'Ambil cart terbaru? FE kirim ref apa?'
+    });
+    throwError('Item tidak ditemukan di cart', 404);
+  }
 
   // ================== Update field ==================
   // quantity
   if (quantity !== undefined) {
     const q = clamp(asInt(quantity, 0), 0, 999);
+    dbg('UPDATE_QTY', { from: cart.items[idx].quantity, to: q });
     if (q === 0) {
-      cart.items.splice(idx, 1);
+      const removed = cart.items.splice(idx, 1);
+      dbg('REMOVED_BY_QTY_ZERO', {
+        removed: removed?.[0]
+          ? { _id: String(removed[0]._id), line_key: removed[0].line_key }
+          : null
+      });
       recomputeTotals(cart);
       await cart.save();
+      dbg('DONE_SAVE_AFTER_REMOVE', { ms: Date.now() - t0 });
       return res.status(200).json(cart.toObject());
     } else {
       cart.items[idx].quantity = q;
@@ -732,36 +796,62 @@ exports.updateItem = asyncHandler(async (req, res) => {
   // addons & notes
   if (cart.items[idx]) {
     if (addons !== undefined) {
-      cart.items[idx].addons = normalizeAddons(addons);
+      const beforeAddons = cart.items[idx].addons;
+      const normalized = normalizeAddons(addons);
+      dbg('UPDATE_ADDONS', {
+        before: beforeAddons,
+        payload: addons,
+        normalized
+      });
+      cart.items[idx].addons = normalized;
     }
     if (notes !== undefined) {
+      const beforeNotes = cart.items[idx].notes;
       cart.items[idx].notes = String(notes || '').trim();
+      dbg('UPDATE_NOTES', {
+        before: beforeNotes,
+        after: cart.items[idx].notes
+      });
     }
 
     // Rebuild line_key sesuai kondisi terbaru
+    const beforeKey = cart.items[idx].line_key;
     cart.items[idx].line_key = makeLineKey({
       menuId: cart.items[idx].menu,
       addons: cart.items[idx].addons,
       notes: cart.items[idx].notes
     });
+    const newKey = cart.items[idx].line_key;
+
+    dbg('REBUILD_LINE_KEY', { beforeKey, newKey });
 
     // Jika setelah update line_key bentrok dengan item lain, merge qty
-    const newKey = cart.items[idx].line_key;
     const dupIdx = cart.items.findIndex(
       (it, i) => i !== idx && String(it.line_key) === String(newKey)
     );
     if (dupIdx >= 0) {
-      // Gabung quantity dan hapus item yang diedit (agar tidak ganda)
-      cart.items[dupIdx].quantity = clamp(
-        asInt(
-          (cart.items[dupIdx].quantity || 0) + (cart.items[idx].quantity || 0),
-          0
-        ),
-        0,
-        999
-      );
+      const qtyA = cart.items[dupIdx].quantity || 0;
+      const qtyB = cart.items[idx].quantity || 0;
+      const merged = clamp(asInt(qtyA + qtyB, 0), 0, 999);
+
+      dbg('MERGE_DUP', {
+        keep: {
+          index: dupIdx,
+          _id: String(cart.items[dupIdx]._id),
+          key: cart.items[dupIdx].line_key,
+          qtyA
+        },
+        remove: {
+          index: idx,
+          _id: String(cart.items[idx]._id),
+          key: newKey,
+          qtyB
+        },
+        mergedQty: merged
+      });
+
+      cart.items[dupIdx].quantity = merged;
       cart.items.splice(idx, 1);
-      // optional: set idx = dupIdx jika ingin lanjut proses lain
     }
   }
 
@@ -769,8 +859,14 @@ exports.updateItem = asyncHandler(async (req, res) => {
   recomputeTotals(cart);
   await cart.save();
 
+  dbg('DONE_SAVE', {
+    itemsCount: cart.items.length,
+    ms: Date.now() - t0
+  });
+
   res.status(200).json(cart.toObject());
 });
+
 
 exports.removeItem = asyncHandler(async (req, res) => {
   const { itemId } = req.params;
