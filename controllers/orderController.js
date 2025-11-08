@@ -702,15 +702,11 @@ exports.updateItem = asyncHandler(async (req, res) => {
 
   dbg('REQ IN', {
     itemId: String(itemId || ''),
-    body: {
-      quantity,
-      addons,
-      notes
-    },
+    body: { quantity, addons, notes },
     identity: {
       mode: iden?.mode,
-      member: iden?.member ? String(iden.member) : null,
-      device: iden?.device ? String(iden.device) : null
+      member: iden?.member || null,
+      device: iden?.device || null
     }
   });
 
@@ -728,9 +724,13 @@ exports.updateItem = asyncHandler(async (req, res) => {
     throwError('Cart tidak ditemukan', 404);
   }
 
+  // ---- extra meta untuk ngebaca konteks cart yang sedang dipakai
   dbg('CART_FOUND', {
     cartId: String(cart._id),
-    itemsCount: cart.items.length
+    itemsCount: cart.items.length,
+    fulfillment_type: cart.fulfillment_type || cart.ft || null,
+    status: cart.status || null,
+    updatedAt: cart.updatedAt
   });
 
   const ref = String(itemId || '').trim();
@@ -739,7 +739,6 @@ exports.updateItem = asyncHandler(async (req, res) => {
     throwError('Parameter itemId kosong', 400);
   }
 
-  // Inventaris id & key untuk membantu diagnosa
   const availableIds = cart.items.map((it) => String(it._id));
   const availableKeys = cart.items.map((it) => String(it.line_key || ''));
 
@@ -749,15 +748,56 @@ exports.updateItem = asyncHandler(async (req, res) => {
     total: cart.items.length
   });
 
-  // Cari item pakai _id ATAU line_key
   let idx = cart.items.findIndex(
     (it) => String(it._id) === ref || String(it.line_key) === ref
   );
 
   dbg('FIND_INDEX', { ref, idx });
 
+  // ======= Fallback diagnosis kalau tidak ketemu =======
   if (idx < 0) {
-    // Log lebih detail supaya kelihatan mismatch-nya
+    // Jika cart kosong, besar kemungkinan FE pegang itemId dari cart lama
+    if (cart.items.length === 0) {
+      // Batasi pencarian ke cart lain yang masih "aktif" / baru-baru ini (24 jam terakhir)
+      const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+      const otherCartQuery = {
+        _id: { $ne: cart._id },
+        'items._id': ref,
+        updatedAt: { $gte: dayAgo }
+      };
+
+      // (Opsional) kalau schema kamu punya tenant/outlet, filter di sini:
+      // otherCartQuery.tenant = cart.tenant;
+      // otherCartQuery.store = cart.store;
+
+      const other = await Cart.findOne(otherCartQuery)
+        .select('_id fulfillment_type status updatedAt')
+        .lean();
+      if (other) {
+        dbg('WRONG_CART_FOUND', {
+          otherCartId: String(other._id),
+          fulfillment_type: other.fulfillment_type,
+          updatedAt: other.updatedAt
+        });
+        // Kirim sinyal ke FE bahwa item ada di cart lain → FE harus refresh / pindah cart
+        return res.status(409).json({
+          error: 'WRONG_CART',
+          message: 'Item berada di cart yang berbeda. Muat ulang cart aktif.',
+          data: {
+            currentCartId: String(cart._id),
+            otherCartId: String(other._id),
+            otherMeta: {
+              fulfillment_type: other.fulfillment_type || null,
+              status: other.status || null,
+              updatedAt: other.updatedAt
+            }
+          }
+        });
+      }
+    }
+
+    // Log detail sampel untuk bantu cocokan di FE
     const shortList = cart.items.slice(0, 5).map((it) => ({
       _id: String(it._id),
       line_key: String(it.line_key || ''),
@@ -767,13 +807,12 @@ exports.updateItem = asyncHandler(async (req, res) => {
     dbg('NOT_FOUND_DETAIL', {
       ref,
       shortList,
-      note: 'Ambil cart terbaru? FE kirim ref apa?'
+      note: 'Kemungkinan FE pakai itemId dari cart lama. Refresh / GET /cart lalu pakai _id terbaru.'
     });
     throwError('Item tidak ditemukan di cart', 404);
   }
 
   // ================== Update field ==================
-  // quantity
   if (quantity !== undefined) {
     const q = clamp(asInt(quantity, 0), 0, 999);
     dbg('UPDATE_QTY', { from: cart.items[idx].quantity, to: q });
@@ -793,7 +832,6 @@ exports.updateItem = asyncHandler(async (req, res) => {
     }
   }
 
-  // addons & notes
   if (cart.items[idx]) {
     if (addons !== undefined) {
       const beforeAddons = cart.items[idx].addons;
@@ -814,7 +852,7 @@ exports.updateItem = asyncHandler(async (req, res) => {
       });
     }
 
-    // Rebuild line_key sesuai kondisi terbaru
+    // Rebuild & merge jika perlu
     const beforeKey = cart.items[idx].line_key;
     cart.items[idx].line_key = makeLineKey({
       menuId: cart.items[idx].menu,
@@ -825,7 +863,6 @@ exports.updateItem = asyncHandler(async (req, res) => {
 
     dbg('REBUILD_LINE_KEY', { beforeKey, newKey });
 
-    // Jika setelah update line_key bentrok dengan item lain, merge qty
     const dupIdx = cart.items.findIndex(
       (it, i) => i !== idx && String(it.line_key) === String(newKey)
     );
@@ -855,18 +892,12 @@ exports.updateItem = asyncHandler(async (req, res) => {
     }
   }
 
-  // ================== Recompute & Save ==================
   recomputeTotals(cart);
   await cart.save();
 
-  dbg('DONE_SAVE', {
-    itemsCount: cart.items.length,
-    ms: Date.now() - t0
-  });
-
+  dbg('DONE_SAVE', { itemsCount: cart.items.length, ms: Date.now() - t0 });
   res.status(200).json(cart.toObject());
 });
-
 
 exports.removeItem = asyncHandler(async (req, res) => {
   const { itemId } = req.params;
