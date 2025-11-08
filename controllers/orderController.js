@@ -1433,9 +1433,76 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
 const buildOrderReceipt = (order) => {
   if (!order) return null;
 
-  // Tentukan nama & phone yang ditampilkan
   const displayName = order.member?.name || order.customer_name || '';
   const displayPhone = order.member?.phone || order.customer_phone || '';
+
+  const items = Array.isArray(order.items) ? order.items : [];
+
+  const items_subtotal = Number(order.items_subtotal || 0);
+  const items_discount = Number(order.items_discount || 0);
+  const delivery_fee = Number(order.delivery_fee || 0);
+  const shipping_discount = Number(order.shipping_discount || 0);
+  const service_fee = Number(order.service_fee || 0);
+  const tax_amount_total = Number(order.tax_amount || 0);
+  const tax_rate_percent = Number(order.tax_rate_percent || 0);
+
+  // Tax base di level order (ikuti rumus yang dipakai saat checkout)
+  const taxDenominator =
+    items_subtotal -
+    items_discount +
+    delivery_fee -
+    shipping_discount +
+    service_fee;
+
+  // helper subtotal per item (internal saja)
+  const lineSubtotalOf = (it) => {
+    const unitBase = Number(it.base_price || 0);
+    const addonsUnit = (it.addons || []).reduce(
+      (s, a) => s + Number(a.price || 0) * Number(a.qty || 1),
+      0
+    );
+    const qty = Number(it.quantity || 0);
+    return (unitBase + addonsUnit) * qty;
+  };
+
+  const detailedItems = items.map((it) => {
+    const qty = Number(it.quantity || 0);
+
+    const unit_base = Number(it.base_price || 0);
+    const addons_unit = (it.addons || []).reduce(
+      (s, a) => s + Number(a.price || 0) * Number(a.qty || 1),
+      0
+    );
+
+    const unit_before_tax = unit_base + addons_unit;
+
+    // alokasi pajak proporsional → ubah ke per-unit
+    const line_before_tax = Number(it.line_subtotal ?? lineSubtotalOf(it));
+    const line_tax =
+      taxDenominator > 0
+        ? Math.round((tax_amount_total * line_before_tax) / taxDenominator)
+        : 0;
+
+    const unit_tax = qty > 0 ? Math.round(line_tax / qty) : 0;
+
+    return {
+      name: it.name,
+      menu_code: it.menu_code || '',
+      imageUrl: it.imageUrl || '',
+      quantity: qty,
+      addons: (it.addons || []).map((ad) => ({
+        name: ad.name,
+        price: Number(ad.price || 0),
+        qty: Number(ad.qty || 1)
+      })),
+
+      // Hanya unit-level agar FE simpel
+      unit_price: unit_before_tax, // sebelum pajak
+      unit_tax, // pajak per unit
+      unit_price_incl_tax: unit_before_tax + unit_tax, // setelah pajak
+      tax_rate_percent: tax_rate_percent // referensi saja
+    };
+  });
 
   return {
     id: String(order._id),
@@ -1443,21 +1510,24 @@ const buildOrderReceipt = (order) => {
     status: order.status,
     payment_status: order.payment_status,
     payment_method: order.payment_method,
-    // ringkasan harga
+
     pricing: {
-      items_subtotal: order.items_subtotal,
-      service_fee: order.service_fee,
-      delivery_fee: order.delivery_fee,
-      items_discount: order.items_discount,
-      shipping_discount: order.shipping_discount,
-      tax_amount: order.tax_amount,
-      rounding_delta: order.rounding_delta,
-      grand_total: order.grand_total
+      items_subtotal,
+      service_fee,
+      delivery_fee,
+      items_discount,
+      shipping_discount,
+      tax_amount: tax_amount_total,
+      tax_rate_percent: tax_rate_percent,
+      rounding_delta: Number(order.rounding_delta || 0),
+      grand_total: Number(order.grand_total || 0)
     },
+
     customer: {
       name: displayName,
       phone: displayPhone
     },
+
     fulfillment: {
       type: order.fulfillment_type,
       table_number:
@@ -1473,18 +1543,9 @@ const buildOrderReceipt = (order) => {
             }
           : null
     },
-    items: (order.items || []).map((it) => ({
-      name: it.name,
-      menu_code: it.menu_code || '',
-      imageUrl: it.imageUrl || '',
-      quantity: it.quantity,
-      addons: (it.addons || []).map((ad) => ({
-        name: ad.name,
-        price: ad.price,
-        qty: ad.qty
-      })),
-      line_subtotal: it.line_subtotal
-    })),
+
+    items: detailedItems,
+
     timestamps: {
       placed_at: order.placed_at,
       paid_at: order.paid_at || null
