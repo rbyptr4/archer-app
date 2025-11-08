@@ -581,7 +581,8 @@ exports.getCart = asyncHandler(async (req, res) => {
       tax_rate_percent: 11,
       tax_amount: 0,
       rounding_delta: 0,
-      grand_total: 0
+      grand_total: 0,
+      grand_total_with_delivery: 0
     };
     return res.status(200).json({ cart: null, ui_totals: empty });
   }
@@ -595,7 +596,7 @@ exports.getCart = asyncHandler(async (req, res) => {
   // Ringkasan UI (tanpa simpan DB)
   const ui = buildUiTotalsFromCart(cart);
 
-  // === PATCH: delivery fee flat dari .env + tambahkan ke grand_total (khusus delivery) ===
+  /* ====== grand_total tetap "pure". Tambahkan grand_total_with_delivery khusus delivery ====== */
   const ft =
     cart?.fulfillment_type ||
     cartObj?.fulfillment_type ||
@@ -604,14 +605,16 @@ exports.getCart = asyncHandler(async (req, res) => {
 
   const FLAT_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
 
+  // simpan nilai pure dari buildUiTotalsFromCart
+  const pureGrand = Number(ui.grand_total || 0);
+  // jangan ubah ui.grand_total (biarkan pure)
   if (ft === 'delivery') {
     ui.delivery_fee = FLAT_DELIV;
-    ui.grand_total = Number(ui.grand_total || 0) + FLAT_DELIV;
+    ui.grand_total_with_delivery = pureGrand + FLAT_DELIV;
   } else {
     ui.delivery_fee = Number(ui.delivery_fee || 0);
-    ui.grand_total = Number(ui.grand_total || 0);
+    ui.grand_total_with_delivery = pureGrand; // atau null kalau mau
   }
-  // === END PATCH ===
 
   /* ======= Tambahkan harga per-item (before/after tax) ======= */
   const items = Array.isArray(cart.items) ? cart.items : [];
