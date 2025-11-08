@@ -581,7 +581,8 @@ exports.getCart = asyncHandler(async (req, res) => {
       tax_amount: 0,
       rounding_delta: 0,
       grand_total: 0,
-      grand_total_with_delivery: 0
+      grand_total_with_delivery: 0,
+      grand_total_before_rounding: 0
     };
     return res.status(200).json({ cart: null, ui_totals: empty });
   }
@@ -592,10 +593,10 @@ exports.getCart = asyncHandler(async (req, res) => {
     )
     .lean();
 
-  // Ringkasan UI (tanpa menyimpan ke DB)
+  // Ringkasan UI (tanpa simpan DB)
   const ui = buildUiTotalsFromCart(cart);
 
-  /* ====== grand_total tetap "pure". Tambahkan grand_total_with_delivery khusus delivery ====== */
+  // ===== Aturan delivery fee + variasi grand total =====
   const ft =
     cart?.fulfillment_type ||
     cartObj?.fulfillment_type ||
@@ -604,25 +605,27 @@ exports.getCart = asyncHandler(async (req, res) => {
 
   const FLAT_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
 
-  // Ambil komponen dasar dari UI
+  // Komponen dasar (pure)
   const items_subtotal = Number(ui.items_subtotal || 0);
   const items_discount = Number(ui.items_discount || 0);
   const shipping_discount = Number(ui.shipping_discount || 0);
-
-  // grand_total dari buildUiTotalsFromCart dibiarkan pure (tanpa ongkir)
   const pureGrand = Number(ui.grand_total || 0);
+  const pureRoundingDelta = Number(ui.rounding_delta || 0);
+
+  // Tambahkan angka pure sebelum pembulatan
+  ui.grand_total_before_rounding = pureGrand - pureRoundingDelta;
 
   if (ft === 'delivery') {
     // Service fee 2% DARI ITEMS SAJA (ongkir tidak ikut)
     const service_fee_on_items = int(items_subtotal * SERVICE_FEE_RATE);
 
     // Pajak HANYA dari items setelah item_discount (tanpa ongkir & service fee)
-    const rate = parsePpnRate(); // ex: 0.11
+    const rate = parsePpnRate(); // contoh: 0.11
     const taxBaseItems = Math.max(0, items_subtotal - items_discount);
     const taxAmountOnItems = int(taxBaseItems * rate);
 
-    // Total sebelum pembulatan (ongkir berdiri sendiri, tidak kena pajak / service fee)
-    const beforeRound =
+    // Total SEBELUM pembulatan (ongkir berdiri sendiri, tidak kena pajak / service fee)
+    const beforeRoundWithDeliv =
       items_subtotal +
       service_fee_on_items +
       FLAT_DELIV -
@@ -630,26 +633,25 @@ exports.getCart = asyncHandler(async (req, res) => {
       shipping_discount +
       taxAmountOnItems;
 
-    const gt_with_deliv = int(roundRupiahCustom(beforeRound));
+    // Hasil pembulatan 0/500/1000
+    const gt_with_deliv = int(roundRupiahCustom(int(beforeRoundWithDeliv)));
 
-    // Set hasil untuk UI
     ui.delivery_fee = FLAT_DELIV;
     ui.grand_total_with_delivery = gt_with_deliv;
   } else {
     ui.delivery_fee = Number(ui.delivery_fee || 0);
-    ui.grand_total_with_delivery = pureGrand; // non-delivery: samakan saja
+    ui.grand_total_with_delivery = pureGrand;
   }
 
-  /* ======= Tambahkan harga per-item (before/after tax) ======= */
+  // ======= Enrich per-item (unit price & unit tax) =======
   const items = Array.isArray(cart.items) ? cart.items : [];
 
-  // Untuk alokasi pajak per item: denominator = items_subtotal - items_discount (tanpa ongkir & service fee)
+  // Alokasi pajak per item: denominator = items_subtotal - items_discount (tanpa ongkir & service fee)
   const tax_amount_total = Number(ui.tax_amount || 0); // pajak "pure" dari buildUiTotalsFromCart
   const taxDenominator = Math.max(0, items_subtotal - items_discount);
 
   const mappedItems = items.map((it) => {
     const qty = Number(it.quantity || 0);
-
     const unit_base = Number(it.base_price || 0);
     const addons_unit = (it.addons || []).reduce(
       (s, a) => s + Number(a.price || 0) * Number(a.qty || 1),
@@ -661,7 +663,6 @@ exports.getCart = asyncHandler(async (req, res) => {
       it.line_subtotal != null ? it.line_subtotal : unit_before_tax * qty
     );
 
-    // Alokasikan pajak hanya proporsional ke nilai items (tanpa ongkir & service fee)
     const line_tax =
       taxDenominator > 0
         ? Math.round((tax_amount_total * line_before_tax) / taxDenominator)
