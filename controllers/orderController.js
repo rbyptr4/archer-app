@@ -593,10 +593,39 @@ exports.getCart = asyncHandler(async (req, res) => {
     )
     .lean();
 
-  // Ringkasan awal dari util (tidak kita pakai mentah-mentah untuk SF/preview)
+  // 1) Ambil ringkasan awal (pure: SF & PPN hanya dari items; tanpa ongkir)
   const ui = buildUiTotalsFromCart(cart);
 
-  // ===== Aturan ongkir & re-hitungan preview =====
+  // 2) Pastikan angka "pure" saling konsisten (pakai satu rumus)
+  const items_subtotal = Number(ui.items_subtotal || 0);
+  const items_discount = Number(ui.items_discount || 0);
+  const shipping_discount = Number(ui.shipping_discount || 0);
+
+  // SF 2% dari ITEMS saja
+  const service_fee_on_items = int(items_subtotal * SERVICE_FEE_RATE);
+  // PPN HANYA dari items setelah item_discount
+  const rate = parsePpnRate();
+  const taxAmountOnItems = int(
+    Math.max(0, items_subtotal - items_discount) * rate
+  );
+
+  // Pure total sebelum pembulatan (tanpa ongkir)
+  const pureBeforeRound =
+    items_subtotal +
+    service_fee_on_items -
+    items_discount -
+    shipping_discount +
+    taxAmountOnItems;
+
+  // Override supaya konsisten
+  ui.service_fee = service_fee_on_items;
+  ui.tax_amount = taxAmountOnItems;
+  ui.grand_total_before_rounding = int(pureBeforeRound);
+  const pureRounded = int(roundRupiahCustom(int(pureBeforeRound)));
+  ui.grand_total = pureRounded;
+  ui.rounding_delta = pureRounded - int(pureBeforeRound);
+
+  // 3) Variant untuk delivery: ongkir flat dari .env, TIDAK kena SF/PPN
   const ft =
     cart?.fulfillment_type ||
     cartObj?.fulfillment_type ||
@@ -605,45 +634,16 @@ exports.getCart = asyncHandler(async (req, res) => {
 
   const FLAT_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
 
-  const items_subtotal = Number(ui.items_subtotal || 0);
-  const items_discount = Number(ui.items_discount || 0);
-  const shipping_discount = Number(ui.shipping_discount || 0);
-  const pureGrand = Number(ui.grand_total || 0); // biarkan tidak diubah
-
-  // === Service fee: 2% dari ITEMS SAJA (ongkir tidak ikut)
-  const service_fee_on_items = int(items_subtotal * SERVICE_FEE_RATE);
-  ui.service_fee = service_fee_on_items; // <== pastikan selalu terisi
-
-  // === Pajak: HANYA dari items setelah item_discount (ongkir & SF tidak kena)
-  const rate = parsePpnRate(); // mis. 0.11
-  const taxBaseItems = Math.max(0, items_subtotal - items_discount);
-  const taxAmountOnItems = int(taxBaseItems * rate);
-  ui.tax_amount = taxAmountOnItems; // sinkronkan tampilan dengan rumus baru
-
-  // === Preview grand_total (P U R E) sebelum pembulatan — untuk transparansi
-  const pureBeforeRound =
-    items_subtotal +
-    service_fee_on_items -
-    items_discount -
-    shipping_discount +
-    taxAmountOnItems;
-
-  ui.grand_total_before_rounding = int(pureBeforeRound);
-  // NOTE: ui.grand_total (rounded pure) tetap pakai nilai dari util agar kompatibel FE lama
-
   if (ft === 'delivery') {
-    // === Tambahkan ongkir flat ke preview delivery (tanpa PPN & tanpa SF)
-    const beforeRoundWithDeliv = pureBeforeRound + FLAT_DELIV;
     ui.delivery_fee = FLAT_DELIV;
-    ui.grand_total_with_delivery = int(
-      roundRupiahCustom(int(beforeRoundWithDeliv))
-    );
+    const beforeRoundWithDeliv = int(pureBeforeRound) + FLAT_DELIV;
+    ui.grand_total_with_delivery = int(roundRupiahCustom(beforeRoundWithDeliv));
   } else {
     ui.delivery_fee = Number(ui.delivery_fee || 0);
-    ui.grand_total_with_delivery = pureGrand; // non-delivery: samakan
+    ui.grand_total_with_delivery = ui.grand_total;
   }
 
-  // ======= Enrich per-item untuk tampilan (alokasi pajak hanya dari items) =======
+  // 4) Enrich item: alokasi pajak hanya proporsional ke items (tanpa ongkir/SF)
   const items = Array.isArray(cart.items) ? cart.items : [];
   const taxDenominator = Math.max(0, items_subtotal - items_discount);
 
@@ -655,16 +655,13 @@ exports.getCart = asyncHandler(async (req, res) => {
       0
     );
     const unit_before_tax = unit_base + addons_unit;
-
     const line_before_tax = Number(
       it.line_subtotal != null ? it.line_subtotal : unit_before_tax * qty
     );
-
     const line_tax =
       taxDenominator > 0
         ? Math.round((taxAmountOnItems * line_before_tax) / taxDenominator)
         : 0;
-
     const unit_tax = qty > 0 ? Math.round(line_tax / qty) : 0;
 
     return {
