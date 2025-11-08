@@ -631,94 +631,44 @@ exports.addItem = asyncHandler(async (req, res) => {
 });
 
 exports.updateItem = asyncHandler(async (req, res) => {
-  const t0 = Date.now();
-  const dbg = (...a) => console.log('[Cart:updateItem]', ...a);
-
   const { itemId } = req.params; // bisa _id atau line_key
   const { quantity, addons, notes } = req.body || {};
   const iden = getIdentity(req);
-
-  dbg('REQ IN', {
-    itemId: String(itemId || ''),
-    body: { quantity, addons, notes },
-    identity: {
-      mode: iden?.mode,
-      member: iden?.member || null,
-      device: iden?.device || null
-    }
-  });
 
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
   if (!cartObj) {
-    dbg('NO_CART_FOR_IDENTITY');
     throwError('Cart tidak ditemukan', 404);
   }
 
   const cart = await Cart.findById(cartObj._id);
   if (!cart) {
-    dbg('CART_DOC_NOT_FOUND', { cartId: String(cartObj._id) });
     throwError('Cart tidak ditemukan', 404);
   }
 
-  // ---- extra meta untuk ngebaca konteks cart yang sedang dipakai
-  dbg('CART_FOUND', {
-    cartId: String(cart._id),
-    itemsCount: cart.items.length,
-    fulfillment_type: cart.fulfillment_type || cart.ft || null,
-    status: cart.status || null,
-    updatedAt: cart.updatedAt
-  });
-
   const ref = String(itemId || '').trim();
   if (!ref) {
-    dbg('EMPTY_ITEMID');
     throwError('Parameter itemId kosong', 400);
   }
-
-  const availableIds = cart.items.map((it) => String(it._id));
-  const availableKeys = cart.items.map((it) => String(it.line_key || ''));
-
-  dbg('AVAILABLE', {
-    ids_sample: availableIds.slice(0, 10),
-    keys_sample: availableKeys.slice(0, 10),
-    total: cart.items.length
-  });
 
   let idx = cart.items.findIndex(
     (it) => String(it._id) === ref || String(it.line_key) === ref
   );
 
-  dbg('FIND_INDEX', { ref, idx });
-
-  // ======= Fallback diagnosis kalau tidak ketemu =======
+  // Fallback diagnosis kalau tidak ketemu
   if (idx < 0) {
-    // Jika cart kosong, besar kemungkinan FE pegang itemId dari cart lama
     if (cart.items.length === 0) {
-      // Batasi pencarian ke cart lain yang masih "aktif" / baru-baru ini (24 jam terakhir)
       const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-
       const otherCartQuery = {
         _id: { $ne: cart._id },
         'items._id': ref,
         updatedAt: { $gte: dayAgo }
       };
-
-      // (Opsional) kalau schema kamu punya tenant/outlet, filter di sini:
-      // otherCartQuery.tenant = cart.tenant;
-      // otherCartQuery.store = cart.store;
-
       const other = await Cart.findOne(otherCartQuery)
         .select('_id fulfillment_type status updatedAt')
         .lean();
       if (other) {
-        dbg('WRONG_CART_FOUND', {
-          otherCartId: String(other._id),
-          fulfillment_type: other.fulfillment_type,
-          updatedAt: other.updatedAt
-        });
-        // Kirim sinyal ke FE bahwa item ada di cart lain → FE harus refresh / pindah cart
         return res.status(409).json({
           error: 'WRONG_CART',
           message: 'Item berada di cart yang berbeda. Muat ulang cart aktif.',
@@ -735,35 +685,16 @@ exports.updateItem = asyncHandler(async (req, res) => {
       }
     }
 
-    // Log detail sampel untuk bantu cocokan di FE
-    const shortList = cart.items.slice(0, 5).map((it) => ({
-      _id: String(it._id),
-      line_key: String(it.line_key || ''),
-      menu: String(it.menu || ''),
-      qty: it.quantity
-    }));
-    dbg('NOT_FOUND_DETAIL', {
-      ref,
-      shortList,
-      note: 'Kemungkinan FE pakai itemId dari cart lama. Refresh / GET /cart lalu pakai _id terbaru.'
-    });
     throwError('Item tidak ditemukan di cart', 404);
   }
 
   // ================== Update field ==================
   if (quantity !== undefined) {
     const q = clamp(asInt(quantity, 0), 0, 999);
-    dbg('UPDATE_QTY', { from: cart.items[idx].quantity, to: q });
     if (q === 0) {
-      const removed = cart.items.splice(idx, 1);
-      dbg('REMOVED_BY_QTY_ZERO', {
-        removed: removed?.[0]
-          ? { _id: String(removed[0]._id), line_key: removed[0].line_key }
-          : null
-      });
+      cart.items.splice(idx, 1);
       recomputeTotals(cart);
       await cart.save();
-      dbg('DONE_SAVE_AFTER_REMOVE', { ms: Date.now() - t0 });
       return res.status(200).json(cart.toObject());
     } else {
       cart.items[idx].quantity = q;
@@ -772,22 +703,11 @@ exports.updateItem = asyncHandler(async (req, res) => {
 
   if (cart.items[idx]) {
     if (addons !== undefined) {
-      const beforeAddons = cart.items[idx].addons;
       const normalized = normalizeAddons(addons);
-      dbg('UPDATE_ADDONS', {
-        before: beforeAddons,
-        payload: addons,
-        normalized
-      });
       cart.items[idx].addons = normalized;
     }
     if (notes !== undefined) {
-      const beforeNotes = cart.items[idx].notes;
       cart.items[idx].notes = String(notes || '').trim();
-      dbg('UPDATE_NOTES', {
-        before: beforeNotes,
-        after: cart.items[idx].notes
-      });
     }
 
     // Rebuild & merge jika perlu
@@ -799,41 +719,24 @@ exports.updateItem = asyncHandler(async (req, res) => {
     });
     const newKey = cart.items[idx].line_key;
 
-    dbg('REBUILD_LINE_KEY', { beforeKey, newKey });
+    if (newKey !== beforeKey) {
+      const dupIdx = cart.items.findIndex(
+        (it, i) => i !== idx && String(it.line_key) === String(newKey)
+      );
+      if (dupIdx >= 0) {
+        const qtyA = cart.items[dupIdx].quantity || 0;
+        const qtyB = cart.items[idx].quantity || 0;
+        const merged = clamp(asInt(qtyA + qtyB, 0), 0, 999);
 
-    const dupIdx = cart.items.findIndex(
-      (it, i) => i !== idx && String(it.line_key) === String(newKey)
-    );
-    if (dupIdx >= 0) {
-      const qtyA = cart.items[dupIdx].quantity || 0;
-      const qtyB = cart.items[idx].quantity || 0;
-      const merged = clamp(asInt(qtyA + qtyB, 0), 0, 999);
-
-      dbg('MERGE_DUP', {
-        keep: {
-          index: dupIdx,
-          _id: String(cart.items[dupIdx]._id),
-          key: cart.items[dupIdx].line_key,
-          qtyA
-        },
-        remove: {
-          index: idx,
-          _id: String(cart.items[idx]._id),
-          key: newKey,
-          qtyB
-        },
-        mergedQty: merged
-      });
-
-      cart.items[dupIdx].quantity = merged;
-      cart.items.splice(idx, 1);
+        cart.items[dupIdx].quantity = merged;
+        cart.items.splice(idx, 1);
+      }
     }
   }
 
   recomputeTotals(cart);
   await cart.save();
 
-  dbg('DONE_SAVE', { itemsCount: cart.items.length, ms: Date.now() - t0 });
   res.status(200).json(cart.toObject());
 });
 
@@ -1016,11 +919,10 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
   }
 
-  // Flag metode
   const methodIsGateway = method === PM.QRIS; // hanya QRIS yang ke PG
   const requiresProof = needProof(method);
 
-  // ===== Identitas member / guest (tetap seperti kode kamu) =====
+  // ===== Member / Guest =====
   const originallyLoggedIn = !!iden0.memberId;
   const wantRegister = String(register_decision || 'register') === 'register';
 
@@ -1039,7 +941,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // ===== Ambil cart aktif (kode kamu, tidak diubah) =====
+  // ===== Ambil cart aktif =====
   const iden = {
     ...iden0,
     memberId: member?._id || iden0.memberId || null,
@@ -1067,7 +969,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Silakan assign nomor meja terlebih dahulu', 400);
   }
 
-  // ===== Idempotency (tetap) =====
+  // ===== Idempotency =====
   if (
     idempotency_key &&
     cart.last_idempotency_key === idempotency_key &&
@@ -1085,7 +987,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     cart.session_id = null;
   }
 
-  // ===== Delivery setup (tetap) =====
+  // ===== Delivery setup =====
   let delivery = undefined;
   let delivery_fee = 0;
   if (ft === 'delivery') {
@@ -1109,7 +1011,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     };
   }
 
-  // ===== Voucher pricing (tetap) =====
+  // ===== Voucher pricing =====
   recomputeTotals(cart);
   await cart.save();
 
@@ -1145,36 +1047,39 @@ exports.checkout = asyncHandler(async (req, res) => {
     voucherClaimIds: eligibleClaimIds
   });
 
-  // ===== PPN =====
-  const rate = parsePpnRate();
+  // ===== PPN + Pembulatan =====
+  const rate = parsePpnRate(); // ex: 0.11
   const taxBase =
     priced.totals.baseSubtotal -
     priced.totals.itemsDiscount +
     priced.totals.deliveryFee -
     priced.totals.shippingDiscount;
-  const taxAmount = Math.round(Math.max(0, taxBase * rate));
+
+  const taxAmount = int(Math.max(0, taxBase * rate));
   const taxRatePercent = Math.round(rate * 100 * 100) / 100;
+
+  const beforeRound = int(taxBase + taxAmount);
+  const rounded = int(roundRupiahCustom(beforeRound));
+  const roundingDelta = int(rounded - beforeRound);
 
   priced.totals.taxAmount = taxAmount;
   priced.totals.taxRatePercent = taxRatePercent;
-  priced.totals.grandTotal = taxBase + taxAmount;
+  priced.totals.grandTotal = rounded;
+  priced.totals.roundingDelta = roundingDelta;
 
   // ===== Bukti transfer (kalau perlu) =====
   const payment_proof_url = await handleTransferProofIfAny(req, method);
 
-  // ===== Tentukan payment_status awal =====
+  // ===== Payment status awal =====
   let payment_status = 'unpaid';
   let payment_provider = null;
 
   if (methodIsGateway) {
-    // qris via PG
     payment_provider = 'xendit';
     payment_status = 'unpaid';
   } else if (requiresProof) {
-    // transfer + bukti → dianggap paid, nunggu verify manual
     payment_status = 'paid';
   } else {
-    // cash / card di flow online: default unpaid, nanti kasir ubah (atau pakai POS endpoint)
     payment_status = 'unpaid';
   }
 
@@ -1187,6 +1092,7 @@ exports.checkout = asyncHandler(async (req, res) => {
           member: member ? member._id : null,
           customer_name: member ? '' : customer_name,
           customer_phone: member ? '' : customer_phone,
+
           table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
           source: iden.source || 'online',
           fulfillment_type: ft,
@@ -1204,10 +1110,18 @@ exports.checkout = asyncHandler(async (req, res) => {
             category: it.category || null
           })),
 
-          delivery_fee: priced.totals.deliveryFee,
-          items_discount: priced.totals.itemsDiscount,
-          shipping_discount: priced.totals.shippingDiscount,
+          // Totals dari pricing (tanpa service fee di flow ini)
+          items_subtotal: int(priced.totals.baseSubtotal),
+          items_discount: int(priced.totals.itemsDiscount),
+          delivery_fee: int(priced.totals.deliveryFee),
+          shipping_discount: int(priced.totals.shippingDiscount),
           discounts: priced.breakdown,
+
+          // Pajak & pembulatan
+          tax_rate_percent: taxRatePercent,
+          tax_amount: taxAmount,
+          rounding_delta: roundingDelta,
+          grand_total: rounded,
 
           payment_method: method,
           payment_provider,
@@ -1649,7 +1563,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   if (!tableNo) throwError('table_number wajib', 400);
   if (!Array.isArray(items) || !items.length) throwError('items wajib', 400);
 
-  // ===== Metode bayar POS (khusus) =====
+  // ===== Metode bayar POS =====
   const PM_POS = { CASH: 'cash', QRIS: 'qris', CARD: 'card' };
   const ALLOWED_PM_POS = [PM_POS.CASH, PM_POS.QRIS, PM_POS.CARD];
   const method = String(payment_method || '').toLowerCase();
@@ -1693,7 +1607,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     }
   }
 
-  // ===== Build items & subtotal (tanpa voucher/ongkir) =====
+  // ===== Build items & subtotal =====
   const orderItems = [];
   let totalQty = 0;
   let itemsSubtotal = 0;
@@ -1732,16 +1646,20 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     itemsSubtotal += line_subtotal;
   }
 
-  // ===== Pajak (PPN) & grand total =====
-  const rate = (() => {
-    const raw = Number(process.env.PPN_RATE ?? 0.11);
-    if (!Number.isFinite(raw)) return 0.11;
-    return raw > 1 ? raw / 100 : raw;
-  })();
+  // ===== Pajak & Pembulatan =====
+  const rawRate = Number(process.env.PPN_RATE ?? 0.11);
+  const rate = Number.isFinite(rawRate)
+    ? rawRate > 1
+      ? rawRate / 100
+      : rawRate
+    : 0.11;
+  const taxRatePercent = Math.round(rate * 100 * 100) / 100;
   const taxBase = itemsSubtotal; // POS: no voucher, no delivery
-  const taxAmount = Math.round(Math.max(0, taxBase * rate));
-  const taxRatePercent = Math.round(rate * 100 * 100) / 100; // 2 desimal
-  const grandTotal = taxBase + taxAmount;
+  const taxAmount = int(Math.max(0, taxBase * rate));
+
+  const beforeRound = int(taxBase + taxAmount);
+  const grandTotal = int(roundRupiahCustom(beforeRound));
+  const roundingDelta = int(grandTotal - beforeRound);
 
   const now = new Date();
 
@@ -1763,17 +1681,16 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           items: orderItems,
           total_quantity: totalQty,
 
-          // totals (tanpa voucher/ongkir)
+          // totals
           items_subtotal: itemsSubtotal,
           items_discount: 0,
           delivery_fee: 0,
           shipping_discount: 0,
           discounts: [],
-          grand_total: grandTotal,
-
-          // pajak
           tax_rate_percent: taxRatePercent,
           tax_amount: taxAmount,
+          rounding_delta: roundingDelta,
+          grand_total: grandTotal,
 
           // pembayaran: langsung verified
           payment_method: method,
@@ -1877,8 +1794,11 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
   const rate = Number.isFinite(raw) ? (raw > 1 ? raw / 100 : raw) : 0.11;
   const taxRatePercent = Math.round(rate * 100 * 100) / 100;
   const taxBase = itemsSubtotal;
-  const taxAmount = Math.round(Math.max(0, taxBase * rate));
-  const grandTotal = taxBase + taxAmount;
+  const taxAmount = int(Math.max(0, taxBase * rate));
+
+  const beforeRound = int(taxBase + taxAmount);
+  const grandTotal = int(roundRupiahCustom(beforeRound));
+  const roundingDelta = int(grandTotal - beforeRound);
 
   res.json({
     success: true,
@@ -1891,7 +1811,8 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       shipping_discount: 0,
       tax_rate_percent: taxRatePercent,
       tax_amount: taxAmount,
-      grand_total: grandTotal
+      grand_total: grandTotal,
+      rounding_delta: roundingDelta
     }
   });
 });
@@ -2271,7 +2192,7 @@ exports.createQrisFromCart = async (req, res, next) => {
       return res.status(400).json({ message: 'fulfillment_type tidak valid' });
     }
 
-    /* ===== Identitas member / guest (mirip checkout) ===== */
+    /* ===== Member / Guest (mirip checkout) ===== */
     const originallyLoggedIn = !!iden0.memberId;
     const wantRegister = String(register_decision || 'register') === 'register';
 
@@ -2281,10 +2202,7 @@ exports.createQrisFromCart = async (req, res, next) => {
 
     if (originallyLoggedIn || wantRegister) {
       const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
-
-      // Fungsi ini di checkout sudah ada, reuse aja
       member = await ensureMemberForCheckout(req, res, joinChannel);
-      // asumsi: ensureMemberForCheckout tidak langsung kirim response di sini
 
       if (member) {
         customer_name =
@@ -2294,21 +2212,19 @@ exports.createQrisFromCart = async (req, res, next) => {
       }
     }
 
-    // Kalau tidak pakai member (skip) → ambil dari body & wajib minimal salah satu
     if (!member) {
       customer_name = String(name || '').trim();
       customer_phone = String(phone || '').trim();
-
       if (!customer_name && !customer_phone) {
-        return res.status(400).json({
-          message: 'Tanpa member: isi minimal nama atau no. telp'
-        });
+        return res
+          .status(400)
+          .json({ message: 'Tanpa member: isi minimal nama atau no. telp' });
       }
     }
 
     const finalMemberId = member ? member._id : null;
 
-    /* ===== Ambil cart aktif (ikat ke member kalau ada) ===== */
+    /* ===== Ambil cart aktif ===== */
     const iden = {
       ...iden0,
       memberId: finalMemberId || iden0.memberId || null,
@@ -2331,7 +2247,6 @@ exports.createQrisFromCart = async (req, res, next) => {
       return res.status(404).json({ message: 'Cart kosong' });
     }
 
-    // Dine-in QR wajib punya nomor meja (mirip checkout)
     if (
       ft === 'dine_in' &&
       (iden.source || 'online') === 'qr' &&
@@ -2342,7 +2257,6 @@ exports.createQrisFromCart = async (req, res, next) => {
         .json({ message: 'Silakan assign nomor meja terlebih dahulu' });
     }
 
-    // Kalau ada member baru tapi cart belum terikat, bisa optional di-set
     if (finalMemberId && !cart.member) {
       cart.member = finalMemberId;
       cart.session_id = null;
@@ -2364,9 +2278,9 @@ exports.createQrisFromCart = async (req, res, next) => {
 
       const distance_km = haversineKm(CAFE_COORD, { lat: latN, lng: lngN });
       if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0)) {
-        return res.status(400).json({
-          message: `Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`
-        });
+        return res
+          .status(400)
+          .json({ message: `Di luar radius ${DELIVERY_MAX_RADIUS_KM} km` });
       }
 
       delivery_fee = calcDeliveryFee();
@@ -2386,7 +2300,6 @@ exports.createQrisFromCart = async (req, res, next) => {
 
     /* ===== Voucher ===== */
     let eligibleClaimIds = [];
-
     if (finalMemberId) {
       if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
         const rawClaims = await VoucherClaim.find({
@@ -2401,10 +2314,9 @@ exports.createQrisFromCart = async (req, res, next) => {
           .map((c) => String(c._id));
       }
     } else if (voucherClaimIds?.length) {
-      // Sama seperti checkout: nggak boleh pakai voucher kalau bukan member
-      return res.status(400).json({
-        message: 'Voucher hanya untuk member. Silakan daftar/login.'
-      });
+      return res
+        .status(400)
+        .json({ message: 'Voucher hanya untuk member. Silakan daftar/login.' });
     }
 
     const priced = await validateAndPrice({
@@ -2438,14 +2350,16 @@ exports.createQrisFromCart = async (req, res, next) => {
       service_fee -
       items_discount -
       shipping_discount;
-
     const safeTaxBase = Math.max(0, taxBase);
     const rate = parsePpnRate();
     const taxAmount = int(safeTaxBase * rate);
 
-    const requested_amount = safeTaxBase + taxAmount;
+    // ===== Pembulatan ke 0/500/1000 dengan roundRupiahCustom =====
+    const beforeRound = int(safeTaxBase + taxAmount);
+    const requested_bvt = int(roundRupiahCustom(beforeRound));
+    const rounding_delta = int(requested_bvt - beforeRound);
 
-    if (requested_amount <= 0) {
+    if (requested_bvt <= 0) {
       return res.status(400).json({ message: 'Total pembayaran tidak valid.' });
     }
 
@@ -2460,7 +2374,7 @@ exports.createQrisFromCart = async (req, res, next) => {
       fulfillment_type: ft,
       table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
       cart: cart._id,
-      session_id: deviceId,
+      session_id: iden.session_id || null, // FIX: gunakan session dari identitas
       items: cart.items.map((it) => ({
         menu: it.menu,
         menu_code: it.menu_code,
@@ -2478,7 +2392,8 @@ exports.createQrisFromCart = async (req, res, next) => {
       items_discount,
       shipping_discount,
       discounts: priced.breakdown,
-      requested_amount,
+      requested_amount: requested_bvt,
+      rounding_delta,
       delivery_snapshot: deliverySnapshot || undefined,
       provider: 'xendit',
       channel: 'qris',
@@ -2490,10 +2405,8 @@ exports.createQrisFromCart = async (req, res, next) => {
       reference_id,
       type: 'DYNAMIC',
       currency: 'IDR',
-      amount: requested_amount,
-      metadata: {
-        payment_session_id: String(session._id)
-      }
+      amount: requested_bvt,
+      metadata: { payment_session_id: String(session._id) }
     };
 
     const resp = await axios.post(`${X_BASE}/qr_codes`, payload, {
@@ -2514,7 +2427,7 @@ exports.createQrisFromCart = async (req, res, next) => {
       data: {
         sessionId: String(session._id),
         channel: 'QRIS',
-        amount: requested_amount,
+        amount: requested_bvt,
         qris: {
           qr_id: qr.id,
           qr_string: qr.qr_string,
