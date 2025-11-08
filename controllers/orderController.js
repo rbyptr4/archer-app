@@ -84,21 +84,6 @@ const DELIVERY_ALLOWED = [
   'failed'
 ];
 
-function makeETag(cart) {
-  const basis = `${cart._id}:${cart.updatedAt?.getTime() || 0}:${
-    cart.total_price || 0
-  }:${cart.total_items || 0}`;
-  const hash = crypto
-    .createHash('md5')
-    .update(basis)
-    .digest('hex')
-    .slice(0, 16);
-  return `W/"cart-${hash}"`;
-}
-
-const normFt = (v) =>
-  String(v).toLowerCase() === 'delivery' ? 'delivery' : 'dine_in';
-
 const toWa62 = (phone) => {
   const s = String(phone ?? '').trim();
   if (!s) return '';
@@ -528,25 +513,19 @@ exports.getCart = asyncHandler(async (req, res) => {
       rounding_delta: 0,
       grand_total: 0
     };
-    res.set('Cache-Control', 'private, no-store');
+    // Tanpa caching header
     return res.status(200).json({ cart: null, ui_totals: empty });
   }
 
   const cart = await Cart.findById(cartObj._id)
     .select(
-      'items total_items total_quantity total_price delivery updatedAt ui_cache fulfillment_type table_number status member session_id source'
+      'items total_items total_quantity total_price delivery updatedAt fulfillment_type table_number status member session_id source'
     )
     .lean();
 
-  const etag = makeETag(cart);
-  res.set('ETag', etag);
-  res.set(
-    'Cache-Control',
-    'private, max-age=0, must-revalidate, stale-while-revalidate=10'
-  );
-  if (req.headers['if-none-match'] === etag) return res.status(304).end();
+  // Hitung ringkasan untuk UI (tanpa menyimpan di DB)
+  const ui = buildUiTotalsFromCart(cart);
 
-  const ui = cart.ui_cache || buildUiTotalsFromCart(cart);
   return res.status(200).json({ ...cart, ui_totals: ui });
 });
 
@@ -936,6 +915,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   } else {
     customer_name = String(name || '').trim();
     customer_phone = String(phone || '').trim();
+    // >>> Perubahan di sini: phone jadi opsional (minimal salah satu terisi)
     if (!customer_name && !customer_phone) {
       throwError('Tanpa member: isi minimal nama atau no. telp', 400);
     }

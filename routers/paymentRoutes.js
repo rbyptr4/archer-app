@@ -10,6 +10,6 @@ router.post(
   wh.xenditQrisWebhook
 );
 // in-app start session
-router.get('/status/:id', ctrl.getSessionStatus);
+router.get('/:id/status', ctrl.getSessionStatus);
 
 module.exports = router;
