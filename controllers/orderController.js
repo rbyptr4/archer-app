@@ -15,6 +15,11 @@ const VoucherClaim = require('../models/voucherClaimModel');
 
 const throwError = require('../utils/throwError');
 const { sendText, buildOrderReceiptMessage } = require('../utils/wablas');
+const {
+  parsePpnRate,
+  SERVICE_FEE_RATE,
+  roundRupiahCustom
+} = require('../utils/money');
 const { baseCookie } = require('../utils/authCookies');
 const { uploadBuffer } = require('../utils/googleDrive');
 const { getDriveFolder } = require('../utils/driveFolders');
@@ -70,12 +75,6 @@ const DELIVERY_ALLOWED = [
   'delivered',
   'failed'
 ];
-
-function parsePpnRate() {
-  const raw = Number(process.env.PPN_RATE ?? 0.11); // default 11%
-  if (!Number.isFinite(raw)) return 0.11;
-  return raw > 1 ? raw / 100 : raw;
-}
 
 const normFt = (v) =>
   String(v).toLowerCase() === 'delivery' ? 'delivery' : 'dine_in';
@@ -602,14 +601,117 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
 };
 
 /* ===================== CART ENDPOINTS ===================== */
+
 exports.getCart = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
   const allowCreateOnline = false;
-  let cart = await getActiveCartForIdentity(iden, {
+
+  let cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline,
     defaultFt: req.query?.fulfillment_type || null
   });
-  res.status(200).json(cart);
+
+  // Jika belum ada cart sama sekali, tetap balas payload kosong + ui_totals 0
+  if (!cartObj) {
+    const rate = parsePpnRate();
+    return res.status(200).json({
+      cart: null,
+      ui_totals: {
+        items_subtotal: 0,
+        service_fee: 0,
+        items_discount: 0,
+        delivery_fee: 0,
+        shipping_discount: 0,
+        tax_rate_percent: Math.round(rate * 100 * 100) / 100,
+        tax_amount: 0,
+        rounding_delta: 0,
+        grand_total: 0
+      }
+    });
+  }
+
+  // Ambil dokumen cart utuh (bukan .lean) biar bisa recompute (kalau mau)
+  const cart = await Cart.findById(cartObj._id);
+  if (!cart) {
+    const rate = parsePpnRate();
+    return res.status(200).json({
+      cart: null,
+      ui_totals: {
+        items_subtotal: 0,
+        service_fee: 0,
+        items_discount: 0,
+        delivery_fee: 0,
+        shipping_discount: 0,
+        tax_rate_percent: Math.round(rate * 100 * 100) / 100,
+        tax_amount: 0,
+        rounding_delta: 0,
+        grand_total: 0
+      }
+    });
+  }
+
+  // (Opsional tapi disarankan) segarkan total internal cart
+  recomputeTotals(cart);
+  await cart.save();
+
+  // ====== Hitung angka untuk visual FE (mirip checkout) ======
+  const itemsSubtotal = (cart.items || []).reduce((sum, it) => {
+    const addonsTotal = (it.addons || []).reduce(
+      (s, a) => s + Number(a.price || 0) * Number(a.qty || 1),
+      0
+    );
+    const unit = Number(it.base_price || 0) + addonsTotal;
+    const qty = Math.max(1, Number(it.quantity || 1));
+    return sum + unit * qty;
+  }, 0);
+
+  const deliveryFee = Number(cart?.delivery?.delivery_fee || 0);
+  const itemsDiscount = 0; // di GET cart umumnya belum ada voucher → 0
+  const shippingDiscount = 0; // sama seperti di atas
+
+  // Service fee pakai custom rounding kalau ada
+  const svcRate = Number(SERVICE_FEE_RATE || 0);
+  const serviceFeeRaw = itemsSubtotal * svcRate;
+  const serviceFee = roundRupiahCustom
+    ? roundRupiahCustom(serviceFeeRaw)
+    : Math.round(serviceFeeRaw);
+
+  // PPN mengikuti base di checkout (tanpa service fee)
+  const rate = parsePpnRate();
+  const taxBase = Math.max(
+    0,
+    itemsSubtotal - itemsDiscount + deliveryFee - shippingDiscount
+  );
+  const taxAmount = Math.round(taxBase * rate);
+  const taxRatePercent = Math.round(rate * 100 * 100) / 100;
+
+  // Grand total = taxBase + tax + service fee
+  const grandBeforeRound = taxBase + taxAmount + serviceFee;
+
+  // Jika punya logika pembulatan khusus, hitung delta-nya
+  let rounded = grandBeforeRound;
+  let roundingDelta = 0;
+  if (typeof roundRupiahCustom === 'function') {
+    const after = roundRupiahCustom(grandBeforeRound);
+    roundingDelta = Number(after) - Number(grandBeforeRound);
+    rounded = after;
+  }
+
+  // Kirim cart + ui_totals
+  res.status(200).json({
+    ...cart.toObject(),
+    ui_totals: {
+      items_subtotal: itemsSubtotal,
+      service_fee: serviceFee,
+      items_discount: itemsDiscount,
+      delivery_fee: deliveryFee,
+      shipping_discount: shippingDiscount,
+      tax_rate_percent: taxRatePercent,
+      tax_amount: taxAmount,
+      rounding_delta: roundingDelta,
+      grand_total: rounded
+    }
+  });
 });
 
 exports.addItem = asyncHandler(async (req, res) => {
