@@ -945,7 +945,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   const methodIsGateway = method === PM.QRIS; // hanya QRIS yang ke PG
   const requiresProof = needProof(method);
 
-  // ===== Member / Guest =====
   const originallyLoggedIn = !!iden0.memberId;
   const wantRegister = String(register_decision || 'register') === 'register';
 
@@ -958,10 +957,23 @@ exports.checkout = asyncHandler(async (req, res) => {
     member = await ensureMemberForCheckout(req, res, joinChannel);
   } else {
     customer_name = String(name || '').trim();
-    customer_phone = String(phone || '').trim();
-    // >>> Perubahan di sini: phone jadi opsional (minimal salah satu terisi)
-    if (!customer_name && !customer_phone) {
+    const rawPhone = String(phone || '').trim();
+
+    // Minimal salah satu terisi
+    if (!customer_name && !rawPhone) {
       throwError('Tanpa member: isi minimal nama atau no. telp', 400);
+    }
+
+    if (rawPhone) {
+      // cek: hanya digit setelah remove non-digit
+      const digits = rawPhone.replace(/\D+/g, '');
+      if (!digits) {
+        throwError('Nomor telepon harus berupa angka', 400);
+      }
+      // normalisasi ke format "0..." (pakai helper kamu)
+      customer_phone = normalizePhone(rawPhone);
+    } else {
+      customer_phone = ''; // boleh kosong kalau nama ada
     }
   }
 
@@ -1038,6 +1050,18 @@ exports.checkout = asyncHandler(async (req, res) => {
   // ===== Voucher pricing =====
   recomputeTotals(cart);
   await cart.save();
+
+  cart.items = cart.items.map((it) => ({
+    ...it,
+    addons: Array.isArray(it.addons)
+      ? it.addons.filter(Boolean).map((a) => ({
+          name: String(a?.name || ''),
+          price: int(a?.price || 0),
+          qty: int(a?.qty || 1)
+        }))
+      : [],
+    notes: String(it.notes || '').trim()
+  }));
 
   let eligibleClaimIds = [];
   if (member) {
@@ -1129,8 +1153,14 @@ exports.checkout = asyncHandler(async (req, res) => {
             imageUrl: it.imageUrl,
             base_price: it.base_price,
             quantity: it.quantity,
-            addons: it.addons,
-            notes: it.notes,
+            addons: Array.isArray(it.addons)
+              ? it.addons.filter(Boolean).map((a) => ({
+                  name: String(a?.name || ''),
+                  price: int(a?.price || 0),
+                  qty: int(a?.qty || 1)
+                }))
+              : [],
+            notes: String(it.notes || '').trim(),
             category: it.category || null
           })),
 
