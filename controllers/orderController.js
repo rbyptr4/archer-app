@@ -1030,7 +1030,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   // ==== Ambil cart ====
   const iden = {
     ...iden0,
-    memberId: member?._id || iden0.memberId || null,
+    memberId: Member?._id || iden0.memberId || null,
     session_id:
       iden0.session_id ||
       req.cookies?.[DEVICE_COOKIE] ||
@@ -1122,7 +1122,7 @@ exports.checkout = asyncHandler(async (req, res) => {
       voucherClaimIds_shape: shape(voucherClaimIds)
     });
     priced = await validateAndPrice({
-      memberId: member ? member._id : null,
+      memberId: member ? Member._id : null,
       cart: {
         items: cart.items.map((it) => ({
           menuId: it.menu,
