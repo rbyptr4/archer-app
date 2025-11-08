@@ -1,6 +1,9 @@
 // controllers/orderController.js
 const asyncHandler = require('express-async-handler');
 const crypto = require('crypto');
+const dayjs = require('dayjs');
+const utc = require('dayjs/plugin/utc');
+const tz = require('dayjs/plugin/timezone');
 
 const Cart = require('../models/cartModel');
 const Menu = require('../models/menuModel');
@@ -25,6 +28,11 @@ const { haversineKm } = require('../utils/distance');
 const { nextDailyTxCode } = require('../utils/txCode');
 const { validateAndPrice } = require('../utils/voucherEngine');
 const { awardPointsIfEligible } = require('../utils/loyalty');
+
+dayjs.extend(utc);
+dayjs.extend(tz);
+
+const LOCAL_TZ = 'Asia/Jakarta';
 
 // logger history
 const { logPaidHistory, logRefundHistory } = require('../utils/historyLoggers');
@@ -222,28 +230,43 @@ async function handleTransferProofIfAny(req, method) {
 }
 
 exports.modeResolver = asyncHandler(async (req, _res, next) => {
-  const ft = req.body?.fulfillment_type || req.query?.fulfillment_type;
-  const headerSrc = String(req.headers['x-order-source'] || '').toLowerCase();
-  const querySrc = String(req.query?.source || '').toLowerCase();
+  // ==== 1) Baca sinyal dari request ====
+  const ft = (req.body?.fulfillment_type || req.query?.fulfillment_type || '')
+    .toString()
+    .toLowerCase();
+  const headerSrc = (req.headers['x-order-source'] || '')
+    .toString()
+    .toLowerCase();
+  const querySrc = (req.query?.source || '').toString().toLowerCase();
+  const tnRaw = req.body?.table_number ?? req.query?.table_number;
+  const tn = Number(tnRaw);
 
-  let mode = 'online';
+  // ==== 2) Tentukan source/mode ====
+  // default
   let source = 'online';
+  let mode = 'online';
 
-  if (String(ft) === 'delivery') {
-    mode = 'online';
+  if (ft === 'delivery') {
     source = 'online';
+    mode = 'online';
+  } else if (!Number.isNaN(tn) && tn > 0) {
+    // ada table_number => self order (QR)
+    source = 'qr';
+    mode = 'self_order';
   } else if (headerSrc === 'qr' || querySrc === 'qr') {
-    mode = 'self_order';
     source = 'qr';
+    mode = 'self_order';
   }
+  // selain kondisi di atas, tetap online
 
-  const tn = Number(req.body?.table_number ?? req.query?.table_number);
+  // simpan table_number (kalau ada) untuk downstream
   if (!Number.isNaN(tn) && tn > 0) {
-    mode = 'self_order';
-    source = 'qr';
+    req.table_number = tn;
   }
 
-  const sessionHeader =
+  // ==== 3) Prioritaskan cookie sebagai session_id ====
+  const cookieDev = req.cookies?.[DEVICE_COOKIE];
+  const headerDev =
     req.get('x-online-session') ||
     req.get('x-qr-session') ||
     req.get('x-device-id') ||
@@ -251,9 +274,12 @@ exports.modeResolver = asyncHandler(async (req, _res, next) => {
     req.body?.session_id ||
     null;
 
-  req.orderMode = mode;
-  req.orderSource = source;
+  const sessionHeader = cookieDev || headerDev;
   req.session_id = sessionHeader ? String(sessionHeader).trim() : null;
+
+  // ==== 4) Set hasil ke request ====
+  req.orderMode = mode; // 'online' | 'self_order'
+  req.orderSource = source; // 'online' | 'qr'
 
   next();
 });
@@ -714,28 +740,224 @@ exports.setFulfillmentType = asyncHandler(async (req, res) => {
   if (!['dine_in', 'delivery'].includes(ft)) {
     throwError('fulfillment_type tidak valid', 400);
   }
+  // Self-order QR tetap tidak boleh set ke delivery
   if ((iden.source || 'online') === 'qr' && ft !== 'dine_in') {
     throwError('Self-order hanya mendukung dine_in', 400);
   }
 
-  const cartObj = await getActiveCartForIdentity(iden, {
-    allowCreateOnline: false
-  });
-  if (!cartObj) throwError('Cart tidak ditemukan', 404);
+  const identityFilter = iden.memberId
+    ? { member: iden.memberId }
+    : { session_id: iden.session_id };
 
-  const cart = await Cart.findById(cartObj._id);
-  if (!cart) throwError('Cart tidak ditemukan', 404);
+  /* ================== CASE A: Target DELIVERY (QR -> ONLINE) ================== */
+  if (ft === 'delivery') {
+    // Coba existing ONLINE dulu
+    let onlineCartObj = await getActiveCartForIdentity(
+      { ...iden, source: 'online' },
+      { allowCreateOnline: false }
+    );
 
-  cart.fulfillment_type = ft;
-  if (ft === 'dine_in') {
-    cart.delivery_draft = undefined;
-    cart.table_number = cart.table_number || null;
-  } else {
-    cart.table_number = null;
+    if (!onlineCartObj) {
+      const qrCart = await Cart.findOne({
+        status: 'active',
+        source: 'qr',
+        ...identityFilter
+      });
+
+      if (qrCart) {
+        // Buat/ambil ONLINE
+        const ensureSession = iden.memberId
+          ? null
+          : iden.session_id || crypto.randomUUID();
+        const upsertFilter = {
+          status: 'active',
+          source: 'online',
+          ...(iden.memberId
+            ? { member: iden.memberId }
+            : { session_id: ensureSession })
+        };
+        const setOnInsert = {
+          member: iden.memberId || null,
+          session_id: iden.memberId ? null : ensureSession,
+          table_number: null,
+          fulfillment_type: 'delivery',
+          items: [],
+          total_items: 0,
+          total_quantity: 0,
+          total_price: 0,
+          status: 'active',
+          source: 'online'
+        };
+
+        let onlineCart = await Cart.findOneAndUpdate(
+          upsertFilter,
+          { $setOnInsert: setOnInsert },
+          { new: true, upsert: true }
+        );
+
+        // Merge item dari QR -> ONLINE
+        const idxMap = new Map(
+          (onlineCart.items || []).map((it, i) => [String(it.line_key), i])
+        );
+        for (const it of qrCart.items || []) {
+          const key = String(it.line_key);
+          if (idxMap.has(key)) {
+            const i = idxMap.get(key);
+            const q =
+              asInt(onlineCart.items[i].quantity, 1) + asInt(it.quantity, 1);
+            onlineCart.items[i].quantity = clamp(q, 1, 999);
+          } else {
+            onlineCart.items.push({
+              menu: it.menu,
+              menu_code: it.menu_code || '',
+              name: it.name,
+              imageUrl: it.imageUrl || '',
+              base_price: asInt(it.base_price, 0),
+              quantity: clamp(asInt(it.quantity, 1), 1, 999),
+              addons: normalizeAddons(it.addons),
+              notes: String(it.notes || '').trim(),
+              line_key: key,
+              category: it.category || null
+            });
+            idxMap.set(key, onlineCart.items.length - 1);
+          }
+        }
+        onlineCart.fulfillment_type = 'delivery';
+        onlineCart.table_number = null;
+        recomputeTotals(onlineCart);
+        await onlineCart.save();
+
+        // Kosongkan QR
+        qrCart.items = [];
+        recomputeTotals(qrCart);
+        await qrCart.save();
+
+        return res.status(200).json(onlineCart.toObject());
+      }
+
+      // Tidak ada QR: buat ONLINE kosong
+      onlineCartObj = await getActiveCartForIdentity(
+        { ...iden, source: 'online' },
+        { allowCreateOnline: true, defaultFt: 'delivery' }
+      );
+    }
+
+    const onlineCart = await Cart.findById(onlineCartObj._id);
+    if (!onlineCart) throwError('Cart tidak ditemukan', 404);
+
+    onlineCart.fulfillment_type = 'delivery';
+    onlineCart.table_number = null;
+    await onlineCart.save();
+
+    return res.status(200).json(onlineCart.toObject());
   }
 
-  await cart.save();
-  res.status(200).json(cart.toObject());
+  /* =========== CASE B: Target DINE_IN (ONLINE -> QR) [migrasi sebaliknya] =========== */
+  // Ambil cart QR jika ada
+  let qrCart = await Cart.findOne({
+    status: 'active',
+    source: 'qr',
+    ...identityFilter
+  });
+
+  // Ambil cart ONLINE sumber item (kalau ada)
+  let onlineCartObj = await getActiveCartForIdentity(
+    { ...iden, source: 'online' },
+    { allowCreateOnline: false }
+  );
+  let onlineCart = onlineCartObj
+    ? await Cart.findById(onlineCartObj._id)
+    : null;
+
+  // Pastikan ada table_number: ambil dari body atau dari qrCart yang eksisting
+  const incomingTable = asInt(req.body?.table_number, 0);
+  const finalTableNo =
+    incomingTable || (qrCart ? asInt(qrCart.table_number, 0) : 0);
+  if (!finalTableNo) {
+    throwError('Nomor meja wajib saat pindah ke dine_in', 400);
+  }
+
+  // Jika belum ada cart QR, buat/ambil satu
+  if (!qrCart) {
+    const ensureSession = iden.memberId
+      ? null
+      : iden.session_id || crypto.randomUUID();
+    qrCart = await Cart.findOneAndUpdate(
+      {
+        status: 'active',
+        source: 'qr',
+        ...(iden.memberId
+          ? { member: iden.memberId }
+          : { session_id: ensureSession })
+      },
+      {
+        $setOnInsert: {
+          member: iden.memberId || null,
+          session_id: iden.memberId ? null : ensureSession,
+          table_number: finalTableNo,
+          fulfillment_type: 'dine_in',
+          items: [],
+          total_items: 0,
+          total_quantity: 0,
+          total_price: 0,
+          status: 'active',
+          source: 'qr'
+        }
+      },
+      { new: true, upsert: true }
+    );
+  } else {
+    // update nomor meja jika datang table_number baru
+    if (incomingTable) qrCart.table_number = finalTableNo;
+  }
+
+  // Kalau ada cart ONLINE: merge item-nya ke QR
+  if (onlineCart && (onlineCart.items?.length || 0) > 0) {
+    const idxMap = new Map(
+      (qrCart.items || []).map((it, i) => [String(it.line_key), i])
+    );
+    for (const it of onlineCart.items || []) {
+      const key = String(it.line_key);
+      if (idxMap.has(key)) {
+        const i = idxMap.get(key);
+        const q = asInt(qrCart.items[i].quantity, 1) + asInt(it.quantity, 1);
+        qrCart.items[i].quantity = clamp(q, 1, 999);
+      } else {
+        qrCart.items.push({
+          menu: it.menu,
+          menu_code: it.menu_code || '',
+          name: it.name,
+          imageUrl: it.imageUrl || '',
+          base_price: asInt(it.base_price, 0),
+          quantity: clamp(asInt(it.quantity, 1), 1, 999),
+          addons: normalizeAddons(it.addons),
+          notes: String(it.notes || '').trim(),
+          line_key: key,
+          category: it.category || null
+        });
+        idxMap.set(key, qrCart.items.length - 1);
+      }
+    }
+    qrCart.fulfillment_type = 'dine_in';
+    qrCart.table_number = finalTableNo;
+    recomputeTotals(qrCart);
+    await qrCart.save();
+
+    // Kosongkan ONLINE
+    onlineCart.items = [];
+    recomputeTotals(onlineCart);
+    await onlineCart.save();
+
+    return res.status(200).json(qrCart.toObject());
+  }
+
+  // Tidak ada ONLINE atau kosong → cukup set FT di cart tujuan (QR)
+  qrCart.fulfillment_type = 'dine_in';
+  qrCart.table_number = finalTableNo;
+  recomputeTotals(qrCart);
+  await qrCart.save();
+
+  return res.status(200).json(qrCart.toObject());
 });
 
 /* ===================== DELIVERY ESTIMATE ===================== */
@@ -1963,5 +2185,82 @@ exports.listEmployeesDropdown = asyncHandler(async (req, res) => {
 
   res.json({
     items
+  });
+});
+
+exports.listTodayOrders = asyncHandler(async (req, res) => {
+  // Hitung range hari ini di timezone lokal
+  const startOfDay = dayjs().tz(LOCAL_TZ).startOf('day').toDate();
+  const endOfDay = dayjs().tz(LOCAL_TZ).endOf('day').toDate();
+
+  const filter = {
+    placed_at: { $gte: startOfDay, $lte: endOfDay },
+    status: { $ne: 'cancelled' } // kalau mau termasuk cancelled, hapus baris ini
+  };
+
+  const orders = await Order.find(filter)
+    .sort({ placed_at: -1, createdAt: -1 })
+    .select({
+      transaction_code: 1,
+      fulfillment_type: 1,
+      table_number: 1,
+      source: 1,
+
+      customer_name: 1,
+      customer_phone: 1,
+
+      items_subtotal: 1,
+      service_fee: 1,
+      delivery_fee: 1,
+      items_discount: 1,
+      shipping_discount: 1,
+      tax_amount: 1,
+      rounding_delta: 1,
+      grand_total: 1,
+
+      payment_method: 1,
+      payment_status: 1,
+
+      status: 1,
+      placed_at: 1,
+      paid_at: 1
+    })
+    .lean({ virtuals: true });
+
+  // Kalau mau sekalian kasih ringkasan item tanpa detail panjang, bisa embed dikit:
+  const mapped = orders.map((o) => ({
+    id: String(o._id),
+    transaction_code: o.transaction_code,
+    status: o.status,
+    payment_status: o.payment_status,
+    payment_method: o.payment_method,
+
+    fulfillment_type: o.fulfillment_type,
+    table_number:
+      o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
+
+    customer: {
+      name: o.customer_name || '',
+      phone: o.customer_phone || ''
+    },
+
+    totals: {
+      items_subtotal: o.items_subtotal,
+      service_fee: o.service_fee,
+      delivery_fee: o.delivery_fee,
+      items_discount: o.items_discount,
+      shipping_discount: o.shipping_discount,
+      tax_amount: o.tax_amount,
+      rounding_delta: o.rounding_delta,
+      grand_total: o.grand_total
+    },
+
+    placed_at: o.placed_at,
+    paid_at: o.paid_at || null
+  }));
+
+  return res.json({
+    success: true,
+    data: mapped
   });
 });

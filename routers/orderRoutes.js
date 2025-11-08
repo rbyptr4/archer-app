@@ -28,6 +28,7 @@ try {
 
 router.use(order.modeResolver);
 
+router.get('/today', order.listTodayOrders);
 router.get('/get-cart', order.getCart);
 router.post('/new-items', order.addItem);
 router.delete('/clear', order.clearCart);

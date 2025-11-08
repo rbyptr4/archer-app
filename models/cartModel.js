@@ -126,6 +126,27 @@ cartSchema.index(
   }
 );
 
+// models/cartModel.js (tambahkan setelah schema)
+cartSchema.index(
+  { status: 1, source: 1, member: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { status: 'active', member: { $type: 'objectId' } }
+  }
+);
+
+cartSchema.index(
+  { status: 1, source: 1, session_id: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      status: 'active',
+      member: { $exists: false },
+      session_id: { $type: 'string' }
+    }
+  }
+);
+
 cartSchema.index({ checked_out_at: 1 }, { expireAfterSeconds: 60 * 60 * 24 });
 
 // Agar require() ulang tidak bikin OverwriteModelError saat hot-reload
