@@ -15,6 +15,7 @@ const VoucherClaim = require('../models/voucherClaimModel');
 
 const throwError = require('../utils/throwError');
 const { sendText, buildOrderReceiptMessage } = require('../utils/wablas');
+const { buildUiTotalsFromCart } = require('../utils/cartUiCache');
 const {
   parsePpnRate,
   SERVICE_FEE_RATE,
@@ -75,6 +76,18 @@ const DELIVERY_ALLOWED = [
   'delivered',
   'failed'
 ];
+
+function makeETag(cart) {
+  const basis = `${cart._id}:${cart.updatedAt?.getTime() || 0}:${
+    cart.total_price || 0
+  }:${cart.total_items || 0}`;
+  const hash = crypto
+    .createHash('md5')
+    .update(basis)
+    .digest('hex')
+    .slice(0, 16);
+  return `W/"cart-${hash}"`;
+}
 
 const normFt = (v) =>
   String(v).toLowerCase() === 'delivery' ? 'delivery' : 'dine_in';
@@ -606,34 +619,37 @@ exports.getCart = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
   const allowCreateOnline = false;
 
-  let cartObj = await getActiveCartForIdentity(iden, {
+  const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline,
     defaultFt: req.query?.fulfillment_type || null
   });
 
-  // Jika belum ada cart sama sekali, tetap balas payload kosong + ui_totals 0
+  // Kirim kosong + ui_totals 0 jika tidak ada cart
   if (!cartObj) {
-    const rate = parsePpnRate();
-    return res.status(200).json({
-      cart: null,
-      ui_totals: {
-        items_subtotal: 0,
-        service_fee: 0,
-        items_discount: 0,
-        delivery_fee: 0,
-        shipping_discount: 0,
-        tax_rate_percent: Math.round(rate * 100 * 100) / 100,
-        tax_amount: 0,
-        rounding_delta: 0,
-        grand_total: 0
-      }
-    });
+    const empty = {
+      items_subtotal: 0,
+      service_fee: 0,
+      items_discount: 0,
+      delivery_fee: 0,
+      shipping_discount: 0,
+      tax_rate_percent: 11,
+      tax_amount: 0,
+      rounding_delta: 0,
+      grand_total: 0
+    };
+    res.set('Cache-Control', 'private, no-store');
+    return res.status(200).json({ cart: null, ui_totals: empty });
   }
 
-  // Ambil dokumen cart utuh (bukan .lean) biar bisa recompute (kalau mau)
-  const cart = await Cart.findById(cartObj._id);
+  // Ambil ringan
+  const cart = await Cart.findById(cartObj._id)
+    .select(
+      'items total_items total_quantity total_price delivery updatedAt ui_cache fulfillment_type table_number status member session_id'
+    )
+    .lean();
+
   if (!cart) {
-    const rate = parsePpnRate();
+    res.set('Cache-Control', 'private, no-store');
     return res.status(200).json({
       cart: null,
       ui_totals: {
@@ -642,7 +658,7 @@ exports.getCart = asyncHandler(async (req, res) => {
         items_discount: 0,
         delivery_fee: 0,
         shipping_discount: 0,
-        tax_rate_percent: Math.round(rate * 100 * 100) / 100,
+        tax_rate_percent: 11,
         tax_amount: 0,
         rounding_delta: 0,
         grand_total: 0
@@ -650,67 +666,23 @@ exports.getCart = asyncHandler(async (req, res) => {
     });
   }
 
-  // (Opsional tapi disarankan) segarkan total internal cart
-  recomputeTotals(cart);
-  await cart.save();
-
-  // ====== Hitung angka untuk visual FE (mirip checkout) ======
-  const itemsSubtotal = (cart.items || []).reduce((sum, it) => {
-    const addonsTotal = (it.addons || []).reduce(
-      (s, a) => s + Number(a.price || 0) * Number(a.qty || 1),
-      0
-    );
-    const unit = Number(it.base_price || 0) + addonsTotal;
-    const qty = Math.max(1, Number(it.quantity || 1));
-    return sum + unit * qty;
-  }, 0);
-
-  const deliveryFee = Number(cart?.delivery?.delivery_fee || 0);
-  const itemsDiscount = 0; // di GET cart umumnya belum ada voucher → 0
-  const shippingDiscount = 0; // sama seperti di atas
-
-  // Service fee pakai custom rounding kalau ada
-  const svcRate = Number(SERVICE_FEE_RATE || 0);
-  const serviceFeeRaw = itemsSubtotal * svcRate;
-  const serviceFee = roundRupiahCustom
-    ? roundRupiahCustom(serviceFeeRaw)
-    : Math.round(serviceFeeRaw);
-
-  // PPN mengikuti base di checkout (tanpa service fee)
-  const rate = parsePpnRate();
-  const taxBase = Math.max(
-    0,
-    itemsSubtotal - itemsDiscount + deliveryFee - shippingDiscount
+  const etag = makeETag(cart);
+  res.set('ETag', etag);
+  res.set(
+    'Cache-Control',
+    'private, max-age=0, must-revalidate, stale-while-revalidate=10'
   );
-  const taxAmount = Math.round(taxBase * rate);
-  const taxRatePercent = Math.round(rate * 100 * 100) / 100;
 
-  // Grand total = taxBase + tax + service fee
-  const grandBeforeRound = taxBase + taxAmount + serviceFee;
-
-  // Jika punya logika pembulatan khusus, hitung delta-nya
-  let rounded = grandBeforeRound;
-  let roundingDelta = 0;
-  if (typeof roundRupiahCustom === 'function') {
-    const after = roundRupiahCustom(grandBeforeRound);
-    roundingDelta = Number(after) - Number(grandBeforeRound);
-    rounded = after;
+  const ifNoneMatch = req.headers['if-none-match'];
+  if (ifNoneMatch && ifNoneMatch === etag) {
+    return res.status(304).end();
   }
 
-  // Kirim cart + ui_totals
-  res.status(200).json({
-    ...cart.toObject(),
-    ui_totals: {
-      items_subtotal: itemsSubtotal,
-      service_fee: serviceFee,
-      items_discount: itemsDiscount,
-      delivery_fee: deliveryFee,
-      shipping_discount: shippingDiscount,
-      tax_rate_percent: taxRatePercent,
-      tax_amount: taxAmount,
-      rounding_delta: roundingDelta,
-      grand_total: rounded
-    }
+  const ui = cart.ui_cache || buildUiTotalsFromCart(cart);
+
+  return res.status(200).json({
+    ...cart,
+    ui_totals: ui
   });
 });
 
