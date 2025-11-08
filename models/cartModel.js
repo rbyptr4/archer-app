@@ -21,13 +21,13 @@ const itemSchema = new mongoose.Schema(
     quantity: { type: Number, required: true, min: 1, max: 999 },
     addons: { type: [addonSchema], default: [] },
     notes: { type: String, trim: true, default: '' },
-    line_key: { type: String, required: true }, // penentu “varian” unik di cart
+    line_key: { type: String, required: true },
     line_subtotal: { type: Number, required: true, min: 0 }
   },
   { _id: true, timestamps: false }
 );
 
-/* ================= Subdoc: Draft Delivery (opsional, untuk FE) ================= */
+/* ================= Subdoc: Draft Delivery ================= */
 const deliveryDraftSchema = new mongoose.Schema(
   {
     address_text: { type: String, trim: true, default: '' },
@@ -43,7 +43,6 @@ const deliveryDraftSchema = new mongoose.Schema(
 /* ================= Main: Cart ================= */
 const cartSchema = new mongoose.Schema(
   {
-    // Identitas pemilik cart (member atau session)
     member: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Member',
@@ -51,26 +50,22 @@ const cartSchema = new mongoose.Schema(
     },
     session_id: { type: String, default: null },
 
-    // Sumber/cart channel: 'qr' (self-order) atau 'online' (website publik)
+    // HANYA sebagai metadata kanal terakhir (tidak memecah cart)
     source: {
       type: String,
       enum: ['qr', 'online'],
-      required: true,
+      default: 'online',
       index: true
     },
 
-    // Diperlukan untuk self-order (qr). Untuk online selalu null.
     table_number: { type: Number, default: null, min: 1 },
 
-    // Item keranjang
     items: { type: [itemSchema], default: [] },
 
-    // Ringkasan
     total_items: { type: Number, default: 0, min: 0 },
     total_quantity: { type: Number, default: 0, min: 0 },
     total_price: { type: Number, default: 0, min: 0 },
 
-    // Status cart
     status: {
       type: String,
       enum: ['active', 'checked_out', 'abandoned'],
@@ -78,7 +73,6 @@ const cartSchema = new mongoose.Schema(
       index: true
     },
 
-    // ====== Metadata checkout/idempotency ======
     last_idempotency_key: { type: String, default: null },
     checked_out_at: { type: Date, default: null },
     order_id: {
@@ -87,61 +81,50 @@ const cartSchema = new mongoose.Schema(
       default: null
     },
 
-    // ====== Preferensi FE ======
-    // Simpan pilihan tipe order terakhir agar FE bisa conditional render:
-    // 'dine_in' | 'delivery' (tidak wajib; controller akan pakai kalau ada)
     fulfillment_type: {
       type: String,
       enum: ['dine_in', 'delivery'],
       default: undefined
     },
 
-    // Draft alamat delivery (opsional, biar user gak ngetik ulang sebelum checkout)
-    delivery_draft: { type: deliveryDraftSchema, default: undefined }
+    delivery_draft: { type: deliveryDraftSchema, default: undefined },
+
+    // opsional: cache UI totals
+    ui_cache: { type: mongoose.Schema.Types.Mixed, default: null }
   },
   { timestamps: true }
 );
 
+/* ====== UNIQUE: Satu cart aktif per identitas (tanpa source) ====== */
 cartSchema.index(
-  { member: 1, source: 1, status: 1 },
-  {
-    unique: true,
-    partialFilterExpression: {
-      member: { $exists: true, $ne: null },
-      source: { $exists: true, $ne: null },
-      status: 'active'
-    }
-  }
-);
-
-cartSchema.index(
-  { session_id: 1, source: 1, status: 1 },
-  {
-    unique: true,
-    partialFilterExpression: {
-      session_id: { $exists: true, $ne: null },
-      source: { $exists: true, $ne: null },
-      status: 'active'
-    }
-  }
-);
-
-// models/cartModel.js (tambahkan setelah schema)
-cartSchema.index(
-  { status: 1, source: 1, member: 1 },
+  { status: 1, member: 1 },
   {
     unique: true,
     partialFilterExpression: { status: 'active', member: { $type: 'objectId' } }
   }
 );
-
 cartSchema.index(
-  { status: 1, source: 1, session_id: 1 },
+  { status: 1, session_id: 1 },
   {
     unique: true,
     partialFilterExpression: {
       status: 'active',
-      member: { $exists: false },
+      session_id: { $type: 'string' }
+    }
+  }
+);
+
+cartSchema.index(
+  { status: 1, member: 1, updatedAt: -1 },
+  {
+    partialFilterExpression: { status: 'active', member: { $type: 'objectId' } }
+  }
+);
+cartSchema.index(
+  { status: 1, session_id: 1, updatedAt: -1 },
+  {
+    partialFilterExpression: {
+      status: 'active',
       session_id: { $type: 'string' }
     }
   }
@@ -149,5 +132,4 @@ cartSchema.index(
 
 cartSchema.index({ checked_out_at: 1 }, { expireAfterSeconds: 60 * 60 * 24 });
 
-// Agar require() ulang tidak bikin OverwriteModelError saat hot-reload
 module.exports = mongoose.models.Cart || mongoose.model('Cart', cartSchema);

@@ -1,7 +1,7 @@
 // routers/paymentInAppRoutes.js
 const express = require('express');
 const router = express.Router();
-const ctrl = require('../controllers/paymentSessionController');
+const ctrl = require('../controllers/orderController');
 const wh = require('../controllers/payments/xenditWebhookController');
 
 router.post(

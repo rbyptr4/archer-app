@@ -4,7 +4,9 @@ const crypto = require('crypto');
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
 const tz = require('dayjs/plugin/timezone');
+const axios = require('axios');
 
+const PaymentSession = require('../models/paymentSessionModel');
 const Cart = require('../models/cartModel');
 const Menu = require('../models/menuModel');
 const User = require('../models/userModel');
@@ -58,6 +60,10 @@ const {
   CAFE_COORD,
   DELIVERY_FLAT_FEE
 } = require('../config/onlineConfig');
+
+const X_BASE = process.env.XENDIT_BASE_URL;
+const X_KEY = process.env.XENDIT_SECRET_KEY;
+const HDRS = { 'Content-Type': 'application/json' };
 
 /* ================= Cookie presets ================= */
 const cookieAccess = { ...baseCookie, httpOnly: true, maxAge: 15 * 60 * 1000 };
@@ -314,16 +320,14 @@ const getIdentity = (req) => {
   };
 };
 
-/* ================= MERGE CARTS: session_id -> member ================= */
 const mergeTwoCarts = (dst, src) => {
   for (const it of src.items || []) {
-    const idx = dst.items.findIndex((d) => d.line_key === it.line_key);
-    if (idx >= 0) {
-      dst.items[idx].quantity = clamp(
-        asInt(dst.items[idx].quantity, 1) + asInt(it.quantity, 1),
-        1,
-        999
-      );
+    const key = String(it.line_key);
+    const i = dst.items.findIndex((d) => String(d.line_key) === key);
+    if (i >= 0) {
+      const sum =
+        (Number(dst.items[i].quantity) || 0) + (Number(it.quantity) || 0);
+      dst.items[i].quantity = Math.max(1, Math.min(999, sum));
     } else {
       dst.items.push(it.toObject ? it.toObject() : { ...it });
     }
@@ -332,181 +336,69 @@ const mergeTwoCarts = (dst, src) => {
 };
 
 const attachOrMergeCartsForIdentity = async (iden) => {
-  if (!iden?.memberId || !iden?.session_id) return;
+  if (!iden?.memberId && !iden?.session_id) return;
 
-  const SOURCES = ['online', 'qr'];
-  for (const src of SOURCES) {
-    const sessionCart = await Cart.findOne({
-      status: 'active',
-      source: src,
-      session_id: iden.session_id,
-      $or: [{ member: null }, { member: { $exists: false } }]
-    });
-    if (!sessionCart) continue;
+  const filter = iden.memberId
+    ? { status: 'active', member: iden.memberId }
+    : { status: 'active', session_id: iden.session_id };
 
-    let memberCart = await Cart.findOne({
-      status: 'active',
-      source: src,
-      member: iden.memberId
-    });
+  const carts = await Cart.find(filter).sort({ updatedAt: -1 }); // newest first
+  if (carts.length <= 1) return;
 
-    if (memberCart) {
-      mergeTwoCarts(memberCart, sessionCart);
-      await memberCart.save();
-      await Cart.deleteOne({ _id: sessionCart._id }).catch(() => {});
-      continue;
-    }
-
-    try {
-      const r = await Cart.updateOne(
-        {
-          _id: sessionCart._id,
-          status: 'active',
-          source: src,
-          session_id: iden.session_id,
-          $or: [{ member: null }, { member: { $exists: false } }]
-        },
-        { $set: { member: iden.memberId, session_id: null } }
-      );
-      if (!r.matchedCount) continue;
-    } catch (e) {
-      if (e && e.code === 11000) {
-        memberCart = await Cart.findOne({
-          status: 'active',
-          source: src,
-          member: iden.memberId
-        });
-        if (memberCart) {
-          const freshSession = await Cart.findById(sessionCart._id);
-          if (freshSession) {
-            mergeTwoCarts(memberCart, freshSession);
-            await memberCart.save();
-            await Cart.deleteOne({ _id: freshSession._id }).catch(() => {});
-          }
-          continue;
-        }
-        throw e;
-      }
-      throw e;
-    }
+  const primary = carts[0];
+  for (let i = 1; i < carts.length; i++) {
+    mergeTwoCarts(primary, carts[i]);
+    await carts[i].deleteOne().catch(() => {});
   }
+  await primary.save();
 };
 
 const getActiveCartForIdentity = async (
   iden,
-  { allowCreateOnline = false, defaultFt = null }
+  {
+    allowCreateOnline = false,
+    allowCreate = false,
+    defaultFt = null,
+    skipAttach = false
+  } = {}
 ) => {
-  await attachOrMergeCartsForIdentity(iden);
+  if (!skipAttach) await attachOrMergeCartsForIdentity(iden);
 
-  const requestedSource = iden.source || '';
-  // Bisa match dengan member atau session_id (atau keduanya)
-  const identityFilter = (() => {
-    const parts = [];
-    if (iden.memberId) parts.push({ member: iden.memberId });
-    if (iden.session_id) parts.push({ session_id: iden.session_id });
-    if (!parts.length) return {}; // fallback: tanpa filter identitas (jarang)
-    if (parts.length === 1) return parts[0];
-    return { $or: parts };
-  })();
+  const canCreate = allowCreate || allowCreateOnline; // kompatibilitas
+  const filter = iden.memberId
+    ? { status: 'active', member: iden.memberId }
+    : iden.session_id
+    ? { status: 'active', session_id: iden.session_id }
+    : null;
 
-  // 🔧 perbaikan: hormati requestedSource
-  const sourcesToCheck = (() => {
-    if (requestedSource === 'qr') return ['qr'];
-    if (requestedSource === 'online') return ['online'];
-    // fallback kalau gak jelas: prefer online baru qr
-    return ['online', 'qr'];
-  })();
+  if (!filter) return null;
 
-  let cart = null;
-  let cartsQueried = [];
-  let foundSource = null;
+  let cart = await Cart.findOne(filter).sort({ updatedAt: -1 }).lean();
+  if (cart) return cart;
 
-  for (const src of sourcesToCheck) {
-    const carts = await Cart.find({
-      status: 'active',
-      source: src,
-      ...identityFilter
-    })
-      .sort([
-        ['table_number', -1],
-        ['updatedAt', -1]
-      ])
-      .limit(2)
-      .lean();
+  if (!canCreate) return null;
 
-    if (carts.length) {
-      cart = carts[0];
-      cartsQueried = carts;
-      foundSource = src;
-      break;
-    }
-  }
-
-  if (!cart) {
-    if (requestedSource === 'qr') {
-      throwError(
-        'Belum ada cart self-order. Silakan assign nomor meja dahulu.',
-        400
-      );
-    } else if (allowCreateOnline) {
-      const ensureSession = iden.memberId
-        ? null
-        : iden.session_id || crypto.randomUUID();
-
-      const upsertFilter = {
-        status: 'active',
-        source: 'online',
-        ...(iden.memberId
-          ? { member: iden.memberId }
-          : { session_id: ensureSession })
-      };
-
-      const setOnInsert = {
+  const sid = iden.memberId ? null : iden.session_id || crypto.randomUUID();
+  cart = await Cart.findOneAndUpdate(
+    filter,
+    {
+      $setOnInsert: {
         member: iden.memberId || null,
-        session_id: iden.memberId ? null : ensureSession,
+        session_id: sid,
+        source: iden.source || 'online', // metadata kanal terakhir
         table_number: null,
-        fulfillment_type: defaultFt ? normFt(defaultFt) : 'dine_in',
+        fulfillment_type: defaultFt
+          ? String(defaultFt).toLowerCase()
+          : 'dine_in',
         items: [],
         total_items: 0,
         total_quantity: 0,
         total_price: 0,
-        status: 'active',
-        source: 'online'
-      };
-
-      try {
-        const upserted = await Cart.findOneAndUpdate(
-          upsertFilter,
-          { $setOnInsert: setOnInsert },
-          { new: true, upsert: true, lean: true }
-        );
-        cart = upserted;
-        foundSource = 'online';
-      } catch (e) {
-        if (e && e.code === 11000) {
-          const retry = await Cart.findOne(upsertFilter).lean();
-          if (retry) {
-            cart = retry;
-            foundSource = 'online';
-          } else {
-            throw e;
-          }
-        } else {
-          throw e;
-        }
+        status: 'active'
       }
-    }
-  }
-
-  if (cart && cartsQueried.length > 1) {
-    await Cart.deleteMany({
-      _id: { $in: cartsQueried.slice(1).map((c) => c._id) },
-      status: 'active',
-      source: foundSource,
-      ...identityFilter
-    }).catch(() => {});
-  }
-
+    },
+    { new: true, upsert: true, lean: true }
+  );
   return cart;
 };
 
@@ -614,17 +506,15 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
 };
 
 /* ===================== CART ENDPOINTS ===================== */
-
 exports.getCart = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
-  const allowCreateOnline = false;
 
   const cartObj = await getActiveCartForIdentity(iden, {
-    allowCreateOnline,
-    defaultFt: req.query?.fulfillment_type || null
+    allowCreate: false,
+    defaultFt: req.query?.fulfillment_type || null,
+    skipAttach: true // GET jangan merge berat
   });
 
-  // Kirim kosong + ui_totals 0 jika tidak ada cart
   if (!cartObj) {
     const empty = {
       items_subtotal: 0,
@@ -641,30 +531,11 @@ exports.getCart = asyncHandler(async (req, res) => {
     return res.status(200).json({ cart: null, ui_totals: empty });
   }
 
-  // Ambil ringan
   const cart = await Cart.findById(cartObj._id)
     .select(
-      'items total_items total_quantity total_price delivery updatedAt ui_cache fulfillment_type table_number status member session_id'
+      'items total_items total_quantity total_price delivery updatedAt ui_cache fulfillment_type table_number status member session_id source'
     )
     .lean();
-
-  if (!cart) {
-    res.set('Cache-Control', 'private, no-store');
-    return res.status(200).json({
-      cart: null,
-      ui_totals: {
-        items_subtotal: 0,
-        service_fee: 0,
-        items_discount: 0,
-        delivery_fee: 0,
-        shipping_discount: 0,
-        tax_rate_percent: 11,
-        tax_amount: 0,
-        rounding_delta: 0,
-        grand_total: 0
-      }
-    });
-  }
 
   const etag = makeETag(cart);
   res.set('ETag', etag);
@@ -672,18 +543,10 @@ exports.getCart = asyncHandler(async (req, res) => {
     'Cache-Control',
     'private, max-age=0, must-revalidate, stale-while-revalidate=10'
   );
-
-  const ifNoneMatch = req.headers['if-none-match'];
-  if (ifNoneMatch && ifNoneMatch === etag) {
-    return res.status(304).end();
-  }
+  if (req.headers['if-none-match'] === etag) return res.status(304).end();
 
   const ui = cart.ui_cache || buildUiTotalsFromCart(cart);
-
-  return res.status(200).json({
-    ...cart,
-    ui_totals: ui
-  });
+  return res.status(200).json({ ...cart, ui_totals: ui });
 });
 
 exports.addItem = asyncHandler(async (req, res) => {
@@ -1023,219 +886,48 @@ exports.clearCart = asyncHandler(async (req, res) => {
   res.status(200).json(cart.toObject());
 });
 
-/* ===== Toggle fulfillment type dari Cart ===== */
-// PATCH /cart/fulfillment-type  { fulfillment_type: 'dine_in'|'delivery' }
 exports.setFulfillmentType = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
   const ft = String(req.body?.fulfillment_type || '').toLowerCase();
-
-  if (!['dine_in', 'delivery'].includes(ft)) {
+  if (!['dine_in', 'delivery'].includes(ft))
     throwError('fulfillment_type tidak valid', 400);
-  }
-  // Self-order QR tetap tidak boleh set ke delivery
-  if ((iden.source || 'online') === 'qr' && ft !== 'dine_in') {
-    throwError('Self-order hanya mendukung dine_in', 400);
-  }
 
-  const identityFilter = iden.memberId
-    ? { member: iden.memberId }
-    : { session_id: iden.session_id };
+  const filter = iden.memberId
+    ? { status: 'active', member: iden.memberId }
+    : { status: 'active', session_id: iden.session_id };
 
-  /* ================== CASE A: Target DELIVERY (QR -> ONLINE) ================== */
-  if (ft === 'delivery') {
-    // Filter identitas
-    const identityFilter = iden.memberId
-      ? { member: iden.memberId }
-      : { session_id: iden.session_id };
+  const cart = await Cart.findOne(filter);
+  if (!cart) throwError('Cart tidak ditemukan', 404);
 
-    // 1) Ambil QR cart (jika ada)
-    const qrCart = await Cart.findOne({
-      status: 'active',
-      source: 'qr',
-      ...identityFilter
-    });
+  cart.fulfillment_type = ft;
 
-    // 2) Ambil atau buat ONLINE cart (karena targetnya delivery)
-    const ensureSession = iden.memberId
-      ? null
-      : iden.session_id || crypto.randomUUID();
-
-    let onlineCart = await Cart.findOneAndUpdate(
-      {
-        status: 'active',
-        source: 'online',
-        ...(iden.memberId
-          ? { member: iden.memberId }
-          : { session_id: ensureSession })
-      },
-      {
-        $setOnInsert: {
-          member: iden.memberId || null,
-          session_id: iden.memberId ? null : ensureSession,
-          table_number: null,
-          fulfillment_type: 'delivery',
-          items: [],
-          total_items: 0,
-          total_quantity: 0,
-          total_price: 0,
-          status: 'active',
-          source: 'online'
-        }
-      },
-      { new: true, upsert: true }
-    );
-
-    // 3) Jika QR ada item, MERGE -> ONLINE lalu kosongkan QR
-    if (qrCart && (qrCart.items?.length || 0) > 0) {
-      const idxMap = new Map(
-        (onlineCart.items || []).map((it, i) => [String(it.line_key), i])
-      );
-
-      for (const it of qrCart.items || []) {
-        const key = String(it.line_key);
-        if (idxMap.has(key)) {
-          const i = idxMap.get(key);
-          const q =
-            asInt(onlineCart.items[i].quantity, 1) + asInt(it.quantity, 1);
-          onlineCart.items[i].quantity = clamp(q, 1, 999);
-        } else {
-          onlineCart.items.push({
-            menu: it.menu,
-            menu_code: it.menu_code || '',
-            name: it.name,
-            imageUrl: it.imageUrl || '',
-            base_price: asInt(it.base_price, 0),
-            quantity: clamp(asInt(it.quantity, 1), 1, 999),
-            addons: normalizeAddons(it.addons),
-            notes: String(it.notes || '').trim(),
-            line_key: key,
-            category: it.category || null
-          });
-          idxMap.set(key, onlineCart.items.length - 1);
-        }
-      }
-
-      // Kosongkan QR (bukan hapus dokumen)
-      qrCart.items = [];
-      recomputeTotals(qrCart);
-      await qrCart.save();
+  if (ft === 'dine_in') {
+    // QR boleh memaksa nomor meja
+    const tableNo = Number(req.body?.table_number) || cart.table_number || null;
+    if ((iden.source || 'online') === 'qr' && !tableNo) {
+      throwError('Nomor meja wajib untuk dine_in (QR).', 400);
     }
-
-    // 4) Set konteks delivery pada ONLINE dan simpan
-    onlineCart.fulfillment_type = 'delivery';
-    onlineCart.table_number = null;
-    recomputeTotals(onlineCart);
-    await onlineCart.save();
-
-    return res.status(200).json(onlineCart.toObject());
-  }
-
-  /* =========== CASE B: Target DINE_IN (ONLINE -> QR) [migrasi sebaliknya] =========== */
-  // Ambil cart QR jika ada
-  let qrCart = await Cart.findOne({
-    status: 'active',
-    source: 'qr',
-    ...identityFilter
-  });
-
-  // Ambil cart ONLINE sumber item (kalau ada)
-  let onlineCartObj = await getActiveCartForIdentity(
-    { ...iden, source: 'online' },
-    { allowCreateOnline: false }
-  );
-  let onlineCart = onlineCartObj
-    ? await Cart.findById(onlineCartObj._id)
-    : null;
-
-  // Pastikan ada table_number: ambil dari body atau dari qrCart yang eksisting
-  const incomingTable = asInt(req.body?.table_number, 0);
-  const finalTableNo =
-    incomingTable || (qrCart ? asInt(qrCart.table_number, 0) : 0);
-  if (!finalTableNo) {
-    throwError('Nomor meja wajib saat pindah ke dine_in', 400);
-  }
-
-  // Jika belum ada cart QR, buat/ambil satu
-  if (!qrCart) {
-    const ensureSession = iden.memberId
-      ? null
-      : iden.session_id || crypto.randomUUID();
-    qrCart = await Cart.findOneAndUpdate(
-      {
-        status: 'active',
-        source: 'qr',
-        ...(iden.memberId
-          ? { member: iden.memberId }
-          : { session_id: ensureSession })
-      },
-      {
-        $setOnInsert: {
-          member: iden.memberId || null,
-          session_id: iden.memberId ? null : ensureSession,
-          table_number: finalTableNo,
-          fulfillment_type: 'dine_in',
-          items: [],
-          total_items: 0,
-          total_quantity: 0,
-          total_price: 0,
-          status: 'active',
-          source: 'qr'
-        }
-      },
-      { new: true, upsert: true }
-    );
+    cart.table_number = tableNo;
+    cart.delivery_draft = undefined;
   } else {
-    // update nomor meja jika datang table_number baru
-    if (incomingTable) qrCart.table_number = finalTableNo;
-  }
-
-  // Kalau ada cart ONLINE: merge item-nya ke QR
-  if (onlineCart && (onlineCart.items?.length || 0) > 0) {
-    const idxMap = new Map(
-      (qrCart.items || []).map((it, i) => [String(it.line_key), i])
-    );
-    for (const it of onlineCart.items || []) {
-      const key = String(it.line_key);
-      if (idxMap.has(key)) {
-        const i = idxMap.get(key);
-        const q = asInt(qrCart.items[i].quantity, 1) + asInt(it.quantity, 1);
-        qrCart.items[i].quantity = clamp(q, 1, 999);
-      } else {
-        qrCart.items.push({
-          menu: it.menu,
-          menu_code: it.menu_code || '',
-          name: it.name,
-          imageUrl: it.imageUrl || '',
-          base_price: asInt(it.base_price, 0),
-          quantity: clamp(asInt(it.quantity, 1), 1, 999),
-          addons: normalizeAddons(it.addons),
-          notes: String(it.notes || '').trim(),
-          line_key: key,
-          category: it.category || null
-        });
-        idxMap.set(key, qrCart.items.length - 1);
-      }
+    // delivery: clear meja, simpan draft bila dikirim
+    cart.table_number = null;
+    if (req.body?.delivery_draft) {
+      cart.delivery_draft = {
+        address_text: String(req.body.delivery_draft.address_text || ''),
+        location: req.body.delivery_draft.location || null,
+        note_to_rider: String(req.body.delivery_draft.note_to_rider || '')
+      };
     }
-    qrCart.fulfillment_type = 'dine_in';
-    qrCart.table_number = finalTableNo;
-    recomputeTotals(qrCart);
-    await qrCart.save();
-
-    // Kosongkan ONLINE
-    onlineCart.items = [];
-    recomputeTotals(onlineCart);
-    await onlineCart.save();
-
-    return res.status(200).json(qrCart.toObject());
   }
 
-  // Tidak ada ONLINE atau kosong → cukup set FT di cart tujuan (QR)
-  qrCart.fulfillment_type = 'dine_in';
-  qrCart.table_number = finalTableNo;
-  recomputeTotals(qrCart);
-  await qrCart.save();
+  // simpan metadata kanal terakhir
+  if (iden.source) cart.source = iden.source;
 
-  return res.status(200).json(qrCart.toObject());
+  recomputeTotals(cart);
+  await cart.save();
+
+  res.status(200).json(cart.toObject());
 });
 
 /* ===================== DELIVERY ESTIMATE ===================== */
@@ -1604,8 +1296,7 @@ exports.checkout = asyncHandler(async (req, res) => {
 
 exports.assignTable = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
-
-  const table_number = asInt(req.body?.table_number, 0);
+  const table_number = Number(req.body?.table_number) || 0;
   if (!table_number) throwError('table_number wajib', 400);
 
   let sessionId = iden.session_id || req.cookies?.[DEVICE_COOKIE];
@@ -1618,40 +1309,30 @@ exports.assignTable = asyncHandler(async (req, res) => {
     });
   }
 
-  const identityFilter = iden.memberId
-    ? { member: iden.memberId }
-    : { session_id: sessionId };
-
-  let cart = await Cart.findOne({
-    status: 'active',
-    source: 'qr',
-    ...identityFilter
-  });
+  const filter = iden.memberId
+    ? { status: 'active', member: iden.memberId }
+    : { status: 'active', session_id: sessionId };
+  let cart = await Cart.findOne(filter);
 
   if (!cart) {
     cart = await Cart.create({
       member: iden.memberId || null,
       session_id: iden.memberId ? null : sessionId,
+      source: 'qr', // metadata kanal
       table_number,
       fulfillment_type: 'dine_in',
       items: [],
       total_items: 0,
       total_quantity: 0,
       total_price: 0,
-      status: 'active',
-      source: 'qr'
+      status: 'active'
     });
   } else {
+    cart.source = 'qr';
+    cart.fulfillment_type = 'dine_in';
     cart.table_number = table_number;
     await cart.save();
   }
-
-  await Cart.deleteMany({
-    _id: { $ne: cart._id },
-    status: 'active',
-    source: 'qr',
-    ...identityFilter
-  }).catch(() => {});
 
   emitToStaff('cart:table_assigned', {
     cart_id: String(cart._id),
@@ -2542,3 +2223,313 @@ exports.listTodayOrders = asyncHandler(async (req, res) => {
     data: mapped
   });
 });
+
+exports.createQrisFromCart = async (req, res, next) => {
+  try {
+    const iden0 = getIdentity(req);
+    const {
+      name,
+      phone,
+      fulfillment_type,
+      address_text,
+      lat,
+      lng,
+      note_to_rider,
+      voucherClaimIds = [],
+      register_decision = 'register'
+    } = req.body || {};
+
+    /* ===== Resolve fulfillment type ===== */
+    const ft =
+      iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
+    if (!['dine_in', 'delivery'].includes(ft)) {
+      return res.status(400).json({ message: 'fulfillment_type tidak valid' });
+    }
+
+    /* ===== Identitas member / guest (mirip checkout) ===== */
+    const originallyLoggedIn = !!iden0.memberId;
+    const wantRegister = String(register_decision || 'register') === 'register';
+
+    let member = null;
+    let customer_name = '';
+    let customer_phone = '';
+
+    if (originallyLoggedIn || wantRegister) {
+      const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
+
+      // Fungsi ini di checkout sudah ada, reuse aja
+      member = await ensureMemberForCheckout(req, res, joinChannel);
+      // asumsi: ensureMemberForCheckout tidak langsung kirim response di sini
+
+      if (member) {
+        customer_name =
+          String(member.name || '').trim() || String(name || '').trim();
+        customer_phone =
+          String(member.phone || '').trim() || String(phone || '').trim();
+      }
+    }
+
+    // Kalau tidak pakai member (skip) → ambil dari body & wajib minimal salah satu
+    if (!member) {
+      customer_name = String(name || '').trim();
+      customer_phone = String(phone || '').trim();
+
+      if (!customer_name && !customer_phone) {
+        return res.status(400).json({
+          message: 'Tanpa member: isi minimal nama atau no. telp'
+        });
+      }
+    }
+
+    const finalMemberId = member ? member._id : null;
+
+    /* ===== Ambil cart aktif (ikat ke member kalau ada) ===== */
+    const iden = {
+      ...iden0,
+      memberId: finalMemberId || iden0.memberId || null,
+      session_id:
+        iden0.session_id ||
+        req.cookies?.[DEVICE_COOKIE] ||
+        req.header('x-device-id') ||
+        null
+    };
+
+    const cartObj = await getActiveCartForIdentity(iden, {
+      allowCreateOnline: false
+    });
+    if (!cartObj) {
+      return res.status(404).json({ message: 'Cart tidak ditemukan / kosong' });
+    }
+
+    const cart = await Cart.findById(cartObj._id);
+    if (!cart || !cart.items?.length) {
+      return res.status(404).json({ message: 'Cart kosong' });
+    }
+
+    // Dine-in QR wajib punya nomor meja (mirip checkout)
+    if (
+      ft === 'dine_in' &&
+      (iden.source || 'online') === 'qr' &&
+      !cart.table_number
+    ) {
+      return res
+        .status(400)
+        .json({ message: 'Silakan assign nomor meja terlebih dahulu' });
+    }
+
+    // Kalau ada member baru tapi cart belum terikat, bisa optional di-set
+    if (finalMemberId && !cart.member) {
+      cart.member = finalMemberId;
+      cart.session_id = null;
+    }
+
+    /* ===== Setup delivery (kalau perlu) ===== */
+    let delivery_fee = 0;
+    let deliverySnapshot = undefined;
+
+    if (ft === 'delivery') {
+      const latN = Number(lat);
+      const lngN = Number(lng);
+
+      if (!Number.isFinite(latN) || !Number.isFinite(lngN)) {
+        return res
+          .status(400)
+          .json({ message: 'Lokasi (lat,lng) wajib untuk delivery' });
+      }
+
+      const distance_km = haversineKm(CAFE_COORD, { lat: latN, lng: lngN });
+      if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0)) {
+        return res.status(400).json({
+          message: `Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`
+        });
+      }
+
+      delivery_fee = calcDeliveryFee();
+      deliverySnapshot = {
+        address_text: String(address_text || '').trim(),
+        location: { lat: latN, lng: lngN },
+        distance_km: Number(distance_km.toFixed(2)),
+        delivery_fee,
+        note_to_rider: String(note_to_rider || ''),
+        status: 'pending'
+      };
+    }
+
+    /* ===== Hitung ulang cart ===== */
+    recomputeTotals(cart);
+    await cart.save();
+
+    /* ===== Voucher ===== */
+    let eligibleClaimIds = [];
+
+    if (finalMemberId) {
+      if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
+        const rawClaims = await VoucherClaim.find({
+          _id: { $in: voucherClaimIds },
+          member: finalMemberId,
+          status: 'claimed'
+        }).lean();
+
+        const now = new Date();
+        eligibleClaimIds = rawClaims
+          .filter((c) => !c.validUntil || c.validUntil > now)
+          .map((c) => String(c._id));
+      }
+    } else if (voucherClaimIds?.length) {
+      // Sama seperti checkout: nggak boleh pakai voucher kalau bukan member
+      return res.status(400).json({
+        message: 'Voucher hanya untuk member. Silakan daftar/login.'
+      });
+    }
+
+    const priced = await validateAndPrice({
+      memberId: finalMemberId,
+      cart: {
+        items: cart.items.map((it) => ({
+          menuId: it.menu,
+          qty: it.quantity,
+          price: it.base_price,
+          category: it.category || null
+        }))
+      },
+      fulfillmentType: ft,
+      deliveryFee: delivery_fee,
+      voucherClaimIds: eligibleClaimIds
+    });
+
+    const items_subtotal = int(priced.totals.baseSubtotal);
+    const items_discount = int(priced.totals.itemsDiscount);
+    const shipping_discount = int(priced.totals.shippingDiscount);
+    const baseDelivery = int(priced.totals.deliveryFee);
+
+    // Service fee 2% dari (items + delivery)
+    const sfBase = items_subtotal + baseDelivery;
+    const service_fee = int(sfBase * SERVICE_FEE_RATE);
+
+    // Tax base
+    const taxBase =
+      items_subtotal +
+      baseDelivery +
+      service_fee -
+      items_discount -
+      shipping_discount;
+
+    const safeTaxBase = Math.max(0, taxBase);
+    const rate = parsePpnRate();
+    const taxAmount = int(safeTaxBase * rate);
+
+    const requested_amount = safeTaxBase + taxAmount;
+
+    if (requested_amount <= 0) {
+      return res.status(400).json({ message: 'Total pembayaran tidak valid.' });
+    }
+
+    /* ===== Buat PaymentSession ===== */
+    const reference_id = `QRIS-${cart._id}-${Date.now()}`;
+
+    const session = await PaymentSession.create({
+      member: finalMemberId || null,
+      customer_name,
+      customer_phone,
+      source: iden.source || 'online',
+      fulfillment_type: ft,
+      table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
+      cart: cart._id,
+      session_id: deviceId,
+      items: cart.items.map((it) => ({
+        menu: it.menu,
+        menu_code: it.menu_code,
+        name: it.name,
+        imageUrl: it.imageUrl,
+        base_price: it.base_price,
+        quantity: it.quantity,
+        addons: it.addons,
+        notes: it.notes,
+        category: it.category || null
+      })),
+      items_subtotal,
+      delivery_fee: baseDelivery,
+      service_fee,
+      items_discount,
+      shipping_discount,
+      discounts: priced.breakdown,
+      requested_amount,
+      delivery_snapshot: deliverySnapshot || undefined,
+      provider: 'xendit',
+      channel: 'qris',
+      external_id: reference_id
+    });
+
+    /* ===== Call Xendit QR ===== */
+    const payload = {
+      reference_id,
+      type: 'DYNAMIC',
+      currency: 'IDR',
+      amount: requested_amount,
+      metadata: {
+        payment_session_id: String(session._id)
+      }
+    };
+
+    const resp = await axios.post(`${X_BASE}/qr_codes`, payload, {
+      auth: { username: X_KEY, password: '' },
+      headers: { ...HDRS, 'api-version': '2022-07-31' },
+      timeout: 15000
+    });
+
+    const qr = resp.data;
+
+    session.qr_code_id = qr.id;
+    session.qr_string = qr.qr_string;
+    session.expires_at = qr.expires_at ? new Date(qr.expires_at) : null;
+    await session.save();
+
+    return res.json({
+      success: true,
+      data: {
+        sessionId: String(session._id),
+        channel: 'QRIS',
+        amount: requested_amount,
+        qris: {
+          qr_id: qr.id,
+          qr_string: qr.qr_string,
+          expiry_at: qr.expires_at
+        },
+        status: 'pending'
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.getSessionStatus = async (req, res, next) => {
+  try {
+    const { id } = req.params || {};
+    const s = await PaymentSession.findById(id).lean();
+    if (!s) return res.status(404).json({ message: 'Session tidak ditemukan' });
+
+    // Kalau sudah dibuat order-nya oleh webhook
+    if (s.order) {
+      return res.json({
+        sessionId: String(s._id),
+        status: 'paid',
+        orderId: String(s.order),
+        provider: s.provider || 'xendit',
+        channel: s.channel || 'qris'
+      });
+    }
+
+    // Kalau belum dibayar
+    return res.json({
+      sessionId: String(s._id),
+      status: s.status || 'pending',
+      provider: s.provider || 'xendit',
+      channel: s.channel || 'qris',
+      amount: s.requested_amount || 0,
+      expires_at: s.expires_at || null
+    });
+  } catch (err) {
+    next(err);
+  }
+};
