@@ -284,8 +284,7 @@ async function handleTransferProofIfAny(req, method) {
     throwError('Bukti transfer wajib diunggah untuk metode transfer', 400);
   }
 
-  const folderId =
-    getDriveFolder('payment_proof') || getDriveFolder('orders') || null;
+  const folderId = getDriveFolder('invoice');
   const filename =
     'TRF_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
 
