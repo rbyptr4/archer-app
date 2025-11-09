@@ -603,43 +603,49 @@ exports.getCart = asyncHandler(async (req, res) => {
 
   // SF 2% dari ITEMS saja
   const service_fee_on_items = int(items_subtotal * SERVICE_FEE_RATE);
+
   // PPN HANYA dari items setelah item_discount
   const rate = parsePpnRate();
   const taxAmountOnItems = int(
     Math.max(0, items_subtotal - items_discount) * rate
   );
 
-  // Pure total sebelum pembulatan (tanpa ongkir)
-  const pureBeforeRound =
-    items_subtotal +
-    service_fee_on_items -
-    items_discount -
-    shipping_discount +
-    taxAmountOnItems;
+  // === Perubahan: "before_rounding" = items + tax (NO discount, NO SF, NO delivery)
+  const baseBeforeRound =
+    items_subtotal /* items */ + taxAmountOnItems; /* tax */ // <-- hanya items + tax
+
+  // Nilai sebelum dibulatkan yang dipakai untuk grand_total (include SF; tanpa ongkir)
+  const pureBeforeWithService =
+    int(baseBeforeRound) + int(service_fee_on_items);
 
   // Override supaya konsisten
-  ui.service_fee = service_fee_on_items;
-  ui.tax_amount = taxAmountOnItems;
-  ui.grand_total_before_rounding = int(pureBeforeRound);
-  const pureRounded = int(roundRupiahCustom(int(pureBeforeRound)));
+  ui.service_fee = service_fee_on_items; // SF dari items
+  ui.tax_amount = taxAmountOnItems; // PPN dari items
+  ui.grand_total_before_rounding = int(baseBeforeRound); // <<< SEKARANG: items + tax saja
+  const pureRounded = int(roundRupiahCustom(int(pureBeforeWithService)));
   ui.grand_total = pureRounded;
-  ui.rounding_delta = pureRounded - int(pureBeforeRound);
+  ui.rounding_delta = pureRounded - int(pureBeforeWithService);
 
-  // 3) Variant untuk delivery: ongkir flat dari .env, TIDAK kena SF/PPN
+  // 3) Variant untuk delivery: ongkir flat dari .env ATAU dari cart.delivery, TIDAK kena SF/PPN
   const ft =
     cart?.fulfillment_type ||
     cartObj?.fulfillment_type ||
     req.query?.fulfillment_type ||
     'dine_in';
 
-  const FLAT_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
+  // ambil dari cart dulu (jika ada), jika kosong pakai ENV
+  const CART_DELIV = Number(cart?.delivery?.delivery_fee || 0);
+  const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
+  const finalDeliveryFee =
+    ft === 'delivery' ? (CART_DELIV > 0 ? CART_DELIV : ENV_DELIV) : 0;
 
   if (ft === 'delivery') {
-    ui.delivery_fee = FLAT_DELIV;
-    const beforeRoundWithDeliv = int(pureBeforeRound) + FLAT_DELIV;
+    ui.delivery_fee = finalDeliveryFee; // <<< Perubahan #2: pastikan terisi
+    const beforeRoundWithDeliv =
+      int(pureBeforeWithService) + int(finalDeliveryFee);
     ui.grand_total_with_delivery = int(roundRupiahCustom(beforeRoundWithDeliv));
   } else {
-    ui.delivery_fee = Number(ui.delivery_fee || 0);
+    ui.delivery_fee = 0;
     ui.grand_total_with_delivery = ui.grand_total;
   }
 
