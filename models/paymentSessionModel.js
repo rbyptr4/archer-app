@@ -1,5 +1,5 @@
 const mongoose = require('mongoose');
-const { int } = require('../utils/money'); // kalau ada, kalau tidak bikin helper kecil
+const { int } = require('../utils/money'); // kalau tidak ada, pake helper int = v=>Math.round(v)
 
 const paymentSessionSchema = new mongoose.Schema(
   {
@@ -39,6 +39,17 @@ const paymentSessionSchema = new mongoose.Schema(
     shipping_discount: { type: Number, min: 0, default: 0 },
     discounts: { type: Array, default: [] },
 
+    // pickup / delivery snapshot
+    delivery_snapshot: {
+      type: mongoose.Schema.Types.Mixed,
+      default: undefined
+    },
+    // normalized pickup window (jika FE kirim range)
+    pickup_window: {
+      from: { type: Date, default: null, index: true },
+      to: { type: Date, default: null, index: true }
+    },
+
     // nilai yang diminta ke gateway
     requested_amount: { type: Number, min: 0, required: true },
 
@@ -66,8 +77,8 @@ const paymentSessionSchema = new mongoose.Schema(
       index: true
     },
     cart: { type: mongoose.Schema.Types.ObjectId, ref: 'Cart', default: null },
-    session_id: { type: String, default: null },
-    expires_at: { type: Date }
+    session_id: { type: String, default: null }
+    // duplicate expires_at removed (keep single)
   },
   {
     timestamps: true,

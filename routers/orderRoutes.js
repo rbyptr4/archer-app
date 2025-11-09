@@ -35,6 +35,13 @@ router.post('/table', order.assignTable);
 router.patch('/change-table', order.changeTable);
 router.patch('/change-order-type', order.setFulfillmentType);
 router.get('/delivery/estimate', order.estimateDelivery);
+router.post(
+  '/assign-batch',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
+  order.assignBatch
+);
 
 router.post(
   '/checkout',
@@ -44,7 +51,6 @@ router.post(
 );
 
 router.get('/delivery-slots', order.deliverySlots);
-
 router.post('/checkout/qris', order.createQrisFromCart);
 router.get(
   '/delivery-board',
@@ -120,7 +126,7 @@ router.post(
   order.completeOrder
 );
 
-router.patch(
+router.post(
   '/:id/delivery/assign',
   validateToken,
   requireRole('owner', 'employee'),

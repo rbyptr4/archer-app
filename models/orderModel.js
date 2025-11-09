@@ -18,6 +18,18 @@ const DeliverySchema = new mongoose.Schema(
     distance_km: { type: Number, min: 0 },
     delivery_fee: { type: Number, min: 0, default: 0, set: int, get: int },
     note_to_rider: { type: String, trim: true, default: '' },
+    mode: {
+      type: String,
+      enum: ['delivery', 'pickup'],
+      default: 'delivery',
+      index: true
+    },
+    // di DeliverySchema
+    pickup_window: {
+      from: { type: Date, default: null, index: true },
+      to: { type: Date, default: null, index: true }
+    },
+
     slot_label: { type: String, trim: true, default: null }, // e.g. "12:00"
     scheduled_at: { type: Date, default: null, index: true },
     assignee: {
@@ -30,14 +42,7 @@ const DeliverySchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: [
-        'pending',
-        'assigned',
-        'picked_up',
-        'on_the_way',
-        'delivered',
-        'failed'
-      ],
+      enum: ['pending', 'assigned', 'delivered', 'failed'],
       default: 'pending',
       index: true
     },
@@ -290,22 +295,23 @@ orderSchema.pre('validate', function (next) {
   this.grand_total = int(rounded);
   this.rounding_delta = int(rounded - rawTotal);
 
-  // Delivery wajib data lokasi + scheduled_at kalau fulfillment_type = delivery
-  if (this.fulfillment_type === 'delivery') {
+  // hanya cek lokasi kalau mode delivery
+  if (
+    this.fulfillment_type === 'delivery' &&
+    this.delivery?.mode === 'delivery'
+  ) {
     const ok =
       this.delivery &&
       typeof this.delivery?.location?.lat === 'number' &&
       typeof this.delivery?.location?.lng === 'number' &&
       typeof this.delivery?.distance_km === 'number';
-    if (!ok) {
-      return next(
-        new Error('Data delivery tidak lengkap (lat, lng, distance_km wajib).')
-      );
-    }
-    if (!this.delivery.scheduled_at) {
-      return next(
-        new Error('scheduled_at / slot pengantaran wajib untuk delivery.')
-      );
+    if (!ok) return next(new Error('Data delivery tidak lengkap.'));
+  }
+
+  // untuk kedua mode, require scheduled_at
+  if (this.fulfillment_type === 'delivery') {
+    if (!this.delivery || !this.delivery.scheduled_at) {
+      return next(new Error('Slot pengantaran wajib diisi.'));
     }
   }
 
