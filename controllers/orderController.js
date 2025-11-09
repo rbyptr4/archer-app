@@ -159,64 +159,6 @@ const safeJson = (v, fallback = null) => {
 
 const short = (arr, n = 3) => (Array.isArray(arr) ? arr.slice(0, n) : arr);
 
-const shape = (v) => {
-  if (Array.isArray(v)) return `Array(${v.length})`;
-  if (v && typeof v === 'object')
-    return `Object(${Object.keys(v).length} keys)`;
-  return typeof v;
-};
-
-const makeCheckoutDebugger = (req) => {
-  const ON = DEBUG_CHECKOUT; // set ke true untuk paksa nyala tanpa env
-  const tag = `[CHK-${Date.now().toString(36)}]`;
-  return (step, extra = {}) => {
-    if (!ON) return;
-    const base = {
-      step,
-      method: req.method,
-      url: req.originalUrl,
-      at: new Date().toISOString()
-    };
-    // Jangan spam log besar — ringkas tapi informatif
-    const summarized = {
-      ...base,
-      ...extra
-    };
-    console.error(tag, safeJson(summarized, `[${step}] <unserializable>`));
-  };
-};
-
-/* ===== Detektor addon bermasalah (hindari 'in' ke undefined) ===== */
-const scanAddonsForIsActiveInUndefined = (items) => {
-  const issues = [];
-  for (let i = 0; i < (items?.length || 0); i++) {
-    const it = items[i];
-    const addons = Array.isArray(it?.addons) ? it.addons : [];
-    for (let j = 0; j < addons.length; j++) {
-      const a = addons[j];
-      // Aman: jangan pakai `'isActive' in a` langsung.
-      const hasIsActive =
-        a &&
-        typeof a === 'object' &&
-        Object.prototype.hasOwnProperty.call(a, 'isActive');
-      // Kalau addon bukan object, laporkan.
-      if (!a || typeof a !== 'object') {
-        issues.push({ itemIndex: i, addonIndex: j, type: typeof a, value: a });
-      }
-      // Bonus: kalau ada properti isActive tapi tipenya aneh, laporkan.
-      if (hasIsActive && typeof a.isActive !== 'boolean') {
-        issues.push({
-          itemIndex: i,
-          addonIndex: j,
-          isActiveType: typeof a.isActive,
-          value: a.isActive
-        });
-      }
-    }
-  }
-  return issues;
-};
-
 const toWa62 = (phone) => {
   const s = String(phone ?? '').trim();
   if (!s) return '';
@@ -1107,8 +1049,6 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
 
 /* ===================== CHECKOUT ===================== */
 exports.checkout = asyncHandler(async (req, res) => {
-  const dbg = makeCheckoutDebugger(req);
-
   // ==== STEP: payload masuk ====
   const rawBodyKeys = Object.keys(req.body || {});
   const rawFiles = req.file
@@ -1116,11 +1056,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     : Array.isArray(req.files)
     ? { multiple: req.files.map((f) => f.fieldname) }
     : null;
-  dbg('payload:received', {
-    bodyKeys: rawBodyKeys,
-    hasFile: !!(req.file || (req.files && req.files.length)),
-    files: rawFiles
-  });
 
   const iden0 = getIdentity(req);
   const {
@@ -1136,15 +1071,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     voucherClaimIds = [],
     register_decision = 'register' // 'register' | 'skip'
   } = req.body || {};
-
-  dbg('identity:resolved', {
-    source: iden0?.source,
-    mode: iden0?.mode,
-    memberId: String(iden0?.memberId || ''),
-    fulfillment_type,
-    payment_method,
-    register_decision
-  });
 
   /* ===== Resolve fulfillment type (ft) & method ===== */
   const ft =
@@ -1201,7 +1127,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
-  dbg('cart:found', { cartId: String(cartObj?._id || ''), hasCart: !!cartObj });
 
   if (!cartObj) throwError('Cart tidak ditemukan / kosong', 404);
 
