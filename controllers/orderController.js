@@ -1059,6 +1059,23 @@ exports.checkout = asyncHandler(async (req, res) => {
     ? { multiple: req.files.map((f) => f.fieldname) }
     : null;
   // -- DEBUG LOG: payload masuk (testing) --
+
+  // -- end debug --
+
+  const iden0 = getIdentity(req);
+  const {
+    name,
+    phone,
+    fulfillment_type, // 'dine_in' | 'delivery'
+    payment_method, // 'qris' | 'transfer' | 'card' | 'cash'
+    address_text,
+    lat,
+    lng,
+    note_to_rider,
+    idempotency_key,
+    voucherClaimIds = [],
+    register_decision = 'register' // 'register' | 'skip'
+  } = req.body || {};
   try {
     const debugPayload = {
       ts: new Date().toISOString(),
@@ -1089,23 +1106,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   } catch (err) {
     console.log('CHECKOUT_PAYLOAD_LOG_ERR', err && err.stack ? err.stack : err);
   }
-  // -- end debug --
-
-  const iden0 = getIdentity(req);
-  const {
-    name,
-    phone,
-    fulfillment_type, // 'dine_in' | 'delivery'
-    payment_method, // 'qris' | 'transfer' | 'card' | 'cash'
-    address_text,
-    lat,
-    lng,
-    note_to_rider,
-    idempotency_key,
-    voucherClaimIds = [],
-    register_decision = 'register' // 'register' | 'skip'
-  } = req.body || {};
-
   /* ===== Resolve fulfillment type (ft) & method ===== */
   const ft =
     iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
