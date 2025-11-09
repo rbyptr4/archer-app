@@ -564,18 +564,30 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
 exports.getCart = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
 
+  // ==== 0) Normalisasi FT dari query ====
+  const qFtRaw = String(req.query?.fulfillment_type || '')
+    .toLowerCase()
+    .trim();
+  const qFt = qFtRaw === 'delivery' ? 'delivery' : 'dine_in';
+
+  // ==== 1) Ambil / Auto-create cart aktif ====
   const cartObj = await getActiveCartForIdentity(iden, {
-    allowCreate: false,
-    defaultFt: req.query?.fulfillment_type || null,
+    allowCreate: true, // <<< BERUBAH: auto-create kalau belum ada
+    defaultFt: qFt, // pakai FT dari query sebagai default
     skipAttach: true
   });
 
+  // Amankan kalau helper masih mengembalikan null (edge case)
   if (!cartObj) {
+    // Buat bentuk kosong tapi sesuai FT yang diminta
     const empty = {
       items_subtotal: 0,
       service_fee: 0,
       items_discount: 0,
-      delivery_fee: 0,
+      delivery_fee:
+        qFt === 'delivery'
+          ? Number(process.env.DELIVERY_FLAT_FEE || 0) || 0
+          : 0,
       shipping_discount: 0,
       tax_rate_percent: 11,
       tax_amount: 0,
@@ -587,60 +599,63 @@ exports.getCart = asyncHandler(async (req, res) => {
     return res.status(200).json({ cart: null, ui_totals: empty });
   }
 
+  // ==== 2) Pastikan FT di cart sesuai default (jika helper tidak menyetel) ====
+  if (!cartObj.fulfillment_type || cartObj.fulfillment_type !== qFt) {
+    await Cart.findByIdAndUpdate(cartObj._id, {
+      $set: { fulfillment_type: qFt }
+    });
+  }
+
+  // ==== 3) Ambil cart lengkap untuk perhitungan UI ====
   const cart = await Cart.findById(cartObj._id)
     .select(
       'items total_items total_quantity total_price delivery updatedAt fulfillment_type table_number status member session_id source'
     )
     .lean();
 
-  // 1) Ambil ringkasan awal (pure: SF & PPN hanya dari items; tanpa ongkir)
+  // 4) Build ringkasan awal dari util (items subtotal, diskon, dll)
   const ui = buildUiTotalsFromCart(cart);
 
-  // 2) Pastikan angka "pure" saling konsisten (pakai satu rumus)
+  // 5) Rumus konsisten
   const items_subtotal = Number(ui.items_subtotal || 0);
   const items_discount = Number(ui.items_discount || 0);
   const shipping_discount = Number(ui.shipping_discount || 0);
 
-  // SF 2% dari ITEMS saja
+  // Service fee = dari items saja
   const service_fee_on_items = int(items_subtotal * SERVICE_FEE_RATE);
 
-  // PPN HANYA dari items setelah item_discount
+  // Pajak = dari (items - item_discount) saja
   const rate = parsePpnRate();
   const taxAmountOnItems = int(
     Math.max(0, items_subtotal - items_discount) * rate
   );
 
-  // === Perubahan: "before_rounding" = items + tax (NO discount, NO SF, NO delivery)
-  const baseBeforeRound =
-    items_subtotal /* items */ + taxAmountOnItems; /* tax */ // <-- hanya items + tax
+  // === BEFORE ROUNDING: items + tax (tanpa diskon, tanpa SF, tanpa ongkir)
+  const baseBeforeRound = items_subtotal + taxAmountOnItems;
 
-  // Nilai sebelum dibulatkan yang dipakai untuk grand_total (include SF; tanpa ongkir)
+  // Nilai yang nanti dibulatkan untuk grand_total (include SF; tanpa ongkir)
   const pureBeforeWithService =
     int(baseBeforeRound) + int(service_fee_on_items);
 
-  // Override supaya konsisten
-  ui.service_fee = service_fee_on_items; // SF dari items
-  ui.tax_amount = taxAmountOnItems; // PPN dari items
-  ui.grand_total_before_rounding = int(baseBeforeRound); // <<< SEKARANG: items + tax saja
+  // Override ke UI agar konsisten
+  ui.service_fee = service_fee_on_items;
+  ui.tax_amount = taxAmountOnItems;
+  ui.grand_total_before_rounding = int(baseBeforeRound);
+
   const pureRounded = int(roundRupiahCustom(int(pureBeforeWithService)));
   ui.grand_total = pureRounded;
   ui.rounding_delta = pureRounded - int(pureBeforeWithService);
 
-  // 3) Variant untuk delivery: ongkir flat dari .env ATAU dari cart.delivery, TIDAK kena SF/PPN
-  const ft =
-    cart?.fulfillment_type ||
-    cartObj?.fulfillment_type ||
-    req.query?.fulfillment_type ||
-    'dine_in';
+  // 6) Delivery fee (tidak kena PPN/SF)
+  const ft = cart?.fulfillment_type || cartObj?.fulfillment_type || qFt;
 
-  // ambil dari cart dulu (jika ada), jika kosong pakai ENV
   const CART_DELIV = Number(cart?.delivery?.delivery_fee || 0);
   const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
   const finalDeliveryFee =
     ft === 'delivery' ? (CART_DELIV > 0 ? CART_DELIV : ENV_DELIV) : 0;
 
   if (ft === 'delivery') {
-    ui.delivery_fee = finalDeliveryFee; // <<< Perubahan #2: pastikan terisi
+    ui.delivery_fee = finalDeliveryFee;
     const beforeRoundWithDeliv =
       int(pureBeforeWithService) + int(finalDeliveryFee);
     ui.grand_total_with_delivery = int(roundRupiahCustom(beforeRoundWithDeliv));
@@ -649,9 +664,15 @@ exports.getCart = asyncHandler(async (req, res) => {
     ui.grand_total_with_delivery = ui.grand_total;
   }
 
-  // 4) Enrich item: alokasi pajak hanya proporsional ke items (tanpa ongkir/SF)
+  // 7) Enrich item: alokasi pajak proporsional hanya ke items
   const items = Array.isArray(cart.items) ? cart.items : [];
-  const taxDenominator = Math.max(0, items_subtotal - items_discount);
+  const taxDenominator = Math.max(
+    0,
+    items_subtotal -
+      items_discount -
+      shipping_discount +
+      0 /* shipping disc tidak mempengaruhi basis pajak */
+  );
 
   const mappedItems = items.map((it) => {
     const qty = Number(it.quantity || 0);
@@ -678,7 +699,9 @@ exports.getCart = asyncHandler(async (req, res) => {
     };
   });
 
-  return res.status(200).json({ ...cart, items: mappedItems, ui_totals: ui });
+  return res
+    .status(200)
+    .json({ ...cart, fulfillment_type: ft, items: mappedItems, ui_totals: ui });
 });
 
 exports.addItem = asyncHandler(async (req, res) => {
