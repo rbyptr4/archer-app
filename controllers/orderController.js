@@ -1341,9 +1341,189 @@ exports.checkout = asyncHandler(async (req, res) => {
     throw err;
   }
 
-  // ... lanjutkan sisa checkout seperti sebelumnya (PPN, payment proof, create Order, emit, dll)
-  // untuk singkat, gunakan kode checkout-mu yang sudah ada mulai dari perhitungan pajak, pembuatan order, dsb.
-  // pastikan saat membuat order: set `delivery: deliveryObj` seperti di versi awal.
+  /* ===== PPN + pembulatan (opsional jika belum di-handle di pre('validate')) ===== */
+  const rate = parsePpnRate(); // ex: 0.11
+  const taxBase =
+    priced.totals.baseSubtotal -
+    priced.totals.itemsDiscount +
+    priced.totals.deliveryFee -
+    priced.totals.shippingDiscount;
+  const taxAmount = int(Math.max(0, Math.floor(taxBase * rate)));
+  const taxRatePercent = Math.round(rate * 100 * 100) / 100;
+  const beforeRound = int(taxBase + taxAmount);
+  const rounded = int(roundRupiahCustom(beforeRound));
+  const roundingDelta = int(rounded - beforeRound);
+
+  priced.totals.taxAmount = taxAmount;
+  priced.totals.taxRatePercent = taxRatePercent;
+  priced.totals.grandTotal = rounded;
+  priced.totals.roundingDelta = roundingDelta;
+
+  /* ===== Bukti transfer (kalau perlu) ===== */
+  const payment_proof_url = await handleTransferProofIfAny(req, method);
+
+  /* ===== Payment status awal ===== */
+  let payment_status = 'unpaid';
+  let payment_provider = null;
+
+  if (methodIsGateway) {
+    payment_provider = 'xendit';
+    payment_status = 'unpaid'; // gateway biasanya menunggu callback/webhook
+  } else if (requiresProof) {
+    // metode seperti transfer bank yang butuh bukti -> tunggu verifikasi staff
+    payment_status = 'pending';
+  } else {
+    payment_status = 'unpaid';
+  }
+
+  /* ===== Buat Order ===== */
+  const order = await (async () => {
+    for (let i = 0; i < 5; i++) {
+      try {
+        const code = await nextDailyTxCode('ARCH');
+        return await Order.create({
+          member: MemberDoc ? MemberDoc._id : null,
+          customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
+          customer_phone: MemberDoc ? MemberDoc.phone || '' : customer_phone,
+          table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
+          source: iden.source || 'online',
+          fulfillment_type: ft,
+          transaction_code: code,
+          items: cart.items.map((it) => ({
+            menu: it.menu,
+            menu_code: it.menu_code,
+            name: it.name,
+            imageUrl: it.imageUrl,
+            base_price: it.base_price,
+            quantity: it.quantity,
+            addons: it.addons,
+            notes: String(it.notes || '').trim(),
+            category: it.category || null // line_subtotal akan dihitung ulang di pre('validate')
+          })),
+          // Totals dari pricing (baseline; kalau pakai pre('validate') finalisasi, ini bisa berubah)
+          items_subtotal: int(priced.totals.baseSubtotal),
+          items_discount: int(priced.totals.itemsDiscount),
+          delivery_fee: int(priced.totals.deliveryFee),
+          shipping_discount: int(priced.totals.shippingDiscount),
+          discounts: priced.breakdown || [],
+          // Pajak & pembulatan
+          tax_rate_percent: taxRatePercent,
+          tax_amount: taxAmount,
+          rounding_delta: roundingDelta,
+          grand_total: rounded,
+          payment_method: method,
+          payment_provider,
+          payment_status,
+          payment_proof_url: payment_proof_url || null,
+          status: 'created',
+          placed_at: new Date(),
+          delivery: deliveryObj
+        });
+      } catch (e) {
+        if (e?.code === 11000 && /transaction_code/.test(String(e.message)))
+          continue;
+        throw e;
+      }
+    }
+    throw new Error('Gagal generate transaction_code unik');
+  })();
+
+  /* ===== Konsumsi voucher ===== */
+  if (MemberDoc) {
+    for (const claimId of priced.chosenClaimIds || []) {
+      try {
+        const c = await VoucherClaim.findById(claimId);
+        if (
+          c &&
+          c.status === 'claimed' &&
+          String(c.member) === String(MemberDoc._id)
+        ) {
+          c.remainingUse -= 1;
+          if (c.remainingUse <= 0) c.status = 'used';
+          c.history.push({
+            action: 'USE',
+            ref: String(order._id),
+            note: 'dipakai pada order'
+          });
+          await c.save();
+        }
+      } catch (_) {
+        // gagal update voucher -> ignore tapi log bila perlu
+      }
+    }
+  }
+
+  /* ===== Tandai cart selesai ===== */
+  await Cart.findByIdAndUpdate(cart._id, {
+    $set: {
+      status: 'checked_out',
+      checked_out_at: new Date(),
+      order_id: order._id,
+      last_idempotency_key: idempotency_key || null,
+      items: [],
+      total_items: 0,
+      total_quantity: 0,
+      total_price: 0
+    }
+  });
+
+  /* ===== Statistik member ===== */
+  if (MemberDoc) {
+    await Member.findByIdAndUpdate(MemberDoc._id, {
+      $inc: { total_spend: order.grand_total || 0 },
+      $set: { last_visit_at: new Date() }
+    });
+  }
+
+  /* ===== Emit realtime ===== */
+  const payload = {
+    id: String(order._id),
+    transaction_code: order.transaction_code,
+    member: MemberDoc
+      ? {
+          id: String(MemberDoc._1d),
+          name: MemberDoc.name,
+          phone: MemberDoc.phone
+        }
+      : null,
+    items_total: order.items_subtotal,
+    grand_total: order.grand_total,
+    total_quantity: order.total_quantity,
+    source: order.source,
+    fulfillment_type: order.fulfillment_type,
+    status: order.status,
+    payment_status: order.payment_status,
+    payment_method: order.payment_method,
+    placed_at: order.placed_at,
+    delivery: order.delivery || null,
+    table_number: order.table_number || null
+  };
+
+  emitToStaff('order:new', payload);
+  if (MemberDoc) emitToMember(MemberDoc._id, 'order:new', payload);
+  if ((iden.source || 'online') === 'qr' && order.table_number) {
+    emitToTable(order.table_number, 'order:new', payload);
+  }
+
+  /* ===== Response ===== */
+  res.status(201).json({
+    order: order.toObject(),
+    totals: {
+      items_subtotal: order.items_subtotal,
+      service_fee: order.service_fee,
+      items_discount: order.items_discount,
+      delivery_fee: order.delivery_fee,
+      shipping_discount: order.shipping_discount,
+      tax_rate_percent: order.tax_rate_percent,
+      tax_amount: order.tax_amount,
+      rounding_delta: order.rounding_delta,
+      grand_total: order.grand_total
+    },
+    message:
+      payment_status === 'unpaid'
+        ? 'Checkout berhasil. Silakan lanjutkan pembayaran.'
+        : 'Checkout berhasil.'
+  });
 });
 
 exports.assignTable = asyncHandler(async (req, res) => {
