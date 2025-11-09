@@ -133,10 +133,11 @@ function getSlotsForDate(dateDay = null) {
   const day = dateDay
     ? dateDay.tz(LOCAL_TZ).startOf('day')
     : dayjs().tz(LOCAL_TZ).startOf('day');
-  const now = dayjs().tz(LOCAL_TZ);
+  // const now = dayjs().tz(LOCAL_TZ); // tidak diperlukan lagi untuk testing "always available"
   return (DELIVERY_SLOTS || []).map((label) => {
     const dt = parseSlotLabelToDate(label, day);
-    const available = dt && dt.isValid() && now.isBefore(dt); // only future slots allowed (strict: now < slot)
+    // Untuk testing: anggap semua slot yang parse-able sebagai available
+    const available = !!(dt && dt.isValid());
     return {
       label,
       datetime: dt ? dt.toDate() : null,
@@ -1764,16 +1765,6 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
   res.status(200).json(order);
 });
 
-/**
- * PREVIEW PRICE — sekarang bisa untuk dine_in maupun delivery.
- * Kirimkan:
- *  {
- *    cart: { items: [{menuId, qty, price, category}] },
- *    fulfillmentType: 'dine_in' | 'delivery',
- *    deliveryFee?: number,
- *    voucherClaimIds?: [string]
- *  }
- */
 exports.previewPrice = asyncHandler(async (req, res) => {
   if (!req.member?.id) throwError('Harus login sebagai member', 401);
 
@@ -1856,7 +1847,7 @@ exports.listOrders = asyncHandler(async (req, res) => {
 
 exports.getDetailOrder = asyncHandler(async (req, res) => {
   const id = req.params.id;
-  // if (!req.user) throwError('Unauthorized', 401);
+  if (!req.user) throwError('Unauthorized', 401);
   if (!mongoose.Types.ObjectId.isValid(id)) throwError('ID tidak valid', 400);
 
   const order = await Order.findById(id).lean();

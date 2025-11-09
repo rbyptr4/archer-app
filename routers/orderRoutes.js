@@ -117,9 +117,9 @@ router.get(
 
 router.get(
   '/:id',
-  // validateToken,
-  // requireRole('owner', 'employee'),
-  // requirePageAccess('orders'),
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
   order.getDetailOrder
 );
 
