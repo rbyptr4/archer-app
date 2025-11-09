@@ -27,7 +27,6 @@ try {
 
 router.use(order.modeResolver);
 
-router.get('/today', order.listTodayOrders);
 router.get('/get-cart', order.getCart);
 router.post('/new-items', order.addItem);
 router.delete('/clear', order.clearCart);
@@ -66,6 +65,14 @@ router.get(
   requirePageAccess('orders'),
   order.listEmployeesDropdown
 );
+router.get(
+  '/today',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
+  order.listTodayOrders
+);
+
 router.get('/my-order', authMemberRequired, order.listMyOrders);
 router.post('/price-preview', authMemberRequired, order.previewPrice);
 
@@ -101,10 +108,18 @@ router.get(
 );
 
 router.get(
-  '/:id',
+  '/dashboard',
   validateToken,
   requireRole('owner', 'employee'),
-  requirePageAccess('orders'),
+  requirePageAccess('kitchen'),
+  order.homeDashboard
+);
+
+router.get(
+  '/:id',
+  // validateToken,
+  // requireRole('owner', 'employee'),
+  // requirePageAccess('orders'),
   order.getDetailOrder
 );
 

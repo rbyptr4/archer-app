@@ -20,8 +20,8 @@ const DeliverySchema = new mongoose.Schema(
     note_to_rider: { type: String, trim: true, default: '' },
     mode: {
       type: String,
-      enum: ['delivery', 'pickup'],
-      default: 'delivery',
+      enum: ['delivery', 'pickup', 'none'],
+      default: 'none',
       index: true
     },
     // di DeliverySchema
