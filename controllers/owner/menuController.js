@@ -764,7 +764,11 @@ exports.getMenuById = asyncHandler(async (req, res) => {
   const { id } = req.params;
   if (!isValidId(id)) throwError('ID tidak valid', 400);
 
-  const menu = await Menu.findById(id).lean({ virtuals: true });
+  // populate subcategory agar response berisi objek (bukan hanya id)
+  const menu = await Menu.findById(id)
+    .populate({ path: 'subcategory', select: '_id name bigCategory' })
+    .lean({ virtuals: true });
+
   if (!menu) throwError('Menu tidak ditemukan', 404);
 
   const isBackoffice =
