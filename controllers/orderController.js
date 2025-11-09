@@ -1058,6 +1058,38 @@ exports.checkout = asyncHandler(async (req, res) => {
     : Array.isArray(req.files)
     ? { multiple: req.files.map((f) => f.fieldname) }
     : null;
+  // -- DEBUG LOG: payload masuk (testing) --
+  try {
+    const debugPayload = {
+      ts: new Date().toISOString(),
+      ip:
+        req.ip ||
+        req.headers['x-forwarded-for'] ||
+        req.connection?.remoteAddress ||
+        null,
+      method: req.method,
+      path: req.originalUrl || req.url,
+      rawBodyKeys,
+      rawFiles,
+      idempotency_key: idempotency_key || null,
+      cookies: req.cookies || null,
+      headers: {
+        'user-agent': req.get('User-Agent'),
+        'content-type': req.get('Content-Type'),
+        'x-device-id': req.header('x-device-id'),
+        'x-request-id': req.header('x-request-id') || null
+      },
+      body: req.body || null,
+      files: req.files || req.file || null
+    };
+    // print pretty for dev logs
+    console.log(
+      '== CHECKOUT PAYLOAD ==\n' + JSON.stringify(debugPayload, null, 2)
+    );
+  } catch (err) {
+    console.log('CHECKOUT_PAYLOAD_LOG_ERR', err && err.stack ? err.stack : err);
+  }
+  // -- end debug --
 
   const iden0 = getIdentity(req);
   const {
