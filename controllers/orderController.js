@@ -50,7 +50,6 @@ dayjs.extend(tz);
 
 const LOCAL_TZ = 'Asia/Jakarta';
 
-
 const {
   ACCESS_COOKIE,
   REFRESH_COOKIE,
@@ -1893,6 +1892,15 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
   const order = await Order.findById(id).lean();
   if (!order) throwError('Order tidak ditemukan', 404);
 
+  // fallback tax rate: pakai order.tax_rate_percent jika tersedia, else default 11%
+  const taxRate =
+    Number.isFinite(Number(order.tax_rate_percent)) &&
+    Number(order.tax_rate_percent) > 0
+      ? Number(order.tax_rate_percent) / 100
+      : 0.11;
+
+  const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
+
   // Susun response yang bersih / minimal
   const slim = {
     id: String(order._id),
@@ -1901,29 +1909,57 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
       name: order.customer_name || null,
       phone: order.customer_phone || null
     },
-    // source: order.source || null,
     fulfillment_type: order.fulfillment_type || null,
     table_number: order.table_number ?? null,
-    items: (order.items || []).map((it) => ({
-      name: it.name,
-      menu: String(it.menu || ''),
-      menu_code: it.menu_code || '',
-      qty: it.quantity || 0,
-      base_price: it.base_price || 0,
-      addons: (it.addons || []).map((a) => ({
-        name: a.name,
-        price: a.price,
-        qty: a.qty || 1
-      })),
-      notes: it.notes || ''
-    })),
+    items: (order.items || []).map((it) => {
+      const qty = safeNumber(it.quantity || 0);
+      const basePrice = safeNumber(it.base_price || 0);
+
+      // total addons per unit
+      const addons_unit = (it.addons || []).reduce(
+        (s, a) => s + (Number.isFinite(+a.price) ? +a.price : 0) * (a.qty || 1),
+        0
+      );
+
+      const unit_before_tax = basePrice + addons_unit;
+
+      // unit tax (rounded)
+      const unit_tax = Math.round(unit_before_tax * taxRate);
+
+      const unit_price_incl_tax = unit_before_tax + unit_tax;
+
+      const line_tax = unit_tax * qty;
+      const line_price_incl_tax = unit_price_incl_tax * qty;
+
+      return {
+        name: it.name,
+        menu: String(it.menu || ''),
+        menu_code: it.menu_code || '',
+        qty,
+        base_price: basePrice,
+        addons: (it.addons || []).map((a) => ({
+          name: a.name,
+          price: safeNumber(a.price),
+          qty: a.qty || 1
+        })),
+        notes: it.notes || '',
+        line_subtotal: safeNumber(it.line_subtotal || 0),
+
+        // tambahan: pajak & harga termasuk pajak
+        unit_before_tax,
+        unit_tax,
+        unit_price_incl_tax,
+        line_tax,
+        line_price_incl_tax
+      };
+    }),
     totals: {
       items_subtotal: order.items_subtotal || 0,
       service_fee: order.service_fee || 0,
       delivery_fee: order.delivery_fee || 0,
       items_discount: order.items_discount || 0,
       shipping_discount: order.shipping_discount || 0,
-      tax_rate_percent: order.tax_rate_percent || 0,
+      tax_rate_percent: order.tax_rate_percent || Math.round(taxRate * 100),
       tax_amount: order.tax_amount || 0,
       rounding_delta: order.rounding_delta || 0,
       grand_total: order.grand_total || 0
@@ -1932,9 +1968,6 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
       method: order.payment_method || null,
       provider: order.payment_provider || null,
       status: order.payment_status || null,
-      // invoice_id: order.payment_invoice_id || null,
-      // invoice_external_id: order.payment_invoice_external_id || null,
-      // invoice_url: order.payment_invoice_url || null,
       proof_url: order.payment_proof_url || null,
       paid_at: order.paid_at || null
     },
@@ -1942,7 +1975,6 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
     placed_at: order.placed_at || null,
     created_at: order.createdAt || null,
     updated_at: order.updatedAt || null,
-    // delivery (optional, hanya sertakan field penting)
     delivery: order.delivery
       ? {
           mode: order.delivery.mode || null,
