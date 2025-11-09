@@ -12,6 +12,8 @@ const guard = requireRole('owner', 'employee');
 
 router.use(validateToken, requirePageAccess('reports'));
 // ===== Laporan Order / Transaksi =====
+
+router.get('/list', guard, ctrl.listWithTimeline);
 router.get('/summary', guard, ctrl.summaryByPeriod);
 router.get('/best-sellers', guard, ctrl.bestSellers);
 router.get('/transactions/paid', guard, ctrl.totalPaidTransactions);

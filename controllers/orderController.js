@@ -16,6 +16,11 @@ const Order = require('../models/orderModel');
 const MemberSession = require('../models/memberSessionModel');
 const VoucherClaim = require('../models/voucherClaimModel');
 
+const {
+  recordOrderHistory,
+  snapshotOrder
+} = require('../controllers/owner/orderHistoryController');
+
 const throwError = require('../utils/throwError');
 const { DELIVERY_SLOTS } = require('../config/onlineConfig'); // import
 const { sendText, buildOrderReceiptMessage } = require('../utils/wablas');
@@ -45,8 +50,6 @@ dayjs.extend(tz);
 
 const LOCAL_TZ = 'Asia/Jakarta';
 
-// logger history
-const { logPaidHistory, logRefundHistory } = require('../utils/historyLoggers');
 
 const {
   ACCESS_COOKIE,
@@ -1547,6 +1550,26 @@ exports.checkout = asyncHandler(async (req, res) => {
     emitToTable(order.table_number, 'order:new', payload);
   }
 
+  try {
+    // If you have `priced` or `ui` in scope, prefer to pass those. We'll try using priced.totals + session payload.
+    const uiTotals = {
+      items_subtotal: order.items_subtotal || 0,
+      delivery_fee: order.delivery_fee || (order.delivery?.delivery_fee ?? 0),
+      service_fee: order.service_fee || 0,
+      items_discount: order.items_discount || 0,
+      shipping_discount: order.shipping_discount || 0,
+      discounts: order.discounts || [],
+      tax_rate_percent: order.tax_rate_percent || 0,
+      tax_amount: order.tax_amount || 0,
+      grand_total: order.grand_total || 0,
+      rounding_delta: order.rounding_delta || 0
+    };
+
+    await snapshotOrder(order._id, { uiTotals }).catch(() => {});
+  } catch (e) {
+    console.error('[OrderHistory][checkout]', e?.message || e);
+  }
+
   /* ===== Response ===== */
   res.status(201).json({
     order: order.toObject(),
@@ -2289,6 +2312,28 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     cashier: req.user ? { id: String(req.user.id), name: req.user.name } : null
   };
 
+  try {
+    const uiTotals = {
+      items_subtotal: order.items_subtotal,
+      delivery_fee: order.delivery_fee || 0,
+      service_fee: order.service_fee || 0,
+      items_discount: order.items_discount || 0,
+      shipping_discount: order.shipping_discount || 0,
+      discounts: order.discounts || [],
+      tax_rate_percent: order.tax_rate_percent,
+      tax_amount: order.tax_amount,
+      grand_total: order.grand_total,
+      rounding_delta: order.rounding_delta
+    };
+
+    await snapshotOrder(order._id, {
+      uiTotals,
+      verified_by_name: req.user?.name
+    }).catch(() => {});
+  } catch (e) {
+    console.error('[OrderHistory][createPosDineIn]', e?.message || e);
+  }
+
   emitToStaff('order:new', payload);
   if (order.table_number) emitToTable(order.table_number, 'order:new', payload);
   if (member) emitToMember(member._id, 'order:new', payload);
@@ -2384,6 +2429,21 @@ exports.completeOrder = asyncHandler(async (req, res) => {
 
   order.status = 'completed';
   await order.save();
+  // history: order completed
+  try {
+    await recordOrderHistory(order._id, 'order_status', req.user, {
+      from: 'accepted',
+      to: 'completed',
+      note: 'Pesanan selesai',
+      at: new Date()
+    });
+    // snapshot final
+    await snapshotOrder(order._id, { verified_by_name: req.user?.name }).catch(
+      () => {}
+    );
+  } catch (e) {
+    console.error('[OrderHistory][completeOrder]', e?.message || e);
+  }
 
   const payload = {
     id: String(order._id),
@@ -2422,7 +2482,35 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
   if (!doc.loyalty_awarded_at) {
     await awardPointsIfEligible(doc, Member);
   }
-  await logPaidHistory(doc, req.user).catch(() => {});
+
+  // history: payment verified & order accepted
+  try {
+    await recordOrderHistory(doc._id, 'payment_status', req.user, {
+      from: 'pending',
+      to: doc.payment_status,
+      note: 'Pembayaran diverifikasi & order diterima',
+      at: doc.verified_at
+    });
+
+    // optional: snapshot saat verified (recommended for accurate price snapshot)
+    await snapshotOrder(doc._id, {
+      uiTotals: {
+        items_subtotal: doc.items_subtotal,
+        delivery_fee: doc.delivery_fee,
+        service_fee: doc.service_fee,
+        items_discount: doc.items_discount,
+        shipping_discount: doc.shipping_discount,
+        discounts: doc.discounts,
+        tax_rate_percent: doc.tax_rate_percent,
+        tax_amount: doc.tax_amount,
+        grand_total: doc.grand_total,
+        rounding_delta: doc.rounding_delta
+      },
+      verified_by_name: req.user?.name
+    }).catch(() => {});
+  } catch (e) {
+    console.error('[OrderHistory][acceptAndVerify]', e?.message || e);
+  }
 
   const payload = {
     id: String(doc._id),

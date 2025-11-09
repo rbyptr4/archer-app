@@ -4,6 +4,10 @@ const Order = require('../../models/orderModel');
 const Member = require('../../models/memberModel');
 const Cart = require('../../models/cartModel');
 
+const {
+  recordOrderHistory,
+  snapshotOrder
+} = require('../../controllers/owner/orderHistoryController');
 const { awardPointsIfEligible } = require('../../utils/loyalty');
 const { nextDailyTxCode } = require('../../utils/txCode');
 const { int } = require('../../utils/money');
@@ -245,6 +249,28 @@ exports.xenditQrisWebhook = async (req, res) => {
         '[Xendit QRIS] Payment applied to order:',
         order.transaction_code
       );
+
+      try {
+        // Catat history: pembayaran berhasil via webhook
+        await recordOrderHistory(order._id, 'payment_status', null, {
+          from: order.payment_status === 'unpaid' ? 'unpaid' : 'pending',
+          to: 'paid',
+          note: 'Pembayaran QRIS berhasil',
+          at: new Date(),
+          transaction_code: order.transaction_code,
+          source: order.source,
+          fulfillment_type: order.fulfillment_type,
+          status: order.status,
+          payment_status: 'paid'
+        });
+
+        // Snapshot baru setelah pembayaran berhasil
+        await snapshotOrder(order._id, {
+          verified_by_name: 'XenditWebhook'
+        }).catch(() => {});
+      } catch (err) {
+        console.error('[OrderHistory][xenditQrisWebhook]', err?.message || err);
+      }
     }
   } catch (e) {
     console.error('[xendit webhook] error', e);

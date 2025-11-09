@@ -1,9 +1,12 @@
 // controllers/orderHistoryController.js
 const asyncHandler = require('express-async-handler');
 const mongoose = require('mongoose');
+
+const Order = require('../../models/orderModel');
 const OrderHistory = require('../../models/orderHistoryModel');
 const Expense = require('../../models/expenseModel'); // sesuaikan path model Expenses kamu
 const { parsePeriod } = require('../../utils/periodRange');
+const throwError = require('../../utils/throwError');
 
 /* ===================== Helpers umum ===================== */
 const asInt = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
@@ -47,119 +50,175 @@ function getRangeFromQuery(q = {}, fallbackMode = 'calendar') {
   return { start, end };
 }
 
-/* ===================== 1) Laporan periode (harian/mingguan/bulanan/tahunan/kustom) ===================== */
-/**
- * GET /order-history/summary
- * Query:
- *  - mode/period: day|week|month|year|overall  (default: day)
- *  - range_mode: calendar|rolling              (default: calendar)
- *  - from,to: ISO (override period jika diisi)
- *  - (opsional filter umum): source, fulfillment_type, cashier_id, member_id, is_member, table, status, payment_status
- * Response: ringkasan count & sums
- */
-exports.summaryByPeriod = asyncHandler(async (req, res) => {
-  const { start, end } = getRangeFromQuery(req.query);
+exports.recordOrderHistory = asyncHandler(
+  async (orderOrId, eventType, user = null, extra = {}) => {
+    let orderDoc = null;
+    if (!orderOrId) throwError('orderId required', 400);
 
-  const match = buildCommonMatch(req.query);
-  // default gunakan paid_at untuk jendela waktu laporan
-  match.paid_at = { $gte: start, $lte: end };
-
-  const pipeline = [
-    { $match: match },
-    {
-      $group: {
-        _id: null,
-        allCount: { $sum: 1 },
-        paidCount: {
-          $sum: { $cond: [{ $eq: ['$payment_status', 'paid'] }, 1, 0] }
-        },
-        refundedCount: {
-          $sum: { $cond: [{ $eq: ['$payment_status', 'refunded'] }, 1, 0] }
-        },
-        voidCount: {
-          $sum: { $cond: [{ $eq: ['$payment_status', 'void'] }, 1, 0] }
-        },
-        cancelledCount: { $sum: { $cond: ['$is_cancelled', 1, 0] } },
-
-        omzet: { $sum: '$items_subtotal' },
-        pendapatan: { $sum: '$grand_total' },
-        delivery_fee: { $sum: '$delivery_fee' },
-        items_discount: { $sum: '$items_discount' },
-        shipping_discount: { $sum: '$shipping_discount' },
-        grand_total: { $sum: '$grand_total' }
-      }
+    if (
+      typeof orderOrId === 'string' ||
+      orderOrId instanceof mongoose.Types.ObjectId
+    ) {
+      orderDoc = await OrderHistory.db
+        .model('Order')
+        .findById(orderOrId)
+        .lean();
+      if (!orderDoc) throwError('Order tidak ditemukan', 404);
+    } else if (orderOrId && orderOrId._id) {
+      orderDoc = orderOrId;
+    } else {
+      throwError('order parameter invalid', 400);
     }
-  ];
 
-  const [agg] = await OrderHistory.aggregate(pipeline);
-  res.json({
-    period: { start, end },
-    count: {
-      all: agg?.allCount || 0,
-      paid: agg?.paidCount || 0,
-      refunded: agg?.refundedCount || 0,
-      void: agg?.voidCount || 0,
-      cancelled: agg?.cancelledCount || 0
-    },
-    sums: {
-      omzet: agg?.omzet || 0,
-      pendapatan: agg?.pendapatan || 0,
-      delivery_fee: agg?.delivery_fee || 0,
-      items_discount: agg?.items_discount || 0,
-      shipping_discount: agg?.shipping_discount || 0,
-      grand_total: agg?.grand_total || 0
-    }
-  });
-});
+    const entry = {
+      type: eventType || 'generic',
+      from: extra.from ?? null,
+      to: extra.to ?? null,
+      by: user
+        ? {
+            id: user._id || user.id,
+            name: user.name || '',
+            role: user.role || ''
+          }
+        : undefined,
+      note: extra.note || undefined,
+      at: extra.at || new Date(),
+      // helpful metadata for fallback minimal docs
+      transaction_code: extra.transaction_code || orderDoc.transaction_code,
+      source: extra.source || orderDoc.source,
+      fulfillment_type: extra.fulfillment_type || orderDoc.fulfillment_type,
+      status: extra.status || orderDoc.status,
+      payment_status: extra.payment_status || orderDoc.payment_status,
+      placed_at: extra.placed_at || orderDoc.placed_at,
+      paid_at: extra.paid_at || orderDoc.paid_at,
+      items_subtotal: extra.items_subtotal ?? orderDoc.items_subtotal,
+      grand_total: extra.grand_total ?? orderDoc.grand_total,
+      total_quantity: extra.total_quantity ?? orderDoc.total_quantity,
+      line_count:
+        extra.line_count ??
+        (Array.isArray(orderDoc.items) ? orderDoc.items.length : undefined)
+    };
 
-/* ===================== 2) Total Transaksi Lunas (filter) ===================== */
-/**
- * GET /order-history/transactions/paid
- * Query: (periode + filter umum) + include=list&limit=...
- */
-exports.totalPaidTransactions = asyncHandler(async (req, res) => {
-  const { start, end } = getRangeFromQuery(req.query);
-  const match = buildCommonMatch({ ...req.query, payment_status: 'paid' });
-  match.paid_at = { $gte: start, $lte: end };
+    // push to timeline (model will upsert minimal doc if none exists)
+    await OrderHistory.createChangeEntry(orderDoc._id, entry);
+  }
+);
 
-  const [agg] = await OrderHistory.aggregate([
-    { $match: match },
-    {
-      $group: {
-        _id: null,
-        count: { $sum: 1 },
-        total_grand: { $sum: '$grand_total' },
-        total_items_subtotal: { $sum: '$items_subtotal' }
-      }
-    }
-  ]);
+exports.snapshotOrder = asyncHandler(async (orderOrId, opts = {}) => {
+  // resolve order doc if needed
+  let orderDoc = null;
+  if (!orderOrId) throwError('orderId required', 400);
 
-  let list = undefined;
-  if (String(req.query.include) === 'list') {
-    const limit = Math.min(asInt(req.query.limit, 50), 200);
-    list = await OrderHistory.find(match)
-      .sort({ paid_at: -1 })
-      .limit(limit)
-      .lean();
+  if (
+    typeof orderOrId === 'string' ||
+    orderOrId instanceof mongoose.Types.ObjectId
+  ) {
+    orderDoc = await OrderHistory.db.model('Order').findById(orderOrId);
+    if (!orderDoc) throwError('Order tidak ditemukan', 404);
+  } else if (orderOrId && (orderOrId._id || orderOrId._doc)) {
+    // If it's a Mongoose doc or plain object, pass through (createFromOrder handles both)
+    orderDoc = orderOrId;
+  } else {
+    throwError('order parameter invalid', 400);
   }
 
-  const count = agg?.count || 0;
-  const totalGrand = agg?.total_grand || 0;
+  await OrderHistory.createFromOrder(orderDoc, opts);
+});
+
+exports.listWithTimeline = asyncHandler(async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  const { start, end } = getRangeFromQuery(req.query);
+  const match = buildCommonMatch(req.query);
+
+  // gunakan paid_at untuk filter waktu (umumnya laporan penjualan)
+  if (start && end) match.paid_at = { $gte: start, $lte: end };
+
+  const docs = await OrderHistory.find(match)
+    .sort({ paid_at: -1, createdAt: -1 })
+    .limit(limit)
+    .lean();
+
+  if (!docs.length) {
+    return res.json({ count: 0, items: [] });
+  }
+
+  // mapping & format hasil agar FE tinggal render timeline
+  const items = docs.map((d) => {
+    const timeline = [];
+
+    // 1️⃣ Buat event awal dari snapshot utama (created)
+    if (d.placed_at) {
+      timeline.push({
+        label: 'Order dibuat',
+        type: 'created',
+        from: null,
+        to: 'created',
+        at: d.placed_at,
+        by: d.verified_by ? d.verified_by.name : null
+      });
+    }
+
+    // 2️⃣ Tambahkan event timeline (perubahan status)
+    if (Array.isArray(d.timeline) && d.timeline.length) {
+      d.timeline
+        .filter((t) => t && t.type)
+        .sort((a, b) => new Date(a.at) - new Date(b.at))
+        .forEach((t) => {
+          timeline.push({
+            label:
+              t.type === 'payment_status'
+                ? `Pembayaran ${t.to}`
+                : t.type === 'order_status'
+                ? `Order ${t.to}`
+                : t.type === 'delivery_status'
+                ? `Delivery ${t.to}`
+                : t.type,
+            type: t.type,
+            from: t.from || null,
+            to: t.to || null,
+            at: t.at || null,
+            by: t.by ? t.by.name : null,
+            note: t.note || ''
+          });
+        });
+    }
+
+    // 3️⃣ Tambahkan event selesai bila ada status completed
+    if (d.status === 'completed' && d.completed_at) {
+      timeline.push({
+        label: 'Pesanan selesai',
+        type: 'order_status',
+        from: 'accepted',
+        to: 'completed',
+        at: d.completed_at,
+        by: d.verified_by?.name || null
+      });
+    }
+
+    // urutkan timeline terbaru di atas (FE bisa langsung render top-down)
+    timeline.sort((a, b) => new Date(b.at) - new Date(a.at));
+
+    return {
+      id: d._id,
+      transaction_code: d.transaction_code,
+      member_name: d.member?.name || d.customer?.name || '',
+      grand_total: d.grand_total || 0,
+      status: d.status,
+      payment_status: d.payment_status,
+      fulfillment_type: d.fulfillment_type,
+      source: d.source,
+      paid_at: d.paid_at,
+      placed_at: d.placed_at,
+      timeline
+    };
+  });
+
   res.json({
-    period: { start, end },
-    count,
-    total_grand: totalGrand,
-    total_items_subtotal: agg?.total_items_subtotal || 0,
-    avg_ticket_size: count ? Math.round(totalGrand / count) : 0,
-    list
+    count: items.length,
+    items
   });
 });
 
-/* ===================== 3) Total Transaksi Batal (cancel/refund) ===================== */
-/**
- * GET /order-history/transactions/cancelled
- * Query: (periode + filter umum) + include=list
- */
 exports.totalCancelledTransactions = asyncHandler(async (req, res) => {
   const { start, end } = getRangeFromQuery(req.query);
   const match = buildCommonMatch(req.query);
@@ -204,14 +263,127 @@ exports.totalCancelledTransactions = asyncHandler(async (req, res) => {
   });
 });
 
-/* ===================== 4) Omzet / Pendapatan ===================== */
-/**
- * GET /order-history/finance/sales
- * Query:
- *  - metric: omzet|pendapatan (default pendapatan)
- *  - groupBy: day|week|month|year|none (default none)
- *  - (periode + filter umum)
- */
+exports.getHistoryDetail = asyncHandler(async (req, res) => {
+  const doc = await OrderHistory.findById(req.params.id).lean();
+  if (!doc) return res.status(404).json({ message: 'History tidak ditemukan' });
+  res.json({ history: doc });
+});
+
+exports.deleteHistory = asyncHandler(async (req, res) => {
+  const doc = await OrderHistory.findById(req.params.id);
+  if (!doc) return res.status(404).json({ message: 'History tidak ditemukan' });
+
+  await OrderHistory.deleteOne({ _id: doc._id });
+  res.json({ message: 'History dihapus' });
+});
+
+exports.summaryByPeriod = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+
+  // base match dari query
+  const match = buildCommonMatch(req.query);
+
+  // default filtering untuk reporting: completed + verified (kamu bisa override dengan query)
+  if (!req.query.status) match.status = 'completed';
+  if (!req.query.payment_status) match.payment_status = 'verified';
+
+  // window pakai paid_at
+  match.paid_at = { $gte: start, $lte: end };
+
+  const pipeline = [
+    { $match: match },
+    {
+      $group: {
+        _id: null,
+        allCount: { $sum: 1 },
+        paidCount: {
+          $sum: { $cond: [{ $eq: ['$payment_status', 'paid'] }, 1, 0] }
+        },
+        verifiedCount: {
+          $sum: { $cond: [{ $eq: ['$payment_status', 'verified'] }, 1, 0] }
+        },
+        refundedCount: {
+          $sum: { $cond: [{ $eq: ['$payment_status', 'refunded'] }, 1, 0] }
+        },
+        voidCount: {
+          $sum: { $cond: [{ $eq: ['$payment_status', 'void'] }, 1, 0] }
+        },
+        cancelledCount: { $sum: { $cond: ['$status', 'cancelled', 1, 0] } },
+
+        omzet: { $sum: '$items_subtotal' },
+        pendapatan: { $sum: '$grand_total' },
+        delivery_fee: { $sum: '$delivery_fee' },
+        items_discount: { $sum: '$items_discount' },
+        shipping_discount: { $sum: '$shipping_discount' },
+        grand_total: { $sum: '$grand_total' }
+      }
+    }
+  ];
+
+  const [agg] = await Order.aggregate(pipeline);
+
+  res.json({
+    period: { start, end },
+    count: {
+      all: agg?.allCount || 0,
+      paid: agg?.paidCount || 0,
+      verified: agg?.verifiedCount || 0,
+      refunded: agg?.refundedCount || 0,
+      void: agg?.voidCount || 0,
+      cancelled: agg?.cancelledCount || 0
+    },
+    sums: {
+      omzet: agg?.omzet || 0,
+      pendapatan: agg?.pendapatan || 0,
+      delivery_fee: agg?.delivery_fee || 0,
+      items_discount: agg?.items_discount || 0,
+      shipping_discount: agg?.shipping_discount || 0,
+      grand_total: agg?.grand_total || 0
+    }
+  });
+});
+
+// ===================== 2) totalPaidTransactions (dari Order) =====================
+exports.totalPaidTransactions = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+
+  const match = buildCommonMatch({ ...req.query, payment_status: 'paid' });
+
+  // default window & if you want still filter status completed/verified by default? we respect query override;
+  // but since metric is "paid transactions", we won't force status=completed here.
+  match.paid_at = { $gte: start, $lte: end };
+
+  const [agg] = await Order.aggregate([
+    { $match: match },
+    {
+      $group: {
+        _id: null,
+        count: { $sum: 1 },
+        total_grand: { $sum: '$grand_total' },
+        total_items_subtotal: { $sum: '$items_subtotal' }
+      }
+    }
+  ]);
+
+  let list;
+  if (String(req.query.include) === 'list') {
+    const limit = Math.min(asInt(req.query.limit, 50), 200);
+    list = await Order.find(match).sort({ paid_at: -1 }).limit(limit).lean();
+  }
+
+  const count = agg?.count || 0;
+  const totalGrand = agg?.total_grand || 0;
+  res.json({
+    period: { start, end },
+    count,
+    total_grand: totalGrand,
+    total_items_subtotal: agg?.total_items_subtotal || 0,
+    avg_ticket_size: count ? Math.round(totalGrand / count) : 0,
+    list
+  });
+});
+
+// ===================== 3) financeSales (dari Order) =====================
 exports.financeSales = asyncHandler(async (req, res) => {
   const { start, end } = getRangeFromQuery(req.query);
   const metric = ['omzet', 'pendapatan'].includes(String(req.query.metric))
@@ -223,15 +395,16 @@ exports.financeSales = asyncHandler(async (req, res) => {
     ? String(req.query.groupBy)
     : 'none';
 
-  // default paid only jika user tidak override
+  // default filter: completed + verified, kecuali user override
   const baseMatch = buildCommonMatch({ ...req.query });
-  if (!req.query.payment_status) baseMatch.payment_status = 'paid';
+  if (!req.query.status) baseMatch.status = 'completed';
+  if (!req.query.payment_status) baseMatch.payment_status = 'verified';
   baseMatch.paid_at = { $gte: start, $lte: end };
 
   const sumField = metric === 'omzet' ? '$items_subtotal' : '$grand_total';
 
   if (groupBy === 'none') {
-    const [agg] = await OrderHistory.aggregate([
+    const [agg] = await Order.aggregate([
       { $match: baseMatch },
       { $group: { _id: null, total: { $sum: sumField } } }
     ]);
@@ -242,7 +415,6 @@ exports.financeSales = asyncHandler(async (req, res) => {
     });
   }
 
-  // group pakai key yang sudah ada di doc: dayKey/weekKey/monthKey/year
   const keyField =
     groupBy === 'day'
       ? '$dayKey'
@@ -252,9 +424,20 @@ exports.financeSales = asyncHandler(async (req, res) => {
       ? '$monthKey'
       : '$year';
 
-  const items = await OrderHistory.aggregate([
+  // ensure we have those keys on Order model? If not, compute via $dateToString on paid_at
+  // We'll use $dateToString to be safe (no need dayKey in Order)
+  const dateKeySpec =
+    groupBy === 'day'
+      ? { $dateToString: { date: '$paid_at', format: '%Y-%m-%d' } }
+      : groupBy === 'week'
+      ? { $dateToString: { date: '$paid_at', format: '%G-W%V' } }
+      : groupBy === 'month'
+      ? { $dateToString: { date: '$paid_at', format: '%Y-%m' } }
+      : { $dateToString: { date: '$paid_at', format: '%Y' } };
+
+  const items = await Order.aggregate([
     { $match: baseMatch },
-    { $group: { _id: keyField, total: { $sum: sumField } } },
+    { $group: { _id: dateKeySpec, total: { $sum: sumField } } },
     { $sort: { _id: 1 } }
   ]);
 
@@ -266,16 +449,8 @@ exports.financeSales = asyncHandler(async (req, res) => {
   });
 });
 
-/* ===================== 5) Pengeluaran (Expenses) ===================== */
-/**
- * GET /order-history/finance/expenses
- * Query:
- *  - groupBy: day|week|month|year|none (default none)
- *  - type: filter jenis
- *  - (periode) -> pakai field Expense.date
- */
+// ===================== 4) financeExpenses (tidak berubah) =====================
 exports.financeExpenses = asyncHandler(async (req, res) => {
-  // untuk expense, tetap pakai parsePeriod kamu (date range)
   const { start, end } = getRangeFromQuery(req.query);
   const groupBy = ['day', 'week', 'month', 'year', 'none'].includes(
     String(req.query.groupBy)
@@ -300,12 +475,11 @@ exports.financeExpenses = asyncHandler(async (req, res) => {
     });
   }
 
-  // bentuk key via $dateToString
   const keySpec =
     groupBy === 'day'
       ? { $dateToString: { date: '$date', format: '%Y-%m-%d' } }
       : groupBy === 'week'
-      ? { $dateToString: { date: '$date', format: '%G-W%V' } } // ISO week
+      ? { $dateToString: { date: '$date', format: '%G-W%V' } }
       : groupBy === 'month'
       ? { $dateToString: { date: '$date', format: '%Y-%m' } }
       : { $dateToString: { date: '$date', format: '%Y' } };
@@ -323,14 +497,7 @@ exports.financeExpenses = asyncHandler(async (req, res) => {
   });
 });
 
-/* ===================== 6) Laba/Rugi ===================== */
-/**
- * GET /order-history/finance/profit-loss
- * Query:
- *  - revenue_metric: pendapatan|omzet (default pendapatan)
- *  - detail: true untuk breakdown
- *  - (periode) untuk revenue (OrderHistory.paid_at) dan expense (Expense.date)
- */
+// ===================== 5) profitLoss (Order + Expense) =====================
 exports.profitLoss = asyncHandler(async (req, res) => {
   const { start, end } = getRangeFromQuery(req.query);
   const revenueMetric = ['pendapatan', 'omzet'].includes(
@@ -339,20 +506,21 @@ exports.profitLoss = asyncHandler(async (req, res) => {
     ? String(req.query.revenue_metric)
     : 'pendapatan';
 
-  // Revenue dari OrderHistory (default paid only)
+  // Revenue from Order model (default completed + verified)
   const revenueMatchBase = buildCommonMatch({ ...req.query });
-  if (!req.query.payment_status) revenueMatchBase.payment_status = 'paid';
+  if (!req.query.status) revenueMatchBase.status = 'completed';
+  if (!req.query.payment_status) revenueMatchBase.payment_status = 'verified';
   revenueMatchBase.paid_at = { $gte: start, $lte: end };
   const revenueField =
     revenueMetric === 'omzet' ? '$items_subtotal' : '$grand_total';
 
-  const [revAgg] = await OrderHistory.aggregate([
+  const [revAgg] = await Order.aggregate([
     { $match: revenueMatchBase },
     { $group: { _id: null, total: { $sum: revenueField } } }
   ]);
   const revenue = revAgg?.total || 0;
 
-  // Expense dari Expense model
+  // Expenses
   const expenseMatch = {
     isDeleted: { $ne: true },
     date: { $gte: start, $lte: end }
@@ -385,7 +553,7 @@ exports.profitLoss = asyncHandler(async (req, res) => {
       { $sort: { total: -1 } }
     ]);
 
-    const revenueBreak = await OrderHistory.aggregate([
+    const revenueBreak = await Order.aggregate([
       { $match: revenueMatchBase },
       {
         $group: {
@@ -415,24 +583,7 @@ exports.profitLoss = asyncHandler(async (req, res) => {
   res.json(result);
 });
 
-/* ===================== Extra: View detail & Delete ===================== */
-
-/** GET /order-history/:id */
-exports.getHistoryDetail = asyncHandler(async (req, res) => {
-  const doc = await OrderHistory.findById(req.params.id).lean();
-  if (!doc) return res.status(404).json({ message: 'History tidak ditemukan' });
-  res.json({ history: doc });
-});
-
-/** DELETE /order-history/:id  (owner only) */
-exports.deleteHistory = asyncHandler(async (req, res) => {
-  const doc = await OrderHistory.findById(req.params.id);
-  if (!doc) return res.status(404).json({ message: 'History tidak ditemukan' });
-
-  await OrderHistory.deleteOne({ _id: doc._id });
-  res.json({ message: 'History dihapus' });
-});
-
+// ===================== 6) bestSellers (dari Order.items) =====================
 exports.bestSellers = asyncHandler(async (req, res) => {
   const metric = ['qty', 'revenue'].includes(String(req.query.metric))
     ? String(req.query.metric)
@@ -448,12 +599,13 @@ exports.bestSellers = asyncHandler(async (req, res) => {
 
   const { start, end } = getRangeFromQuery(req.query);
   const match = buildCommonMatch({ ...req.query });
-  if (!req.query.payment_status) {
-    match.payment_status = 'verified';
-  }
+
+  // default to only take completed+verified sales for best-sellers (overrideable)
+  if (!req.query.status) match.status = 'completed';
+  if (!req.query.payment_status) match.payment_status = 'verified';
   match.paid_at = { $gte: start, $lte: end };
 
-  // === Group key ===
+  // build group id like before but using Order.items fields
   let groupId;
   if (groupBy === 'big_category') {
     groupId = { big: '$items.category.big' };
@@ -464,7 +616,6 @@ exports.bestSellers = asyncHandler(async (req, res) => {
       big: '$items.category.big'
     };
   } else {
-    // groupBy menu (default)
     if (collapseVariants) {
       groupId = {
         menu: '$items.menu',
@@ -526,9 +677,9 @@ exports.bestSellers = asyncHandler(async (req, res) => {
     { $limit: limit }
   ];
 
-  const rows = await OrderHistory.aggregate(pipeline);
+  const rows = await Order.aggregate(pipeline);
 
-  // === Normalize output ===
+  // normalize output like sebelumnya
   const items = rows.map((r) => {
     if (groupBy === 'big_category') {
       return {
@@ -551,7 +702,6 @@ exports.bestSellers = asyncHandler(async (req, res) => {
         order_count: r.order_count || 0
       };
     }
-    // menu
     const base = {
       key: String(r._id.menu || r._id.code || r._id.name),
       type: 'menu',
