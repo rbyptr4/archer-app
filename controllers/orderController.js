@@ -1078,24 +1078,9 @@ exports.checkout = asyncHandler(async (req, res) => {
   } = req.body || {};
   try {
     const debugPayload = {
-      ts: new Date().toISOString(),
-      ip:
-        req.ip ||
-        req.headers['x-forwarded-for'] ||
-        req.connection?.remoteAddress ||
-        null,
-      method: req.method,
-      path: req.originalUrl || req.url,
       rawBodyKeys,
-      rawFiles,
       idempotency_key: idempotency_key || null,
       cookies: req.cookies || null,
-      headers: {
-        'user-agent': req.get('User-Agent'),
-        'content-type': req.get('Content-Type'),
-        'x-device-id': req.header('x-device-id'),
-        'x-request-id': req.header('x-request-id') || null
-      },
       body: req.body || null,
       files: req.files || req.file || null
     };
