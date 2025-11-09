@@ -18,6 +18,8 @@ const DeliverySchema = new mongoose.Schema(
     distance_km: { type: Number, min: 0 },
     delivery_fee: { type: Number, min: 0, default: 0, set: int, get: int },
     note_to_rider: { type: String, trim: true, default: '' },
+    slot_label: { type: String, trim: true, default: null }, // e.g. "12:00"
+    scheduled_at: { type: Date, default: null, index: true },
     assignee: {
       user: {
         type: mongoose.Schema.Types.ObjectId,
@@ -288,7 +290,7 @@ orderSchema.pre('validate', function (next) {
   this.grand_total = int(rounded);
   this.rounding_delta = int(rounded - rawTotal);
 
-  // Delivery wajib data lokasi kalau fulfillment_type = delivery
+  // Delivery wajib data lokasi + scheduled_at kalau fulfillment_type = delivery
   if (this.fulfillment_type === 'delivery') {
     const ok =
       this.delivery &&
@@ -298,6 +300,11 @@ orderSchema.pre('validate', function (next) {
     if (!ok) {
       return next(
         new Error('Data delivery tidak lengkap (lat, lng, distance_km wajib).')
+      );
+    }
+    if (!this.delivery.scheduled_at) {
+      return next(
+        new Error('scheduled_at / slot pengantaran wajib untuk delivery.')
       );
     }
   }

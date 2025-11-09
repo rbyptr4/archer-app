@@ -43,6 +43,8 @@ router.post(
   order.checkout
 );
 
+router.get('/delivery-slots', order.deliverySlots);
+
 router.post('/checkout/qris', order.createQrisFromCart);
 router.get(
   '/delivery-board',

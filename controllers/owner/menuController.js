@@ -32,6 +32,31 @@ const parseMaybeJson = (v, fallback) => {
   }
 };
 
+async function attachSubcategoriesToRawItems(items) {
+  // kumpulkan semua subcategory ids yang ada
+  const subIds = Array.from(
+    new Set(
+      items
+        .map((it) => it.subcategory)
+        .filter((v) => v !== null && v !== undefined)
+        .map((v) => String(v))
+    )
+  );
+  if (!subIds.length) return items;
+
+  const subs = await MenuSubcategory.find({ _id: { $in: subIds } })
+    .select('_id name nameLower bigCategory sortOrder')
+    .lean();
+
+  const mapSub = new Map(subs.map((s) => [String(s._id), s]));
+  return items.map((it) => {
+    const sub = it.subcategory
+      ? mapSub.get(String(it.subcategory)) || it.subcategory
+      : it.subcategory;
+    return { ...it, subcategory: sub };
+  });
+}
+
 const toBool = (v, def = true) => {
   if (typeof v === 'boolean') return v;
   if (typeof v === 'number') return v !== 0;
@@ -358,7 +383,6 @@ exports.listMenuForMember = asyncHandler(async (req, res) => {
   const isActiveParam = (req.query.isActive || '').toLowerCase();
   const filter = {};
 
-  // ===== Helper lokal =====
   const calcFinalPrice = (price = {}) => {
     const original = Number(price.original || 0);
     const mode = price.discountMode || 'none';
@@ -368,38 +392,28 @@ exports.listMenuForMember = asyncHandler(async (req, res) => {
     if (mode === 'manual' && manualPromo > 0) {
       return manualPromo;
     }
-
     if (mode === 'percent' && discPercent > 0 && discPercent < 100) {
       const after = original * (1 - discPercent / 100);
       return Math.round(after);
     }
-
     return original;
   };
 
-  const ppnRateRaw = typeof parsePpnRate === 'function' ? parsePpnRate() : 0.11; // fallback kalau util nggak kepasang
+  const ppnRateRaw = typeof parsePpnRate === 'function' ? parsePpnRate() : 0.11;
   const ppnRate =
     Number.isFinite(ppnRateRaw) && ppnRateRaw >= 0 ? ppnRateRaw : 0.11;
 
   const attachDisplayPrices = (items) =>
     items.map((m) => {
-      // kalau pipeline sortBy=price.final sudah punya price_final
       const baseFinal =
         typeof m.price_final === 'number'
           ? m.price_final
           : calcFinalPrice(m.price);
-
       const taxAmount = Math.round(Math.max(0, baseFinal * ppnRate));
       const priceWithTax = baseFinal + taxAmount;
-
-      return {
-        ...m,
-        price_final: baseFinal,
-        price_with_tax: priceWithTax
-      };
+      return { ...m, price_final: baseFinal, price_with_tax: priceWithTax };
     });
 
-  // ===== Pencarian =====
   if (q) {
     filter.$or = [
       { name: { $regex: q, $options: 'i' } },
@@ -419,7 +433,6 @@ exports.listMenuForMember = asyncHandler(async (req, res) => {
   if (isActiveParam === 'true') filter.isActive = true;
   else if (isActiveParam === 'false') filter.isActive = false;
 
-  // subcategory filter
   if (subId) {
     if (!isValidId(subId)) throwError('subId tidak valid', 400);
     filter.subcategory = asId(subId);
@@ -437,7 +450,7 @@ exports.listMenuForMember = asyncHandler(async (req, res) => {
     filter.subcategory = sub._id;
   }
 
-  // ===== Sort by price.final via aggregation =====
+  // Sorting by price.final via aggregation
   if (sortBy === 'price.final') {
     const pipeline = [
       { $match: filter },
@@ -467,9 +480,7 @@ exports.listMenuForMember = asyncHandler(async (req, res) => {
                                 1,
                                 {
                                   $divide: [
-                                    {
-                                      $ifNull: ['$price.discountPercent', 0]
-                                    },
+                                    { $ifNull: ['$price.discountPercent', 0] },
                                     100
                                   ]
                                 }
@@ -498,7 +509,9 @@ exports.listMenuForMember = asyncHandler(async (req, res) => {
       Menu.countDocuments(filter)
     ]);
 
-    const items = attachDisplayPrices(rawItems);
+    // attach subcategory objects to rawItems (so frontend dapat object, bukan id)
+    const rawWithSubs = await attachSubcategoriesToRawItems(rawItems);
+    const items = attachDisplayPrices(rawWithSubs);
 
     return res.json({
       success: true,
@@ -507,7 +520,7 @@ exports.listMenuForMember = asyncHandler(async (req, res) => {
     });
   }
 
-  // ===== Sorting biasa =====
+  // Sorting biasa — gunakan populate untuk subcategory
   const sort = {};
   if (
     [
@@ -525,6 +538,10 @@ exports.listMenuForMember = asyncHandler(async (req, res) => {
 
   const [rawItems, total] = await Promise.all([
     Menu.find(filter)
+      .populate({
+        path: 'subcategory',
+        select: '_id name nameLower bigCategory sortOrder'
+      })
       .sort(sort)
       .skip(skip)
       .limit(limit)
@@ -541,6 +558,7 @@ exports.listMenuForMember = asyncHandler(async (req, res) => {
   });
 });
 
+/* ========== LIST MENUS (admin/public general) ========== */
 exports.listMenus = asyncHandler(async (req, res) => {
   const page = Math.max(parseInt(req.query.page || '1', 10), 1);
   const limit = Math.min(
@@ -566,22 +584,16 @@ exports.listMenus = asyncHandler(async (req, res) => {
   const isActiveParam = (req.query.isActive || '').toLowerCase();
   const filter = {};
 
-  /* ===== Helper harga ===== */
   const calcFinalPrice = (price = {}) => {
     const original = Number(price.original || 0);
     const mode = price.discountMode || 'none';
     const discPercent = Number(price.discountPercent || 0);
     const manualPromo = Number(price.manualPromoPrice || 0);
 
-    if (mode === 'manual' && manualPromo > 0) {
-      return manualPromo;
-    }
-
+    if (mode === 'manual' && manualPromo > 0) return manualPromo;
     if (mode === 'percent' && discPercent > 0 && discPercent < 100) {
-      const after = original * (1 - discPercent / 100);
-      return Math.round(after);
+      return Math.round(original * (1 - discPercent / 100));
     }
-
     return original;
   };
 
@@ -595,18 +607,11 @@ exports.listMenus = asyncHandler(async (req, res) => {
         typeof m.price_final === 'number'
           ? m.price_final
           : calcFinalPrice(m.price || {});
-
       const taxAmount = Math.round(Math.max(0, baseFinal * ppnRate));
       const priceWithTax = baseFinal + taxAmount;
-
-      return {
-        ...m,
-        price_final: baseFinal,
-        price_with_tax: priceWithTax
-      };
+      return { ...m, price_final: baseFinal, price_with_tax: priceWithTax };
     });
 
-  /* ====== SEARCH (q) ====== */
   if (q) {
     filter.$or = [
       { name: { $regex: q, $options: 'i' } },
@@ -615,36 +620,29 @@ exports.listMenus = asyncHandler(async (req, res) => {
     ];
   }
 
-  /* ====== EXCLUDE PACKAGE BY DEFAULT ====== */
   let selectedBig = '';
   if (big) {
     if (!BIG_CATEGORIES.includes(big)) throwError('big tidak valid', 400);
-    if (big === 'package') {
-      // Endpoint ini khusus non-package
+    if (big === 'package')
       throwError('Endpoint ini hanya untuk menu non-package', 400, 'big');
-    }
     selectedBig = big;
     filter.bigCategory = selectedBig;
   } else {
-    // Tidak memilih big => exclude package
     filter.bigCategory = { $ne: 'package' };
   }
 
-  /* ====== FLAG-FLAG LAIN ====== */
   if (recommendedParam === 'true') filter.isRecommended = true;
   else if (recommendedParam === 'false') filter.isRecommended = false;
 
   if (isActiveParam === 'true') filter.isActive = true;
   else if (isActiveParam === 'false') filter.isActive = false;
 
-  /* ====== SUBCATEGORY FILTER ====== */
   if (subId) {
     if (!isValidId(subId)) throwError('subId tidak valid', 400);
     filter.subcategory = asId(subId);
   } else if (subName) {
     const cond = { nameLower: subName.toLowerCase() };
     if (selectedBig) cond.bigCategory = selectedBig;
-
     const sub = await MenuSubcategory.findOne(cond).select('_id').lean();
     if (!sub) {
       return res.json({
@@ -656,7 +654,6 @@ exports.listMenus = asyncHandler(async (req, res) => {
     filter.subcategory = sub._id;
   }
 
-  /* ====== SORTING: price.final pakai aggregate ====== */
   if (sortBy === 'price.final') {
     const pipeline = [
       { $match: filter },
@@ -686,9 +683,7 @@ exports.listMenus = asyncHandler(async (req, res) => {
                                 1,
                                 {
                                   $divide: [
-                                    {
-                                      $ifNull: ['$price.discountPercent', 0]
-                                    },
+                                    { $ifNull: ['$price.discountPercent', 0] },
                                     100
                                   ]
                                 }
@@ -717,7 +712,8 @@ exports.listMenus = asyncHandler(async (req, res) => {
       Menu.countDocuments(filter)
     ]);
 
-    const items = attachDisplayPrices(rawItems);
+    const rawWithSubs = await attachSubcategoriesToRawItems(rawItems);
+    const items = attachDisplayPrices(rawWithSubs);
 
     return res.json({
       success: true,
@@ -726,7 +722,6 @@ exports.listMenus = asyncHandler(async (req, res) => {
     });
   }
 
-  /* ====== SORTING biasa ====== */
   const sort = {};
   if (
     [
@@ -744,6 +739,10 @@ exports.listMenus = asyncHandler(async (req, res) => {
 
   const [rawItems, total] = await Promise.all([
     Menu.find(filter)
+      .populate({
+        path: 'subcategory',
+        select: '_id name nameLower bigCategory sortOrder'
+      })
       .sort(sort)
       .skip(skip)
       .limit(limit)

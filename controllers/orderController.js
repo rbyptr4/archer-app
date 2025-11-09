@@ -16,6 +16,7 @@ const MemberSession = require('../models/memberSessionModel');
 const VoucherClaim = require('../models/voucherClaimModel');
 
 const throwError = require('../utils/throwError');
+const { DELIVERY_SLOTS } = require('../config/onlineConfig'); // import
 const { sendText, buildOrderReceiptMessage } = require('../utils/wablas');
 const { buildUiTotalsFromCart } = require('../utils/cartUiCache');
 const {
@@ -84,8 +85,44 @@ const DELIVERY_ALLOWED = [
   'failed'
 ];
 
-/* ===== Debug helpers (nyalakan dengan DEBUG_CHECKOUT=1) ===== */
-const DEBUG_CHECKOUT = String(process.env.DEBUG_CHECKOUT || '0') === '1';
+// helper delivery slots (letakkan di top file controller)
+
+function parseSlotLabelToDate(slotLabel, day = null) {
+  const base = (day ? day : dayjs().tz(LOCAL_TZ)).startOf('day');
+  if (!slotLabel) return null;
+  // jika sudah ISO (mengandung 'T' atau '-' di awal) coba parse
+  if (/T/.test(slotLabel) || /-/.test(slotLabel)) {
+    const d = dayjs(slotLabel).tz(LOCAL_TZ);
+    return d.isValid() ? d : null;
+  }
+  // format 'HH:mm'
+  const [hh, mm] = String(slotLabel)
+    .split(':')
+    .map((x) => parseInt(x, 10));
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  return base.hour(hh).minute(mm).second(0).millisecond(0);
+}
+
+function getSlotsForDate(dateDay = null) {
+  const day = dateDay
+    ? dateDay.tz(LOCAL_TZ).startOf('day')
+    : dayjs().tz(LOCAL_TZ).startOf('day');
+  const now = dayjs().tz(LOCAL_TZ);
+  return (DELIVERY_SLOTS || []).map((label) => {
+    const dt = parseSlotLabelToDate(label, day);
+    const available = dt && dt.isValid() && now.isBefore(dt); // only future slots allowed (strict: now < slot)
+    return {
+      label,
+      datetime: dt ? dt.toDate() : null,
+      available
+    };
+  });
+}
+
+function isSlotAvailable(label, dateDay = null) {
+  const slot = getSlotsForDate(dateDay).find((s) => s.label === label);
+  return !!(slot && slot.available);
+}
 
 const safeJson = (v, fallback = null) => {
   try {
@@ -1162,6 +1199,47 @@ exports.checkout = asyncHandler(async (req, res) => {
   let delivery_fee = 0;
   let delivery = undefined;
   if (ft === 'delivery') {
+    // expecting req.body.delivery_slot (string 'HH:mm' atau ISO) OR scheduled_at (ISO)
+    const providedSlot = (req.body?.delivery_slot || '').trim();
+    const providedScheduledAt = req.body?.scheduled_at
+      ? dayjs(req.body.scheduled_at).tz(LOCAL_TZ)
+      : null;
+
+    // Require slot or scheduled time
+    if (!providedSlot && !providedScheduledAt) {
+      throwError(
+        'delivery_slot (HH:mm) atau scheduled_at (ISO) wajib untuk delivery',
+        400
+      );
+    }
+
+    // Determine slotLabel and slotDatetime
+    let slotLabel = null;
+    let slotDt = null;
+    if (
+      providedScheduledAt &&
+      providedScheduledAt.isValid &&
+      providedScheduledAt.isValid()
+    ) {
+      slotDt = providedScheduledAt.startOf('minute');
+      // label as HH:mm
+      slotLabel = slotDt.format('HH:mm');
+    } else if (providedSlot) {
+      // Use today's date by default (you may allow explicit date e.g. '2025-11-10T12:00')
+      const maybeDt = parseSlotLabelToDate(providedSlot); // uses local day
+      if (!maybeDt || !maybeDt.isValid())
+        throwError('delivery_slot tidak valid', 400);
+      slotDt = maybeDt;
+      slotLabel = providedSlot.includes('T')
+        ? slotDt.format('HH:mm')
+        : providedSlot;
+    }
+
+    // Validate availability (slot must be in config and not passed)
+    if (!isSlotAvailable(slotLabel)) {
+      throwError('Slot pengantaran sudah tidak tersedia / sudah lewat', 409);
+    }
+
     const latN = Number(lat),
       lngN = Number(lng);
     if (!Number.isFinite(latN) || !Number.isFinite(lngN)) {
@@ -1178,7 +1256,9 @@ exports.checkout = asyncHandler(async (req, res) => {
       distance_km: Number(distance_km.toFixed(2)),
       delivery_fee,
       note_to_rider: String(note_to_rider || ''),
-      status: 'pending'
+      status: 'pending',
+      slot_label: slotLabel,
+      scheduled_at: slotDt ? slotDt.toDate() : null
     };
   }
 
@@ -2788,3 +2868,25 @@ exports.getSessionStatus = async (req, res, next) => {
     next(err);
   }
 };
+
+// GET /orders/delivery-slots?day=YYYY-MM-DD&days=1
+exports.deliverySlots = asyncHandler(async (req, res) => {
+  const dayQuery = req.query.day
+    ? dayjs(req.query.day).tz(LOCAL_TZ)
+    : dayjs().tz(LOCAL_TZ);
+  const days = Math.max(1, parseInt(req.query.days || '1', 10)); // hari ke depan
+  const result = [];
+  for (let i = 0; i < days; i++) {
+    const d = dayQuery.add(i, 'day').startOf('day');
+    const slots = getSlotsForDate(d).map((s) => ({
+      label: s.label,
+      datetime: s.datetime ? s.datetime.toISOString() : null,
+      available: s.available
+    }));
+    result.push({
+      date: d.format('YYYY-MM-DD'),
+      slots
+    });
+  }
+  res.json({ success: true, items: result });
+});
