@@ -151,7 +151,7 @@ exports.createMenu = asyncHandler(async (req, res) => {
 
       const addonsSrc = Array.isArray(addons)
         ? addons
-        : parseMaybeJson(addons, []);
+        : parseMaybeJson(addons, []); // parseMaybeJson ada di file controller
       const addonsNorm = Array.isArray(addonsSrc)
         ? addonsSrc.map(sanitizeNewAddon).filter((x) => x.name)
         : [];

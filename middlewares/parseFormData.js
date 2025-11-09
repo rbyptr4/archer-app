@@ -1,10 +1,7 @@
-// middlewares/normalizeBody.js
-/* Middleware normalisasi body yang aman untuk multipart */
 module.exports = (req, res, next) => {
   const ct = String(req.headers['content-type'] || '');
   const isMultipart = ct.includes('multipart/form-data');
 
-  // --- DEBUG tipis: kelihatan kapan middleware ini jalan & tipe konten
   if (process.env.DEBUG_NORMALIZE === '1') {
     console.error('[normalizeBody] hit', {
       isMultipart,
@@ -16,12 +13,11 @@ module.exports = (req, res, next) => {
   }
 
   // Kalau multipart & body belum object (artinya multer belum jalan), JANGAN utak-atik.
-  // Pastikan urutan router: parseFormData (multer) -> normalizeBody -> handler.
+  // Pastikan urutan router: multer -> normalizeBody -> handler.
   if (isMultipart && (req.body == null || typeof req.body !== 'object')) {
     return next();
   }
 
-  // Untuk non-multipart atau kalau body sudah object (pasca multer), pastikan object.
   if (req.body == null || typeof req.body !== 'object') {
     req.body = {};
   }
@@ -45,8 +41,10 @@ module.exports = (req, res, next) => {
   const toBool = (v, d = false) => {
     if (typeof v === 'boolean') return v;
     const s = String(v).toLowerCase();
-    if (s === 'true') return true;
-    if (s === 'false') return false;
+    if (s === 'true' || s === '1' || s === 'yes' || s === 'y' || s === 'on')
+      return true;
+    if (s === 'false' || s === '0' || s === 'no' || s === 'n' || s === 'off')
+      return false;
     return d;
   };
 
@@ -77,13 +75,11 @@ module.exports = (req, res, next) => {
       if (!['none', 'percent', 'manual'].includes(mode)) mode = 'none';
       p.discountMode = mode;
 
-      // buang field yang tak relevan dengan mode
       if (mode !== 'percent' && hasOwn(p, 'discountPercent'))
         delete p.discountPercent;
       if (mode !== 'manual' && hasOwn(p, 'manualPromoPrice'))
         delete p.manualPromoPrice;
 
-      // koersi numerik
       if (hasOwn(p, 'original')) p.original = toInt(p.original, 0);
       if (hasOwn(p, 'discountPercent'))
         p.discountPercent = toInt(p.discountPercent, 0);
@@ -98,14 +94,40 @@ module.exports = (req, res, next) => {
     if (Array.isArray(req.body.items)) {
       req.body.items = req.body.items
         .map((it) => ({
-          menu: it?.menu ? String(it.menu) : undefined, // ObjectId string
-          name: it?.name ? String(it.name).trim() : undefined, // optional fallback
+          menu: it?.menu ? String(it.menu) : undefined,
+          name: it?.name ? String(it.name).trim() : undefined,
           qty: toInt(it?.qty, 1) || 1
         }))
         .filter((it) => it.menu || it.name);
     } else {
       req.body.items = [];
     }
+  }
+
+  /* ===== Addons (JSON string / object -> normalized array) ===== */
+  if (hasOwn(req.body, 'addons')) {
+    const raw = parseMaybeJSON(req.body.addons, []);
+    let arr = Array.isArray(raw)
+      ? raw
+      : raw && typeof raw === 'object'
+      ? [raw]
+      : [];
+    arr = arr
+      .map((a) => {
+        if (!a || typeof a !== 'object') return null;
+        const out = {};
+        if ('name' in a) out.name = String(a.name || '').trim();
+        if ('price' in a) out.price = toInt(a.price, 0);
+        if ('isActive' in a) out.isActive = toBool(a.isActive, true);
+        // juga dukung field is_active / is_active string kalau perlu:
+        if (!('isActive' in a) && 'is_active' in a) {
+          out.isActive = toBool(a.is_active, true);
+        }
+        return out;
+      })
+      .filter(Boolean)
+      .filter((x) => x.name); // buang addon tanpa name
+    req.body.addons = arr;
   }
 
   // --- DEBUG tipis: lihat keys yang ada setelah normalisasi
