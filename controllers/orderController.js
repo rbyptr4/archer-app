@@ -1276,20 +1276,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     if (!pickupWindowFrom.isBefore(pickupWindowTo))
       throwError('pickup_window: from harus < to', 400);
 
-    const now = dayjs().tz(LOCAL_TZ);
-    if (pickupWindowFrom.isBefore(now.add(MIN_LEAD_MINUTES, 'minute'))) {
-      throwError(
-        `Waktu pickup mulai harus setidaknya ${MIN_LEAD_MINUTES} menit dari sekarang`,
-        409
-      );
-    }
-    const diffHours = pickupWindowTo.diff(pickupWindowFrom, 'hour', true);
-    if (diffHours > MAX_WINDOW_HOURS)
-      throwError(
-        `Durasi pickup window terlalu panjang (max ${MAX_WINDOW_HOURS} jam)`,
-        400
-      );
-
     deliveryObj.pickup_window = {
       from: pickupWindowFrom.toDate(),
       to: pickupWindowTo.toDate()
@@ -1796,20 +1782,6 @@ exports.createQrisFromCart = async (req, res, next) => {
       // validasi lengkapnya
       if (!pickupWindowFrom.isBefore(pickupWindowTo))
         throwError('pickup_window: from harus < to', 400);
-
-      const now = dayjs().tz(LOCAL_TZ);
-      if (pickupWindowFrom.isBefore(now.add(MIN_LEAD_MINUTES, 'minute'))) {
-        throwError(
-          `Waktu pickup mulai harus setidaknya ${MIN_LEAD_MINUTES} menit dari sekarang`,
-          409
-        );
-      }
-      const diffHours = pickupWindowTo.diff(pickupWindowFrom, 'hour', true);
-      if (diffHours > MAX_WINDOW_HOURS)
-        throwError(
-          `Durasi pickup window terlalu panjang (max ${MAX_WINDOW_HOURS} jam)`,
-          400
-        );
 
       deliveryObj.pickup_window = {
         from: pickupWindowFrom.toDate(),
@@ -2530,8 +2502,7 @@ const buildOrderReceipt = (order) => {
 
     pricing: {
       // keep original semantics: items_subtotal = before-tax (schema)
-      items_subtotal: items_subtotal,
-      items_subtotal_with_tax: items_subtotal_with_tax, // added: menu + tax
+      items_subtotal: items_subtotal_with_tax, // added: menu + tax
       service_fee,
       delivery_fee,
       items_discount,
