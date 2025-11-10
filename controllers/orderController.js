@@ -1097,21 +1097,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     voucherClaimIds = [],
     register_decision = 'register' // 'register' | 'skip'
   } = req.body || {};
-  try {
-    const debugPayload = {
-      rawBodyKeys,
-      idempotency_key: idempotency_key || null,
-      cookies: req.cookies || null,
-      body: req.body || null,
-      files: req.files || req.file || null
-    };
-    // print pretty for dev logs
-    console.log(
-      '== CHECKOUT PAYLOAD ==\n' + JSON.stringify(debugPayload, null, 2)
-    );
-  } catch (err) {
-    console.log('CHECKOUT_PAYLOAD_LOG_ERR', err && err.stack ? err.stack : err);
-  }
   /* ===== Resolve fulfillment type (ft) & method ===== */
   const ft =
     iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
