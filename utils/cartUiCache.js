@@ -5,47 +5,55 @@ const {
 } = require('../utils/money');
 
 function buildUiTotalsFromCart(cart) {
-  const itemsSubtotalBeforeTax = Number(cart.total_price || 0); // total menu tanpa pajak
+  // safety parse
+  const itemsSubtotalBeforeTax = Number(cart.total_price || 0); // total menu + addons (BEFORE tax)
   const deliveryFee = Number(cart?.delivery?.delivery_fee || 0);
   const itemsDiscount = Number(cart.items_discount || 0) || 0;
   const shippingDiscount = Number(cart.shipping_discount || 0) || 0;
 
-  // === Service fee 2% dari total items (sebelum pajak & diskon) ===
+  // --- Service fee: 2% dari items subtotal (aggregate) ---
   const svcRate = Number(SERVICE_FEE_RATE || 0);
   const serviceFee = Math.round(itemsSubtotalBeforeTax * svcRate);
 
-  // === Pajak (PPN) dihitung dari items - item_discount ===
+  // --- Tax: dihitung dari items subtotal (aggregate). NOT affected by voucher ---
   const rate = parsePpnRate();
-  const taxBase = Math.max(0, itemsSubtotalBeforeTax - itemsDiscount);
-  const taxAmount = Math.round(taxBase * rate);
+  const taxAmount = Math.round(itemsSubtotalBeforeTax * rate);
   const taxRatePercent = Math.round(rate * 100 * 100) / 100;
 
-  // === Subtotal termasuk pajak (biar FE lebih mudah pakai untuk tampilan) ===
-  const itemsSubtotalWithTax = itemsSubtotalBeforeTax + taxAmount;
+  // --- Compose raw total (sebelum custom rounding) ---
+  // Formula: items + service + delivery - itemDiscount - shippingDiscount + tax
+  const rawTotal =
+    itemsSubtotalBeforeTax +
+    serviceFee +
+    deliveryFee -
+    itemsDiscount -
+    shippingDiscount +
+    taxAmount;
 
-  // === Total sebelum pembulatan (belum termasuk ongkir) ===
-  const grandBeforeRound =
-    itemsSubtotalWithTax + serviceFee - itemsDiscount - shippingDiscount;
-
-  // === Pembulatan custom (misal ke 0/500/1000) ===
-  const after =
+  // --- Custom rounding (if helper tersedia), else normal Math.round ---
+  const rounded =
     typeof roundRupiahCustom === 'function'
-      ? roundRupiahCustom(grandBeforeRound)
-      : Math.round(grandBeforeRound);
+      ? roundRupiahCustom(rawTotal)
+      : Math.round(rawTotal);
 
-  const roundingDelta = Number(after) - Number(grandBeforeRound);
+  const roundingDelta = Number(rounded) - Number(rawTotal);
 
   return {
-    items_subtotal: itemsSubtotalWithTax,
-    items_subtotal_before_tax: itemsSubtotalBeforeTax, // tambahan: kalau FE butuh harga sebelum pajak
+    // keep both before-tax and with-tax subtotals for FE clarity
+    items_subtotal_before_tax: itemsSubtotalBeforeTax,
+    items_subtotal_with_tax: itemsSubtotalBeforeTax + taxAmount,
+
     service_fee: serviceFee,
-    items_discount: itemsDiscount,
-    delivery_fee: deliveryFee,
-    shipping_discount: shippingDiscount,
     tax_rate_percent: taxRatePercent,
     tax_amount: taxAmount,
+
+    delivery_fee: deliveryFee,
+    items_discount: itemsDiscount,
+    shipping_discount: shippingDiscount,
+
+    // bookkeeping
     rounding_delta: roundingDelta,
-    grand_total: after
+    grand_total: Number(rounded)
   };
 }
 

@@ -1,3 +1,4 @@
+// models/orderModel.js
 const mongoose = require('mongoose');
 
 const {
@@ -24,13 +25,11 @@ const DeliverySchema = new mongoose.Schema(
       default: 'none',
       index: true
     },
-    // di DeliverySchema
     pickup_window: {
       from: { type: Date, default: null, index: true },
       to: { type: Date, default: null, index: true }
     },
-
-    slot_label: { type: String, trim: true, default: null }, // e.g. "12:00"
+    slot_label: { type: String, trim: true, default: null },
     scheduled_at: { type: Date, default: null, index: true },
     assignee: {
       user: {
@@ -66,6 +65,7 @@ const addonSchema = new mongoose.Schema(
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
 );
 
+/* orderItemSchema: simplified — no per-item tax/service stored */
 const orderItemSchema = new mongoose.Schema(
   {
     menu: { type: mongoose.Schema.Types.ObjectId, ref: 'Menu', required: true },
@@ -76,6 +76,8 @@ const orderItemSchema = new mongoose.Schema(
     quantity: { type: Number, min: 1, max: 999, required: true },
     addons: { type: [addonSchema], default: [] },
     notes: { type: String, trim: true, default: '' },
+
+    // keep line_subtotal (menu+addons * qty) for clarity
     line_subtotal: { type: Number, min: 0, required: true, set: int, get: int }
   },
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
@@ -158,7 +160,7 @@ const orderSchema = new mongoose.Schema(
     },
     delivery_fee: { type: Number, min: 0, default: 0, set: int, get: int },
 
-    // service fee 2% dari (items_subtotal + delivery_fee), sebelum voucher
+    // service fee: simplified aggregate (2% dari items_subtotal)
     service_fee: { type: Number, min: 0, default: 0, set: int, get: int },
 
     // diskon voucher
@@ -166,13 +168,12 @@ const orderSchema = new mongoose.Schema(
     shipping_discount: { type: Number, min: 0, default: 0, set: int, get: int },
     discounts: { type: [discountBreakdownSchema], default: [] },
 
-    // pajak
+    // pajak aggregate (dihitung dari items_subtotal)
     tax_rate_percent: { type: Number, min: 0, max: 100, default: 0 },
     tax_amount: { type: Number, min: 0, default: 0, set: int, get: int },
 
-    // grand total (sudah DIPBULATKAN pake aturan 0/500/1000)
+    // grand total (sudah DIPBULATKAN pake aturan custom)
     grand_total: { type: Number, min: 0, required: true, set: int, get: int },
-    // simpan delta pembulatan (opsional, buat transparansi)
     rounding_delta: {
       type: Number,
       default: 0,
@@ -233,7 +234,7 @@ orderSchema.virtual('items_total').get(function () {
   return this.items_subtotal;
 });
 
-/* ===== Pre-validate: enforce urutan harga =====
+/* ===== Pre-validate: enforce price order (simplified aggregate tax/service) =====
  * Base (items+ongkir) -> service fee -> voucher -> pajak -> pembulatan
  */
 orderSchema.pre('validate', function (next) {
@@ -242,46 +243,45 @@ orderSchema.pre('validate', function (next) {
   let itemsSubtotal = 0;
 
   for (const it of items) {
-    const addonsSum = (it.addons || []).reduce(
+    const addonsSumPerUnit = (it.addons || []).reduce(
       (a, x) => a + int(x.price) * (x.qty || 1),
       0
     );
-    const line = (int(it.base_price) + addonsSum) * int(it.quantity || 1);
+
+    const unitBefore = int(it.base_price) + int(addonsSumPerUnit);
+    const qty = int(it.quantity || 1);
+
+    // recalc line_subtotal (menu+addons) * qty
+    const line = unitBefore * qty;
     it.line_subtotal = int(line);
-    totalQty += int(it.quantity || 0);
+
+    totalQty += qty;
     itemsSubtotal += int(line);
   }
 
   this.total_quantity = totalQty;
   this.items_subtotal = int(itemsSubtotal);
 
+  // delivery fee (either in delivery subdoc or top-level)
   const deliveryFee = this.delivery?.delivery_fee
     ? int(this.delivery.delivery_fee)
     : int(this.delivery_fee || 0);
   this.delivery_fee = deliveryFee;
 
-  // 1) Service fee 2% dari ITEMS SAJA (ongkir tidak ikut)
-  const sfBase = this.items_subtotal;
-  const rawServiceFee = sfBase > 0 ? sfBase * SERVICE_FEE_RATE : 0;
-  this.service_fee = int(rawServiceFee);
+  // SERVICE FEE: aggregate from items_subtotal (2% of items only)
+  const sfRate = SERVICE_FEE_RATE;
+  this.service_fee = int(Math.round(this.items_subtotal * sfRate));
 
   // Normalisasi diskon (tidak boleh negatif)
   this.items_discount = int(Math.max(0, this.items_discount || 0));
   this.shipping_discount = int(Math.max(0, this.shipping_discount || 0));
 
-  // 2) Tax base: HANYA DARI MENU (setelah item discount).
-  //   (service fee & ongkir tidak kena PPN)
-  const taxBase = this.items_subtotal - this.items_discount;
-
-  const safeTaxBase = Math.max(0, taxBase);
-
-  // 3) Pajak
+  // TAX: aggregate from items_subtotal (11% default via parsePpnRate)
   const rate = parsePpnRate();
   this.tax_rate_percent = Math.round(rate * 100 * 100) / 100;
-  this.tax_amount = int(safeTaxBase * rate);
+  this.tax_amount = int(Math.round(this.items_subtotal * rate));
 
-  // 4) Raw total sebelum rounding:
-  //    items + service_fee + delivery - discounts tax (tax dari items saja)
+  // Raw total sebelum rounding:
   const rawTotal =
     this.items_subtotal +
     this.service_fee +
@@ -290,12 +290,12 @@ orderSchema.pre('validate', function (next) {
     this.shipping_discount +
     this.tax_amount;
 
-  // 5) Pembulatan custom
+  // Pembulatan custom
   const rounded = roundRupiahCustom(rawTotal);
   this.grand_total = int(rounded);
   this.rounding_delta = int(rounded - rawTotal);
 
-  // hanya cek lokasi kalau mode delivery
+  // delivery validation same as before...
   if (
     this.fulfillment_type === 'delivery' &&
     this.delivery?.mode === 'delivery'

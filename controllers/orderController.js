@@ -646,33 +646,38 @@ exports.getCart = asyncHandler(async (req, res) => {
   /* ========== 4) Build ringkasan awal ========== */
   const ui = buildUiTotalsFromCart(cart);
 
-  const items_subtotal = Number(ui.items_subtotal || 0);
+  const itemsSubtotalBeforeTax = Number(
+    ui.items_subtotal_before_tax || ui.items_subtotal || 0
+  );
   const items_discount = Number(ui.items_discount || 0);
   const shipping_discount = Number(ui.shipping_discount || 0);
 
-  // Service fee: hanya dari items
-  const service_fee_on_items = int(items_subtotal * SERVICE_FEE_RATE);
-
-  // Pajak: dari (items - item_discount) saja
-  const rate = parsePpnRate();
-  const taxAmountOnItems = int(
-    Math.max(0, items_subtotal - items_discount) * rate
+  const service_fee_on_items = int(
+    Math.round(itemsSubtotalBeforeTax * SERVICE_FEE_RATE)
   );
 
-  // === BEFORE ROUNDING: items + tax (NO discount, NO SF, NO delivery)
-  const baseBeforeRound = items_subtotal + taxAmountOnItems;
+  const rate = parsePpnRate();
+  const taxAmountOnItems = int(Math.round(itemsSubtotalBeforeTax * rate));
+  const taxRatePercent = Math.round(rate * 100 * 100) / 100;
 
-  // Grand total (tanpa ongkir): (items + tax + SF) dibulatkan
-  const pureBeforeWithService =
-    int(baseBeforeRound) + int(service_fee_on_items);
+  const baseBeforeRound = int(itemsSubtotalBeforeTax); // items only, before tax
+  const pureBeforeWithService = int(
+    baseBeforeRound +
+      taxAmountOnItems +
+      service_fee_on_items -
+      items_discount -
+      shipping_discount
+  );
 
+  // Store into ui
   ui.service_fee = service_fee_on_items;
   ui.tax_amount = taxAmountOnItems;
-  ui.grand_total_before_rounding = int(baseBeforeRound);
+  ui.tax_rate_percent = taxRatePercent;
+  ui.grand_total_before_rounding = int(pureBeforeWithService);
 
   const pureRounded = int(roundRupiahCustom(int(pureBeforeWithService)));
   ui.grand_total = pureRounded;
-  ui.rounding_delta = pureRounded - int(pureBeforeWithService);
+  ui.rounding_delta = int(pureRounded - int(pureBeforeWithService));
 
   /* ========== 5) Delivery fee: hanya jika FT cart memang delivery ========== */
   const ft = cart.fulfillment_type || 'dine_in';
@@ -691,42 +696,12 @@ exports.getCart = asyncHandler(async (req, res) => {
     ui.grand_total_with_delivery = ui.grand_total;
   }
 
-  /* ========== 6) Enrich item: alokasi pajak proporsional ke items (tanpa ongkir/SF) ========== */
   const items = Array.isArray(cart.items) ? cart.items : [];
-  const taxDenominator = Math.max(0, items_subtotal - items_discount);
-
-  const mappedItems = items.map((it) => {
-    const qty = Number(it.quantity || 0);
-    const unit_base = Number(it.base_price || 0);
-    const addons_unit = (it.addons || []).reduce(
-      (s, a) => s + Number(a.price || 0) * Number(a.qty || 1),
-      0
-    );
-    const unit_before_tax = unit_base + addons_unit;
-    const line_before_tax = Number(
-      it.line_subtotal != null ? it.line_subtotal : unit_before_tax * qty
-    );
-    const line_tax =
-      taxDenominator > 0
-        ? Math.round((taxAmountOnItems * line_before_tax) / taxDenominator)
-        : 0;
-    const unit_tax = qty > 0 ? Math.round(line_tax / qty) : 0;
-    const unit_price_incl_tax = unit_before_tax + unit_tax;
-    const total_unit_with_tax = int(unit_price_incl_tax * qty);
-
-    return {
-      ...it,
-      unit_price: unit_before_tax,
-      unit_tax,
-      unit_price_incl_tax, // harga 1 unit termasuk pajak
-      total_unit_with_tax // unit_price_incl_tax * qty
-    };
-  });
 
   return res.status(200).json({
     ...cart,
     fulfillment_type: ft, // kembalikan FT yang AKTUAL di cart
-    items: mappedItems,
+    items: items,
     ui_totals: ui
   });
 });
@@ -1072,17 +1047,6 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
 
 /* ===================== CHECKOUT ===================== */
 exports.checkout = asyncHandler(async (req, res) => {
-  // ==== STEP: payload masuk ====
-  const rawBodyKeys = Object.keys(req.body || {});
-  const rawFiles = req.file
-    ? { single: req.file?.fieldname }
-    : Array.isArray(req.files)
-    ? { multiple: req.files.map((f) => f.fieldname) }
-    : null;
-  // -- DEBUG LOG: payload masuk (testing) --
-
-  // -- end debug --
-
   const iden0 = getIdentity(req);
   const {
     name,
@@ -1097,6 +1061,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     voucherClaimIds = [],
     register_decision = 'register' // 'register' | 'skip'
   } = req.body || {};
+
   /* ===== Resolve fulfillment type (ft) & method ===== */
   const ft =
     iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
@@ -1179,14 +1144,12 @@ exports.checkout = asyncHandler(async (req, res) => {
     ? dayjs(providedScheduledAtRaw).tz(LOCAL_TZ)
     : null;
 
-  // pickup ISO (preferensi baru) — untuk pickup wajib pakai ISO: pickup_from & pickup_to
   const pickup_from_iso = req.body?.pickup_from || null;
   const pickup_to_iso = req.body?.pickup_to || null;
 
   // VALIDASI HANYA JIKA BUKAN DINE_IN
   if (ft !== 'dine_in') {
     if (delivery_mode === 'delivery') {
-      // delivery: wajib delivery_slot atau scheduled_at
       if (
         !providedSlot &&
         (!providedScheduledAt || !providedScheduledAt.isValid())
@@ -1197,12 +1160,10 @@ exports.checkout = asyncHandler(async (req, res) => {
         );
       }
     } else if (delivery_mode === 'pickup') {
-      // pickup: wajib pickup_from & pickup_to (ISO) — pickup_window_raw tidak dipakai lagi
       if (!pickup_from_iso || !pickup_to_iso) {
         throwError('Untuk pickup: pickup_from dan pickup_to (ISO) wajib', 400);
       }
     } else {
-      // jika ada mode lain yang tak terduga
       throwError('delivery_mode tidak valid', 400);
     }
   }
@@ -1227,7 +1188,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // check slot availability only if slotLabel provided and not dine_in and mode delivery
   if (
     slotLabel &&
     ft !== 'dine_in' &&
@@ -1238,13 +1198,13 @@ exports.checkout = asyncHandler(async (req, res) => {
   }
 
   let deliveryObj = {
-    mode: ft === 'dine_in' ? 'none' : delivery_mode, // dine_in -> none
+    mode: ft === 'dine_in' ? 'none' : delivery_mode,
     slot_label: slotLabel || null,
     scheduled_at: slotDt ? slotDt.toDate() : null,
     status: 'pending'
   };
 
-  // --- proses pickup window hanya via ISO (pickup_from & pickup_to) ---
+  // pickup window handling
   let pickupWindowFrom = null;
   let pickupWindowTo = null;
 
@@ -1257,7 +1217,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     pickupWindowFrom = f;
     pickupWindowTo = t;
 
-    // validasi lengkapnya
     if (!pickupWindowFrom.isBefore(pickupWindowTo))
       throwError('pickup_window: from harus < to', 400);
 
@@ -1266,14 +1225,13 @@ exports.checkout = asyncHandler(async (req, res) => {
       to: pickupWindowTo.toDate()
     };
 
-    // set scheduled_at/slot_label kalau belum ada scheduled (bantu UI)
     if (!deliveryObj.scheduled_at) {
       deliveryObj.scheduled_at = pickupWindowFrom.toDate();
       deliveryObj.slot_label = pickupWindowFrom.format('HH:mm');
     }
   }
 
-  // Delivery-specific: alamat & radius — jalankan hanya kalau delivery_mode==='delivery' dan fulfillment bukan dine_in
+  // Delivery-specific: alamat & radius
   let delivery_fee = 0;
   if (ft !== 'dine_in' && delivery_mode === 'delivery') {
     const latN = Number(req.body?.lat);
@@ -1291,7 +1249,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     delivery_fee = calcDeliveryFee();
     deliveryObj.delivery_fee = delivery_fee;
   } else {
-    // untuk dine_in atau non-delivery: simpan note_to_rider bila ada
     deliveryObj.note_to_rider = String(req.body?.note_to_rider || '');
   }
 
@@ -1316,7 +1273,7 @@ exports.checkout = asyncHandler(async (req, res) => {
       };
     });
 
-  // ==== STEP: snapshot cart setelah sanitasi ====
+  // ==== snapshot cart ====
   const cartPreview = short(cart.items).map((it, idx) => ({
     i: idx,
     menu: String(it.menu || ''),
@@ -1377,23 +1334,35 @@ exports.checkout = asyncHandler(async (req, res) => {
     throw err;
   }
 
-  /* ===== PPN + pembulatan (opsional jika belum di-handle di pre('validate')) ===== */
-  const rate = parsePpnRate(); // ex: 0.11
-  const taxBase =
-    priced.totals.baseSubtotal -
-    priced.totals.itemsDiscount +
-    priced.totals.deliveryFee -
-    priced.totals.shippingDiscount;
-  const taxAmount = int(Math.max(0, Math.floor(taxBase * rate)));
-  const taxRatePercent = Math.round(rate * 100 * 100) / 100;
-  const beforeRound = int(taxBase + taxAmount);
-  const rounded = int(roundRupiahCustom(beforeRound));
-  const roundingDelta = int(rounded - beforeRound);
+  /* ===== AGGREGATE: service & tax dari items_subtotal (SINGLE SOURCE) ===== */
+  const items_subtotal = int(priced.totals.baseSubtotal);
+  const items_discount = int(priced.totals.itemsDiscount);
+  const shipping_discount = int(priced.totals.shippingDiscount);
+  const baseDelivery = int(priced.totals.deliveryFee);
 
-  priced.totals.taxAmount = taxAmount;
-  priced.totals.taxRatePercent = taxRatePercent;
-  priced.totals.grandTotal = rounded;
-  priced.totals.roundingDelta = roundingDelta;
+  // Service fee: 2% dari total items (aggregate)
+  const service_fee = int(Math.round(items_subtotal * SERVICE_FEE_RATE));
+
+  // Tax: aggregate dari items_subtotal (NOT affected by voucher)
+  const rateForTax = parsePpnRate();
+  const taxAmount = int(Math.round(items_subtotal * rateForTax));
+  const taxRatePercent = Math.round(rateForTax * 100 * 100) / 100;
+
+  // ===== Total sebelum pembulatan (items + service + delivery - discounts + tax)
+  const beforeRound = int(
+    items_subtotal +
+      service_fee +
+      baseDelivery -
+      items_discount -
+      shipping_discount +
+      taxAmount
+  );
+  const requested_bvt = int(roundRupiahCustom(beforeRound));
+  const rounding_delta = int(requested_bvt - beforeRound);
+
+  if (requested_bvt <= 0) {
+    throwError('Total pembayaran tidak valid.', 400);
+  }
 
   /* ===== Bukti transfer (kalau perlu) ===== */
   const payment_proof_url = await handleTransferProofIfAny(req, method);
@@ -1404,9 +1373,8 @@ exports.checkout = asyncHandler(async (req, res) => {
 
   if (methodIsGateway) {
     payment_provider = 'xendit';
-    payment_status = 'unpaid'; // gateway biasanya menunggu callback/webhook
+    payment_status = 'unpaid';
   } else if (requiresProof) {
-    // metode seperti transfer bank yang butuh bukti -> tunggu verifikasi staff
     payment_status = 'unpaid';
   } else {
     payment_status = 'unpaid';
@@ -1434,19 +1402,22 @@ exports.checkout = asyncHandler(async (req, res) => {
             quantity: it.quantity,
             addons: it.addons,
             notes: String(it.notes || '').trim(),
-            category: it.category || null // line_subtotal akan dihitung ulang di pre('validate')
+            category: it.category || null
           })),
-          // Totals dari pricing (baseline; kalau pakai pre('validate') finalisasi, ini bisa berubah)
+          // Totals
           items_subtotal: int(priced.totals.baseSubtotal),
           items_discount: int(priced.totals.itemsDiscount),
           delivery_fee: int(priced.totals.deliveryFee),
           shipping_discount: int(priced.totals.shippingDiscount),
           discounts: priced.breakdown || [],
-          // Pajak & pembulatan
+
+          // Pajak & service & pembulatan
+          service_fee: service_fee,
           tax_rate_percent: taxRatePercent,
           tax_amount: taxAmount,
-          rounding_delta: roundingDelta,
-          grand_total: rounded,
+          rounding_delta: rounding_delta,
+          grand_total: requested_bvt,
+
           payment_method: method,
           payment_provider,
           payment_status,
@@ -1483,9 +1454,7 @@ exports.checkout = asyncHandler(async (req, res) => {
           });
           await c.save();
         }
-      } catch (_) {
-        // gagal update voucher -> ignore tapi log bila perlu
-      }
+      } catch (_) {}
     }
   }
 
@@ -1517,7 +1486,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     transaction_code: order.transaction_code,
     member: MemberDoc
       ? {
-          id: String(MemberDoc._1d),
+          id: String(MemberDoc._id),
           name: MemberDoc.name,
           phone: MemberDoc.phone
         }
@@ -1542,7 +1511,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   }
 
   try {
-    // If you have `priced` or `ui` in scope, prefer to pass those. We'll try using priced.totals + session payload.
     const uiTotals = {
       items_subtotal: order.items_subtotal || 0,
       delivery_fee: order.delivery_fee || (order.delivery?.delivery_fee ?? 0),
@@ -1582,7 +1550,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   });
 });
 
-exports.createQrisFromCart = async (req, res, next) => {
+exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
   try {
     const iden0 = getIdentity(req);
     const {
@@ -1677,23 +1645,19 @@ exports.createQrisFromCart = async (req, res, next) => {
     const delivery_mode =
       ft === 'dine_in'
         ? 'none'
-        : String(req.body?.delivery_mode || 'delivery').toLowerCase(); // 'delivery'|'pickup'|'none'
+        : String(req.body?.delivery_mode || 'delivery').toLowerCase();
 
-    // ambil input slot/scheduled/pickup window (tetap baca kalau ada, tapi validasi dipisah berdasarkan delivery_mode)
     const providedSlot = (req.body?.delivery_slot || '').trim();
     const providedScheduledAtRaw = req.body?.scheduled_at || null;
     const providedScheduledAt = providedScheduledAtRaw
       ? dayjs(providedScheduledAtRaw).tz(LOCAL_TZ)
       : null;
 
-    // pickup ISO (preferensi baru) — untuk pickup wajib pakai ISO: pickup_from & pickup_to
     const pickup_from_iso = req.body?.pickup_from || null;
     const pickup_to_iso = req.body?.pickup_to || null;
 
-    // VALIDASI HANYA JIKA BUKAN DINE_IN
     if (ft !== 'dine_in') {
       if (delivery_mode === 'delivery') {
-        // delivery: wajib delivery_slot atau scheduled_at
         if (
           !providedSlot &&
           (!providedScheduledAt || !providedScheduledAt.isValid())
@@ -1701,7 +1665,6 @@ exports.createQrisFromCart = async (req, res, next) => {
           throwError('Jadwal pengantaran wajib diisi (delivery_slot)', 400);
         }
       } else if (delivery_mode === 'pickup') {
-        // pickup: wajib pickup_from & pickup_to (ISO) — pickup_window_raw tidak dipakai lagi
         if (!pickup_from_iso || !pickup_to_iso) {
           throwError(
             'Jadwal pengambilan wajib diisi (pickup_from & pickup_to)',
@@ -1709,12 +1672,10 @@ exports.createQrisFromCart = async (req, res, next) => {
           );
         }
       } else {
-        // jika ada mode lain yang tak terduga
         throwError('delivery_mode tidak valid', 400);
       }
     }
 
-    // --- proses slot untuk delivery (jika ada) ---
     let slotLabel = null;
     let slotDt = null;
     if (
@@ -1734,7 +1695,6 @@ exports.createQrisFromCart = async (req, res, next) => {
       }
     }
 
-    // check slot availability only if slotLabel provided and not dine_in and mode delivery
     if (
       slotLabel &&
       ft !== 'dine_in' &&
@@ -1745,13 +1705,12 @@ exports.createQrisFromCart = async (req, res, next) => {
     }
 
     let deliveryObj = {
-      mode: ft === 'dine_in' ? 'none' : delivery_mode, // dine_in -> none
+      mode: ft === 'dine_in' ? 'none' : delivery_mode,
       slot_label: slotLabel || null,
       scheduled_at: slotDt ? slotDt.toDate() : null,
       status: 'pending'
     };
 
-    // --- proses pickup window hanya via ISO (pickup_from & pickup_to) ---
     let pickupWindowFrom = null;
     let pickupWindowTo = null;
 
@@ -1764,7 +1723,6 @@ exports.createQrisFromCart = async (req, res, next) => {
       pickupWindowFrom = f;
       pickupWindowTo = t;
 
-      // validasi lengkapnya
       if (!pickupWindowFrom.isBefore(pickupWindowTo))
         throwError('pickup_window: from harus < to', 400);
 
@@ -1773,14 +1731,13 @@ exports.createQrisFromCart = async (req, res, next) => {
         to: pickupWindowTo.toDate()
       };
 
-      // set scheduled_at/slot_label kalau belum ada scheduled (bantu UI)
       if (!deliveryObj.scheduled_at) {
         deliveryObj.scheduled_at = pickupWindowFrom.toDate();
         deliveryObj.slot_label = pickupWindowFrom.format('HH:mm');
       }
     }
 
-    // Delivery-specific: alamat & radius — jalankan hanya kalau delivery_mode==='delivery' dan fulfillment bukan dine_in
+    // Delivery-specific: alamat & radius
     let delivery_fee = 0;
     if (ft !== 'dine_in' && delivery_mode === 'delivery') {
       const latN = Number(req.body?.lat);
@@ -1798,7 +1755,6 @@ exports.createQrisFromCart = async (req, res, next) => {
       delivery_fee = calcDeliveryFee();
       deliveryObj.delivery_fee = delivery_fee;
     } else {
-      // untuk dine_in atau non-delivery: simpan note_to_rider bila ada
       deliveryObj.note_to_rider = String(req.body?.note_to_rider || '');
     }
 
@@ -1842,22 +1798,21 @@ exports.createQrisFromCart = async (req, res, next) => {
       voucherClaimIds: eligibleClaimIds
     });
 
+    /* ===== AGGREGATE: service & tax dari items_subtotal (SINGLE SOURCE) ===== */
     const items_subtotal = int(priced.totals.baseSubtotal);
     const items_discount = int(priced.totals.itemsDiscount);
     const shipping_discount = int(priced.totals.shippingDiscount);
     const baseDelivery = int(priced.totals.deliveryFee);
 
-    // Service fee 2% dari ITEMS SAJA
-    const sfBase = items_subtotal;
-    const service_fee = int(sfBase * SERVICE_FEE_RATE);
+    // Service fee: 2% dari total items (aggregate)
+    const service_fee = int(Math.round(items_subtotal * SERVICE_FEE_RATE));
 
-    // Tax base: HANYA dari menu (setelah item discount)
-    const taxBase = items_subtotal - items_discount;
-    const safeTaxBase = Math.max(0, taxBase);
-    const rate = parsePpnRate();
-    const taxAmount = int(safeTaxBase * rate);
+    // Tax: aggregate dari items_subtotal (NOT affected by voucher)
+    const rateForTax = parsePpnRate();
+    const taxAmount = int(Math.round(items_subtotal * rateForTax));
+    const taxRatePercent = Math.round(rateForTax * 100 * 100) / 100;
 
-    // ===== Total sebelum pembulatan (ongkir & service fee berdiri sendiri, tax dari menu)
+    // ===== Total sebelum pembulatan (items + service + delivery - discounts + tax)
     const beforeRound = int(
       items_subtotal +
         service_fee +
@@ -1910,7 +1865,6 @@ exports.createQrisFromCart = async (req, res, next) => {
       external_id: reference_id
     };
 
-    // attach pickup_window at top-level session if present
     if (deliveryObj.pickup_window) {
       sessionPayload.pickup_window = {
         from: deliveryObj.pickup_window.from,
@@ -1959,7 +1913,7 @@ exports.createQrisFromCart = async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-};
+});
 
 exports.assignTable = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
@@ -2263,16 +2217,9 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
   const order = await Order.findById(id).lean();
   if (!order) throwError('Order tidak ditemukan', 404);
 
-  // fallback tax rate: pakai order.tax_rate_percent jika tersedia, else default 11%
-  const taxRate =
-    Number.isFinite(Number(order.tax_rate_percent)) &&
-    Number(order.tax_rate_percent) > 0
-      ? Number(order.tax_rate_percent) / 100
-      : 0.11;
-
   const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
 
-  // Susun response yang bersih / minimal
+  // Susun response yang bersih / minimal (aggregate approach)
   const slim = {
     id: String(order._id),
     transaction_code: order.transaction_code,
@@ -2282,25 +2229,18 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
     },
     fulfillment_type: order.fulfillment_type || null,
     table_number: order.table_number ?? null,
+    // items: show base price, addons and line_subtotal (no per-item tax/service)
     items: (order.items || []).map((it) => {
       const qty = safeNumber(it.quantity || 0);
       const basePrice = safeNumber(it.base_price || 0);
 
-      // total addons per unit
       const addons_unit = (it.addons || []).reduce(
         (s, a) => s + (Number.isFinite(+a.price) ? +a.price : 0) * (a.qty || 1),
         0
       );
 
       const unit_before_tax = basePrice + addons_unit;
-
-      // unit tax (rounded)
-      const unit_tax = Math.round(unit_before_tax * taxRate);
-
-      const unit_price_incl_tax = unit_before_tax + unit_tax;
-
-      const line_tax = unit_tax * qty;
-      const line_price_incl_tax = unit_price_incl_tax * qty;
+      const line_subtotal = Number(it.line_subtotal ?? unit_before_tax * qty);
 
       return {
         name: it.name,
@@ -2314,26 +2254,21 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
           qty: a.qty || 1
         })),
         notes: it.notes || '',
-        line_subtotal: safeNumber(it.line_subtotal || 0),
-
-        // tambahan: pajak & harga termasuk pajak
-        unit_before_tax,
-        unit_tax,
-        unit_price_incl_tax,
-        line_tax,
-        line_price_incl_tax
+        line_subtotal
       };
     }),
     totals: {
-      items_subtotal: order.items_subtotal || 0,
-      service_fee: order.service_fee || 0,
-      delivery_fee: order.delivery_fee || 0,
-      items_discount: order.items_discount || 0,
-      shipping_discount: order.shipping_discount || 0,
-      tax_rate_percent: order.tax_rate_percent || Math.round(taxRate * 100),
-      tax_amount: order.tax_amount || 0,
-      rounding_delta: order.rounding_delta || 0,
-      grand_total: order.grand_total || 0
+      items_subtotal: safeNumber(order.items_subtotal || 0), // BEFORE tax
+      service_fee: safeNumber(order.service_fee || 0),
+      delivery_fee: safeNumber(order.delivery_fee || 0),
+      items_discount: safeNumber(order.items_discount || 0),
+      shipping_discount: safeNumber(order.shipping_discount || 0),
+      tax_rate_percent: safeNumber(
+        order.tax_rate_percent || Math.round((parsePpnRate() || 0.11) * 100)
+      ),
+      tax_amount: safeNumber(order.tax_amount || 0),
+      rounding_delta: safeNumber(order.rounding_delta || 0),
+      grand_total: safeNumber(order.grand_total || 0)
     },
     payment: {
       method: order.payment_method || null,
@@ -2378,16 +2313,15 @@ const buildOrderReceipt = (order) => {
 
   const items = Array.isArray(order.items) ? order.items : [];
 
-  const items_subtotal = Number(order.items_subtotal || 0); // BEFORE tax (schema)
+  const items_subtotal = Number(order.items_subtotal || 0); // BEFORE tax
   const items_discount = Number(order.items_discount || 0);
   const delivery_fee = Number(order.delivery_fee || 0);
   const shipping_discount = Number(order.shipping_discount || 0);
   const service_fee = Number(order.service_fee || 0);
   const tax_amount_total = Number(order.tax_amount || 0);
-  const tax_rate_percent = Number(order.tax_rate_percent || 0);
-
-  // ===== Correct tax base: only items after item discount (per schema logic) =====
-  const taxDenominator = Math.max(0, items_subtotal - items_discount);
+  const tax_rate_percent = Number(
+    order.tax_rate_percent || Math.round(parsePpnRate() * 100)
+  );
 
   // helper: compute line subtotal (before tax) from item
   const lineSubtotalOf = (it) => {
@@ -2400,56 +2334,16 @@ const buildOrderReceipt = (order) => {
     return (unitBase + addonsUnit) * qty;
   };
 
-  // 1) first pass: compute line_before_tax for each item
-  const tmp = items.map((it) => {
+  // build items array: no per-item tax/service, only base & line_subtotal
+  const detailedItems = items.map((it) => {
     const qty = Number(it.quantity || 0);
-    const line_before_tax = Number(it.line_subtotal ?? lineSubtotalOf(it));
-    return {
-      raw: it,
-      line_before_tax,
-      qty
-    };
-  });
-
-  // 2) allocate tax proportionally (round each line), but keep total consistent with order.tax_amount
-  let allocatedTotalTax = 0;
-  const perLineTax = tmp.map((row) => {
-    let line_tax = 0;
-    if (taxDenominator > 0 && row.line_before_tax > 0) {
-      line_tax = Math.round(
-        (tax_amount_total * row.line_before_tax) / taxDenominator
-      );
-    } else {
-      line_tax = 0;
-    }
-    allocatedTotalTax += line_tax;
-    return line_tax;
-  });
-
-  // 3) fix rounding diff by adding remainder to first non-zero line (or first line)
-  const taxDiff = tax_amount_total - allocatedTotalTax;
-  if (taxDiff !== 0 && perLineTax.length > 0) {
-    // find index of first line that has >0 line_before_tax, else use 0
-    let idx = perLineTax.findIndex((t, i) => tmp[i].line_before_tax > 0);
-    if (idx === -1) idx = 0;
-    perLineTax[idx] = (perLineTax[idx] || 0) + taxDiff;
-  }
-
-  // 4) build detailed items array with unit-level fields and line totals
-  const detailedItems = tmp.map((row, i) => {
-    const it = row.raw;
-    const qty = row.qty;
     const unit_base = Number(it.base_price || 0);
     const addons_unit = (it.addons || []).reduce(
       (s, a) => s + Number(a.price || 0) * Number(a.qty || 1),
       0
     );
     const unit_before_tax = unit_base + addons_unit;
-    const line_before_tax = row.line_before_tax;
-    const line_tax = perLineTax[i] || 0;
-    const unit_tax = qty > 0 ? Math.round(line_tax / qty) : 0;
-    const unit_price_incl_tax = unit_before_tax + unit_tax;
-    const line_total_incl_tax = line_before_tax + line_tax;
+    const line_before_tax = Number(it.line_subtotal ?? lineSubtotalOf(it));
 
     return {
       name: it.name,
@@ -2461,23 +2355,21 @@ const buildOrderReceipt = (order) => {
         price: Number(ad.price || 0),
         qty: Number(ad.qty || 1)
       })),
-      // per-unit and per-line pricing
-      unit_price: unit_before_tax, // before tax
-      unit_tax, // per unit tax (rounded)
-      unit_price_incl_tax, // per unit incl tax
-      line_before_tax, // line total before tax
-      line_tax, // line tax (rounded)
-      line_total_incl_tax // line total including tax
+      unit_price: unit_before_tax,
+      line_before_tax
     };
   });
 
-  // 5) totals sanity: compute items_subtotal_with_tax from detailedItems
-  const items_subtotal_with_tax = detailedItems.reduce(
-    (s, it) => s + Number(it.line_total_incl_tax || 0),
-    0
-  );
+  // totals for display
+  const items_subtotal_with_tax = items_subtotal + tax_amount_total;
+  const raw_total_before_rounding =
+    items_subtotal +
+    service_fee +
+    delivery_fee -
+    items_discount -
+    shipping_discount +
+    tax_amount_total;
 
-  // Return receipt-shaped object (clear & easy for FE)
   return {
     id: String(order._id),
     transaction_code: order.transaction_code || '',
@@ -2486,8 +2378,9 @@ const buildOrderReceipt = (order) => {
     payment_method: order.payment_method,
 
     pricing: {
-      // keep original semantics: items_subtotal = before-tax (schema)
-      items_subtotal: items_subtotal_with_tax, // added: menu + tax
+      // clearly separate before-tax and with-tax values
+      items_subtotal_before_tax: items_subtotal,
+      items_subtotal_with_tax: items_subtotal_with_tax,
       service_fee,
       delivery_fee,
       items_discount,
@@ -2495,7 +2388,8 @@ const buildOrderReceipt = (order) => {
       tax_amount: tax_amount_total,
       tax_rate_percent,
       rounding_delta: Number(order.rounding_delta || 0),
-      grand_total: Number(order.grand_total || 0)
+      grand_total: Number(order.grand_total || 0),
+      raw_total_before_rounding
     },
 
     customer: {
@@ -2662,20 +2556,24 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     itemsSubtotal += line_subtotal;
   }
 
-  // ===== Pajak & Pembulatan =====
-  const rawRate = Number(process.env.PPN_RATE ?? 0.11);
-  const rate = Number.isFinite(rawRate)
-    ? rawRate > 1
-      ? rawRate / 100
-      : rawRate
-    : 0.11;
+  // ===== Aggregate service & tax & rounding =====
+  const sfRate = Number(SERVICE_FEE_RATE || 0);
+  const serviceFee = int(Math.round(itemsSubtotal * sfRate));
+
+  const rate =
+    Number.isFinite(Number(process.env.PPN_RATE ?? 0.11)) &&
+    Number(process.env.PPN_RATE ?? 0.11) > 0
+      ? Number(process.env.PPN_RATE) > 1
+        ? Number(process.env.PPN_RATE) / 100
+        : Number(process.env.PPN_RATE)
+      : parsePpnRate();
   const taxRatePercent = Math.round(rate * 100 * 100) / 100;
   const taxBase = itemsSubtotal; // POS: no voucher, no delivery
-  const taxAmount = int(Math.max(0, taxBase * rate));
+  const taxAmount = int(Math.max(0, Math.round(taxBase * rate)));
 
-  const beforeRound = int(taxBase + taxAmount);
-  const grandTotal = int(roundRupiahCustom(beforeRound));
-  const roundingDelta = int(grandTotal - beforeRound);
+  const rawBeforeRound = itemsSubtotal + serviceFee + taxAmount;
+  const grandTotal = int(roundRupiahCustom(rawBeforeRound));
+  const roundingDelta = int(grandTotal - rawBeforeRound);
 
   const now = new Date();
 
@@ -2703,6 +2601,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           delivery_fee: 0,
           shipping_discount: 0,
           discounts: [],
+          service_fee: serviceFee,
           tax_rate_percent: taxRatePercent,
           tax_amount: taxAmount,
           rounding_delta: roundingDelta,
@@ -2827,16 +2726,23 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     itemsSubtotal += line_subtotal;
   }
 
-  // Pajak (PPN) — sama rumusnya dengan createPosDineIn
-  const raw = Number(process.env.PPN_RATE ?? 0.11);
-  const rate = Number.isFinite(raw) ? (raw > 1 ? raw / 100 : raw) : 0.11;
+  // Aggregate service & tax
+  const sfRate = Number(SERVICE_FEE_RATE || 0);
+  const serviceFee = int(Math.round(itemsSubtotal * sfRate));
+
+  const rawRate = Number(process.env.PPN_RATE ?? 0.11);
+  const rate = Number.isFinite(rawRate)
+    ? rawRate > 1
+      ? rawRate / 100
+      : rawRate
+    : parsePpnRate();
   const taxRatePercent = Math.round(rate * 100 * 100) / 100;
   const taxBase = itemsSubtotal;
-  const taxAmount = int(Math.max(0, taxBase * rate));
+  const taxAmount = int(Math.max(0, Math.round(taxBase * rate)));
 
-  const beforeRound = int(taxBase + taxAmount);
-  const grandTotal = int(roundRupiahCustom(beforeRound));
-  const roundingDelta = int(grandTotal - beforeRound);
+  const rawBeforeRound = itemsSubtotal + serviceFee + taxAmount;
+  const grandTotal = int(roundRupiahCustom(rawBeforeRound));
+  const roundingDelta = int(grandTotal - rawBeforeRound);
 
   res.json({
     success: true,
@@ -2844,9 +2750,11 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       items: orderItems,
       total_quantity: totalQty,
       items_subtotal: itemsSubtotal,
+      items_subtotal_before_tax: itemsSubtotal,
       items_discount: 0,
       delivery_fee: 0,
       shipping_discount: 0,
+      service_fee: serviceFee,
       tax_rate_percent: taxRatePercent,
       tax_amount: taxAmount,
       grand_total: grandTotal,
