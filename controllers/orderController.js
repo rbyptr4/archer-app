@@ -1724,16 +1724,13 @@ exports.createQrisFromCart = async (req, res, next) => {
           !providedSlot &&
           (!providedScheduledAt || !providedScheduledAt.isValid())
         ) {
-          throwError(
-            'Untuk delivery: delivery_slot atau scheduled_at wajib',
-            400
-          );
+          throwError('Jadwal pengantaran wajib diisi (delivery_slot)', 400);
         }
       } else if (delivery_mode === 'pickup') {
         // pickup: wajib pickup_from & pickup_to (ISO) — pickup_window_raw tidak dipakai lagi
         if (!pickup_from_iso || !pickup_to_iso) {
           throwError(
-            'Untuk pickup: pickup_from dan pickup_to (ISO) wajib',
+            'Jadwal pengambilan wajib diisi (pickup_from & pickup_to)',
             400
           );
         }
