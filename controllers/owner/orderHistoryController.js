@@ -284,8 +284,8 @@ exports.summaryByPeriod = asyncHandler(async (req, res) => {
   const match = buildCommonMatch(req.query);
 
   // default filtering untuk reporting: completed + verified (kamu bisa override dengan query)
-  if (!req.query.status) match.status = 'completed';
-  if (!req.query.payment_status) match.payment_status = 'verified';
+  if (!req.query.status) match.status = 'created';
+  if (!req.query.payment_status) match.payment_status = 'paid';
 
   // window pakai paid_at
   match.paid_at = { $gte: start, $lte: end };
@@ -308,7 +308,10 @@ exports.summaryByPeriod = asyncHandler(async (req, res) => {
         voidCount: {
           $sum: { $cond: [{ $eq: ['$payment_status', 'void'] }, 1, 0] }
         },
-        cancelledCount: { $sum: { $cond: ['$status', 'cancelled', 1, 0] } },
+        // <<-- perbaikan di sini: pakai format [ condition, then, else ]
+        cancelledCount: {
+          $sum: { $cond: [{ $eq: ['$status', 'cancelled'] }, 1, 0] }
+        },
 
         omzet: { $sum: '$items_subtotal' },
         pendapatan: { $sum: '$grand_total' },
@@ -378,7 +381,7 @@ exports.totalPaidTransactions = asyncHandler(async (req, res) => {
     count,
     total_grand: totalGrand,
     total_items_subtotal: agg?.total_items_subtotal || 0,
-    avg_ticket_size: count ? Math.round(totalGrand / count) : 0,
+    average_per_orders: count ? Math.round(totalGrand / count) : 0,
     list
   });
 });
@@ -397,8 +400,8 @@ exports.financeSales = asyncHandler(async (req, res) => {
 
   // default filter: completed + verified, kecuali user override
   const baseMatch = buildCommonMatch({ ...req.query });
-  if (!req.query.status) baseMatch.status = 'completed';
-  if (!req.query.payment_status) baseMatch.payment_status = 'verified';
+  if (!req.query.status) baseMatch.status = 'created';
+  if (!req.query.payment_status) baseMatch.payment_status = 'paid';
   baseMatch.paid_at = { $gte: start, $lte: end };
 
   const sumField = metric === 'omzet' ? '$items_subtotal' : '$grand_total';
@@ -508,8 +511,8 @@ exports.profitLoss = asyncHandler(async (req, res) => {
 
   // Revenue from Order model (default completed + verified)
   const revenueMatchBase = buildCommonMatch({ ...req.query });
-  if (!req.query.status) revenueMatchBase.status = 'completed';
-  if (!req.query.payment_status) revenueMatchBase.payment_status = 'verified';
+  if (!req.query.status) revenueMatchBase.status = 'created';
+  if (!req.query.payment_status) revenueMatchBase.payment_status = 'paid';
   revenueMatchBase.paid_at = { $gte: start, $lte: end };
   const revenueField =
     revenueMetric === 'omzet' ? '$items_subtotal' : '$grand_total';
@@ -601,8 +604,8 @@ exports.bestSellers = asyncHandler(async (req, res) => {
   const match = buildCommonMatch({ ...req.query });
 
   // default to only take completed+verified sales for best-sellers (overrideable)
-  if (!req.query.status) match.status = 'completed';
-  if (!req.query.payment_status) match.payment_status = 'verified';
+  if (!req.query.status) match.status = 'created';
+  if (!req.query.payment_status) match.payment_status = 'paid';
   match.paid_at = { $gte: start, $lte: end };
 
   // build group id like before but using Order.items fields

@@ -711,12 +711,15 @@ exports.getCart = asyncHandler(async (req, res) => {
         ? Math.round((taxAmountOnItems * line_before_tax) / taxDenominator)
         : 0;
     const unit_tax = qty > 0 ? Math.round(line_tax / qty) : 0;
+    const unit_price_incl_tax = unit_before_tax + unit_tax;
+    const total_unit_with_tax = int(unit_price_incl_tax * qty);
 
     return {
       ...it,
       unit_price: unit_before_tax,
       unit_tax,
-      unit_price_incl_tax: unit_before_tax + unit_tax
+      unit_price_incl_tax, // harga 1 unit termasuk pajak
+      total_unit_with_tax // unit_price_incl_tax * qty
     };
   });
 
