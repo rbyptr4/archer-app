@@ -645,9 +645,7 @@ exports.getCart = asyncHandler(async (req, res) => {
   /* ========== 4) Build ringkasan awal ========== */
   const ui = buildUiTotalsFromCart(cart);
 
-  const items_subtotal = Number(
-    ui.items_subtotal_before_tax || ui.items_subtotal || 0
-  );
+  const items_subtotal = Number(ui.items_subtotal || 0);
   const items_discount = Number(ui.items_discount || 0);
   const shipping_discount = Number(ui.shipping_discount || 0);
 
@@ -1561,17 +1559,14 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
       register_decision = 'register'
     } = req.body || {};
 
-    /* ===== Resolve fulfillment type ===== */
     const ft =
       iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
-    if (!['dine_in', 'delivery'].includes(ft)) {
+    if (!['dine_in', 'delivery'].includes(ft))
       return res.status(400).json({ message: 'fulfillment_type tidak valid' });
-    }
 
-    /* ===== Member / Guest (mirip checkout) ===== */
+    // Member / guest resolution
     const originallyLoggedIn = !!iden0.memberId;
     const wantRegister = String(register_decision || 'register') === 'register';
-
     let member = null;
     let customer_name = '';
     let customer_phone = '';
@@ -1579,7 +1574,6 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
     if (originallyLoggedIn || wantRegister) {
       const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
       member = await ensureMemberForCheckout(req, res, joinChannel);
-
       if (member) {
         customer_name =
           String(member.name || '').trim() || String(name || '').trim();
@@ -1599,8 +1593,6 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
     }
 
     const finalMemberId = member ? member._id : null;
-
-    /* ===== Ambil cart aktif ===== */
     const iden = {
       ...iden0,
       memberId: finalMemberId || iden0.memberId || null,
@@ -1611,17 +1603,16 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
         null
     };
 
+    // get active cart
     const cartObj = await getActiveCartForIdentity(iden, {
       allowCreateOnline: false
     });
-    if (!cartObj) {
+    if (!cartObj)
       return res.status(404).json({ message: 'Cart tidak ditemukan / kosong' });
-    }
 
     const cart = await Cart.findById(cartObj._id);
-    if (!cart || !cart.items?.length) {
+    if (!cart || !cart.items?.length)
       return res.status(404).json({ message: 'Cart kosong' });
-    }
 
     if (
       ft === 'dine_in' &&
@@ -1643,12 +1634,12 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
         ? 'none'
         : String(req.body?.delivery_mode || 'delivery').toLowerCase();
 
+    // --- slot/pickup validation (reuse your existing logic if present) ---
     const providedSlot = (req.body?.delivery_slot || '').trim();
     const providedScheduledAtRaw = req.body?.scheduled_at || null;
     const providedScheduledAt = providedScheduledAtRaw
       ? dayjs(providedScheduledAtRaw).tz(LOCAL_TZ)
       : null;
-
     const pickup_from_iso = req.body?.pickup_from || null;
     const pickup_to_iso = req.body?.pickup_to || null;
 
@@ -1672,93 +1663,34 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
       }
     }
 
-    let slotLabel = null;
-    let slotDt = null;
-    if (
-      delivery_mode === 'delivery' &&
-      providedScheduledAt &&
-      providedScheduledAt.isValid()
-    ) {
-      slotDt = providedScheduledAt.startOf('minute');
-      slotLabel = slotDt.format('HH:mm');
-    } else if (delivery_mode === 'delivery' && providedSlot) {
-      const maybeDt = parseSlotLabelToDate(providedSlot);
-      if (!maybeDt || !maybeDt.isValid()) {
-        throwError('delivery_slot tidak valid', 400);
-      } else {
-        slotDt = maybeDt;
-        slotLabel = providedSlot;
-      }
-    }
+    // sanitize items & addons
+    cart.items = (Array.isArray(cart.items) ? cart.items : [])
+      .filter(Boolean)
+      .map((it) => {
+        const rawAddons = Array.isArray(it.addons) ? it.addons : [];
+        const safeAddons = rawAddons
+          .filter((a) => a && typeof a === 'object')
+          .map((a) => ({
+            name: String(a.name || '').trim(),
+            price: int(a.price || 0),
+            qty: clamp(int(a.qty || 1), 1, 999),
+            ...(typeof a.isActive === 'boolean'
+              ? { isActive: !!a.isActive }
+              : {})
+          }));
 
-    if (
-      slotLabel &&
-      ft !== 'dine_in' &&
-      delivery_mode === 'delivery' &&
-      !isSlotAvailable(slotLabel, null, delivery_mode)
-    ) {
-      throwError('Slot sudah tidak tersedia / sudah lewat', 409);
-    }
+        return {
+          ...it,
+          addons: safeAddons,
+          notes: String(it.notes || '').trim()
+        };
+      });
 
-    let deliveryObj = {
-      mode: ft === 'dine_in' ? 'none' : delivery_mode,
-      slot_label: slotLabel || null,
-      scheduled_at: slotDt ? slotDt.toDate() : null,
-      status: 'pending'
-    };
-
-    let pickupWindowFrom = null;
-    let pickupWindowTo = null;
-
-    if (delivery_mode === 'pickup' && ft !== 'dine_in') {
-      const f = dayjs(pickup_from_iso).tz(LOCAL_TZ);
-      const t = dayjs(pickup_to_iso).tz(LOCAL_TZ);
-      if (!f.isValid() || !t.isValid()) {
-        throwError('pickup_from/pickup_to tidak valid ISO', 400);
-      }
-      pickupWindowFrom = f;
-      pickupWindowTo = t;
-
-      if (!pickupWindowFrom.isBefore(pickupWindowTo))
-        throwError('pickup_window: from harus < to', 400);
-
-      deliveryObj.pickup_window = {
-        from: pickupWindowFrom.toDate(),
-        to: pickupWindowTo.toDate()
-      };
-
-      if (!deliveryObj.scheduled_at) {
-        deliveryObj.scheduled_at = pickupWindowFrom.toDate();
-        deliveryObj.slot_label = pickupWindowFrom.format('HH:mm');
-      }
-    }
-
-    // Delivery-specific: alamat & radius
-    let delivery_fee = 0;
-    if (ft !== 'dine_in' && delivery_mode === 'delivery') {
-      const latN = Number(req.body?.lat);
-      const lngN = Number(req.body?.lng);
-      if (!Number.isFinite(latN) || !Number.isFinite(lngN)) {
-        throwError('Lokasi (lat,lng) wajib untuk delivery', 400);
-      }
-      const distance_km = haversineKm(CAFE_COORD, { lat: latN, lng: lngN });
-      if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0)) {
-        throwError(`Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`, 400);
-      }
-      deliveryObj.address_text = String(req.body?.address_text || '').trim();
-      deliveryObj.location = { lat: latN, lng: lngN };
-      deliveryObj.distance_km = Number(distance_km.toFixed(2));
-      delivery_fee = calcDeliveryFee();
-      deliveryObj.delivery_fee = delivery_fee;
-    } else {
-      deliveryObj.note_to_rider = String(req.body?.note_to_rider || '');
-    }
-
-    /* ===== Hitung ulang cart ===== */
+    // recompute cart totals and persist
     recomputeTotals(cart);
     await cart.save();
 
-    /* ===== Voucher ===== */
+    // voucher filtering (if member)
     let eligibleClaimIds = [];
     if (finalMemberId) {
       if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
@@ -1767,7 +1699,6 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
           member: finalMemberId,
           status: 'claimed'
         }).lean();
-
         const now = new Date();
         eligibleClaimIds = rawClaims
           .filter((c) => !c.validUntil || c.validUntil > now)
@@ -1779,6 +1710,7 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
         .json({ message: 'Voucher hanya untuk member. Silakan daftar/login.' });
     }
 
+    // optional: validateAndPrice for promotions/breakdown (we still call it)
     const priced = await validateAndPrice({
       memberId: finalMemberId,
       cart: {
@@ -1790,43 +1722,21 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
         }))
       },
       fulfillmentType: ft,
-      deliveryFee: delivery_fee,
+      deliveryFee: cart.delivery?.delivery_fee || 0,
       voucherClaimIds: eligibleClaimIds
     });
 
-    /* ===== AGGREGATE: service & tax dari items_subtotal (SINGLE SOURCE) ===== */
-    const items_subtotal = int(priced.totals.baseSubtotal);
-    const items_discount = int(priced.totals.itemsDiscount);
-    const shipping_discount = int(priced.totals.shippingDiscount);
-    const baseDelivery = int(priced.totals.deliveryFee);
+    // --- KEY: use cart UI totals as authoritative for payment amount ---
+    const uiTotals = buildUiTotalsFromCart(cart);
+    const requested_bvt = int(Number(uiTotals.grand_total || 0));
+    const rounding_delta = int(Number(uiTotals.rounding_delta || 0));
 
-    // Service fee: 2% dari total items (aggregate)
-    const service_fee = int(Math.round(items_subtotal * SERVICE_FEE_RATE));
-
-    // Tax: aggregate dari items_subtotal (NOT affected by voucher)
-    const rateForTax = parsePpnRate();
-    const taxAmount = int(Math.round(items_subtotal * rateForTax));
-    const taxRatePercent = Math.round(rateForTax * 100 * 100) / 100;
-
-    // ===== Total sebelum pembulatan (items + service + delivery - discounts + tax)
-    const beforeRound = int(
-      items_subtotal +
-        service_fee +
-        baseDelivery -
-        items_discount -
-        shipping_discount +
-        taxAmount
-    );
-    const requested_bvt = int(roundRupiahCustom(beforeRound));
-    const rounding_delta = int(requested_bvt - beforeRound);
-
-    if (requested_bvt <= 0) {
+    if (!requested_bvt || requested_bvt <= 0) {
       return res.status(400).json({ message: 'Total pembayaran tidak valid.' });
     }
 
-    /* ===== Buat PaymentSession ===== */
+    // create payment session and attach uiTotals so FE can render identical numbers
     const reference_id = `QRIS-${cart._id}-${Date.now()}`;
-
     const sessionPayload = {
       member: finalMemberId || null,
       customer_name,
@@ -1847,62 +1757,48 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
         notes: it.notes,
         category: it.category || null
       })),
-      items_subtotal,
-      delivery_fee: baseDelivery,
-      service_fee,
-      items_discount,
-      shipping_discount,
-      discounts: priced.breakdown,
+      items_subtotal: int(priced.totals.baseSubtotal),
+      delivery_fee: int(priced.totals.deliveryFee),
+      service_fee: int(uiTotals.service_fee || 0),
+      items_discount: int(priced.totals.itemsDiscount || 0),
+      shipping_discount: int(priced.totals.shippingDiscount || 0),
+      discounts: priced.breakdown || [],
       requested_amount: requested_bvt,
       rounding_delta,
-      delivery_snapshot: deliveryObj,
+      ui_totals: uiTotals,
+      delivery_snapshot: cart.delivery || {},
       provider: 'xendit',
       channel: 'qris',
       external_id: reference_id
     };
 
-    if (deliveryObj.pickup_window) {
+    if (cart.delivery?.pickup_window) {
       sessionPayload.pickup_window = {
-        from: deliveryObj.pickup_window.from,
-        to: deliveryObj.pickup_window.to
+        from: cart.delivery.pickup_window.from,
+        to: cart.delivery.pickup_window.to
       };
     }
 
     const session = await PaymentSession.create(sessionPayload);
 
-    /* ===== Call Xendit QR ===== */
-    const payload = {
+    // call Xendit with authoritative amount from cart
+    const xenditPayload = {
       reference_id,
       type: 'DYNAMIC',
       currency: 'IDR',
-      amount: requested_bvt,
+      amount: Number(requested_bvt),
       metadata: { payment_session_id: String(session._id) }
     };
-    // tepat sebelum call axios.post(`${X_BASE}/qr_codes`, payload, ...)
+
+    // optional debug log (remove later)
     console.log(
-      '[QR][DEBUG] items_subtotal=',
-      items_subtotal,
-      'service_fee=',
-      service_fee,
-      'taxAmount=',
-      taxAmount,
-      'baseDelivery=',
-      baseDelivery,
-      'items_discount=',
-      items_discount,
-      'shipping_discount=',
-      shipping_discount
-    );
-    console.log(
-      '[QR][DEBUG] beforeRound=',
-      beforeRound,
-      'requested_bvt=',
-      requested_bvt,
-      'payload.amount=',
-      payload.amount
+      '[QR][DEBUG] amount->',
+      xenditPayload.amount,
+      'uiTotals.grand_total=',
+      uiTotals.grand_total
     );
 
-    const resp = await axios.post(`${X_BASE}/qr_codes`, payload, {
+    const resp = await axios.post(`${X_BASE}/qr_codes`, xenditPayload, {
       auth: { username: X_KEY, password: '' },
       headers: { ...HDRS, 'api-version': '2022-07-31' },
       timeout: 15000
@@ -1910,9 +1806,12 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
 
     const qr = resp.data;
 
+    // persist back
     session.qr_code_id = qr.id;
     session.qr_string = qr.qr_string;
     session.expires_at = qr.expires_at ? new Date(qr.expires_at) : null;
+    session.requested_amount = requested_bvt;
+    session.ui_totals = uiTotals;
     await session.save();
 
     return res.json({
@@ -1920,12 +1819,13 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
       data: {
         sessionId: String(session._id),
         channel: 'QRIS',
-        amount: requested_bvt,
+        amount: requested_bvt, // authoritative: taken from cart UI totals
         qris: {
           qr_id: qr.id,
           qr_string: qr.qr_string,
           expiry_at: qr.expires_at
         },
+        ui_totals: uiTotals,
         status: 'pending'
       }
     });
@@ -2397,7 +2297,7 @@ const buildOrderReceipt = (order) => {
 
     pricing: {
       // clearly separate before-tax and with-tax values
-      items_subtotal_before_tax: items_subtotal,
+      items_subtotal: items_subtotal,
       service_fee,
       delivery_fee,
       items_discount,
@@ -2767,7 +2667,6 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       items: orderItems,
       total_quantity: totalQty,
       items_subtotal: itemsSubtotal,
-      items_subtotal_before_tax: itemsSubtotal,
       items_discount: 0,
       delivery_fee: 0,
       shipping_discount: 0,
