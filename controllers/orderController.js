@@ -131,31 +131,14 @@ function parseSlotLabelToDate(slotLabel, day = null) {
   return base.hour(hh).minute(mm).second(0).millisecond(0);
 }
 
-// function getSlotsForDate(dateDay = null) {
-//   const day = dateDay
-//     ? dateDay.tz(LOCAL_TZ).startOf('day')
-//     : dayjs().tz(LOCAL_TZ).startOf('day');
-//   const now = dayjs().tz(LOCAL_TZ);
-//   return (DELIVERY_SLOTS || []).map((label) => {
-//     const dt = parseSlotLabelToDate(label, day);
-//     const available = dt && dt.isValid() && now.isBefore(dt); // only future slots allowed (strict: now < slot)
-//     return {
-//       label,
-//       datetime: dt ? dt.toDate() : null,
-//       available
-//     };
-//   });
-// }
-
 function getSlotsForDate(dateDay = null) {
   const day = dateDay
     ? dateDay.tz(LOCAL_TZ).startOf('day')
     : dayjs().tz(LOCAL_TZ).startOf('day');
-  // const now = dayjs().tz(LOCAL_TZ); // tidak diperlukan lagi untuk testing "always available"
+  const now = dayjs().tz(LOCAL_TZ);
   return (DELIVERY_SLOTS || []).map((label) => {
     const dt = parseSlotLabelToDate(label, day);
-    // Untuk testing: anggap semua slot yang parse-able sebagai available
-    const available = !!(dt && dt.isValid());
+    const available = dt && dt.isValid() && now.isBefore(dt); // only future slots allowed (strict: now < slot)
     return {
       label,
       datetime: dt ? dt.toDate() : null,
@@ -163,6 +146,23 @@ function getSlotsForDate(dateDay = null) {
     };
   });
 }
+
+// function getSlotsForDate(dateDay = null) {
+//   const day = dateDay
+//     ? dateDay.tz(LOCAL_TZ).startOf('day')
+//     : dayjs().tz(LOCAL_TZ).startOf('day');
+//   // const now = dayjs().tz(LOCAL_TZ); // tidak diperlukan lagi untuk testing "always available"
+//   return (DELIVERY_SLOTS || []).map((label) => {
+//     const dt = parseSlotLabelToDate(label, day);
+//     // Untuk testing: anggap semua slot yang parse-able sebagai available
+//     const available = !!(dt && dt.isValid());
+//     return {
+//       label,
+//       datetime: dt ? dt.toDate() : null,
+//       available
+//     };
+//   });
+// }
 
 function isSlotAvailable(label, dateDay = null) {
   const slot = getSlotsForDate(dateDay).find((s) => s.label === label);
