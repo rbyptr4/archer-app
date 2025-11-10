@@ -10,6 +10,7 @@ const {
 } = require('../../controllers/owner/orderHistoryController');
 const { awardPointsIfEligible } = require('../../utils/loyalty');
 const { nextDailyTxCode } = require('../../utils/txCode');
+const throwError = require('../../utils/throwError');
 const { int } = require('../../utils/money');
 const {
   emitToMember,
@@ -269,10 +270,12 @@ exports.xenditQrisWebhook = async (req, res) => {
           verified_by_name: 'XenditWebhook'
         }).catch(() => {});
       } catch (err) {
+        throwError('');
         console.error('[OrderHistory][xenditQrisWebhook]', err?.message || err);
       }
     }
   } catch (e) {
+    throwError('error: ' + e, 400);
     console.error('[xendit webhook] error', e);
   }
 };
