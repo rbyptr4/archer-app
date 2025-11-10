@@ -270,12 +270,10 @@ exports.xenditQrisWebhook = async (req, res) => {
           verified_by_name: 'XenditWebhook'
         }).catch(() => {});
       } catch (err) {
-        throwError('');
         console.error('[OrderHistory][xenditQrisWebhook]', err?.message || err);
       }
     }
   } catch (e) {
-    throwError('error: ' + e, 400);
     console.error('[xendit webhook] error', e);
   }
 };
