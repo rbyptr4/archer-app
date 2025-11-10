@@ -622,8 +622,7 @@ exports.getCart = asyncHandler(async (req, res) => {
       tax_amount: 0,
       rounding_delta: 0,
       grand_total: 0,
-      grand_total_with_delivery: 0,
-      grand_total_before_rounding: 0
+      grand_total_with_delivery: 0
     };
     return res.status(200).json({ cart: null, ui_totals: empty });
   }
@@ -673,7 +672,6 @@ exports.getCart = asyncHandler(async (req, res) => {
   ui.service_fee = service_fee_on_items;
   ui.tax_amount = taxAmountOnItems;
   ui.tax_rate_percent = taxRatePercent;
-  ui.grand_total_before_rounding = int(pureBeforeWithService);
 
   const pureRounded = int(roundRupiahCustom(int(pureBeforeWithService)));
   ui.grand_total = pureRounded;
@@ -1882,6 +1880,29 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
       amount: requested_bvt,
       metadata: { payment_session_id: String(session._id) }
     };
+    // tepat sebelum call axios.post(`${X_BASE}/qr_codes`, payload, ...)
+    console.log(
+      '[QR][DEBUG] items_subtotal=',
+      items_subtotal,
+      'service_fee=',
+      service_fee,
+      'taxAmount=',
+      taxAmount,
+      'baseDelivery=',
+      baseDelivery,
+      'items_discount=',
+      items_discount,
+      'shipping_discount=',
+      shipping_discount
+    );
+    console.log(
+      '[QR][DEBUG] beforeRound=',
+      beforeRound,
+      'requested_bvt=',
+      requested_bvt,
+      'payload.amount=',
+      payload.amount
+    );
 
     const resp = await axios.post(`${X_BASE}/qr_codes`, payload, {
       auth: { username: X_KEY, password: '' },
@@ -2361,7 +2382,6 @@ const buildOrderReceipt = (order) => {
   });
 
   // totals for display
-  const items_subtotal_with_tax = items_subtotal + tax_amount_total;
   const raw_total_before_rounding =
     items_subtotal +
     service_fee +
@@ -2380,7 +2400,6 @@ const buildOrderReceipt = (order) => {
     pricing: {
       // clearly separate before-tax and with-tax values
       items_subtotal_before_tax: items_subtotal,
-      items_subtotal_with_tax: items_subtotal_with_tax,
       service_fee,
       delivery_fee,
       items_discount,
