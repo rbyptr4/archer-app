@@ -131,6 +131,22 @@ function parseSlotLabelToDate(slotLabel, day = null) {
   return base.hour(hh).minute(mm).second(0).millisecond(0);
 }
 
+// function getSlotsForDate(dateDay = null) {
+//   const day = dateDay
+//     ? dateDay.tz(LOCAL_TZ).startOf('day')
+//     : dayjs().tz(LOCAL_TZ).startOf('day');
+//   const now = dayjs().tz(LOCAL_TZ);
+//   return (DELIVERY_SLOTS || []).map((label) => {
+//     const dt = parseSlotLabelToDate(label, day);
+//     const available = dt && dt.isValid() && now.isBefore(dt); // only future slots allowed (strict: now < slot)
+//     return {
+//       label,
+//       datetime: dt ? dt.toDate() : null,
+//       available
+//     };
+//   });
+// }
+
 function getSlotsForDate(dateDay = null) {
   const day = dateDay
     ? dateDay.tz(LOCAL_TZ).startOf('day')
@@ -1168,50 +1184,66 @@ exports.checkout = asyncHandler(async (req, res) => {
       ? 'none'
       : String(req.body?.delivery_mode || 'delivery').toLowerCase(); // 'delivery'|'pickup'|'none'
 
-  // ambil input slot/scheduled/pickup window (tetap baca kalau ada, tapi validasi hanya untuk delivery/pickup)
+  // ambil input slot/scheduled/pickup window (tetap baca kalau ada, tapi validasi dipisah berdasarkan delivery_mode)
   const providedSlot = (req.body?.delivery_slot || '').trim();
   const providedScheduledAtRaw = req.body?.scheduled_at || null;
   const providedScheduledAt = providedScheduledAtRaw
     ? dayjs(providedScheduledAtRaw).tz(LOCAL_TZ)
     : null;
 
-  const pickup_window_raw = String(req.body?.pickup_window_raw || '').trim();
-  const pickup_date = req.body?.pickup_date || null;
+  // pickup ISO (preferensi baru) — untuk pickup wajib pakai ISO: pickup_from & pickup_to
   const pickup_from_iso = req.body?.pickup_from || null;
   const pickup_to_iso = req.body?.pickup_to || null;
 
-  // VALIDASI HANYA JIKA BUKAN DINE_IN (artinya mode delivery/pickup diperlukan)
+  // VALIDASI HANYA JIKA BUKAN DINE_IN
   if (ft !== 'dine_in') {
-    if (
-      !providedSlot &&
-      (!providedScheduledAt || !providedScheduledAt.isValid()) &&
-      !pickup_window_raw &&
-      !(pickup_from_iso && pickup_to_iso)
-    ) {
-      throwError('delivery_slot / scheduled_at atau pickup window wajib', 400);
+    if (delivery_mode === 'delivery') {
+      // delivery: wajib delivery_slot atau scheduled_at
+      if (
+        !providedSlot &&
+        (!providedScheduledAt || !providedScheduledAt.isValid())
+      ) {
+        throwError(
+          'Untuk delivery: delivery_slot atau scheduled_at wajib',
+          400
+        );
+      }
+    } else if (delivery_mode === 'pickup') {
+      // pickup: wajib pickup_from & pickup_to (ISO) — pickup_window_raw tidak dipakai lagi
+      if (!pickup_from_iso || !pickup_to_iso) {
+        throwError('Untuk pickup: pickup_from dan pickup_to (ISO) wajib', 400);
+      }
+    } else {
+      // jika ada mode lain yang tak terduga
+      throwError('delivery_mode tidak valid', 400);
     }
   }
 
+  // --- proses slot untuk delivery (jika ada) ---
   let slotLabel = null;
   let slotDt = null;
-  if (providedScheduledAt && providedScheduledAt.isValid()) {
+  if (
+    delivery_mode === 'delivery' &&
+    providedScheduledAt &&
+    providedScheduledAt.isValid()
+  ) {
     slotDt = providedScheduledAt.startOf('minute');
     slotLabel = slotDt.format('HH:mm');
-  } else if (providedSlot) {
+  } else if (delivery_mode === 'delivery' && providedSlot) {
     const maybeDt = parseSlotLabelToDate(providedSlot);
     if (!maybeDt || !maybeDt.isValid()) {
-      // hanya error jika bukan dine_in (karena jika dine_in kita tidak memerlukan slot)
-      if (ft !== 'dine_in') throwError('delivery_slot tidak valid', 400);
+      throwError('delivery_slot tidak valid', 400);
     } else {
       slotDt = maybeDt;
       slotLabel = providedSlot;
     }
   }
 
-  // check slot availability only if slotLabel provided (type-aware) and not dine_in
+  // check slot availability only if slotLabel provided and not dine_in and mode delivery
   if (
     slotLabel &&
     ft !== 'dine_in' &&
+    delivery_mode === 'delivery' &&
     !isSlotAvailable(slotLabel, null, delivery_mode)
   ) {
     throwError('Slot sudah tidak tersedia / sudah lewat', 409);
@@ -1224,39 +1256,23 @@ exports.checkout = asyncHandler(async (req, res) => {
     status: 'pending'
   };
 
-  // parse pickup window if provided (still parse but validate only when non-dine_in & delivery_mode === 'pickup')
+  // --- proses pickup window hanya via ISO (pickup_from & pickup_to) ---
   let pickupWindowFrom = null;
   let pickupWindowTo = null;
-  if (pickup_window_raw) {
-    const parsed = parseTimeRangeToDayjs(pickup_window_raw, pickup_date);
-    if (!parsed) {
-      if (ft !== 'dine_in')
-        throwError('pickup_window_raw tidak valid (HH:mm-HH:mm)', 400);
-    } else {
-      pickupWindowFrom = parsed.from;
-      pickupWindowTo = parsed.to;
-    }
-  } else if (pickup_from_iso && pickup_to_iso) {
+
+  if (delivery_mode === 'pickup' && ft !== 'dine_in') {
     const f = dayjs(pickup_from_iso).tz(LOCAL_TZ);
     const t = dayjs(pickup_to_iso).tz(LOCAL_TZ);
     if (!f.isValid() || !t.isValid()) {
-      if (ft !== 'dine_in')
-        throwError('pickup_from/pickup_to tidak valid ISO', 400);
-    } else {
-      pickupWindowFrom = f;
-      pickupWindowTo = t;
+      throwError('pickup_from/pickup_to tidak valid ISO', 400);
     }
-  }
+    pickupWindowFrom = f;
+    pickupWindowTo = t;
 
-  if (
-    ft !== 'dine_in' &&
-    delivery_mode === 'pickup' &&
-    (pickupWindowFrom || pickupWindowTo)
-  ) {
-    if (!pickupWindowFrom || !pickupWindowTo)
-      throwError('pickup window tidak lengkap', 400);
+    // validasi lengkapnya
     if (!pickupWindowFrom.isBefore(pickupWindowTo))
       throwError('pickup_window: from harus < to', 400);
+
     const now = dayjs().tz(LOCAL_TZ);
     if (pickupWindowFrom.isBefore(now.add(MIN_LEAD_MINUTES, 'minute'))) {
       throwError(
@@ -1275,6 +1291,8 @@ exports.checkout = asyncHandler(async (req, res) => {
       from: pickupWindowFrom.toDate(),
       to: pickupWindowTo.toDate()
     };
+
+    // set scheduled_at/slot_label kalau belum ada scheduled (bantu UI)
     if (!deliveryObj.scheduled_at) {
       deliveryObj.scheduled_at = pickupWindowFrom.toDate();
       deliveryObj.slot_label = pickupWindowFrom.format('HH:mm');
@@ -1415,7 +1433,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     payment_status = 'unpaid'; // gateway biasanya menunggu callback/webhook
   } else if (requiresProof) {
     // metode seperti transfer bank yang butuh bukti -> tunggu verifikasi staff
-    payment_status = 'pending';
+    payment_status = 'unpaid';
   } else {
     payment_status = 'unpaid';
   }
@@ -1589,6 +1607,402 @@ exports.checkout = asyncHandler(async (req, res) => {
         : 'Checkout berhasil.'
   });
 });
+
+exports.createQrisFromCart = async (req, res, next) => {
+  try {
+    const iden0 = getIdentity(req);
+    const {
+      name,
+      phone,
+      fulfillment_type,
+      address_text,
+      lat,
+      lng,
+      note_to_rider,
+      voucherClaimIds = [],
+      register_decision = 'register'
+    } = req.body || {};
+
+    /* ===== Resolve fulfillment type ===== */
+    const ft =
+      iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
+    if (!['dine_in', 'delivery'].includes(ft)) {
+      return res.status(400).json({ message: 'fulfillment_type tidak valid' });
+    }
+
+    /* ===== Member / Guest (mirip checkout) ===== */
+    const originallyLoggedIn = !!iden0.memberId;
+    const wantRegister = String(register_decision || 'register') === 'register';
+
+    let member = null;
+    let customer_name = '';
+    let customer_phone = '';
+
+    if (originallyLoggedIn || wantRegister) {
+      const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
+      member = await ensureMemberForCheckout(req, res, joinChannel);
+
+      if (member) {
+        customer_name =
+          String(member.name || '').trim() || String(name || '').trim();
+        customer_phone =
+          String(member.phone || '').trim() || String(phone || '').trim();
+      }
+    }
+
+    if (!member) {
+      customer_name = String(name || '').trim();
+      customer_phone = String(phone || '').trim();
+      if (!customer_name && !customer_phone) {
+        return res
+          .status(400)
+          .json({ message: 'Tanpa member: isi minimal nama atau no. telp' });
+      }
+    }
+
+    const finalMemberId = member ? member._id : null;
+
+    /* ===== Ambil cart aktif ===== */
+    const iden = {
+      ...iden0,
+      memberId: finalMemberId || iden0.memberId || null,
+      session_id:
+        iden0.session_id ||
+        req.cookies?.[DEVICE_COOKIE] ||
+        req.header('x-device-id') ||
+        null
+    };
+
+    const cartObj = await getActiveCartForIdentity(iden, {
+      allowCreateOnline: false
+    });
+    if (!cartObj) {
+      return res.status(404).json({ message: 'Cart tidak ditemukan / kosong' });
+    }
+
+    const cart = await Cart.findById(cartObj._id);
+    if (!cart || !cart.items?.length) {
+      return res.status(404).json({ message: 'Cart kosong' });
+    }
+
+    if (
+      ft === 'dine_in' &&
+      (iden.source || 'online') === 'qr' &&
+      !cart.table_number
+    ) {
+      return res
+        .status(400)
+        .json({ message: 'Silakan assign nomor meja terlebih dahulu' });
+    }
+
+    if (finalMemberId && !cart.member) {
+      cart.member = finalMemberId;
+      cart.session_id = null;
+    }
+
+    const delivery_mode =
+      ft === 'dine_in'
+        ? 'none'
+        : String(req.body?.delivery_mode || 'delivery').toLowerCase(); // 'delivery'|'pickup'|'none'
+
+    // ambil input slot/scheduled/pickup window (tetap baca kalau ada, tapi validasi dipisah berdasarkan delivery_mode)
+    const providedSlot = (req.body?.delivery_slot || '').trim();
+    const providedScheduledAtRaw = req.body?.scheduled_at || null;
+    const providedScheduledAt = providedScheduledAtRaw
+      ? dayjs(providedScheduledAtRaw).tz(LOCAL_TZ)
+      : null;
+
+    // pickup ISO (preferensi baru) — untuk pickup wajib pakai ISO: pickup_from & pickup_to
+    const pickup_from_iso = req.body?.pickup_from || null;
+    const pickup_to_iso = req.body?.pickup_to || null;
+
+    // VALIDASI HANYA JIKA BUKAN DINE_IN
+    if (ft !== 'dine_in') {
+      if (delivery_mode === 'delivery') {
+        // delivery: wajib delivery_slot atau scheduled_at
+        if (
+          !providedSlot &&
+          (!providedScheduledAt || !providedScheduledAt.isValid())
+        ) {
+          throwError(
+            'Untuk delivery: delivery_slot atau scheduled_at wajib',
+            400
+          );
+        }
+      } else if (delivery_mode === 'pickup') {
+        // pickup: wajib pickup_from & pickup_to (ISO) — pickup_window_raw tidak dipakai lagi
+        if (!pickup_from_iso || !pickup_to_iso) {
+          throwError(
+            'Untuk pickup: pickup_from dan pickup_to (ISO) wajib',
+            400
+          );
+        }
+      } else {
+        // jika ada mode lain yang tak terduga
+        throwError('delivery_mode tidak valid', 400);
+      }
+    }
+
+    // --- proses slot untuk delivery (jika ada) ---
+    let slotLabel = null;
+    let slotDt = null;
+    if (
+      delivery_mode === 'delivery' &&
+      providedScheduledAt &&
+      providedScheduledAt.isValid()
+    ) {
+      slotDt = providedScheduledAt.startOf('minute');
+      slotLabel = slotDt.format('HH:mm');
+    } else if (delivery_mode === 'delivery' && providedSlot) {
+      const maybeDt = parseSlotLabelToDate(providedSlot);
+      if (!maybeDt || !maybeDt.isValid()) {
+        throwError('delivery_slot tidak valid', 400);
+      } else {
+        slotDt = maybeDt;
+        slotLabel = providedSlot;
+      }
+    }
+
+    // check slot availability only if slotLabel provided and not dine_in and mode delivery
+    if (
+      slotLabel &&
+      ft !== 'dine_in' &&
+      delivery_mode === 'delivery' &&
+      !isSlotAvailable(slotLabel, null, delivery_mode)
+    ) {
+      throwError('Slot sudah tidak tersedia / sudah lewat', 409);
+    }
+
+    let deliveryObj = {
+      mode: ft === 'dine_in' ? 'none' : delivery_mode, // dine_in -> none
+      slot_label: slotLabel || null,
+      scheduled_at: slotDt ? slotDt.toDate() : null,
+      status: 'pending'
+    };
+
+    // --- proses pickup window hanya via ISO (pickup_from & pickup_to) ---
+    let pickupWindowFrom = null;
+    let pickupWindowTo = null;
+
+    if (delivery_mode === 'pickup' && ft !== 'dine_in') {
+      const f = dayjs(pickup_from_iso).tz(LOCAL_TZ);
+      const t = dayjs(pickup_to_iso).tz(LOCAL_TZ);
+      if (!f.isValid() || !t.isValid()) {
+        throwError('pickup_from/pickup_to tidak valid ISO', 400);
+      }
+      pickupWindowFrom = f;
+      pickupWindowTo = t;
+
+      // validasi lengkapnya
+      if (!pickupWindowFrom.isBefore(pickupWindowTo))
+        throwError('pickup_window: from harus < to', 400);
+
+      const now = dayjs().tz(LOCAL_TZ);
+      if (pickupWindowFrom.isBefore(now.add(MIN_LEAD_MINUTES, 'minute'))) {
+        throwError(
+          `Waktu pickup mulai harus setidaknya ${MIN_LEAD_MINUTES} menit dari sekarang`,
+          409
+        );
+      }
+      const diffHours = pickupWindowTo.diff(pickupWindowFrom, 'hour', true);
+      if (diffHours > MAX_WINDOW_HOURS)
+        throwError(
+          `Durasi pickup window terlalu panjang (max ${MAX_WINDOW_HOURS} jam)`,
+          400
+        );
+
+      deliveryObj.pickup_window = {
+        from: pickupWindowFrom.toDate(),
+        to: pickupWindowTo.toDate()
+      };
+
+      // set scheduled_at/slot_label kalau belum ada scheduled (bantu UI)
+      if (!deliveryObj.scheduled_at) {
+        deliveryObj.scheduled_at = pickupWindowFrom.toDate();
+        deliveryObj.slot_label = pickupWindowFrom.format('HH:mm');
+      }
+    }
+
+    // Delivery-specific: alamat & radius — jalankan hanya kalau delivery_mode==='delivery' dan fulfillment bukan dine_in
+    let delivery_fee = 0;
+    if (ft !== 'dine_in' && delivery_mode === 'delivery') {
+      const latN = Number(req.body?.lat);
+      const lngN = Number(req.body?.lng);
+      if (!Number.isFinite(latN) || !Number.isFinite(lngN)) {
+        throwError('Lokasi (lat,lng) wajib untuk delivery', 400);
+      }
+      const distance_km = haversineKm(CAFE_COORD, { lat: latN, lng: lngN });
+      if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0)) {
+        throwError(`Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`, 400);
+      }
+      deliveryObj.address_text = String(req.body?.address_text || '').trim();
+      deliveryObj.location = { lat: latN, lng: lngN };
+      deliveryObj.distance_km = Number(distance_km.toFixed(2));
+      delivery_fee = calcDeliveryFee();
+      deliveryObj.delivery_fee = delivery_fee;
+    } else {
+      // untuk dine_in atau non-delivery: simpan note_to_rider bila ada
+      deliveryObj.note_to_rider = String(req.body?.note_to_rider || '');
+    }
+
+    /* ===== Hitung ulang cart ===== */
+    recomputeTotals(cart);
+    await cart.save();
+
+    /* ===== Voucher ===== */
+    let eligibleClaimIds = [];
+    if (finalMemberId) {
+      if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
+        const rawClaims = await VoucherClaim.find({
+          _id: { $in: voucherClaimIds },
+          member: finalMemberId,
+          status: 'claimed'
+        }).lean();
+
+        const now = new Date();
+        eligibleClaimIds = rawClaims
+          .filter((c) => !c.validUntil || c.validUntil > now)
+          .map((c) => String(c._id));
+      }
+    } else if (voucherClaimIds?.length) {
+      return res
+        .status(400)
+        .json({ message: 'Voucher hanya untuk member. Silakan daftar/login.' });
+    }
+
+    const priced = await validateAndPrice({
+      memberId: finalMemberId,
+      cart: {
+        items: cart.items.map((it) => ({
+          menuId: it.menu,
+          qty: it.quantity,
+          price: it.base_price,
+          category: it.category || null
+        }))
+      },
+      fulfillmentType: ft,
+      deliveryFee: delivery_fee,
+      voucherClaimIds: eligibleClaimIds
+    });
+
+    const items_subtotal = int(priced.totals.baseSubtotal);
+    const items_discount = int(priced.totals.itemsDiscount);
+    const shipping_discount = int(priced.totals.shippingDiscount);
+    const baseDelivery = int(priced.totals.deliveryFee);
+
+    // Service fee 2% dari ITEMS SAJA
+    const sfBase = items_subtotal;
+    const service_fee = int(sfBase * SERVICE_FEE_RATE);
+
+    // Tax base: HANYA dari menu (setelah item discount)
+    const taxBase = items_subtotal - items_discount;
+    const safeTaxBase = Math.max(0, taxBase);
+    const rate = parsePpnRate();
+    const taxAmount = int(safeTaxBase * rate);
+
+    // ===== Total sebelum pembulatan (ongkir & service fee berdiri sendiri, tax dari menu)
+    const beforeRound = int(
+      items_subtotal +
+        service_fee +
+        baseDelivery -
+        items_discount -
+        shipping_discount +
+        taxAmount
+    );
+    const requested_bvt = int(roundRupiahCustom(beforeRound));
+    const rounding_delta = int(requested_bvt - beforeRound);
+
+    if (requested_bvt <= 0) {
+      return res.status(400).json({ message: 'Total pembayaran tidak valid.' });
+    }
+
+    /* ===== Buat PaymentSession ===== */
+    const reference_id = `QRIS-${cart._id}-${Date.now()}`;
+
+    const sessionPayload = {
+      member: finalMemberId || null,
+      customer_name,
+      customer_phone,
+      source: iden.source || 'online',
+      fulfillment_type: ft,
+      table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
+      cart: cart._id,
+      session_id: iden.session_id || null,
+      items: cart.items.map((it) => ({
+        menu: it.menu,
+        menu_code: it.menu_code,
+        name: it.name,
+        imageUrl: it.imageUrl,
+        base_price: it.base_price,
+        quantity: it.quantity,
+        addons: it.addons,
+        notes: it.notes,
+        category: it.category || null
+      })),
+      items_subtotal,
+      delivery_fee: baseDelivery,
+      service_fee,
+      items_discount,
+      shipping_discount,
+      discounts: priced.breakdown,
+      requested_amount: requested_bvt,
+      rounding_delta,
+      delivery_snapshot: deliveryObj,
+      provider: 'xendit',
+      channel: 'qris',
+      external_id: reference_id
+    };
+
+    // attach pickup_window at top-level session if present
+    if (deliveryObj.pickup_window) {
+      sessionPayload.pickup_window = {
+        from: deliveryObj.pickup_window.from,
+        to: deliveryObj.pickup_window.to
+      };
+    }
+
+    const session = await PaymentSession.create(sessionPayload);
+
+    /* ===== Call Xendit QR ===== */
+    const payload = {
+      reference_id,
+      type: 'DYNAMIC',
+      currency: 'IDR',
+      amount: requested_bvt,
+      metadata: { payment_session_id: String(session._id) }
+    };
+
+    const resp = await axios.post(`${X_BASE}/qr_codes`, payload, {
+      auth: { username: X_KEY, password: '' },
+      headers: { ...HDRS, 'api-version': '2022-07-31' },
+      timeout: 15000
+    });
+
+    const qr = resp.data;
+
+    session.qr_code_id = qr.id;
+    session.qr_string = qr.qr_string;
+    session.expires_at = qr.expires_at ? new Date(qr.expires_at) : null;
+    await session.save();
+
+    return res.json({
+      success: true,
+      data: {
+        sessionId: String(session._id),
+        channel: 'QRIS',
+        amount: requested_bvt,
+        qris: {
+          qr_id: qr.id,
+          qr_string: qr.qr_string,
+          expiry_at: qr.expires_at
+        },
+        status: 'pending'
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
 
 exports.assignTable = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
@@ -2518,7 +2932,7 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
   // history: payment verified & order accepted
   try {
     await recordOrderHistory(doc._id, 'payment_status', req.user, {
-      from: 'pending',
+      from: 'unpaid',
       to: doc.payment_status,
       note: 'Pembayaran diverifikasi & order diterima',
       at: doc.verified_at
@@ -2954,400 +3368,6 @@ exports.listTodayOrders = asyncHandler(async (req, res) => {
     data: mapped
   });
 });
-
-exports.createQrisFromCart = async (req, res, next) => {
-  try {
-    const iden0 = getIdentity(req);
-    const {
-      name,
-      phone,
-      fulfillment_type,
-      address_text,
-      lat,
-      lng,
-      note_to_rider,
-      voucherClaimIds = [],
-      register_decision = 'register'
-    } = req.body || {};
-
-    /* ===== Resolve fulfillment type ===== */
-    const ft =
-      iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
-    if (!['dine_in', 'delivery'].includes(ft)) {
-      return res.status(400).json({ message: 'fulfillment_type tidak valid' });
-    }
-
-    /* ===== Member / Guest (mirip checkout) ===== */
-    const originallyLoggedIn = !!iden0.memberId;
-    const wantRegister = String(register_decision || 'register') === 'register';
-
-    let member = null;
-    let customer_name = '';
-    let customer_phone = '';
-
-    if (originallyLoggedIn || wantRegister) {
-      const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
-      member = await ensureMemberForCheckout(req, res, joinChannel);
-
-      if (member) {
-        customer_name =
-          String(member.name || '').trim() || String(name || '').trim();
-        customer_phone =
-          String(member.phone || '').trim() || String(phone || '').trim();
-      }
-    }
-
-    if (!member) {
-      customer_name = String(name || '').trim();
-      customer_phone = String(phone || '').trim();
-      if (!customer_name && !customer_phone) {
-        return res
-          .status(400)
-          .json({ message: 'Tanpa member: isi minimal nama atau no. telp' });
-      }
-    }
-
-    const finalMemberId = member ? member._id : null;
-
-    /* ===== Ambil cart aktif ===== */
-    const iden = {
-      ...iden0,
-      memberId: finalMemberId || iden0.memberId || null,
-      session_id:
-        iden0.session_id ||
-        req.cookies?.[DEVICE_COOKIE] ||
-        req.header('x-device-id') ||
-        null
-    };
-
-    const cartObj = await getActiveCartForIdentity(iden, {
-      allowCreateOnline: false
-    });
-    if (!cartObj) {
-      return res.status(404).json({ message: 'Cart tidak ditemukan / kosong' });
-    }
-
-    const cart = await Cart.findById(cartObj._id);
-    if (!cart || !cart.items?.length) {
-      return res.status(404).json({ message: 'Cart kosong' });
-    }
-
-    if (
-      ft === 'dine_in' &&
-      (iden.source || 'online') === 'qr' &&
-      !cart.table_number
-    ) {
-      return res
-        .status(400)
-        .json({ message: 'Silakan assign nomor meja terlebih dahulu' });
-    }
-
-    if (finalMemberId && !cart.member) {
-      cart.member = finalMemberId;
-      cart.session_id = null;
-    }
-
-    const delivery_mode =
-      ft === 'dine_in'
-        ? 'none'
-        : String(req.body?.delivery_mode || 'delivery').toLowerCase(); // 'delivery'|'pickup'|'none'
-
-    // ambil input slot/scheduled/pickup window (tetap baca kalau ada, tapi validasi hanya untuk delivery/pickup)
-    const providedSlot = (req.body?.delivery_slot || '').trim();
-    const providedScheduledAtRaw = req.body?.scheduled_at || null;
-    const providedScheduledAt = providedScheduledAtRaw
-      ? dayjs(providedScheduledAtRaw).tz(LOCAL_TZ)
-      : null;
-
-    const pickup_window_raw = String(req.body?.pickup_window_raw || '').trim();
-    const pickup_date = req.body?.pickup_date || null;
-    const pickup_from_iso = req.body?.pickup_from || null;
-    const pickup_to_iso = req.body?.pickup_to || null;
-
-    // VALIDASI HANYA JIKA BUKAN DINE_IN (artinya mode delivery/pickup diperlukan)
-    if (ft !== 'dine_in') {
-      if (
-        !providedSlot &&
-        (!providedScheduledAt || !providedScheduledAt.isValid()) &&
-        !pickup_window_raw &&
-        !(pickup_from_iso && pickup_to_iso)
-      ) {
-        throwError(
-          'delivery_slot / scheduled_at atau pickup window wajib',
-          400
-        );
-      }
-    }
-
-    let slotLabel = null;
-    let slotDt = null;
-    if (providedScheduledAt && providedScheduledAt.isValid()) {
-      slotDt = providedScheduledAt.startOf('minute');
-      slotLabel = slotDt.format('HH:mm');
-    } else if (providedSlot) {
-      const maybeDt = parseSlotLabelToDate(providedSlot);
-      if (!maybeDt || !maybeDt.isValid()) {
-        // hanya error jika bukan dine_in (karena jika dine_in kita tidak memerlukan slot)
-        if (ft !== 'dine_in') throwError('delivery_slot tidak valid', 400);
-      } else {
-        slotDt = maybeDt;
-        slotLabel = providedSlot;
-      }
-    }
-
-    // check slot availability only if slotLabel provided (type-aware) and not dine_in
-    if (
-      slotLabel &&
-      ft !== 'dine_in' &&
-      !isSlotAvailable(slotLabel, null, delivery_mode)
-    ) {
-      throwError('Slot sudah tidak tersedia / sudah lewat', 409);
-    }
-
-    let deliveryObj = {
-      mode: ft === 'dine_in' ? 'none' : delivery_mode, // dine_in -> none
-      slot_label: slotLabel || null,
-      scheduled_at: slotDt ? slotDt.toDate() : null,
-      status: 'pending'
-    };
-
-    // parse pickup window if provided (still parse but validate only when non-dine_in & delivery_mode === 'pickup')
-    let pickupWindowFrom = null;
-    let pickupWindowTo = null;
-    if (pickup_window_raw) {
-      const parsed = parseTimeRangeToDayjs(pickup_window_raw, pickup_date);
-      if (!parsed) {
-        if (ft !== 'dine_in')
-          throwError('pickup_window_raw tidak valid (HH:mm-HH:mm)', 400);
-      } else {
-        pickupWindowFrom = parsed.from;
-        pickupWindowTo = parsed.to;
-      }
-    } else if (pickup_from_iso && pickup_to_iso) {
-      const f = dayjs(pickup_from_iso).tz(LOCAL_TZ);
-      const t = dayjs(pickup_to_iso).tz(LOCAL_TZ);
-      if (!f.isValid() || !t.isValid()) {
-        if (ft !== 'dine_in')
-          throwError('pickup_from/pickup_to tidak valid ISO', 400);
-      } else {
-        pickupWindowFrom = f;
-        pickupWindowTo = t;
-      }
-    }
-
-    if (
-      ft !== 'dine_in' &&
-      delivery_mode === 'pickup' &&
-      (pickupWindowFrom || pickupWindowTo)
-    ) {
-      if (!pickupWindowFrom || !pickupWindowTo)
-        throwError('pickup window tidak lengkap', 400);
-      if (!pickupWindowFrom.isBefore(pickupWindowTo))
-        throwError('pickup_window: from harus < to', 400);
-      const now = dayjs().tz(LOCAL_TZ);
-      if (pickupWindowFrom.isBefore(now.add(MIN_LEAD_MINUTES, 'minute'))) {
-        throwError(
-          `Waktu pickup mulai harus setidaknya ${MIN_LEAD_MINUTES} menit dari sekarang`,
-          409
-        );
-      }
-      const diffHours = pickupWindowTo.diff(pickupWindowFrom, 'hour', true);
-      if (diffHours > MAX_WINDOW_HOURS)
-        throwError(
-          `Durasi pickup window terlalu panjang (max ${MAX_WINDOW_HOURS} jam)`,
-          400
-        );
-
-      deliveryObj.pickup_window = {
-        from: pickupWindowFrom.toDate(),
-        to: pickupWindowTo.toDate()
-      };
-      if (!deliveryObj.scheduled_at) {
-        deliveryObj.scheduled_at = pickupWindowFrom.toDate();
-        deliveryObj.slot_label = pickupWindowFrom.format('HH:mm');
-      }
-    }
-
-    // Delivery-specific: alamat & radius — jalankan hanya kalau delivery_mode==='delivery' dan fulfillment bukan dine_in
-    let delivery_fee = 0;
-    if (ft !== 'dine_in' && delivery_mode === 'delivery') {
-      const latN = Number(req.body?.lat);
-      const lngN = Number(req.body?.lng);
-      if (!Number.isFinite(latN) || !Number.isFinite(lngN)) {
-        throwError('Lokasi (lat,lng) wajib untuk delivery', 400);
-      }
-      const distance_km = haversineKm(CAFE_COORD, { lat: latN, lng: lngN });
-      if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0)) {
-        throwError(`Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`, 400);
-      }
-      deliveryObj.address_text = String(req.body?.address_text || '').trim();
-      deliveryObj.location = { lat: latN, lng: lngN };
-      deliveryObj.distance_km = Number(distance_km.toFixed(2));
-      delivery_fee = calcDeliveryFee();
-      deliveryObj.delivery_fee = delivery_fee;
-    } else {
-      // untuk dine_in atau non-delivery: simpan note_to_rider bila ada
-      deliveryObj.note_to_rider = String(req.body?.note_to_rider || '');
-    }
-
-    /* ===== Hitung ulang cart ===== */
-    recomputeTotals(cart);
-    await cart.save();
-
-    /* ===== Voucher ===== */
-    let eligibleClaimIds = [];
-    if (finalMemberId) {
-      if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
-        const rawClaims = await VoucherClaim.find({
-          _id: { $in: voucherClaimIds },
-          member: finalMemberId,
-          status: 'claimed'
-        }).lean();
-
-        const now = new Date();
-        eligibleClaimIds = rawClaims
-          .filter((c) => !c.validUntil || c.validUntil > now)
-          .map((c) => String(c._id));
-      }
-    } else if (voucherClaimIds?.length) {
-      return res
-        .status(400)
-        .json({ message: 'Voucher hanya untuk member. Silakan daftar/login.' });
-    }
-
-    const priced = await validateAndPrice({
-      memberId: finalMemberId,
-      cart: {
-        items: cart.items.map((it) => ({
-          menuId: it.menu,
-          qty: it.quantity,
-          price: it.base_price,
-          category: it.category || null
-        }))
-      },
-      fulfillmentType: ft,
-      deliveryFee: delivery_fee,
-      voucherClaimIds: eligibleClaimIds
-    });
-
-    const items_subtotal = int(priced.totals.baseSubtotal);
-    const items_discount = int(priced.totals.itemsDiscount);
-    const shipping_discount = int(priced.totals.shippingDiscount);
-    const baseDelivery = int(priced.totals.deliveryFee);
-
-    // Service fee 2% dari ITEMS SAJA
-    const sfBase = items_subtotal;
-    const service_fee = int(sfBase * SERVICE_FEE_RATE);
-
-    // Tax base: HANYA dari menu (setelah item discount)
-    const taxBase = items_subtotal - items_discount;
-    const safeTaxBase = Math.max(0, taxBase);
-    const rate = parsePpnRate();
-    const taxAmount = int(safeTaxBase * rate);
-
-    // ===== Total sebelum pembulatan (ongkir & service fee berdiri sendiri, tax dari menu)
-    const beforeRound = int(
-      items_subtotal +
-        service_fee +
-        baseDelivery -
-        items_discount -
-        shipping_discount +
-        taxAmount
-    );
-    const requested_bvt = int(roundRupiahCustom(beforeRound));
-    const rounding_delta = int(requested_bvt - beforeRound);
-
-    if (requested_bvt <= 0) {
-      return res.status(400).json({ message: 'Total pembayaran tidak valid.' });
-    }
-
-    /* ===== Buat PaymentSession ===== */
-    const reference_id = `QRIS-${cart._id}-${Date.now()}`;
-
-    const sessionPayload = {
-      member: finalMemberId || null,
-      customer_name,
-      customer_phone,
-      source: iden.source || 'online',
-      fulfillment_type: ft,
-      table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
-      cart: cart._id,
-      session_id: iden.session_id || null,
-      items: cart.items.map((it) => ({
-        menu: it.menu,
-        menu_code: it.menu_code,
-        name: it.name,
-        imageUrl: it.imageUrl,
-        base_price: it.base_price,
-        quantity: it.quantity,
-        addons: it.addons,
-        notes: it.notes,
-        category: it.category || null
-      })),
-      items_subtotal,
-      delivery_fee: baseDelivery,
-      service_fee,
-      items_discount,
-      shipping_discount,
-      discounts: priced.breakdown,
-      requested_amount: requested_bvt,
-      rounding_delta,
-      delivery_snapshot: deliveryObj,
-      provider: 'xendit',
-      channel: 'qris',
-      external_id: reference_id
-    };
-
-    // attach pickup_window at top-level session if present
-    if (deliveryObj.pickup_window) {
-      sessionPayload.pickup_window = {
-        from: deliveryObj.pickup_window.from,
-        to: deliveryObj.pickup_window.to
-      };
-    }
-
-    const session = await PaymentSession.create(sessionPayload);
-
-    /* ===== Call Xendit QR ===== */
-    const payload = {
-      reference_id,
-      type: 'DYNAMIC',
-      currency: 'IDR',
-      amount: requested_bvt,
-      metadata: { payment_session_id: String(session._id) }
-    };
-
-    const resp = await axios.post(`${X_BASE}/qr_codes`, payload, {
-      auth: { username: X_KEY, password: '' },
-      headers: { ...HDRS, 'api-version': '2022-07-31' },
-      timeout: 15000
-    });
-
-    const qr = resp.data;
-
-    session.qr_code_id = qr.id;
-    session.qr_string = qr.qr_string;
-    session.expires_at = qr.expires_at ? new Date(qr.expires_at) : null;
-    await session.save();
-
-    return res.json({
-      success: true,
-      data: {
-        sessionId: String(session._id),
-        channel: 'QRIS',
-        amount: requested_bvt,
-        qris: {
-          qr_id: qr.id,
-          qr_string: qr.qr_string,
-          expiry_at: qr.expires_at
-        },
-        status: 'pending'
-      }
-    });
-  } catch (err) {
-    next(err);
-  }
-};
 
 exports.getSessionStatus = async (req, res, next) => {
   try {
