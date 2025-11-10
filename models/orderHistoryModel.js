@@ -127,7 +127,6 @@ const OrderHistorySchema = new Schema(
     items_subtotal: {
       type: Number,
       min: 0,
-      required: true,
       set: int,
       get: int
     },
@@ -138,7 +137,7 @@ const OrderHistorySchema = new Schema(
     discounts: { type: [discountBreakdownSchema], default: [] },
     tax_rate_percent: { type: Number, min: 0, max: 100, default: 0 },
     tax_amount: { type: Number, min: 0, default: 0, set: int, get: int },
-    grand_total: { type: Number, min: 0, required: true, set: int, get: int },
+    grand_total: { type: Number, min: 0, set: int, get: int },
     rounding_delta: { type: Number, default: 0, set: int, get: int },
 
     // --- Ringkasan item & lain-lain ---

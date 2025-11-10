@@ -308,13 +308,6 @@ orderSchema.pre('validate', function (next) {
     if (!ok) return next(new Error('Data delivery tidak lengkap.'));
   }
 
-  // untuk kedua mode, require scheduled_at
-  if (this.fulfillment_type === 'delivery') {
-    if (!this.delivery || !this.delivery.scheduled_at) {
-      return next(new Error('Slot pengantaran wajib diisi.'));
-    }
-  }
-
   if (!this.member) {
     const hasGuest =
       (this.customer_name && this.customer_name.trim().length > 0) ||
