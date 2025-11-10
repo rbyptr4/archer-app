@@ -6,24 +6,23 @@ const {
 
 function buildUiTotalsFromCart(cart) {
   // safety parse
-  const itemsSubtotalBeforeTax = Number(cart.total_price || 0); // total menu + addons (BEFORE tax)
+  const items_subtotal = Number(cart.total_price || 0); // total menu + addons (BEFORE tax)
   const deliveryFee = Number(cart?.delivery?.delivery_fee || 0);
   const itemsDiscount = Number(cart.items_discount || 0) || 0;
   const shippingDiscount = Number(cart.shipping_discount || 0) || 0;
 
   // --- Service fee: 2% dari items subtotal (aggregate) ---
   const svcRate = Number(SERVICE_FEE_RATE || 0);
-  const serviceFee = Math.round(itemsSubtotalBeforeTax * svcRate);
+  const serviceFee = Math.round(items_subtotal * svcRate);
 
   // --- Tax: dihitung dari items subtotal (aggregate). NOT affected by voucher ---
   const rate = parsePpnRate();
-  const taxAmount = Math.round(itemsSubtotalBeforeTax * rate);
-  const taxRatePercent = Math.round(rate * 100 * 100) / 100;
+  const taxAmount = Math.round(items_subtotal * rate);
 
   // --- Compose raw total (sebelum custom rounding) ---
   // Formula: items + service + delivery - itemDiscount - shippingDiscount + tax
   const rawTotal =
-    itemsSubtotalBeforeTax +
+    items_subtotal +
     serviceFee +
     deliveryFee -
     itemsDiscount -
@@ -40,18 +39,14 @@ function buildUiTotalsFromCart(cart) {
 
   return {
     // keep both before-tax and with-tax subtotals for FE clarity
-    items_subtotal_before_tax: itemsSubtotalBeforeTax,
-    items_subtotal_with_tax: itemsSubtotalBeforeTax + taxAmount,
-
+    items_subtotal: items_subtotal,
     service_fee: serviceFee,
-    tax_rate_percent: taxRatePercent,
     tax_amount: taxAmount,
 
     delivery_fee: deliveryFee,
     items_discount: itemsDiscount,
     shipping_discount: shippingDiscount,
 
-    // bookkeeping
     rounding_delta: roundingDelta,
     grand_total: Number(rounded)
   };

@@ -645,21 +645,20 @@ exports.getCart = asyncHandler(async (req, res) => {
   /* ========== 4) Build ringkasan awal ========== */
   const ui = buildUiTotalsFromCart(cart);
 
-  const itemsSubtotalBeforeTax = Number(
+  const items_subtotal = Number(
     ui.items_subtotal_before_tax || ui.items_subtotal || 0
   );
   const items_discount = Number(ui.items_discount || 0);
   const shipping_discount = Number(ui.shipping_discount || 0);
 
   const service_fee_on_items = int(
-    Math.round(itemsSubtotalBeforeTax * SERVICE_FEE_RATE)
+    Math.round(items_subtotal * SERVICE_FEE_RATE)
   );
 
   const rate = parsePpnRate();
-  const taxAmountOnItems = int(Math.round(itemsSubtotalBeforeTax * rate));
-  const taxRatePercent = Math.round(rate * 100 * 100) / 100;
+  const taxAmountOnItems = int(Math.round(items_subtotal * rate));
 
-  const baseBeforeRound = int(itemsSubtotalBeforeTax); // items only, before tax
+  const baseBeforeRound = int(items_subtotal); // items only, before tax
   const pureBeforeWithService = int(
     baseBeforeRound +
       taxAmountOnItems +
@@ -671,7 +670,6 @@ exports.getCart = asyncHandler(async (req, res) => {
   // Store into ui
   ui.service_fee = service_fee_on_items;
   ui.tax_amount = taxAmountOnItems;
-  ui.tax_rate_percent = taxRatePercent;
 
   const pureRounded = int(roundRupiahCustom(int(pureBeforeWithService)));
   ui.grand_total = pureRounded;
