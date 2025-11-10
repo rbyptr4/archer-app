@@ -2421,7 +2421,7 @@ const buildOrderReceipt = (order) => {
 
   const items = Array.isArray(order.items) ? order.items : [];
 
-  const items_subtotal = Number(order.items_subtotal || 0);
+  const items_subtotal = Number(order.items_subtotal || 0); // BEFORE tax (schema)
   const items_discount = Number(order.items_discount || 0);
   const delivery_fee = Number(order.delivery_fee || 0);
   const shipping_discount = Number(order.shipping_discount || 0);
@@ -2429,15 +2429,10 @@ const buildOrderReceipt = (order) => {
   const tax_amount_total = Number(order.tax_amount || 0);
   const tax_rate_percent = Number(order.tax_rate_percent || 0);
 
-  // Tax base di level order (ikuti rumus yang dipakai saat checkout)
-  const taxDenominator =
-    items_subtotal -
-    items_discount +
-    delivery_fee -
-    shipping_discount +
-    service_fee;
+  // ===== Correct tax base: only items after item discount (per schema logic) =====
+  const taxDenominator = Math.max(0, items_subtotal - items_discount);
 
-  // helper subtotal per item (internal saja)
+  // helper: compute line subtotal (before tax) from item
   const lineSubtotalOf = (it) => {
     const unitBase = Number(it.base_price || 0);
     const addonsUnit = (it.addons || []).reduce(
@@ -2448,25 +2443,56 @@ const buildOrderReceipt = (order) => {
     return (unitBase + addonsUnit) * qty;
   };
 
-  const detailedItems = items.map((it) => {
+  // 1) first pass: compute line_before_tax for each item
+  const tmp = items.map((it) => {
     const qty = Number(it.quantity || 0);
+    const line_before_tax = Number(it.line_subtotal ?? lineSubtotalOf(it));
+    return {
+      raw: it,
+      line_before_tax,
+      qty
+    };
+  });
 
+  // 2) allocate tax proportionally (round each line), but keep total consistent with order.tax_amount
+  let allocatedTotalTax = 0;
+  const perLineTax = tmp.map((row) => {
+    let line_tax = 0;
+    if (taxDenominator > 0 && row.line_before_tax > 0) {
+      line_tax = Math.round(
+        (tax_amount_total * row.line_before_tax) / taxDenominator
+      );
+    } else {
+      line_tax = 0;
+    }
+    allocatedTotalTax += line_tax;
+    return line_tax;
+  });
+
+  // 3) fix rounding diff by adding remainder to first non-zero line (or first line)
+  const taxDiff = tax_amount_total - allocatedTotalTax;
+  if (taxDiff !== 0 && perLineTax.length > 0) {
+    // find index of first line that has >0 line_before_tax, else use 0
+    let idx = perLineTax.findIndex((t, i) => tmp[i].line_before_tax > 0);
+    if (idx === -1) idx = 0;
+    perLineTax[idx] = (perLineTax[idx] || 0) + taxDiff;
+  }
+
+  // 4) build detailed items array with unit-level fields and line totals
+  const detailedItems = tmp.map((row, i) => {
+    const it = row.raw;
+    const qty = row.qty;
     const unit_base = Number(it.base_price || 0);
     const addons_unit = (it.addons || []).reduce(
       (s, a) => s + Number(a.price || 0) * Number(a.qty || 1),
       0
     );
-
     const unit_before_tax = unit_base + addons_unit;
-
-    // alokasi pajak proporsional → ubah ke per-unit
-    const line_before_tax = Number(it.line_subtotal ?? lineSubtotalOf(it));
-    const line_tax =
-      taxDenominator > 0
-        ? Math.round((tax_amount_total * line_before_tax) / taxDenominator)
-        : 0;
-
+    const line_before_tax = row.line_before_tax;
+    const line_tax = perLineTax[i] || 0;
     const unit_tax = qty > 0 ? Math.round(line_tax / qty) : 0;
+    const unit_price_incl_tax = unit_before_tax + unit_tax;
+    const line_total_incl_tax = line_before_tax + line_tax;
 
     return {
       name: it.name,
@@ -2478,15 +2504,23 @@ const buildOrderReceipt = (order) => {
         price: Number(ad.price || 0),
         qty: Number(ad.qty || 1)
       })),
-
-      // Hanya unit-level agar FE simpel
-      unit_price: unit_before_tax, // sebelum pajak
-      unit_tax, // pajak per unit
-      unit_price_incl_tax: unit_before_tax + unit_tax, // setelah pajak
-      tax_rate_percent: tax_rate_percent // referensi saja
+      // per-unit and per-line pricing
+      unit_price: unit_before_tax, // before tax
+      unit_tax, // per unit tax (rounded)
+      unit_price_incl_tax, // per unit incl tax
+      line_before_tax, // line total before tax
+      line_tax, // line tax (rounded)
+      line_total_incl_tax // line total including tax
     };
   });
 
+  // 5) totals sanity: compute items_subtotal_with_tax from detailedItems
+  const items_subtotal_with_tax = detailedItems.reduce(
+    (s, it) => s + Number(it.line_total_incl_tax || 0),
+    0
+  );
+
+  // Return receipt-shaped object (clear & easy for FE)
   return {
     id: String(order._id),
     transaction_code: order.transaction_code || '',
@@ -2495,13 +2529,15 @@ const buildOrderReceipt = (order) => {
     payment_method: order.payment_method,
 
     pricing: {
-      items_subtotal,
+      // keep original semantics: items_subtotal = before-tax (schema)
+      items_subtotal: items_subtotal,
+      items_subtotal_with_tax: items_subtotal_with_tax, // added: menu + tax
       service_fee,
       delivery_fee,
       items_discount,
       shipping_discount,
       tax_amount: tax_amount_total,
-      tax_rate_percent: tax_rate_percent,
+      tax_rate_percent,
       rounding_delta: Number(order.rounding_delta || 0),
       grand_total: Number(order.grand_total || 0)
     },
