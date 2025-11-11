@@ -20,6 +20,8 @@ const {
   recordOrderHistory,
   snapshotOrder
 } = require('../controllers/owner/orderHistoryController');
+// di bagian atas orderController.js
+const { afterCreateOrderEmit } = require('./socket/emitHelpers'); // sesuaikan path
 
 const throwError = require('../utils/throwError');
 const { DELIVERY_SLOTS } = require('../config/onlineConfig'); // import
@@ -2990,10 +2992,6 @@ exports.assignBatch = asyncHandler(async (req, res) => {
   });
 });
 
-/**
- * PATCH /orders/:id/delivery/status
- * Body: { status: 'assigned'|'picked_up'|'on_the_way'|'delivered'|'failed', note?: string }
- */
 exports.updateDeliveryStatus = asyncHandler(async (req, res) => {
   // boleh diakses oleh staff/kasir/kurir tergantung policy; cek user dulu
   if (!req.user) throwError('Unauthorized', 401);
@@ -3062,9 +3060,6 @@ exports.updateDeliveryStatus = asyncHandler(async (req, res) => {
   });
 });
 
-/**
- * GET /orders/delivery-board
- */
 exports.deliveryBoard = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 

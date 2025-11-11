@@ -134,28 +134,56 @@ exports.devLoginMember = asyncHandler(async (req, res) => {
     throwError('Nama tidak cocok dengan nomor ini.', 400);
   }
 
-  const jwtSecret = process.env.MEMBER_TOKEN_SECRET;
-  const token = jwt.sign(
-    {
-      id: String(member._id),
-      phone: member.phone,
-      name: member.name
-    },
-    jwtSecret,
-    { expiresIn: '30d' }
-  );
+  // update minimal metadata sama seperti verifyLoginOtp
+  if (!member.phone_verified_at) member.phone_verified_at = new Date();
+  member.visit_count = (member.visit_count || 0) + 1;
+  member.last_visit_at = new Date();
+  await member.save();
 
-  res.json({
-    success: true,
-    message: 'Login tanpa OTP (dev mode)',
-    token,
-    member: {
-      _id: member._id,
-      name: member.name,
-      phone: member.phone,
-      is_active: member.is_active
-    }
+  // device id: prioritas cookie, lalu header, bila tidak ada generate baru
+  const incomingDev = req.cookies?.[DEVICE_COOKIE] || req.header('x-device-id');
+  const device_id =
+    incomingDev && String(incomingDev).trim()
+      ? String(incomingDev).trim()
+      : crypto.randomUUID();
+
+  // Token handling: access JWT + opaque refresh
+  const accessToken = signAccessToken(member);
+  const refreshToken = generateOpaqueToken();
+  const refreshHash = hashToken(refreshToken);
+
+  // Simpan session member (mirip alur verifyLoginOtp)
+  await MemberSession.create({
+    member: member._id,
+    device_id,
+    refresh_hash: refreshHash,
+    user_agent: req.get('user-agent') || '',
+    ip: req.ip,
+    // gunakan TTL yang sama dengan mekanisme lain (REFRESH_TTL_MS)
+    expires_at: new Date(Date.now() + REFRESH_TTL_MS)
   });
+
+  // set cookie (akses HTTP-only untuk access & refresh, device non-httpOnly)
+  res
+    .cookie(ACCESS_COOKIE, accessToken, cookieAccess)
+    .cookie(REFRESH_COOKIE, refreshToken, cookieRefresh)
+    .cookie(DEVICE_COOKIE, device_id, cookieDevice)
+    .status(200)
+    .json({
+      message: 'Login tanpa OTP (dev mode)',
+      member: {
+        id: member._id,
+        name: member.name,
+        phone: member.phone,
+        points: member.points,
+        total_spend: member.total_spend,
+        visit_count: member.visit_count,
+        phone_verified_at: member.phone_verified_at || null,
+        is_active: member.is_active
+      },
+      access_expires: ACCESS_TTL,
+      refresh_expires_ms: REFRESH_TTL_MS
+    });
 });
 
 exports.verifyLoginOtp = asyncHandler(async (req, res) => {

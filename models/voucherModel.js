@@ -31,7 +31,7 @@ const VoucherSchema = new mongoose.Schema(
       categories: [{ type: String }] // kalau kamu punya field category di Menu
       // untuk bundling: beli X item dari set ini => diskon Y (atau free_item)
       // bundling: {
-      //   buyQty: { type: Number, min: 1, default: 0 },
+      //   buyQty: { type: Number, min: 0, default: 0 },
       //   getPercent: { type: Number, min: 0, max: 100, default: 0 }, // contoh "beli X, diskon Y%"
       //   targetMenuIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Menu' }] // menu yang kena diskon
       // }
