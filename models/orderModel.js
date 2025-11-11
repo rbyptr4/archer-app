@@ -37,7 +37,8 @@ const DeliverySchema = new mongoose.Schema(
         ref: 'User',
         default: null
       },
-      name: { type: String, trim: true, default: '' }
+      name: { type: String, trim: true, default: '' },
+      phone: { type: String, trim: true, default: '' }
     },
     status: {
       type: String,

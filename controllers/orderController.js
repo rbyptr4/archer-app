@@ -428,6 +428,53 @@ const mergeTwoCarts = (dst, src) => {
 const attachOrMergeCartsForIdentity = async (iden) => {
   if (!iden?.memberId && !iden?.session_id) return;
 
+  if (iden.memberId && iden.session_id) {
+    const memberCart = await Cart.findOne({
+      status: 'active',
+      member: iden.memberId
+    }).sort({ updatedAt: -1 });
+
+    const sessionCart = await Cart.findOne({
+      status: 'active',
+      session_id: iden.session_id
+    }).sort({ updatedAt: -1 });
+
+    if (!memberCart && !sessionCart) return;
+
+    if (!memberCart && sessionCart) {
+      sessionCart.member = iden.memberId;
+      sessionCart.session_id = null;
+      sessionCart.source = sessionCart.source || 'online';
+      await sessionCart.save();
+      return;
+    }
+
+    if (memberCart && !sessionCart) return;
+
+    if (memberCart && sessionCart) {
+      for (const it of sessionCart.items || []) {
+        const key = String(it.line_key);
+        const i = memberCart.items.findIndex((d) => String(d.line_key) === key);
+        if (i >= 0) {
+          const sum =
+            (Number(memberCart.items[i].quantity) || 0) +
+            (Number(it.quantity) || 0);
+          memberCart.items[i].quantity = Math.max(1, Math.min(999, sum));
+        } else {
+          memberCart.items.push(it.toObject ? it.toObject() : { ...it });
+        }
+      }
+
+      recomputeTotals(memberCart);
+
+      await memberCart.save();
+      try {
+        await sessionCart.deleteOne();
+      } catch (_) {}
+      return;
+    }
+  }
+
   const filter = iden.memberId
     ? { status: 'active', member: iden.memberId }
     : { status: 'active', session_id: iden.session_id };

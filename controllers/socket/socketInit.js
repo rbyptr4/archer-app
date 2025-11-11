@@ -1,3 +1,4 @@
+// socket/initSocket.js
 const { Server } = require('socket.io');
 const cookie = require('cookie');
 const jwt = require('jsonwebtoken');
@@ -31,6 +32,7 @@ async function resolveStaffFromCookie(cookies) {
     const userId = String(payload.sub || payload.id || '');
     if (!userId) return null;
 
+    // ambil field yang perlu saja; jangan andalkan courierId di model
     const user = await User.findById(userId).select('role pages name').lean();
     if (!user) return null;
 
@@ -42,8 +44,8 @@ async function resolveStaffFromCookie(cookies) {
       id: String(user._id),
       role: user.role,
       pages,
-      name: user.name || '',
-      courierId: user.courierId || null
+      name: user.name || ''
+      // catatan: tidak lagi mengembalikan courierId
     };
   } catch {
     return null;
@@ -87,36 +89,59 @@ function initSocket(httpServer) {
   io.on('connection', async (socket) => {
     const cookies = normalizeCookies(socket);
 
-    // member (customer) via cookie/token
+    // ===== Member (customer) via cookie/token =====
     try {
       const rawMemberJwt = cookies[MEMBER_ACCESS_COOKIE] || cookies.memberToken;
       if (rawMemberJwt) {
         const m = verifyMemberAccessJWT(rawMemberJwt);
         if (m?.id) socket.join(rooms.member(m.id));
       }
-    } catch {}
-
-    // staff/kasir/kitchen/kurir
-    const staff = await resolveStaffFromCookie(cookies);
-    if (staff && (staff.role === 'owner' || staff.role === 'employee')) {
-      socket.join(rooms.staff);
-      if (staff.role === 'owner' || staff.pages?.cashier === true)
-        socket.join(rooms.cashier);
-      if (staff.role === 'owner' || staff.pages?.kitchen === true)
-        socket.join(rooms.kitchen);
-      if (staff.courierId) socket.join(rooms.courier(staff.courierId));
+    } catch {
+      // ignore
     }
 
-    // welcome
+    // ===== Staff: owner / employee / kurir =====
+    const staff = await resolveStaffFromCookie(cookies);
+    if (
+      staff &&
+      (staff.role === 'owner' ||
+        staff.role === 'employee' ||
+        staff.role === 'courier')
+    ) {
+      // join global staff room (opsional)
+      socket.join(rooms.staff);
+
+      // join room kasir bila punya akses
+      if (staff.role === 'owner' || staff.pages?.cashier === true) {
+        socket.join(rooms.cashier);
+      }
+
+      // join room kitchen bila punya akses
+      if (staff.role === 'owner' || staff.pages?.kitchen === true) {
+        socket.join(rooms.kitchen);
+      }
+
+      // --- refactor courier join:
+      // sebelumnya pakai user.courierId; sekarang kita join courier room berdasarkan user._id
+      // Syarat join: user memiliki halaman/akses courier (pages.courier === true) atau role === 'courier'
+      if (staff.role === 'courier' || staff.pages?.courier === true) {
+        // rooms.courier expects an id string; gunakan staff.id (user._id)
+        socket.join(rooms.courier(staff.id));
+      }
+    }
+
+    // ===== welcome =====
     try {
       const who = staff && staff.name ? staff.name : 'Pengguna';
       socket.emit('system:welcome', {
         msg: `Selamat datang, ${who}`,
         serverTime: new Date().toISOString()
       });
-    } catch {}
+    } catch {
+      // ignore
+    }
 
-    // handlers: guest / join member / join by guestToken
+    // ===== Handlers: guest / member join via event =====
     socket.on('join:guest', async (payload, ack) => {
       try {
         const token = payload && payload.guestToken;
@@ -145,7 +170,6 @@ function initSocket(httpServer) {
       }
     });
 
-    // optional: client bisa join member room via tokenless flow (server can send memberId on page boot)
     socket.on('join:member', (payload, ack) => {
       try {
         const memberId = payload && payload.memberId;
