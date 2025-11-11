@@ -1,3 +1,5 @@
+const asyncHandler = require('express-async-handler');
+
 // controllers/paymentWebhookController.js
 const PaymentSession = require('../../models/paymentSessionModel');
 const Order = require('../../models/orderModel');
@@ -164,117 +166,98 @@ async function applyPaymentSuccess(session, rawEvent) {
 }
 
 /* ============================ WEBHOOK (QRIS) ============================ */
-exports.xenditQrisWebhook = async (req, res) => {
-  try {
-    // Optional: verifikasi callback token
-    const token = req.headers['x-callback-token'];
-    if (
-      process.env.XENDIT_CALLBACK_TOKEN &&
-      token !== process.env.XENDIT_CALLBACK_TOKEN
-    ) {
-      return res.status(401).json({ message: 'Invalid callback token' });
-    }
-
-    // Body bisa text atau object (tergantung parser di router)
-    let ev;
-    if (typeof req.body === 'string') {
-      try {
-        ev = JSON.parse(req.body);
-      } catch {
-        console.warn('[Xendit QRIS] invalid JSON body');
-        return res.status(400).json({ message: 'Invalid JSON' });
-      }
-    } else {
-      ev = req.body || {};
-    }
-
-    // Balas cepat agar Xendit tidak retry
-    res.json({ received: true });
-
-    // Normalisasi payload
-    const data = ev.data || ev;
-    const reference_id = data.reference_id || ev.reference_id || null;
-    const metadata = data.metadata || ev.metadata || {};
-    const rawStatus = data.status || ev.status || '';
-    const status = String(rawStatus).toUpperCase();
-
-    // Status-status yang dianggap "paid"
-    const PAID_STATUSES = ['PAID', 'SUCCEEDED', 'COMPLETED', 'CAPTURED'];
-
-    if (!reference_id && !metadata.payment_session_id) {
-      console.warn('[Xendit QRIS] Missing reference_id & payment_session_id');
-      return;
-    }
-
-    if (!PAID_STATUSES.includes(status)) {
-      console.log('[Xendit QRIS] Non-paid status:', status);
-      // Optional: update session status expired/failed (jika ada reference_id)
-      if (reference_id) {
-        const sess = await PaymentSession.findOne({
-          external_id: reference_id
-        });
-        if (sess) {
-          sess.status = status.toLowerCase();
-          await sess.save();
-        }
-      }
-      return;
-    }
-
-    // Cari session
-    let session = null;
-    if (metadata.payment_session_id) {
-      session = await PaymentSession.findById(metadata.payment_session_id);
-    }
-    if (!session && reference_id) {
-      session = await PaymentSession.findOne({ external_id: reference_id });
-    }
-    if (!session) {
-      console.warn(
-        '[Xendit QRIS] PaymentSession not found for ref=',
-        reference_id,
-        'meta=',
-        metadata.payment_session_id
-      );
-      return;
-    }
-
-    // Catat provider ref id / raw event
-    session.provider_ref_id = data.id || session.provider_ref_id;
-    session.raw = ev;
-    await session.save();
-
-    // Terapkan sukses (idempotent)
-    const order = await applyPaymentSuccess(session, ev);
-    if (order) {
-      console.log(
-        '[Xendit QRIS] Payment applied to order:',
-        order.transaction_code
-      );
-
-      try {
-        // Catat history: pembayaran berhasil via webhook
-        await recordOrderHistory(order._id, 'payment_status', null, {
-          from: order.payment_status === 'unpaid' ? 'unpaid' : 'pending',
-          to: 'paid',
-          note: 'Pembayaran QRIS berhasil',
-          at: new Date(),
-          transaction_code: order.transaction_code,
-          source: order.source,
-          fulfillment_type: order.fulfillment_type,
-          status: order.status,
-          payment_status: 'paid'
-        });
-
-        // Snapshot baru setelah pembayaran berhasil
-        await snapshotOrder(order._id, {
-          verified_by_name: 'XenditWebhook'
-        }).catch(() => {});
-      } catch (err) {
-        console.error('[OrderHistory][xenditQrisWebhook]', err?.message || err);
-      }
-    }
-  } catch (e) {
-    console.error('[xendit webhook] error', e);
+exports.xenditQrisWebhook = asyncHandler(async (req, res) => {
+  const token = req.headers['x-callback-token'];
+  if (
+    process.env.XENDIT_CALLBACK_TOKEN &&
+    token !== process.env.XENDIT_CALLBACK_TOKEN
+  ) {
+    throwError('Invalid callback token', 401);
   }
-};
+
+  let ev;
+  if (typeof req.body === 'string') {
+    try {
+      ev = JSON.parse(req.body);
+    } catch (err) {
+      throwError('Invalid JSON body', 400);
+    }
+  } else {
+    ev = req.body || {};
+  }
+
+  const data = ev.data || ev;
+  const reference_id = data.reference_id || ev.reference_id || null;
+  const metadata = data.metadata || ev.metadata || {};
+  const rawStatus = data.status || ev.status || '';
+  const status = String(rawStatus || '').toUpperCase();
+
+  const PAID_STATUSES = ['PAID', 'SUCCEEDED', 'COMPLETED', 'CAPTURED'];
+
+  if (!reference_id && !metadata.payment_session_id) {
+    throwError('Missing reference_id & payment_session_id', 400);
+  }
+
+  if (!PAID_STATUSES.includes(status)) {
+    if (reference_id) {
+      const sess = await PaymentSession.findOne({ external_id: reference_id });
+      if (sess) {
+        sess.status = String(status || '').toLowerCase();
+        await sess.save();
+      }
+    }
+    return res
+      .status(200)
+      .json({ received: true, status: String(status || '') });
+  }
+
+  let session = null;
+  if (metadata.payment_session_id) {
+    session = await PaymentSession.findById(metadata.payment_session_id);
+  }
+  if (!session && reference_id) {
+    session = await PaymentSession.findOne({ external_id: reference_id });
+  }
+  if (!session) {
+    throwError(
+      `PaymentSession not found for reference_id=${reference_id}`,
+      404
+    );
+  }
+
+  session.provider_ref_id = data.id || session.provider_ref_id;
+  session.raw = ev;
+  await session.save();
+
+  const order = await applyPaymentSuccess(session, ev);
+  if (!order) {
+    throwError('applyPaymentSuccess tidak mengembalikan order', 500);
+  }
+
+  await recordOrderHistory(order._id, 'payment_status', null, {
+    from: order.payment_status === 'unpaid' ? 'unpaid' : 'pending',
+    to: 'paid',
+    note: 'Pembayaran QRIS berhasil',
+    at: new Date(),
+    transaction_code: order.transaction_code,
+    source: order.source,
+    fulfillment_type: order.fulfillment_type,
+    status: order.status,
+    payment_status: 'paid'
+  });
+
+  await snapshotOrder(order._id, { verified_by_name: 'XenditWebhook' });
+
+  const summary = makeOrderSummary(order);
+
+  emitToStaff('order:payment:paid', summary);
+
+  if (order.member) {
+    emitToMember(String(order.member), 'order:payment:paid', summary);
+  }
+  if (order.guestToken) {
+    emitToGuest(order.guestToken, 'order:payment:paid', summary);
+  }
+
+  return res.status(200).json({ received: true, appliedTo: String(order._id) });
+});

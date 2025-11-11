@@ -21,7 +21,22 @@ const {
   snapshotOrder
 } = require('../controllers/owner/orderHistoryController');
 // di bagian atas orderController.js
-const { afterCreateOrderEmit } = require('./socket/emitHelpers'); // sesuaikan path
+const {
+  afterCreateOrderEmit,
+  makeOrderSummary
+} = require('./socket/emitHelpers'); // sesuaikan path
+// tambahkan di atas file
+const {
+  emitToStaff,
+  emitToCashier,
+  emitToKitchen,
+  emitToCourier,
+  emitToMember,
+  emitToGuest
+} = require('./socket/socketBus'); // sesuaikan path
+
+// jika belum ada, untuk generate guest token
+const { v4: uuidv4 } = require('uuid');
 
 const throwError = require('../utils/throwError');
 const { DELIVERY_SLOTS } = require('../config/onlineConfig'); // import
@@ -36,11 +51,6 @@ const {
 const { baseCookie } = require('../utils/authCookies');
 const { uploadBuffer } = require('../utils/googleDrive');
 const { getDriveFolder } = require('../utils/driveFolders');
-const {
-  emitToMember,
-  emitToStaff,
-  emitToTable
-} = require('./socket/socketBus');
 
 const { haversineKm } = require('../utils/distance');
 const { nextDailyTxCode } = require('../utils/txCode');
@@ -1482,34 +1492,36 @@ exports.checkout = asyncHandler(async (req, res) => {
     });
   }
 
-  /* ===== Emit realtime ===== */
-  const payload = {
-    id: String(order._id),
-    transaction_code: order.transaction_code,
-    member: MemberDoc
-      ? {
-          id: String(MemberDoc._id),
-          name: MemberDoc.name,
-          phone: MemberDoc.phone
-        }
-      : null,
-    items_total: order.items_subtotal,
-    grand_total: order.grand_total,
-    total_quantity: order.total_quantity,
-    source: order.source,
-    fulfillment_type: order.fulfillment_type,
-    status: order.status,
-    payment_status: order.payment_status,
-    payment_method: order.payment_method,
-    placed_at: order.placed_at,
-    delivery: order.delivery || null,
-    table_number: order.table_number || null
-  };
+  /* ===== Emit realtime & guest token handling ===== */
+  try {
+    // jika guest (bukan member), buat guestToken dan simpan di order
+    if (!MemberDoc) {
+      // jika order belum punya guestToken, buat
+      const guestToken = uuidv4();
+      order.guestToken = guestToken;
+      await Order.findByIdAndUpdate(
+        order._id,
+        { $set: { guestToken } },
+        { new: true }
+      ).catch(() => {});
+    }
 
-  emitToStaff('order:new', payload);
-  if (MemberDoc) emitToMember(MemberDoc._id, 'order:new', payload);
-  if ((iden.source || 'online') === 'qr' && order.table_number) {
-    emitToTable(order.table_number, 'order:new', payload);
+    // payload ringkas (sudah ada di variabel payload sebelumnya — tapi lebih konsisten gunakan makeOrderSummary)
+    const summary = makeOrderSummary(order);
+
+    // emit ke staff/kasir/kitchen
+    emitToStaff('order:new', summary);
+    emitToCashier('order:new', summary); // opsional: khusus kasir jika ingin
+    emitToKitchen('order:new', summary);
+
+    // emit ke member atau guest
+    if (MemberDoc) {
+      emitToMember(String(MemberDoc._id), 'order:created', summary);
+    } else if (order.guestToken) {
+      emitToGuest(order.guestToken, 'order:created', summary);
+    }
+  } catch (err) {
+    console.error('[emit][checkout] error', err?.message || err);
   }
 
   try {
@@ -1534,6 +1546,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   /* ===== Response ===== */
   res.status(201).json({
     order: order.toObject(),
+    guestToken: order.guestToken || null,
     totals: {
       items_subtotal: order.items_subtotal,
       service_fee: order.service_fee,
@@ -1890,14 +1903,6 @@ exports.assignTable = asyncHandler(async (req, res) => {
     await cart.save();
   }
 
-  emitToStaff('cart:table_assigned', {
-    cart_id: String(cart._id),
-    table_number
-  });
-  emitToTable(table_number, 'cart:table_assigned', {
-    cart_id: String(cart._id)
-  });
-
   res.json({ message: 'Nomor meja diset', cart: cart.toObject() });
 });
 
@@ -1916,15 +1921,6 @@ exports.changeTable = asyncHandler(async (req, res) => {
   const oldNo = cart.table_number;
   cart.table_number = newNo;
   await cart.save();
-
-  if (oldNo)
-    emitToTable(oldNo, 'cart:unassigned', { cart_id: String(cart._id) });
-  emitToTable(newNo, 'cart:reassigned', { cart_id: String(cart._id) });
-  emitToStaff('cart:table_changed', {
-    oldNo,
-    newNo,
-    cart_id: String(cart._id)
-  });
 
   res.json({
     message: 'Nomor meja diperbarui',
@@ -2601,9 +2597,26 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     console.error('[OrderHistory][createPosDineIn]', e?.message || e);
   }
 
-  emitToStaff('order:new', payload);
-  if (order.table_number) emitToTable(order.table_number, 'order:new', payload);
-  if (member) emitToMember(member._id, 'order:new', payload);
+  try {
+    const summary = makeOrderSummary(order);
+
+    emitToStaff('order:new', summary);
+    emitToCashier('order:new', summary); // kasir khusus
+    emitToKitchen('order:new', summary);
+
+    if (member) {
+      emitToMember(String(member._id), 'order:created', summary);
+    } else {
+      // POS guest: buat guestToken agar device pelanggan bisa rejoin/terima notifikasi
+      const guestToken = uuidv4();
+      await Order.findByIdAndUpdate(order._id, { $set: { guestToken } }).catch(
+        () => {}
+      );
+      emitToGuest(guestToken, 'order:created', summary);
+    }
+  } catch (err) {
+    console.error('[emit][createPosDineIn]', err?.message || err);
+  }
 
   res.status(201).json({
     order: { ...order.toObject(), transaction_code: order.transaction_code },
@@ -2725,10 +2738,18 @@ exports.completeOrder = asyncHandler(async (req, res) => {
     transaction_code: order.transaction_code,
     status: order.status
   };
-  emitToStaff('order:completed', payload);
-  if (order.member) emitToMember(order.member, 'order:completed', payload);
-  if (order.table_number)
-    emitToTable(order.table_number, 'order:completed', payload);
+  try {
+    emitToStaff('order:completed', payload);
+    emitToCashier('order:completed', payload);
+    emitToKitchen('order:completed', payload);
+
+    if (order.member)
+      emitToMember(String(order.member), 'order:completed', payload);
+    if (order.guestToken)
+      emitToGuest(order.guestToken, 'order:completed', payload);
+  } catch (err) {
+    console.error('[emit][completeOrder]', err?.message || err);
+  }
 
   res.status(200).json({ message: 'Pesanan selesai', order });
 });
@@ -2795,10 +2816,18 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     verified_by: { id: String(req.user._id), name: req.user.name },
     at: doc.verified_at
   };
-  emitToStaff('order:accepted_verified', payload);
-  if (doc.member) emitToMember(doc.member, 'order:accepted_verified', payload);
-  if (doc.table_number)
-    emitToTable(doc.table_number, 'order:accepted_verified', payload);
+  try {
+    emitToStaff('order:accepted_verified', payload);
+    emitToKitchen('order:accepted_verified', payload);
+    emitToCashier('order:accepted_verified', payload);
+
+    if (doc.member)
+      emitToMember(String(doc.member), 'order:accepted_verified', payload);
+    if (doc.guestToken)
+      emitToGuest(doc.guestToken, 'order:accepted_verified', payload);
+  } catch (err) {
+    console.error('[emit][acceptAndVerify]', err?.message || err);
+  }
 
   (async () => {
     try {
@@ -2875,9 +2904,26 @@ exports.assignDelivery = asyncHandler(async (req, res) => {
     }
   };
 
-  emitToStaff('order:delivery_assigned', payload);
-  if (updated.member)
-    emitToMember(updated.member, 'order:delivery_assigned', payload);
+  try {
+    emitToStaff('order:delivery_assigned', payload);
+    emitToCashier('order:delivery_assigned', payload);
+
+    if (updated.member)
+      emitToMember(String(updated.member), 'order:delivery_assigned', payload);
+    if (updated.guestToken)
+      emitToGuest(updated.guestToken, 'order:delivery_assigned', payload);
+
+    // emit ke kurir personal kalau ada id
+    if (updated.delivery?.courier?.id) {
+      emitToCourier(
+        String(updated.delivery.courier.id),
+        'order:assign:courier',
+        payload
+      );
+    }
+  } catch (err) {
+    console.error('[emit][assignDelivery]', err?.message || err);
+  }
 
   res.status(200).json({
     message: 'Kurir berhasil di-assign (manual)',
@@ -2971,7 +3017,7 @@ exports.assignBatch = asyncHandler(async (req, res) => {
   });
 
   for (const u of updatedOrders) {
-    const payload = {
+    const p = {
       id: String(u._id),
       transaction_code: u.transaction_code,
       delivery: {
@@ -2980,7 +3026,10 @@ exports.assignBatch = asyncHandler(async (req, res) => {
         assigned_at: u.delivery?.assigned_at
       }
     };
-    if (u.member) emitToMember(u.member, 'order:delivery_assigned', payload);
+    if (u.member) emitToMember(String(u.member), 'order:delivery_assigned', p);
+    if (u.guestToken) emitToGuest(u.guestToken, 'order:delivery_assigned', p);
+    if (u.delivery?.courier?.id)
+      emitToCourier(String(u.delivery.courier.id), 'order:assign:courier', p);
   }
 
   res.json({
@@ -3050,9 +3099,23 @@ exports.updateDeliveryStatus = asyncHandler(async (req, res) => {
     },
     order_status: order.status
   };
-  emitToStaff('order:delivery_status', payload);
-  if (order.member)
-    emitToMember(order.member, 'order:delivery_status', payload);
+  try {
+    emitToStaff('order:delivery_status', payload);
+    emitToCashier('order:delivery_status', payload);
+    if (order.delivery?.courier?.id) {
+      emitToCourier(
+        String(order.delivery.courier.id),
+        'delivery:status',
+        payload
+      );
+    }
+    if (order.member)
+      emitToMember(String(order.member), 'order:delivery_status', payload);
+    if (order.guestToken)
+      emitToGuest(order.guestToken, 'order:delivery_status', payload);
+  } catch (err) {
+    console.error('[emit][updateDeliveryStatus]', err?.message || err);
+  }
 
   res.status(200).json({
     message: 'Status delivery diperbarui',

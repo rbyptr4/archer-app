@@ -139,6 +139,7 @@ const orderSchema = new mongoose.Schema(
         message: 'table_number wajib untuk dine-in QR/POS.'
       }
     },
+    guestToken: { type: String, index: true, default: null },
 
     items: {
       type: [orderItemSchema],

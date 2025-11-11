@@ -31,9 +31,7 @@ async function resolveStaffFromCookie(cookies) {
     const userId = String(payload.sub || payload.id || '');
     if (!userId) return null;
 
-    const user = await User.findById(userId)
-      .select('role pages name courierId')
-      .lean();
+    const user = await User.findById(userId).select('role pages name').lean();
     if (!user) return null;
 
     const pages =
