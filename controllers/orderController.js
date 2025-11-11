@@ -22,7 +22,7 @@ const {
   recordOrderHistory,
   snapshotOrder
 } = require('../controllers/owner/orderHistoryController');
-// di bagian atas orderController.js
+
 const {
   afterCreateOrderEmit,
   makeOrderSummary
@@ -462,65 +462,40 @@ const mergeTwoCarts = (dst, src) => {
 const attachOrMergeCartsForIdentity = async (iden) => {
   if (!iden?.memberId && !iden?.session_id) return;
 
-  if (iden.memberId && iden.session_id) {
-    const memberCart = await Cart.findOne({
-      status: 'active',
-      member: iden.memberId
-    }).sort({ updatedAt: -1 });
+  const filters = [];
+  if (iden.memberId) filters.push({ status: 'active', member: iden.memberId });
+  if (iden.session_id)
+    filters.push({ status: 'active', session_id: iden.session_id });
 
-    const sessionCart = await Cart.findOne({
-      status: 'active',
-      session_id: iden.session_id
-    }).sort({ updatedAt: -1 });
-
-    if (!memberCart && !sessionCart) return;
-
-    if (!memberCart && sessionCart) {
-      sessionCart.member = iden.memberId;
-      sessionCart.session_id = null;
-      sessionCart.source = sessionCart.source || 'online';
-      await sessionCart.save();
-      return;
-    }
-
-    if (memberCart && !sessionCart) return;
-
-    if (memberCart && sessionCart) {
-      for (const it of sessionCart.items || []) {
-        const key = String(it.line_key);
-        const i = memberCart.items.findIndex((d) => String(d.line_key) === key);
-        if (i >= 0) {
-          const sum =
-            (Number(memberCart.items[i].quantity) || 0) +
-            (Number(it.quantity) || 0);
-          memberCart.items[i].quantity = Math.max(1, Math.min(999, sum));
-        } else {
-          memberCart.items.push(it.toObject ? it.toObject() : { ...it });
-        }
-      }
-
-      recomputeTotals(memberCart);
-
-      await memberCart.save();
-      try {
-        await sessionCart.deleteOne();
-      } catch (_) {}
-      return;
-    }
-  }
-
-  const filter = iden.memberId
-    ? { status: 'active', member: iden.memberId }
-    : { status: 'active', session_id: iden.session_id };
-
-  const carts = await Cart.find(filter).sort({ updatedAt: -1 }); // newest first
+  const carts = await Cart.find({ $or: filters }).sort({ updatedAt: -1 });
   if (carts.length <= 1) return;
 
-  const primary = carts[0];
-  for (let i = 1; i < carts.length; i++) {
-    mergeTwoCarts(primary, carts[i]);
-    await carts[i].deleteOne().catch(() => {});
+  let primary = carts[0];
+
+  if (iden.memberId) {
+    const memberOwned = carts.find(
+      (c) => String(c.member) === String(iden.memberId)
+    );
+    if (memberOwned) primary = memberOwned;
   }
+
+  for (const c of carts) {
+    if (String(c._id) === String(primary._id)) continue;
+    mergeTwoCarts(primary, c);
+    try {
+      await c.deleteOne();
+    } catch (e) {
+      // jangan crash kalau gagal delete, tapi log untuk debugging
+      console.error(
+        '[attachOrMergeCartsForIdentity] failed to delete cart',
+        c._id,
+        e?.message || e
+      );
+    }
+  }
+
+  if (iden.memberId) primary.member = iden.memberId;
+  primary.session_id = null;
   await primary.save();
 };
 
