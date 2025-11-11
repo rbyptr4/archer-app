@@ -1,7 +1,6 @@
 // controllers/orderController.js
 const asyncHandler = require('express-async-handler');
 const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
 const tz = require('dayjs/plugin/timezone');
@@ -181,6 +180,8 @@ function isSlotAvailable(label, dateDay = null) {
   const slot = getSlotsForDate(dateDay).find((s) => s.label === label);
   return !!(slot && slot.available);
 }
+
+const short = (arr, n = 3) => (Array.isArray(arr) ? arr.slice(0, n) : arr);
 
 const toWa62 = (phone) => {
   const s = String(phone ?? '').trim();
