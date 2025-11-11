@@ -1134,10 +1134,6 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
 /* ===================== CHECKOUT ===================== */
 exports.checkout = asyncHandler(async (req, res) => {
   const iden0 = getIdentity(req);
-  console.log('[checkout] headers:', req.headers);
-  console.log('[checkout] cookies:', req.cookies);
-  console.log('[checkout] identity:', iden0);
-
   const {
     name,
     phone,
@@ -1177,11 +1173,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   if (originallyLoggedIn || wantRegister) {
     const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
     MemberDoc = await ensureMemberForCheckout(req, res, joinChannel);
-    console.log(
-      '[checkout] ensureMemberForCheckout ->',
-      !!MemberDoc,
-      MemberDoc?._id
-    );
   } else {
     customer_name = String(name || '').trim();
     const rawPhone = String(phone || '').trim();
@@ -1429,6 +1420,45 @@ exports.checkout = asyncHandler(async (req, res) => {
     throw err;
   }
   console.log('[VOUCHER][PRICED]', JSON.stringify(priced, null, 2));
+
+  // tambahan: per-item inspect untuk setiap breakdown entry
+  for (const b of priced.breakdown || []) {
+    try {
+      const v = b.voucher || b.voucherId || {}; // depending on shape
+      console.log(
+        '[VOUCHER][BREAK]',
+        b.name,
+        'note=',
+        b.note,
+        'itemsDiscount=',
+        b.itemsDiscount
+      );
+      // jika mau lihat scoped items, compute again quickly:
+      // (hanya untuk debug — jangan simpan di prod)
+      const voucherDoc = await Voucher.findById(
+        b.voucherId || b.voucher
+      ).lean();
+      const scoped = filterItemsByScope(
+        cart.items.map((it) => ({
+          menuId: it.menu,
+          qty: it.quantity,
+          price: it.base_price,
+          category: it.category
+        })),
+        voucherDoc.appliesTo
+      );
+      console.log(
+        '[VOUCHER][SCOPE]',
+        voucherDoc.appliesTo,
+        'scopedSubtotal=',
+        scoped.reduce((s, i) => s + i.price * i.qty, 0),
+        'scopedItems=',
+        scoped
+      );
+    } catch (e) {
+      console.error(e);
+    }
+  }
 
   // base harga menu (pre-discount) — simpan di order sebagai reference
   const baseItemsSubtotal = int(priced.totals.baseSubtotal);
@@ -1837,6 +1867,45 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
       voucherClaimIds: eligibleClaimIds
     });
     console.log('[VOUCHER][PRICED]', JSON.stringify(priced, null, 2));
+
+    // tambahan: per-item inspect untuk setiap breakdown entry
+    for (const b of priced.breakdown || []) {
+      try {
+        const v = b.voucher || b.voucherId || {}; // depending on shape
+        console.log(
+          '[VOUCHER][BREAK]',
+          b.name,
+          'note=',
+          b.note,
+          'itemsDiscount=',
+          b.itemsDiscount
+        );
+        // jika mau lihat scoped items, compute again quickly:
+        // (hanya untuk debug — jangan simpan di prod)
+        const voucherDoc = await Voucher.findById(
+          b.voucherId || b.voucher
+        ).lean();
+        const scoped = filterItemsByScope(
+          cart.items.map((it) => ({
+            menuId: it.menu,
+            qty: it.quantity,
+            price: it.base_price,
+            category: it.category
+          })),
+          voucherDoc.appliesTo
+        );
+        console.log(
+          '[VOUCHER][SCOPE]',
+          voucherDoc.appliesTo,
+          'scopedSubtotal=',
+          scoped.reduce((s, i) => s + i.price * i.qty, 0),
+          'scopedItems=',
+          scoped
+        );
+      } catch (e) {
+        console.error(e);
+      }
+    }
 
     // --- KEY: use cart UI totals as authoritative for payment amount ---
     // build uiTotals FROM priced (authoritative)
