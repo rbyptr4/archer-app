@@ -1101,6 +1101,10 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
 /* ===================== CHECKOUT ===================== */
 exports.checkout = asyncHandler(async (req, res) => {
   const iden0 = getIdentity(req);
+  console.log('[checkout] headers:', req.headers);
+  console.log('[checkout] cookies:', req.cookies);
+  console.log('[checkout] identity:', iden0);
+
   const {
     name,
     phone,
@@ -1140,6 +1144,11 @@ exports.checkout = asyncHandler(async (req, res) => {
   if (originallyLoggedIn || wantRegister) {
     const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
     MemberDoc = await ensureMemberForCheckout(req, res, joinChannel);
+    console.log(
+      '[checkout] ensureMemberForCheckout ->',
+      !!MemberDoc,
+      MemberDoc?._id
+    );
   } else {
     customer_name = String(name || '').trim();
     const rawPhone = String(phone || '').trim();
