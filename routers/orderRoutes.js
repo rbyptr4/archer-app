@@ -5,6 +5,7 @@ const validateToken = require('../utils/tokenHandler');
 const requireRole = require('../utils/requireRole');
 const requirePageAccess = require('../utils/requirePageAccess');
 const authMemberRequired = require('../middlewares/authMember');
+const authMemberOptional = require('../middlewares/authMemberOptional');
 
 const order = require('../controllers/orderController');
 
@@ -44,13 +45,14 @@ router.post(
 
 router.post(
   '/checkout',
+  authMemberOptional,
   fileUploader.single('payment_proof'),
   parseFormData,
   order.checkout
 );
 
 router.get('/delivery-slots', order.deliverySlots);
-router.post('/checkout/qris', order.createQrisFromCart);
+router.post('/checkout/qris', authMemberOptional, order.createQrisFromCart);
 router.get(
   '/delivery-board',
   validateToken,
