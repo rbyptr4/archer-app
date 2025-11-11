@@ -16,6 +16,7 @@ const Member = require('../models/memberModel');
 const Order = require('../models/orderModel');
 const MemberSession = require('../models/memberSessionModel');
 const VoucherClaim = require('../models/voucherClaimModel');
+const Voucher = require('../models/voucherModel');
 
 const {
   recordOrderHistory,
