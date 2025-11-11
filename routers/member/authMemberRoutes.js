@@ -6,7 +6,8 @@ const {
   member,
   refreshMember,
   verifyLoginOtp,
-  verifyRegisterOtp
+  verifyRegisterOtp,
+  devLoginMember
 } = require('../../controllers/member/authMemberController');
 const authMember = require('../../middlewares/authMember');
 const {
@@ -18,6 +19,7 @@ const {
 } = require('../../controllers/member/waOtpController');
 const router = express.Router();
 
+router.post('/dev-login', devLoginMember);
 router.post('/request-change-phone', requestChangePhone);
 router.post('/verify-change-phone', verifyChangePhone);
 router.post('/request-change-name', requestChangeName);

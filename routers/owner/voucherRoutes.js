@@ -6,7 +6,10 @@ const router = express.Router();
 
 router.use(validateToken, requireRole('owner'));
 
-router.post('/create-voucher', ctrl.createVoucher);
+router.post('/percent', ctrl.createPercentVoucher);
+router.post('/bundling', ctrl.createBundlingVoucher);
+router.post('/amount', ctrl.createAmountVoucher);
+router.post('/shipping', ctrl.createShippingVoucher);
 router.get('/all-voucher', ctrl.listVoucher);
 router.get('/:id', ctrl.getVoucher);
 router.patch('/update/:id', ctrl.updateVoucher);

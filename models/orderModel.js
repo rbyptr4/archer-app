@@ -268,25 +268,28 @@ orderSchema.pre('validate', function (next) {
     : int(this.delivery_fee || 0);
   this.delivery_fee = deliveryFee;
 
-  // SERVICE FEE: aggregate from items_subtotal (2% of items only)
-  const sfRate = SERVICE_FEE_RATE;
-  this.service_fee = int(Math.round(this.items_subtotal * sfRate));
-
   // Normalisasi diskon (tidak boleh negatif)
   this.items_discount = int(Math.max(0, this.items_discount || 0));
   this.shipping_discount = int(Math.max(0, this.shipping_discount || 0));
 
-  // TAX: aggregate from items_subtotal (11% default via parsePpnRate)
+  // TAX & SERVICE: kedua-duanya dihitung dari items setelah diskon
+  const taxableItems = Math.max(0, this.items_subtotal - this.items_discount);
+
+  // SERVICE FEE: aggregate from taxable items (2% dari items setelah diskon)
+  const sfRate = SERVICE_FEE_RATE;
+  this.service_fee = int(Math.round(taxableItems * sfRate));
+
+  // TAX: aggregate from taxable items
   const rate = parsePpnRate();
   this.tax_rate_percent = Math.round(rate * 100 * 100) / 100;
-  this.tax_amount = int(Math.round(this.items_subtotal * rate));
+  this.tax_amount = int(Math.round(taxableItems * rate));
 
   // Raw total sebelum rounding:
+  // - gunakan taxableItems (items after discount) + service + delivery - shipping_discount + tax
   const rawTotal =
-    this.items_subtotal +
+    taxableItems +
     this.service_fee +
     this.delivery_fee -
-    this.items_discount -
     this.shipping_discount +
     this.tax_amount;
 

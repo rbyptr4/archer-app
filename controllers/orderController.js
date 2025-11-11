@@ -1328,29 +1328,35 @@ exports.checkout = asyncHandler(async (req, res) => {
     throw err;
   }
 
-  /* ===== AGGREGATE: service & tax dari items_subtotal (SINGLE SOURCE) ===== */
-  const items_subtotal = int(priced.totals.baseSubtotal);
-  const items_discount = int(priced.totals.itemsDiscount);
-  const shipping_discount = int(priced.totals.shippingDiscount);
-  const baseDelivery = int(priced.totals.deliveryFee);
+  // base harga menu (pre-discount) — simpan di order sebagai reference
+  const baseItemsSubtotal = int(priced.totals.baseSubtotal);
+  const items_discount = int(priced.totals.itemsDiscount || 0);
+  const shipping_discount = int(priced.totals.shippingDiscount || 0);
+  const baseDelivery = int(priced.totals.deliveryFee || 0);
 
-  // Service fee: 2% dari total items (aggregate)
-  const service_fee = int(Math.round(items_subtotal * SERVICE_FEE_RATE));
+  // items subtotal setelah diskon voucher (taxable base)
+  const items_subtotal_after_discount = Math.max(
+    0,
+    baseItemsSubtotal - items_discount
+  );
 
-  // Tax: aggregate dari items_subtotal (NOT affected by voucher)
+  // SERVICE FEE: 2% dari items AFTER discount (sesuai permintaan)
+  const service_fee = int(
+    Math.round(items_subtotal_after_discount * SERVICE_FEE_RATE)
+  );
+
   const rateForTax = parsePpnRate();
-  const taxAmount = int(Math.round(items_subtotal * rateForTax));
+  const taxAmount = int(Math.round(items_subtotal_after_discount * rateForTax));
   const taxRatePercent = Math.round(rateForTax * 100 * 100) / 100;
 
-  // ===== Total sebelum pembulatan (items + service + delivery - discounts + tax)
   const beforeRound = int(
-    items_subtotal +
+    items_subtotal_after_discount +
       service_fee +
       baseDelivery -
-      items_discount -
       shipping_discount +
       taxAmount
   );
+
   const requested_bvt = int(roundRupiahCustom(beforeRound));
   const rounding_delta = int(requested_bvt - beforeRound);
 
@@ -1757,13 +1763,18 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
         notes: it.notes,
         category: it.category || null
       })),
-      items_subtotal: int(priced.totals.baseSubtotal),
-      delivery_fee: int(priced.totals.deliveryFee),
-      service_fee: int(uiTotals.service_fee || 0),
-      items_discount: int(priced.totals.itemsDiscount || 0),
+
+      items_subtotal: int(priced.totals.baseSubtotal), // pre-discount reference
+      items_discount: int(priced.totals.itemsDiscount || 0), // vouchers on items
+      delivery_fee: int(priced.totals.deliveryFee || 0),
       shipping_discount: int(priced.totals.shippingDiscount || 0),
+
+      service_fee: int(uiTotals.service_fee || 0),
+      tax_amount: int(uiTotals.tax_amount || 0),
+
       discounts: priced.breakdown || [],
-      requested_amount: requested_bvt,
+
+      requested_amount: requested_bvt, // authoritative amount (from uiTotals.grand_total)
       rounding_delta,
       ui_totals: uiTotals,
       delivery_snapshot: cart.delivery || {},

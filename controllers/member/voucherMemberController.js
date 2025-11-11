@@ -17,7 +17,6 @@ function inWindow(v, now = new Date()) {
   return true;
 }
 
-// Selalu kembalikan string ObjectId (atau null)
 const getMemberId = (req) => {
   const m = req?.member;
   if (!m) return null;
@@ -31,6 +30,7 @@ exports.explore = asyncHandler(async (req, res) => {
   if (!meId) throwError('Unauthorized (member)', 401);
 
   const now = new Date();
+  // only active + not deleted vouchers
   const list = await Voucher.find({ isDeleted: false, isActive: true })
     .sort('-createdAt')
     .lean();
@@ -38,7 +38,7 @@ exports.explore = asyncHandler(async (req, res) => {
   const visible = list.filter((v) => {
     if (!inWindow(v, now)) return false;
 
-    // include/exclude
+    // include/exclude lists
     if (v.target?.excludeMemberIds?.some((id) => String(id) === meId))
       return false;
 
@@ -50,7 +50,7 @@ exports.explore = asyncHandler(async (req, res) => {
         return false;
     }
 
-    // global stock (opsional)
+    // global stock
     if (
       v.visibility?.mode === 'global_stock' &&
       (v.visibility?.globalStock || 0) <= 0
@@ -63,7 +63,11 @@ exports.explore = asyncHandler(async (req, res) => {
   res.json({ vouchers: visible });
 });
 
-// POST /member/vouchers/:voucherId/claim
+/**
+ * POST /member/vouchers/:voucherId/claim
+ * - Requires authenticated member (req.member)
+ * - No body required (server computes/records the claim)
+ */
 exports.claim = asyncHandler(async (req, res) => {
   const meId = getMemberId(req);
   if (!meId) throwError('Unauthorized (member)', 401);
@@ -71,25 +75,35 @@ exports.claim = asyncHandler(async (req, res) => {
   const { voucherId } = req.params;
   if (!isValidId(voucherId)) throwError('voucherId tidak valid', 400);
 
+  // Start transaction to be safe for stock/points concurrency
   const session = await mongoose.startSession();
   try {
+    let createdClaim = null;
     await session.withTransaction(async () => {
+      // Lock/read voucher inside session
       const v = await Voucher.findById(voucherId).session(session);
       if (!v || v.isDeleted || !v.isActive)
         throwError('Voucher tidak tersedia', 400);
 
       const now = new Date();
+      // claim window check
       if (!inWindow(v, now)) throwError('Di luar periode klaim', 400);
 
-      // global stock (opsional)
+      // If voucher is auto-applied (claimRequired=false), don't allow manual claim.
+      // This avoids confusion where FE tries to "claim" something that should be auto-applied at checkout.
+      if (v.usage && v.usage.claimRequired === false) {
+        throwError('Voucher ini tidak perlu diklaim (auto-applied).', 400);
+      }
+
+      // global stock: ensure still >0 then decrement
       if (v.visibility?.mode === 'global_stock') {
         if ((v.visibility.globalStock || 0) < 1)
           throwError('Stok voucher habis', 400);
-        v.visibility.globalStock -= 1;
+        v.visibility.globalStock = (v.visibility.globalStock || 0) - 1;
         await v.save({ session });
       }
 
-      // per-member limit
+      // per-member limit (count claims for this voucher by this member)
       if ((v.visibility?.perMemberLimit || 0) > 0) {
         const count = await VoucherClaim.countDocuments({
           voucher: v._id,
@@ -99,39 +113,85 @@ exports.claim = asyncHandler(async (req, res) => {
           throwError('Batas klaim per member tercapai', 400);
       }
 
-      // potong poin (kalau perlu)
+      // oneTimePerPeriod (if enabled) => check claims in the same period window (visibility.startAt..endAt)
+      if (v.target?.oneTimePerPeriod) {
+        // define the period: use visibility.startAt..visibility.endAt if periodic, otherwise fallback to createdAt month
+        let periodStart = v.visibility?.startAt || null;
+        let periodEnd = v.visibility?.endAt || null;
+        if (!periodStart || !periodEnd) {
+          // fallback: use voucher.createdAt month window
+          const created = v.createdAt || new Date();
+          periodStart = new Date(created.getFullYear(), created.getMonth(), 1);
+          periodEnd = new Date(
+            created.getFullYear(),
+            created.getMonth() + 1,
+            0,
+            23,
+            59,
+            59,
+            999
+          );
+        }
+        const existing = await VoucherClaim.countDocuments({
+          voucher: v._id,
+          member: meId,
+          claimedAt: { $gte: periodStart, $lte: periodEnd }
+        }).session(session);
+        if (existing > 0)
+          throwError(
+            'Voucher ini hanya boleh diklaim sekali pada periode yang sama',
+            400
+          );
+      }
+
+      // require points? deduct from member
       if ((v.target?.requiredPoints || 0) > 0) {
         const m = await Member.findById(meId).session(session);
         if (!m) throwError('Member tidak ditemukan', 404);
-        if ((m.points || 0) < v.target.requiredPoints)
-          throwError('Poin tidak cukup', 400);
-        m.points -= v.target.requiredPoints;
+        const need = Number(v.target.requiredPoints || 0);
+        if ((m.points || 0) < need) throwError('Poin tidak cukup', 400);
+        m.points = (m.points || 0) - need;
         await m.save({ session });
       }
 
-      // buat claim wallet
-      const claimDocs = await VoucherClaim.create(
+      // compute validUntil:
+      // - if useValidDaysAfterClaim > 0 => now + days
+      // - else if visibility.endAt exists => visibility.endAt
+      // - else undefined (no expiry)
+      let validUntil = undefined;
+      const days = v.usage?.useValidDaysAfterClaim || 0;
+      if (days > 0) {
+        validUntil = new Date(now.getTime() + days * 86400000);
+      } else if (v.visibility?.endAt) {
+        validUntil = v.visibility.endAt;
+      }
+
+      // remainingUse based on voucher.usage.maxUsePerClaim
+      const remainingUse = Math.max(1, Number(v.usage?.maxUsePerClaim || 1));
+
+      // create claim document
+      const claim = await VoucherClaim.create(
         [
           {
             voucher: v._id,
             member: meId,
             status: 'claimed',
-            remainingUse: v.usage?.maxUsePerClaim || 1,
-            validUntil:
-              (v.usage?.useValidDaysAfterClaim || 0) > 0
-                ? new Date(
-                    now.getTime() + v.usage.useValidDaysAfterClaim * 86400000
-                  )
-                : undefined,
-            spentPoints: v.target?.requiredPoints || 0,
-            history: [{ action: 'CLAIM', note: 'claim voucher' }]
+            remainingUse,
+            validUntil,
+            spentPoints: Number(v.target?.requiredPoints || 0),
+            history: [
+              { at: now, action: 'CLAIM', note: 'Member claimed voucher' }
+            ]
           }
         ],
         { session }
       );
 
-      res.status(201).json({ claim: claimDocs[0] });
+      createdClaim = claim[0];
     });
+
+    // transaction committed
+    res.status(201).json({ claim: createdClaim });
   } finally {
     session.endSession();
   }

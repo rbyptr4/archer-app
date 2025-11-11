@@ -1,5 +1,6 @@
 const asyncHandler = require('express-async-handler');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const Member = require('../../models/memberModel');
 const MemberSession = require('../../models/memberSessionModel');
 const MemberOtp = require('../../models/memberOtpModel'); // <-- pastikan ada model ini
@@ -108,6 +109,52 @@ exports.loginMember = asyncHandler(async (req, res) => {
     phone: phone,
     success: true,
     message: `OTP dikirim ke WhatsApp (${OTP_TTL_MIN} menit berlaku).`
+  });
+});
+
+exports.devLoginMember = asyncHandler(async (req, res) => {
+  const { name, phone } = req.body || {};
+  if (!name || !phone) throwError('Nama dan nomor WA wajib diisi', 400);
+
+  const normalizedPhone = normalizePhone(phone);
+  if (!/^0\d{9,13}$/.test(normalizedPhone)) {
+    throwError('Format nomor tidak valid (gunakan 08xxxxxxxx)', 400);
+  }
+
+  const member = await Member.findOne({ phone: normalizedPhone });
+  if (!member)
+    throwError(
+      'Nomor belum terdaftar. Silakan registrasi terlebih dahulu.',
+      404
+    );
+  if (!member.is_active) throwError('Akun member tidak aktif.', 403);
+
+  // optional: cek nama kalau mau
+  if (!sameName(member.name, name)) {
+    throwError('Nama tidak cocok dengan nomor ini.', 400);
+  }
+
+  const jwtSecret = process.env.MEMBER_TOKEN_SECRET;
+  const token = jwt.sign(
+    {
+      id: String(member._id),
+      phone: member.phone,
+      name: member.name
+    },
+    jwtSecret,
+    { expiresIn: '30d' }
+  );
+
+  res.json({
+    success: true,
+    message: 'Login tanpa OTP (dev mode)',
+    token,
+    member: {
+      _id: member._id,
+      name: member.name,
+      phone: member.phone,
+      is_active: member.is_active
+    }
   });
 });
 
