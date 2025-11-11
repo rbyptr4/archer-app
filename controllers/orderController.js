@@ -1427,6 +1427,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   } catch (err) {
     throw err;
   }
+  console.log('[VOUCHER][PRICED]', JSON.stringify(priced, null, 2));
 
   // base harga menu (pre-discount) — simpan di order sebagai reference
   const baseItemsSubtotal = int(priced.totals.baseSubtotal);
@@ -1834,9 +1835,17 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
       deliveryFee: cart.delivery?.delivery_fee || 0,
       voucherClaimIds: eligibleClaimIds
     });
+    console.log('[VOUCHER][PRICED]', JSON.stringify(priced, null, 2));
 
     // --- KEY: use cart UI totals as authoritative for payment amount ---
-    const uiTotals = buildUiTotalsFromCart(cart);
+    // build uiTotals FROM priced (authoritative)
+    const uiTotals = buildUiTotalsFromCart({
+      total_price: priced.totals.baseSubtotal, // pre-discount
+      items_discount: priced.totals.itemsDiscount || 0,
+      shipping_discount: priced.totals.shippingDiscount || 0,
+      delivery: { delivery_fee: priced.totals.deliveryFee || 0 }
+    });
+
     const requested_bvt = int(Number(uiTotals.grand_total || 0));
     const rounding_delta = int(Number(uiTotals.rounding_delta || 0));
 
