@@ -181,16 +181,6 @@ function isSlotAvailable(label, dateDay = null) {
   return !!(slot && slot.available);
 }
 
-const safeJson = (v, fallback = null) => {
-  try {
-    return JSON.stringify(v);
-  } catch (_) {
-    return fallback;
-  }
-};
-
-const short = (arr, n = 3) => (Array.isArray(arr) ? arr.slice(0, n) : arr);
-
 const toWa62 = (phone) => {
   const s = String(phone ?? '').trim();
   if (!s) return '';
@@ -394,20 +384,60 @@ exports.modeResolver = asyncHandler(async (req, _res, next) => {
 
 /* Ambil identitas caller (member/session) + mode/source */
 const getIdentity = (req) => {
-  const memberId = req.member?.id || null;
-  const session_id =
-    req.session_id ||
-    req.cookies?.[DEVICE_COOKIE] ||
-    req.header('x-device-id') ||
-    null;
-
-  return {
-    mode: req.orderMode,
-    source: req.orderSource,
-    memberId,
-    session_id,
+  const iden = {
+    mode: req.orderMode || null,
+    source: req.orderSource || null,
+    memberId: null,
+    session_id: null,
     table_number: req.table_number || null
   };
+
+  // === session / device id ===
+  iden.session_id =
+    req.session_id ||
+    req.cookies?.[DEVICE_COOKIE] ||
+    req.header?.('x-device-id') ||
+    req.header?.('session_id') ||
+    null;
+
+  // === 1) prioritas: req.member (middleware-auth) ===
+  if (req.member && (req.member.id || req.member._id)) {
+    iden.memberId = req.member.id || req.member._id;
+    return iden;
+  }
+
+  // === 2) coba header explicit (x-member-id / memberid) ===
+  const hdrMember =
+    req.header?.('x-member-id') ||
+    req.header?.('memberid') ||
+    req.header?.('member-id') ||
+    req.header?.('x-user-id') ||
+    null;
+  if (hdrMember) {
+    iden.memberId = String(hdrMember);
+    return iden;
+  }
+
+  // === 3) coba cookie / authorization token (memberToken / bearer) ===
+  const token = req.cookies?.memberToken;
+
+  if (token) {
+    try {
+      // pastikan SECRET sama dengan saat token dibuat
+      const payload = jwt.verify(token, process.env.MEMBER_TOKEN_SECRET || '');
+      // toleransi terhadap berbagai nama field
+      iden.memberId = payload?.id || payload?._id || payload?.userId || null;
+
+      // optionally attach some quick info
+      if (!iden.memberId && payload?.phone) iden.memberPhone = payload.phone;
+      if (!iden.memberId && payload?.name) iden.memberName = payload.name;
+    } catch (e) {
+      // jangan throw; hanya log untuk debugging
+      console.warn('[getIdentity] token verify failed:', e?.message || e);
+    }
+  }
+
+  return iden;
 };
 
 const mergeTwoCarts = (dst, src) => {
