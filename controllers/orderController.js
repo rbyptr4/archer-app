@@ -2360,7 +2360,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     ok: result.ok,
     reasons: result.reasons || [],
     breakdown: result.breakdown || [],
-    totals: result.totals || {},
     ui_totals
   });
 });
