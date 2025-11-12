@@ -274,4 +274,4 @@ async function validateAndPrice(
   };
 }
 
-module.exports = { validateAndPrice };
+module.exports = { validateAndPrice, filterItemsByScope };

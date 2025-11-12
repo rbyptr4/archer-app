@@ -56,7 +56,10 @@ const { getDriveFolder } = require('../utils/driveFolders');
 
 const { haversineKm } = require('../utils/distance');
 const { nextDailyTxCode } = require('../utils/txCode');
-const { validateAndPrice } = require('../utils/voucherEngine');
+const {
+  validateAndPrice,
+  filterItemsByScope
+} = require('../utils/voucherEngine');
 const { awardPointsIfEligible } = require('../utils/loyalty');
 
 dayjs.extend(utc);
