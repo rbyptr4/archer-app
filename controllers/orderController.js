@@ -2310,13 +2310,27 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   }
 
   // ===== NORMALISASI CART ITEMS untuk validateAndPrice =====
+  // PENTING: price harus sudah termasuk addons. Pastikan front-end mengirim price per unit yang sudah
+  // mencakup harga addons (atau kamu hitung di sini jika struktur cart mengandung addons detail).
   const normalizedCart = {
-    items: (Array.isArray(cart.items) ? cart.items : []).map((it) => ({
-      menuId: it.menu || it.menuId || it.id || null,
-      qty: Number(it.quantity ?? it.qty ?? 0),
-      price: Number(it.base_price ?? it.price ?? it.unit_price ?? 0),
-      category: it.category ?? it.cat ?? null
-    }))
+    items: (Array.isArray(cart.items) ? cart.items : []).map((it) => {
+      // Jika cart item punya addons detail, hitung price per unit termasuk addons:
+      const addons = Array.isArray(it.addons) ? it.addons : [];
+      const addonsPerUnit = addons.reduce((s, a) => {
+        const ap = Number(a?.price || 0);
+        const aq = Number(a?.qty || 1);
+        // asumsi: a.qty adalah qty PER UNIT item. Jika strukturmu berbeda, sesuaikan.
+        return s + ap * aq;
+      }, 0);
+      const unitBase = Number(it.base_price ?? it.price ?? it.unit_price ?? 0);
+      const unitPrice = int(unitBase + addonsPerUnit);
+      return {
+        menuId: it.menu || it.menuId || it.id || null,
+        qty: Number(it.quantity ?? it.qty ?? 0),
+        price: unitPrice,
+        category: it.category ?? it.cat ?? null
+      };
+    })
   };
 
   const result = await validateAndPrice({
@@ -2327,7 +2341,28 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     voucherClaimIds: eligible
   });
 
-  res.status(200).json(result);
+  // build ui_totals mirip getCart
+  const t = result.totals || {};
+  const ui_totals = {
+    items_subtotal: Number(t.baseSubtotal || 0),
+    items_subtotal_after_discount: Number(t.items_subtotal_after_discount || 0),
+    items_discount: Number(t.itemsDiscount || 0),
+    service_fee: Number(t.service_fee || 0),
+    tax_amount: Number(t.tax_amount || 0),
+    delivery_fee: Number(t.deliveryFee || 0),
+    shipping_discount: Number(t.shippingDiscount || 0),
+    rounding_delta: Number(t.rounding_delta || 0),
+    grand_total: Number(t.grandTotal || 0),
+    grand_total_with_delivery: Number(t.grandTotal || 0) // delivery sudah ikut di grandTotal per implementasi di atas
+  };
+
+  return res.status(200).json({
+    ok: result.ok,
+    reasons: result.reasons || [],
+    breakdown: result.breakdown || [],
+    totals: result.totals || {},
+    ui_totals
+  });
 });
 
 /* ===================== STAFF / OWNER ENDPOINTS ===================== */

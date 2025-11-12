@@ -39,8 +39,6 @@ const VoucherSchema = new mongoose.Schema(
 
     // ---- periode & stok ----
     visibility: {
-      // global_stock: stok voucher habis = tak bisa diklaim lagi
-      // periodic: klaim dibatasi rentang tanggal (stok opsional), owner bisa set perMemberLimit
       mode: {
         type: String,
         enum: ['global_stock', 'periodic'],
