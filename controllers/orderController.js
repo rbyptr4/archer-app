@@ -2226,13 +2226,24 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       .map((c) => String(c._id));
   }
 
+  // ===== NORMALISASI CART ITEMS untuk validateAndPrice =====
+  const normalizedCart = {
+    items: (Array.isArray(cart.items) ? cart.items : []).map((it) => ({
+      menuId: it.menu || it.menuId || it.id || null,
+      qty: Number(it.quantity ?? it.qty ?? 0),
+      price: Number(it.base_price ?? it.price ?? it.unit_price ?? 0),
+      category: it.category ?? it.cat ?? null
+    }))
+  };
+
   const result = await validateAndPrice({
     memberId: req.member.id,
-    cart,
+    cart: normalizedCart,
     fulfillmentType,
     deliveryFee: fulfillmentType === 'delivery' ? Number(deliveryFee || 0) : 0,
     voucherClaimIds: eligible
   });
+
   res.status(200).json(result);
 });
 

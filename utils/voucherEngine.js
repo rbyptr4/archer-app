@@ -4,8 +4,6 @@ const Voucher = require('../models/voucherModel');
 const VoucherClaim = require('../models/voucherClaimModel');
 const throwError = require('./throwError');
 
-// Ambil info kebutuhan dari cart:
-// - items: [{menuId, qty, price, category}]
 function subtotalFromItems(items = []) {
   return items.reduce((sum, it) => sum + it.price * it.qty, 0);
 }
@@ -24,31 +22,80 @@ function filterItemsByScope(items, appliesTo) {
 }
 
 function calcPercent(val, pct) {
-  return Math.floor((val * pct) / 100);
+  // pembulatan ke nearest integer supaya adil
+  return Math.max(0, Math.round((Number(val || 0) * Number(pct || 0)) / 100));
 }
 
 function computeVoucherDiscount(voucher, items, deliveryFee) {
   const scoped = filterItemsByScope(items, voucher.appliesTo);
   const scopedSubtotal = subtotalFromItems(scoped);
 
+  // helper shipping discount (voucher-defined)
+  const computeShippingDiscount = () => {
+    const pct = Number(voucher.shipping?.percent ?? 0);
+    const cap = Number(voucher.shipping?.maxAmount ?? 0);
+    if (!pct || !deliveryFee) return 0;
+    let d = calcPercent(deliveryFee, pct);
+    if (cap > 0) d = Math.min(d, cap);
+    return Math.min(d, deliveryFee);
+  };
+
   switch (voucher.type) {
     case 'percent': {
-      const d = calcPercent(scopedSubtotal, voucher.percent || 0);
-      return { itemsDiscount: d, shippingDiscount: 0, note: 'percent' };
+      const pct = Number(voucher.percent || 0);
+      let itemsDisc = calcPercent(scopedSubtotal, pct);
+
+      // APPLY GLOBAL CAP jika ada (contoh field: voucher.maxDiscount)
+      if (Number.isFinite(Number(voucher.maxDiscount))) {
+        const cap = Number(voucher.maxDiscount);
+        if (cap >= 0) itemsDisc = Math.min(itemsDisc, cap);
+      }
+
+      // jangan melebihi subtotal
+      itemsDisc = Math.min(itemsDisc, scopedSubtotal);
+
+      // optional: jika config mengizinkan, voucher percent juga bisa memotong ongkir
+      const shippingDisc =
+        voucher.shipping && voucher.usage?.stackableWithShipping
+          ? computeShippingDiscount()
+          : 0;
+
+      return {
+        itemsDiscount: itemsDisc,
+        shippingDiscount: shippingDisc,
+        note: 'percent'
+      };
     }
+
     case 'amount': {
-      const d = Math.min(voucher.amount || 0, scopedSubtotal);
-      return { itemsDiscount: d, shippingDiscount: 0, note: 'amount' };
+      // untuk tipe amount, voucher.amount adalah nominal potongan
+      // tetap batasi supaya tidak negatif, dan tidak melebihi subtotal (kecuali kamu mau memperbolehkan "free" -> tapi jangan negatif)
+      let d = Number(voucher.amount || 0);
+      // jika voucher punya maxDiscount juga, respect it (safety)
+      if (Number.isFinite(Number(voucher.maxDiscount))) {
+        d = Math.min(d, Number(voucher.maxDiscount));
+      }
+      d = Math.max(0, Math.min(d, scopedSubtotal));
+      const shippingDisc =
+        voucher.shipping && voucher.usage?.stackableWithShipping
+          ? computeShippingDiscount()
+          : 0;
+      return {
+        itemsDiscount: d,
+        shippingDiscount: shippingDisc,
+        note: 'amount'
+      };
     }
+
     case 'free_item': {
-      // versi simpel: gratis 1 item termurah di scope
       const cheapest = scoped.reduce(
         (m, it) => (m && m.price < it.price ? m : it),
         null
       );
-      const d = cheapest ? cheapest.price : 0;
+      const d = Math.min(cheapest ? cheapest.price : 0, scopedSubtotal);
       return { itemsDiscount: d, shippingDiscount: 0, note: 'free_item' };
     }
+
     case 'bundling': {
       const need = voucher.appliesTo?.bundling?.buyQty || 0;
       if (!need)
@@ -65,16 +112,21 @@ function computeVoucherDiscount(voucher, items, deliveryFee) {
           note: 'bundling(not enough qty)'
         };
       const pct = voucher.appliesTo?.bundling?.getPercent || 0;
-      const d = calcPercent(scopedSubtotal, pct);
+      let d = calcPercent(scopedSubtotal, pct);
+
+      if (Number.isFinite(Number(voucher.maxDiscount))) {
+        d = Math.min(d, Number(voucher.maxDiscount));
+      }
+      d = Math.min(d, scopedSubtotal);
+
       return { itemsDiscount: d, shippingDiscount: 0, note: 'bundling' };
     }
+
     case 'shipping': {
-      const pct = voucher.shipping?.percent ?? 100;
-      const cap = voucher.shipping?.maxAmount ?? 0;
-      let d = calcPercent(deliveryFee, pct);
-      if (cap > 0) d = Math.min(d, cap);
+      const d = computeShippingDiscount();
       return { itemsDiscount: 0, shippingDiscount: d, note: 'shipping' };
     }
+
     default:
       return { itemsDiscount: 0, shippingDiscount: 0, note: 'unknown' };
   }

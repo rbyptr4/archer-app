@@ -4,7 +4,7 @@ const requireRole = require('../../utils/requireRole'); // pastikan ada
 const ctrl = require('../../controllers/owner/voucherController');
 const router = express.Router();
 
-router.use(validateToken, requireRole('owner'));
+// router.use(validateToken, requireRole('owner'));
 
 router.post('/percent', ctrl.createPercentVoucher);
 router.post('/bundling', ctrl.createBundlingVoucher);
