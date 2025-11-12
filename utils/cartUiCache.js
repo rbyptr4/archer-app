@@ -1,13 +1,40 @@
+// utils/buildUiTotalsFromCart.js
 const {
   parsePpnRate,
   SERVICE_FEE_RATE,
   roundRupiahCustom
 } = require('../utils/money');
 
-function buildUiTotalsFromCart(cart) {
+function buildUiTotalsFromCart(cart = {}, opts = {}) {
+  const deliveryModeOpt = opts.deliveryMode ?? null;
+  const envDeliveryFee =
+    Number(opts.envDeliveryFee ?? process.env.DELIVERY_FLAT_FEE ?? 0) || 0;
+  const forceChargeDelivery = !!opts.forceChargeDelivery;
+
   // safety parse
   const items_subtotal = Number(cart.total_price || 0); // total menu + addons (BEFORE discount)
-  const deliveryFee = Number(cart?.delivery?.delivery_fee || 0);
+
+  // pick delivery source: prefer delivery_draft (cart model you have), fallback delivery
+  const deliverySrc = cart.delivery_draft || cart.delivery || null;
+
+  // if delivery fee stored on cart, use it (but only if mode says 'delivery')
+  let rawDeliveryFeeFromCart = Number(deliverySrc?.delivery_fee || 0);
+
+  // determine effective delivery mode: priority opts > cart.delivery_draft.mode > cart.delivery.mode
+  const cartDeliveryMode =
+    (deliveryModeOpt && String(deliveryModeOpt).toLowerCase()) ||
+    (deliverySrc?.mode && String(deliverySrc.mode).toLowerCase()) ||
+    null;
+
+  // decide final delivery fee: charge only if mode === 'delivery' OR forceChargeDelivery true
+  const shouldChargeDelivery =
+    forceChargeDelivery || cartDeliveryMode === 'delivery';
+  const deliveryFee = shouldChargeDelivery
+    ? rawDeliveryFeeFromCart > 0
+      ? rawDeliveryFeeFromCart
+      : envDeliveryFee
+    : 0;
+
   const itemsDiscount = Number(cart.items_discount || 0) || 0; // voucher item discount
   const shippingDiscount = Number(cart.shipping_discount || 0) || 0; // voucher shipping discount
 
@@ -43,9 +70,8 @@ function buildUiTotalsFromCart(cart) {
   const roundingDelta = Number(rounded) - Number(rawTotal);
 
   return {
-    // keep both before-discount and after-discount for FE clarity
-    items_subtotal: items_subtotal,
-    items_subtotal_after_discount: items_subtotal_after_discount, // NEW
+    items_subtotal,
+    items_subtotal_after_discount,
     items_discount: itemsDiscount,
     service_fee: serviceFee,
     tax_amount: taxAmount,

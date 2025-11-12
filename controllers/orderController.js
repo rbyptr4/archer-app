@@ -781,46 +781,59 @@ exports.getCart = asyncHandler(async (req, res) => {
     return res.status(200).json({ cart: null, ui_totals: empty });
   }
 
-  /* ========== 2) Update fulfillment_type & delivery_mode jika ada query ========== */
+  /* ========== 2) Update fulfillment_type jika query ada ========== */
   if (hasFtQuery && qFt && cartObj.fulfillment_type !== qFt) {
-    await Cart.findByIdAndUpdate(cartObj._id, {
-      $set: { fulfillment_type: qFt }
-    });
+    try {
+      await Cart.findByIdAndUpdate(cartObj._id, {
+        $set: { fulfillment_type: qFt }
+      });
+    } catch (e) {
+      console.error('[getCart] failed set fulfillment_type:', e?.message || e);
+    }
   }
 
+  /* ========== 3) Jika ada delivery_mode in query -> simpan ke delivery_draft (doc.save) ========== */
   if (hasDeliveryModeQuery && qDeliveryMode) {
     try {
       const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
 
-      // read existing cart delivery_draft (fresh)
-      const existing = await Cart.findById(cartObj._id)
-        .select('delivery_draft')
-        .lean();
+      // ambil doc mongoose supaya bisa save() (triggers & validators jalan)
+      const doc = await Cart.findById(cartObj._id);
+      if (!doc) {
+        console.warn('[getCart] cart doc not found for id', cartObj._id);
+      } else {
+        const existingDraft =
+          doc.delivery_draft && typeof doc.delivery_draft === 'object'
+            ? { ...doc.delivery_draft }
+            : {};
 
-      // prepare newDeliveryDraft (always set whole subdoc)
-      let newDeliveryDraft = existing?.delivery_draft
-        ? { ...existing.delivery_draft }
-        : {};
+        // set sesuai query
+        if (qDeliveryMode === 'delivery') {
+          existingDraft.mode = 'delivery';
+          const cur = Number(existingDraft.delivery_fee || 0);
+          existingDraft.delivery_fee = cur > 0 ? cur : ENV_DELIV;
+          // optional: set fulfillment_type juga supaya charge ongkir terjadi
+          doc.fulfillment_type = 'delivery';
+        } else if (qDeliveryMode === 'pickup') {
+          existingDraft.mode = 'pickup';
+          existingDraft.delivery_fee = 0;
+        } else if (qDeliveryMode === 'none') {
+          existingDraft.mode = 'none';
+          existingDraft.delivery_fee = 0;
+        }
 
-      if (qDeliveryMode === 'delivery') {
-        const currentDeliv = Number(
-          existing?.delivery_draft?.delivery_fee || 0
-        );
-        newDeliveryDraft.mode = 'delivery';
-        newDeliveryDraft.delivery_fee =
-          currentDeliv > 0 ? currentDeliv : ENV_DELIV;
-      } else if (qDeliveryMode === 'pickup') {
-        newDeliveryDraft.mode = 'pickup';
-      } else if (qDeliveryMode === 'none') {
-        newDeliveryDraft.mode = 'none';
+        doc.delivery_draft = existingDraft;
+
+        try {
+          const saved = await doc.save();
+          // saved.delivery_draft sudah terpersist
+        } catch (saveErr) {
+          console.error(
+            '[getCart] doc.save() failed when setting delivery_mode:',
+            saveErr?.message || saveErr
+          );
+        }
       }
-
-      // write entire subdoc (overwrite delivery_draft)
-      await Cart.findByIdAndUpdate(
-        cartObj._id,
-        { $set: { delivery_draft: newDeliveryDraft } },
-        { new: true }
-      );
     } catch (err) {
       console.error(
         '[getCart] failed to set delivery_mode:',
@@ -829,80 +842,54 @@ exports.getCart = asyncHandler(async (req, res) => {
     }
   }
 
-  /* ========== 3) Ambil cart terbaru untuk hitung UI ========== */
+  /* ========== 4) Ambil cart terbaru & normalisasi delivery dari delivery_draft ========== */
   const cart = await Cart.findById(cartObj._id)
     .select(
-      'items total_items total_quantity total_price delivery_draft updatedAt fulfillment_type table_number status member session_id source'
+      'items total_items total_quantity total_price delivery_draft updatedAt fulfillment_type table_number status member session_id source items'
     )
     .lean();
 
-  // normalize: gunakan delivery alias supaya fungsi lain tetap jalan
+  // normalisasi supaya kode lain pakai cart.delivery
   cart.delivery = cart.delivery_draft || undefined;
 
-  /* ========== 4) Build ringkasan awal ========== */
-  const ui = buildUiTotalsFromCart(cart);
-
-  const items_subtotal = Number(ui.items_subtotal || 0);
-  const items_discount = Number(ui.items_discount || 0);
-  const shipping_discount = Number(ui.shipping_discount || 0);
-
-  const service_fee_on_items = int(
-    Math.round(items_subtotal * SERVICE_FEE_RATE)
-  );
-
-  const rate = parsePpnRate();
-  const taxAmountOnItems = int(Math.round(items_subtotal * rate));
-
-  const baseBeforeRound = int(items_subtotal);
-  const pureBeforeWithService = int(
-    baseBeforeRound +
-      taxAmountOnItems +
-      service_fee_on_items -
-      items_discount -
-      shipping_discount
-  );
-
-  ui.service_fee = service_fee_on_items;
-  ui.tax_amount = taxAmountOnItems;
-
-  const pureRounded = int(roundRupiahCustom(int(pureBeforeWithService)));
-  ui.grand_total = pureRounded;
-  ui.rounding_delta = int(pureRounded - int(pureBeforeWithService));
-
-  /* ========== 5) Delivery fee: hanya jika FT delivery & mode delivery ========== */
-  const ft = cart.fulfillment_type || 'dine_in';
+  /* ========== 5) Hitung UI totals: tanpa delivery dan dengan delivery final ========== */
+  const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
   const cartDeliveryMode = (cart?.delivery?.mode || '').toLowerCase() || null;
 
-  const CART_DELIV = Number(cart?.delivery?.delivery_fee || 0);
-  const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
+  // totals tanpa mempertimbangkan delivery (FE mungkin butuh ini)
+  const ui_no_delivery = buildUiTotalsFromCart(cart, {
+    deliveryMode: null, // paksa tanpa ongkir
+    envDeliveryFee: ENV_DELIV
+  });
 
-  const shouldChargeDelivery =
-    ft === 'delivery' && cartDeliveryMode === 'delivery';
+  // totals final sesuai mode/engine (ini yang dipakai FE untuk tampil)
+  const ui_with_delivery = buildUiTotalsFromCart(cart, {
+    deliveryMode: cartDeliveryMode,
+    envDeliveryFee: ENV_DELIV
+  });
 
-  const finalDeliveryFee = shouldChargeDelivery
-    ? CART_DELIV > 0
-      ? CART_DELIV
-      : ENV_DELIV
-    : 0;
+  // kalau kamu ingin memastikan struktur, kita bisa masukkan kedua variant ke response
+  const ui = {
+    ...ui_with_delivery,
+    // tambahkan field helper
+    items_subtotal_after_discount:
+      ui_no_delivery.items_subtotal_after_discount ??
+      ui_with_delivery.items_subtotal_after_discount,
+    items_subtotal: ui_with_delivery.items_subtotal
+  };
 
-  if (shouldChargeDelivery && finalDeliveryFee > 0) {
-    ui.delivery_fee = finalDeliveryFee;
-    const beforeRoundWithDeliv =
-      int(pureBeforeWithService) + int(finalDeliveryFee);
-    ui.grand_total_with_delivery = int(roundRupiahCustom(beforeRoundWithDeliv));
-  } else {
-    ui.delivery_fee = 0;
-    ui.grand_total_with_delivery = ui.grand_total;
-  }
-
-  const items = Array.isArray(cart.items) ? cart.items : [];
+  // sediakan both values agar FE bisa bandingkan
+  ui.grand_total_without_delivery = ui_no_delivery.grand_total;
+  ui.grand_total_with_delivery = ui_with_delivery.grand_total;
 
   /* ========== 6) Response ========== */
+  const items = Array.isArray(cart.items) ? cart.items : [];
+
   return res.status(200).json({
     ...cart,
-    fulfillment_type: ft,
+    fulfillment_type: cart.fulfillment_type || 'dine_in',
     delivery_mode: cartDeliveryMode,
-    items: items,
+    items,
     ui_totals: ui
   });
 });
