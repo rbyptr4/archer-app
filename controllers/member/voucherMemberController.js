@@ -204,7 +204,7 @@ exports.myWallet = asyncHandler(async (req, res) => {
 
   const data = await VoucherClaim.find({
     member: meId,
-    status: { $in: ['claimed', 'used'] }
+    status: 'claimed'
   })
     .populate('voucher')
     .sort('-createdAt');
