@@ -852,12 +852,17 @@ exports.getCart = asyncHandler(async (req, res) => {
       : 0;
 
   // set ui.delivery_fee dan grand_total_with_delivery sesuai finalDeliveryFee
-  if (ft === 'delivery' && finalDeliveryFee > 0) {
+  if (
+    ft === 'delivery' &&
+    cartDeliveryMode === 'delivery' &&
+    finalDeliveryFee > 0
+  ) {
     ui.delivery_fee = finalDeliveryFee;
     const beforeRoundWithDeliv =
       int(pureBeforeWithService) + int(finalDeliveryFee);
     ui.grand_total_with_delivery = int(roundRupiahCustom(beforeRoundWithDeliv));
   } else {
+    // pickup / dine_in / mode invalid: no delivery fee
     ui.delivery_fee = 0;
     ui.grand_total_with_delivery = ui.grand_total;
   }
@@ -2448,7 +2453,10 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
   if (!mongoose.Types.ObjectId.isValid(id)) throwError('ID tidak valid', 400);
 
-  const order = await Order.findById(id).lean();
+  // populate member (ambil hanya name & phone)
+  const order = await Order.findById(id)
+    .populate({ path: 'member', select: 'name phone' })
+    .lean();
   if (!order) throwError('Order tidak ditemukan', 404);
 
   const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
@@ -2458,8 +2466,9 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
     id: String(order._id),
     transaction_code: order.transaction_code,
     customer: {
-      name: order.customer_name || null,
-      phone: order.customer_phone || null
+      // prioritas: member (populate) -> explicit customer_name/phone di order
+      name: order.member?.name || order.customer_name || null,
+      phone: order.member?.phone || order.customer_phone || null
     },
     fulfillment_type: order.fulfillment_type || null,
     table_number: order.table_number ?? null,
