@@ -460,43 +460,110 @@ const mergeTwoCarts = (dst, src) => {
 };
 
 const attachOrMergeCartsForIdentity = async (iden) => {
-  if (!iden?.memberId && !iden?.session_id) return;
+  if (!iden || (!iden.memberId && !iden.session_id)) return;
 
-  const filters = [];
-  if (iden.memberId) filters.push({ status: 'active', member: iden.memberId });
-  if (iden.session_id)
-    filters.push({ status: 'active', session_id: iden.session_id });
-
-  const carts = await Cart.find({ $or: filters }).sort({ updatedAt: -1 });
-  if (carts.length <= 1) return;
-
-  let primary = carts[0];
-
-  if (iden.memberId) {
-    const memberOwned = carts.find(
-      (c) => String(c.member) === String(iden.memberId)
-    );
-    if (memberOwned) primary = memberOwned;
-  }
-
-  for (const c of carts) {
-    if (String(c._id) === String(primary._id)) continue;
-    mergeTwoCarts(primary, c);
-    try {
-      await c.deleteOne();
-    } catch (e) {
-      // jangan crash kalau gagal delete, tapi log untuk debugging
-      console.error(
-        '[attachOrMergeCartsForIdentity] failed to delete cart',
-        c._id,
-        e?.message || e
-      );
+  // 1) hanya memberId (tidak ada session) -> dedupe multiple member carts
+  if (iden.memberId && !iden.session_id) {
+    const carts = await Cart.find({
+      status: 'active',
+      member: iden.memberId
+    }).sort({ updatedAt: -1 });
+    if (carts.length <= 1) return;
+    const primary = carts[0];
+    for (let i = 1; i < carts.length; i++) {
+      mergeTwoCarts(primary, carts[i]);
+      try {
+        await carts[i].deleteOne();
+      } catch (e) {
+        console.error(
+          '[attachOrMergeCartsForIdentity] gagal delete member cart',
+          carts[i]._id,
+          e?.message || e
+        );
+      }
     }
+    primary.member = iden.memberId;
+    primary.session_id = null;
+    await primary.save();
+    return;
   }
 
-  if (iden.memberId) primary.member = iden.memberId;
-  primary.session_id = null;
-  await primary.save();
+  // 2) hanya session_id (guest) -> dedupe multiple session carts
+  if (!iden.memberId && iden.session_id) {
+    const carts = await Cart.find({
+      status: 'active',
+      session_id: iden.session_id
+    }).sort({ updatedAt: -1 });
+    if (carts.length <= 1) return;
+    const primary = carts[0];
+    for (let i = 1; i < carts.length; i++) {
+      mergeTwoCarts(primary, carts[i]);
+      try {
+        await carts[i].deleteOne();
+      } catch (e) {
+        console.error(
+          '[attachOrMergeCartsForIdentity] gagal delete session cart',
+          carts[i]._id,
+          e?.message || e
+        );
+      }
+    }
+    primary.session_id = iden.session_id;
+    await primary.save();
+    return;
+  }
+
+  // 3) KEDUANYA: memberId + session_id => user baru login:
+  //    HAPUS semua cart yang terikat session_id (guest carts) agar tidak tercampur.
+  try {
+    // hapus semua guest carts terkait session_id
+    const sessionCarts = await Cart.find({
+      status: 'active',
+      session_id: iden.session_id
+    }).lean();
+    if (sessionCarts && sessionCarts.length) {
+      for (const sc of sessionCarts) {
+        try {
+          await Cart.deleteOne({ _id: sc._id });
+        } catch (e) {
+          console.error(
+            '[attachOrMergeCartsForIdentity] gagal delete guest cart on login',
+            sc._id,
+            e?.message || e
+          );
+        }
+      }
+    }
+
+    // dedupe member carts jika ada >1
+    const memberCarts = await Cart.find({
+      status: 'active',
+      member: iden.memberId
+    }).sort({ updatedAt: -1 });
+    if (memberCarts.length > 1) {
+      const primary = memberCarts[0];
+      for (let i = 1; i < memberCarts.length; i++) {
+        mergeTwoCarts(primary, memberCarts[i]);
+        try {
+          await memberCarts[i].deleteOne();
+        } catch (e) {
+          console.error(
+            '[attachOrMergeCartsForIdentity] gagal delete duplicate member cart (both-case)',
+            memberCarts[i]._1,
+            e?.message || e
+          );
+        }
+      }
+      primary.member = iden.memberId;
+      primary.session_id = null;
+      await primary.save();
+    }
+  } catch (e) {
+    console.error(
+      '[attachOrMergeCartsForIdentity] unexpected error',
+      e?.message || e
+    );
+  }
 };
 
 const getActiveCartForIdentity = async (
