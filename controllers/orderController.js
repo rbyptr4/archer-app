@@ -1897,21 +1897,34 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
         .json({ message: 'Voucher hanya untuk member. Silakan daftar/login.' });
     }
 
-    // optional: validateAndPrice for promotions/breakdown (we still call it)
     const priced = await validateAndPrice({
       memberId: finalMemberId,
       cart: {
-        items: cart.items.map((it) => ({
-          menuId: it.menu,
-          qty: it.quantity,
-          price: it.base_price,
-          category: it.category || null
-        }))
+        items: cart.items.map((it) => {
+          // hitung price per unit termasuk addon per-unit (addon.qty dianggap qty addon per item)
+          const addonsTotalPerItem = (
+            Array.isArray(it.addons) ? it.addons : []
+          ).reduce((s, a) => {
+            const ap = Number(a?.price || 0);
+            const aq = Number(a?.qty || 1);
+            return s + ap * aq;
+          }, 0);
+          const unitPriceWithAddons =
+            int(Number(it.base_price || 0)) + int(addonsTotalPerItem);
+
+          return {
+            menuId: it.menu,
+            qty: it.quantity,
+            price: unitPriceWithAddons,
+            category: it.category || null
+          };
+        })
       },
       fulfillmentType: ft,
       deliveryFee: cart.delivery?.delivery_fee || 0,
       voucherClaimIds: eligibleClaimIds
     });
+
     console.log('[VOUCHER][PRICED]', JSON.stringify(priced, null, 2));
 
     // tambahan: per-item inspect untuk setiap breakdown entry
