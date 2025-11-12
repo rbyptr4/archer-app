@@ -1,23 +1,153 @@
-// utils/voucherEngine.js (modifikasi)
-// tambahkan di bagian atas file (di atas fungsi-fungsi lain)
-const SERVICE_FEE_RATE = Number(process.env.SERVICE_FEE_RATE || 0.02); // default 2%
-const PPN_RATE = Number(process.env.PPN_RATE || 0.11); // default 11%
+// utils/voucherEngine.js
+const mongoose = require('mongoose');
+const Voucher = require('../models/voucherModel');
+const VoucherClaim = require('../models/voucherClaimModel');
+const throwError = require('./throwError');
 
-const int = (v) => Math.round(Number(v || 0));
+// gunakan helpers money yang sudah kamu sediakan
+const {
+  int,
+  parsePpnRate,
+  SERVICE_FEE_RATE,
+  roundRupiahCustom
+} = require('./money');
 
-// simple rounding helper (approximation).
-// Jika kamu punya roundRupiahCustom di project, ganti penggunaan ini dengan import tersebut.
-function roundRupiahCustom(n) {
-  // contoh: pembulatan ke kelipatan 50 (sesuai banyak implementasi lokal)
-  return Math.round(n / 50) * 50;
+function subtotalFromItems(items = []) {
+  return items.reduce(
+    (sum, it) => sum + Number(it.price || 0) * Number(it.qty || 0),
+    0
+  );
 }
 
+function filterItemsByScope(items, appliesTo) {
+  if (!appliesTo || appliesTo.mode === 'all') return items;
+  if (appliesTo.mode === 'menus') {
+    const set = new Set((appliesTo.menuIds || []).map(String));
+    return items.filter((it) => set.has(String(it.menuId)));
+  }
+  if (appliesTo.mode === 'category') {
+    const set = new Set((appliesTo.categories || []).map(String));
+    return items.filter((it) => set.has(String(it.category)));
+  }
+  return items;
+}
+
+function calcPercent(val, pct) {
+  // pembulatan ke integer
+  return Math.max(0, Math.round((Number(val || 0) * Number(pct || 0)) / 100));
+}
+
+function computeVoucherDiscount(voucher, items, deliveryFee) {
+  const scoped = filterItemsByScope(items, voucher.appliesTo);
+  const scopedSubtotal = subtotalFromItems(scoped);
+
+  const computeShippingDiscount = () => {
+    const pct = Number(voucher.shipping?.percent ?? 0);
+    const cap = Number(voucher.shipping?.maxAmount ?? 0);
+    if (!pct || !deliveryFee) return 0;
+    let d = calcPercent(deliveryFee, pct);
+    if (cap > 0) d = Math.min(d, cap);
+    return Math.min(d, deliveryFee);
+  };
+
+  switch (voucher.type) {
+    case 'percent': {
+      const pct = Number(voucher.percent || 0);
+      let itemsDisc = calcPercent(scopedSubtotal, pct);
+
+      // APPLY GLOBAL CAP jika ada
+      if (Number.isFinite(Number(voucher.maxDiscount))) {
+        const cap = Number(voucher.maxDiscount);
+        if (cap >= 0) itemsDisc = Math.min(itemsDisc, cap);
+      }
+
+      itemsDisc = Math.min(itemsDisc, scopedSubtotal);
+
+      const shippingDisc =
+        voucher.shipping && voucher.usage?.stackableWithShipping
+          ? computeShippingDiscount()
+          : 0;
+
+      return {
+        itemsDiscount: itemsDisc,
+        shippingDiscount: shippingDisc,
+        note: 'percent'
+      };
+    }
+
+    case 'amount': {
+      let d = Number(voucher.amount || 0);
+      if (Number.isFinite(Number(voucher.maxDiscount))) {
+        d = Math.min(d, Number(voucher.maxDiscount));
+      }
+      d = Math.max(0, Math.min(d, scopedSubtotal));
+      const shippingDisc =
+        voucher.shipping && voucher.usage?.stackableWithShipping
+          ? computeShippingDiscount()
+          : 0;
+      return {
+        itemsDiscount: d,
+        shippingDiscount: shippingDisc,
+        note: 'amount'
+      };
+    }
+
+    case 'free_item': {
+      const cheapest = scoped.reduce(
+        (m, it) => (m && m.price < it.price ? m : it),
+        null
+      );
+      const d = Math.min(cheapest ? cheapest.price : 0, scopedSubtotal);
+      return { itemsDiscount: d, shippingDiscount: 0, note: 'free_item' };
+    }
+
+    case 'bundling': {
+      const need = voucher.appliesTo?.bundling?.buyQty || 0;
+      if (!need)
+        return {
+          itemsDiscount: 0,
+          shippingDiscount: 0,
+          note: 'bundling(no config)'
+        };
+      const qtyTotal = scoped.reduce((q, it) => q + it.qty, 0);
+      if (qtyTotal < need)
+        return {
+          itemsDiscount: 0,
+          shippingDiscount: 0,
+          note: 'bundling(not enough qty)'
+        };
+      const pct = voucher.appliesTo?.bundling?.getPercent || 0;
+      let d = calcPercent(scopedSubtotal, pct);
+
+      if (Number.isFinite(Number(voucher.maxDiscount))) {
+        d = Math.min(d, Number(voucher.maxDiscount));
+      }
+      d = Math.min(d, scopedSubtotal);
+
+      return { itemsDiscount: d, shippingDiscount: 0, note: 'bundling' };
+    }
+
+    case 'shipping': {
+      const d = computeShippingDiscount();
+      return { itemsDiscount: 0, shippingDiscount: d, note: 'shipping' };
+    }
+
+    default:
+      return { itemsDiscount: 0, shippingDiscount: 0, note: 'unknown' };
+  }
+}
+
+/**
+ * validateAndPrice({ memberId, cart, deliveryFee, voucherClaimIds[] })
+ * Mengembalikan { ok, reasons[], breakdown, totals }
+ */
 async function validateAndPrice(
   { memberId, cart, deliveryFee = 0, voucherClaimIds = [] },
   { session } = {}
 ) {
   const items = cart.items || [];
-  const baseSubtotal = subtotalFromItems(items); // sudah diasumsikan price tiap item termasuk addons
+  // baseSubtotal: sum(price * qty). Pastikan price tiap item sudah termasuk addon per-unit.
+  const baseSubtotal = subtotalFromItems(items);
 
   // load claims+voucher
   const claims = await VoucherClaim.find({
@@ -39,7 +169,6 @@ async function validateAndPrice(
       continue;
     }
 
-    // window & expiry
     const mode = v.visibility?.mode || 'periodic';
     if (mode === 'periodic') {
       if (v.visibility.startAt && now < v.visibility.startAt) {
@@ -60,7 +189,7 @@ async function validateAndPrice(
       continue;
     }
 
-    // min transaksi (catatan: gunakan baseSubtotal yang sudah termasuk addons)
+    // min transaksi (gunakan baseSubtotal yang sudah termasuk addons)
     if ((v.target?.minTransaction || 0) > baseSubtotal) {
       reasons.push(`${v.name}: minimal transaksi belum terpenuhi`);
       continue;
@@ -69,7 +198,7 @@ async function validateAndPrice(
     validClaims.push(c);
   }
 
-  // stacking rule: maksimal 1 non-shipping + opsional 1 shipping
+  // stacking rule
   const shippingClaims = validClaims.filter(
     (c) => c.voucher.type === 'shipping'
   );
@@ -77,7 +206,6 @@ async function validateAndPrice(
 
   const chosen = [];
   if (nonShipping.length > 1) {
-    // pilih yang benefit terbesar
     let best = null,
       bestValue = -1;
     for (const c of nonShipping) {
@@ -95,9 +223,7 @@ async function validateAndPrice(
   } else if (nonShipping.length === 1) {
     chosen.push(nonShipping[0]);
   }
-  // boleh tambah 1 shipping (kalau ada)
   if (shippingClaims.length > 0) {
-    // ambil yang shipping diskonnya paling besar
     let best = null,
       bestValue = -1;
     for (const c of shippingClaims) {
@@ -111,7 +237,7 @@ async function validateAndPrice(
     chosen.push(best);
   }
 
-  // hitung voucher effect
+  // compute chosen voucher effects
   const breakdown = [];
   let itemsDiscount = 0;
   let shippingDiscount = 0;
@@ -140,24 +266,24 @@ async function validateAndPrice(
     Number(deliveryFee || 0) - shippingDiscount
   );
 
-  // SERVICE FEE: dihitung dari items subtotal setelah discount (sesuai kebutuhanmu)
+  // SERVICE FEE: dihitung dari items subtotal setelah discount
   const service_fee = int(
-    Math.round(items_subtotal_after_discount * SERVICE_FEE_RATE)
+    Math.round(items_subtotal_after_discount * Number(SERVICE_FEE_RATE))
   );
 
-  // Pajak (PPN) dihitung dari items subtotal setelah discount (sesuaikan kalau mau inklusif service)
-  const taxAmount = int(Math.round(items_subtotal_after_discount * PPN_RATE));
+  // Pajak (PPN): gunakan parsePpnRate() sehingga sama dengan money util
+  const ppnRate = parsePpnRate();
+  const taxAmount = int(Math.round(items_subtotal_after_discount * ppnRate));
 
   // sebelum pembulatan
   const beforeRound = int(
     items_subtotal_after_discount + service_fee + deliveryAfter + taxAmount
   );
 
-  // pembulatan custom (gunakan rule rounding yang sama dengan checkout)
+  // pembulatan sesuai rule project
   const grandTotalRounded = int(roundRupiahCustom(beforeRound));
   const rounding_delta = int(grandTotalRounded - beforeRound);
 
-  // final grand total yang akan dibayar (tidak boleh negatif)
   const grandTotal = Math.max(0, grandTotalRounded);
 
   return {
@@ -172,7 +298,6 @@ async function validateAndPrice(
       shippingDiscount: int(shippingDiscount),
       deliveryAfter: int(deliveryAfter),
 
-      // tambahan fields
       service_fee: int(service_fee),
       tax_amount: int(taxAmount),
       beforeRound: int(beforeRound),
