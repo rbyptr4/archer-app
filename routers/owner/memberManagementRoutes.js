@@ -8,13 +8,13 @@ const requirePageAccess = require('../../utils/requirePageAccess');
 const validateToken = require('../../utils/tokenHandler'); // staff token middleware
 
 const guard = requireRole('owner', 'employee');
-router.use(validateToken, requirePageAccess('members'));
+// router.use(validateToken, requirePageAccess('members'));
 
-router.get('/summary', guard, ctrl.listMemberSummary);
-router.get('/customer-growth', guard, ctrl.newCustomers);
-router.get('/top-spenders', guard, ctrl.topSpenders);
+router.get('/summary', ctrl.listMemberSummary);
+router.get('/customer-growth', ctrl.newCustomers);
+router.get('/top-spenders', ctrl.topSpenders);
 
-router.get('/:id', guard, ctrl.getMemberDetail);
+router.get('/:id', ctrl.getMemberDetail);
 router.delete('remove/:id', requireRole('owner'), ctrl.deleteMemberAccount);
 
 module.exports = router;

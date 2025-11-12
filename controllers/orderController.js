@@ -739,6 +739,23 @@ exports.getCart = asyncHandler(async (req, res) => {
       ? 'dine_in'
       : null;
 
+  // juga baca delivery_mode dari query (opsional): 'delivery'|'pickup'|'none'
+  const hasDeliveryModeQuery = Object.prototype.hasOwnProperty.call(
+    req.query || {},
+    'delivery_mode'
+  );
+  const qDeliveryModeRaw = String(req.query?.delivery_mode || '')
+    .toLowerCase()
+    .trim();
+  const qDeliveryMode =
+    qDeliveryModeRaw === 'delivery'
+      ? 'delivery'
+      : qDeliveryModeRaw === 'pickup'
+      ? 'pickup'
+      : qDeliveryModeRaw === 'none'
+      ? 'none'
+      : null;
+
   /* ========== 1) Ambil / auto-create cart aktif ========== */
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreate: true, // auto-create jika belum ada
@@ -771,6 +788,14 @@ exports.getCart = asyncHandler(async (req, res) => {
     await Cart.findByIdAndUpdate(cartObj._id, {
       $set: { fulfillment_type: qFt }
     });
+  }
+
+  // Jika ada delivery_mode query, simpan juga ke cart.delivery.mode (agar DB konsisten)
+  if (hasDeliveryModeQuery && qDeliveryMode) {
+    // jaga struktur delivery ada
+    await Cart.findByIdAndUpdate(cartObj._id, {
+      $set: { 'delivery.mode': qDeliveryMode }
+    }).catch(() => {}); // jangan crash kalau gagal
   }
 
   /* ========== 3) Ambil cart terbaru untuk hitung UI ========== */
@@ -811,14 +836,23 @@ exports.getCart = asyncHandler(async (req, res) => {
   ui.grand_total = pureRounded;
   ui.rounding_delta = int(pureRounded - int(pureBeforeWithService));
 
-  /* ========== 5) Delivery fee: hanya jika FT cart memang delivery ========== */
+  /* ========== 5) Delivery fee: hanya jika FT cart memang delivery AND mode delivery ========== */
   const ft = cart.fulfillment_type || 'dine_in';
+  // baca delivery.mode dari cart (bisa 'delivery' | 'pickup' | 'none')
+  const cartDeliveryMode = (cart?.delivery?.mode || '').toLowerCase() || null;
+
+  // finalDeliveryFee hanya dihitung kalau fulfillment_type=delivery AND delivery.mode=delivery
   const CART_DELIV = Number(cart?.delivery?.delivery_fee || 0);
   const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
   const finalDeliveryFee =
-    ft === 'delivery' ? (CART_DELIV > 0 ? CART_DELIV : ENV_DELIV) : 0;
+    ft === 'delivery' && cartDeliveryMode !== 'pickup'
+      ? CART_DELIV > 0
+        ? CART_DELIV
+        : ENV_DELIV
+      : 0;
 
-  if (ft === 'delivery') {
+  // set ui.delivery_fee dan grand_total_with_delivery sesuai finalDeliveryFee
+  if (ft === 'delivery' && finalDeliveryFee > 0) {
     ui.delivery_fee = finalDeliveryFee;
     const beforeRoundWithDeliv =
       int(pureBeforeWithService) + int(finalDeliveryFee);
@@ -833,6 +867,7 @@ exports.getCart = asyncHandler(async (req, res) => {
   return res.status(200).json({
     ...cart,
     fulfillment_type: ft, // kembalikan FT yang AKTUAL di cart
+    delivery_mode: cartDeliveryMode, // informasikan delivery_mode agar FE tahu
     items: items,
     ui_totals: ui
   });
@@ -2731,7 +2766,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
 
   if (as_member) {
     if (!member_id && !(name && phone)) {
-      throwError('as_member=true: sertakan member_id atau name+phone', 400);
+      throwError('Sertakan member_id atau name+phone', 400);
     }
     if (member_id) {
       member = await Member.findById(member_id).lean();
@@ -3026,10 +3061,13 @@ exports.completeOrder = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
   const order = await Order.findById(req.params.id);
-  if (!order) throwError('Order tidak ditemukan', 404);
+  if (!order) throwError('Data order tidak ditemukan', 404);
 
   if (order.status !== 'accepted') {
-    throwError('Hanya pesanan accepted yang bisa diselesaikan', 409);
+    throwError(
+      'Hanya pesanan dengan status diterima yang bisa diselesaikan',
+      409
+    );
   }
 
   order.status = 'completed';
@@ -3622,4 +3660,36 @@ exports.deliverySlots = asyncHandler(async (req, res) => {
     });
   }
   res.json({ success: true, items: result });
+});
+
+exports.listMembers = asyncHandler(async (req, res) => {
+  const keyword = String(req.query.q || '').trim();
+  const limit = Math.min(Number(req.query.limit) || 20, 100); // batas aman max 100
+
+  // base filter
+  const filter = { is_active: true };
+
+  if (keyword) {
+    // cari nama atau phone yang mengandung keyword (case-insensitive)
+    filter.$or = [
+      { name: { $regex: keyword, $options: 'i' } },
+      { phone: { $regex: keyword.replace(/\D+/g, ''), $options: 'i' } } // hilangkan non-digit
+    ];
+  }
+
+  const members = await Member.find(filter)
+    .select('_id name phone')
+    .sort({ name: 1 })
+    .limit(limit)
+    .lean();
+
+  res.status(200).json({
+    ok: true,
+    count: members.length,
+    data: members.map((m) => ({
+      id: String(m._id),
+      name: m.name,
+      phone: m.phone
+    }))
+  });
 });

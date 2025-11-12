@@ -67,6 +67,14 @@ router.get(
   requirePageAccess('orders'),
   order.listEmployeesDropdown
 );
+
+router.get(
+  '/list-member',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
+  order.listMembers
+);
 router.get(
   '/today',
   validateToken,

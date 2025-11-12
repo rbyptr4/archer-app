@@ -27,6 +27,7 @@ const MemberSchema = new mongoose.Schema(
 
 // Index: phone unik (kalau sebelumnya belum unique, jalankan createIndex atau atur di migration)
 MemberSchema.index({ phone: 1 }, { unique: true, sparse: false });
+MemberSchema.index({ name: 'text', phone: 'text' });
 
 module.exports =
   mongoose.models.Member || mongoose.model('Member', MemberSchema);
