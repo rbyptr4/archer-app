@@ -790,25 +790,56 @@ exports.getCart = asyncHandler(async (req, res) => {
 
   if (hasDeliveryModeQuery && qDeliveryMode) {
     try {
+      // ambil fallback dari env sekali saja
       const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
 
+      // baca current cart (fresh) untuk lihat apakah sudah punya delivery_fee
       const existing = await Cart.findById(cartObj._id)
         .select('delivery')
         .lean();
+
+      // Debug log supaya bisa lihat apa yang terjadi di runtime
+      console.log(
+        '[getCart] delivery_mode requested ->',
+        qDeliveryMode,
+        'existing.delivery:',
+        existing?.delivery,
+        'ENV_DELIV:',
+        ENV_DELIV
+      );
+
+      // Build updates: always set delivery.mode; jika delivery request = 'delivery' set delivery_fee
       const updates = { 'delivery.mode': qDeliveryMode };
 
       if (qDeliveryMode === 'delivery') {
+        // Force set delivery_fee: prefer existing positive, fallback to ENV_DELIV,
+        // if ENV_DELIV is 0 we still set it to 0 but log a warning so Dev tahu.
         const currentDeliv = Number(existing?.delivery?.delivery_fee || 0);
+
         if (currentDeliv > 0) {
           updates['delivery.delivery_fee'] = currentDeliv;
-        } else if (ENV_DELIV > 0) {
-          updates['delivery.delivery_fee'] = ENV_DELIV;
         } else {
-          updates['delivery.delivery_fee'] = 0;
+          updates['delivery.delivery_fee'] = ENV_DELIV;
+          if (ENV_DELIV <= 0) {
+            console.warn(
+              '[getCart] DELIVERY_FLAT_FEE is not set or zero; delivery_fee will remain 0. Set DELIVERY_FLAT_FEE env var.'
+            );
+          }
         }
       }
 
-      await Cart.findByIdAndUpdate(cartObj._id, { $set: updates });
+      // lakukan update dan ambil document yang sudah di-update (new: true)
+      await Cart.findByIdAndUpdate(
+        cartObj._id,
+        { $set: updates },
+        { new: true }
+      ).catch((e) => {
+        console.error('[getCart] findByIdAndUpdate failed:', e?.message || e);
+      });
+
+      // re-read immediately to ensure we use latest
+      const after = await Cart.findById(cartObj._id).select('delivery').lean();
+      console.log('[getCart] after update delivery:', after?.delivery);
     } catch (err) {
       console.error(
         '[getCart] failed to set delivery_mode:',
