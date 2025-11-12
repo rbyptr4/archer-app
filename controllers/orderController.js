@@ -2512,61 +2512,104 @@ const buildOrderReceipt = (order) => {
 
   const items = Array.isArray(order.items) ? order.items : [];
 
-  const items_subtotal = Number(order.items_subtotal || 0); // BEFORE tax
-  const items_discount = Number(order.items_discount || 0);
-  const delivery_fee = Number(order.delivery_fee || 0);
-  const shipping_discount = Number(order.shipping_discount || 0);
-  const service_fee = Number(order.service_fee || 0);
-  const tax_amount_total = Number(order.tax_amount || 0);
-  const tax_rate_percent = Number(
-    order.tax_rate_percent || Math.round(parsePpnRate() * 100)
-  );
-
-  // helper: compute line subtotal (before tax) from item
-  const lineSubtotalOf = (it) => {
+  // compute items_subtotal from items (menu base + addons * qty) — authoritative
+  const computeLineSubtotal = (it) => {
     const unitBase = Number(it.base_price || 0);
     const addonsUnit = (it.addons || []).reduce(
       (s, a) => s + Number(a.price || 0) * Number(a.qty || 1),
       0
     );
-    const qty = Number(it.quantity || 0);
-    return (unitBase + addonsUnit) * qty;
+    const qty = Number(it.quantity || it.qty || 0);
+    return int((unitBase + addonsUnit) * qty);
   };
 
-  // build items array: no per-item tax/service, only base & line_subtotal
+  const items_subtotal = items.reduce(
+    (s, it) => s + computeLineSubtotal(it),
+    0
+  );
+
+  // items_discount: prefer explicit field order.items_discount, fallback to sum of breakdown itemsDiscount
+  let items_discount = Number(order.items_discount || 0);
+  if (!items_discount || items_discount === 0) {
+    const discounts = Array.isArray(order.discounts) ? order.discounts : [];
+    const sumFromBreakdown = discounts.reduce(
+      (sum, d) => sum + Number(d.itemsDiscount || d.items_discount || 0),
+      0
+    );
+    // choose max of explicit or breakdown-sum (defensive)
+    items_discount = Math.max(items_discount, sumFromBreakdown);
+  }
+
+  // shipping discount: prefer explicit, fallback to sum of shippingDiscount from breakdown
+  let shipping_discount = Number(order.shipping_discount || 0);
+  if (!shipping_discount || shipping_discount === 0) {
+    const discounts = Array.isArray(order.discounts) ? order.discounts : [];
+    const sumShip = discounts.reduce(
+      (sum, d) => sum + Number(d.shippingDiscount || d.shipping_discount || 0),
+      0
+    );
+    shipping_discount = Math.max(shipping_discount, sumShip);
+  }
+
+  const delivery_fee = Number(
+    order.delivery?.delivery_fee ?? order.delivery_fee ?? 0
+  );
+
+  // items subtotal after discount (taxable base)
+  const items_subtotal_after_discount = Math.max(
+    0,
+    items_subtotal - items_discount
+  );
+
+  // service fee & tax (use project helpers for exact same logic as checkout)
+  const service_fee = int(
+    Math.round(items_subtotal_after_discount * Number(SERVICE_FEE_RATE))
+  );
+
+  const ppnRate = parsePpnRate();
+  const tax_amount = int(Math.round(items_subtotal_after_discount * ppnRate));
+
+  // raw total before rounding (same formula as checkout)
+  const raw_total_before_rounding =
+    items_subtotal_after_discount +
+    service_fee +
+    Number(delivery_fee || 0) -
+    shipping_discount +
+    tax_amount;
+
+  // rounding delta and grand total: prefer stored order.grand_total if present (checkout source of truth)
+  const grand_total_from_order =
+    typeof order.grand_total !== 'undefined' ? int(order.grand_total) : null;
+  const rounded =
+    grand_total_from_order !== null
+      ? grand_total_from_order
+      : int(roundRupiahCustom(raw_total_before_rounding));
+  const rounding_delta = int(rounded - int(raw_total_before_rounding));
+
+  // Build detailed items list (unit price incl. addons, line subtotal)
   const detailedItems = items.map((it) => {
-    const qty = Number(it.quantity || 0);
+    const qty = Number(it.quantity || it.qty || 0);
     const unit_base = Number(it.base_price || 0);
     const addons_unit = (it.addons || []).reduce(
       (s, a) => s + Number(a.price || 0) * Number(a.qty || 1),
       0
     );
-    const unit_before_tax = unit_base + addons_unit;
-    const line_before_tax = Number(it.line_subtotal ?? lineSubtotalOf(it));
+    const unit_before_tax = int(unit_base + addons_unit);
+    const line_before_tax = int(it.line_subtotal ?? computeLineSubtotal(it));
 
     return {
       name: it.name,
       menu_code: it.menu_code || '',
-      imageUrl: it.imageUrl || '',
       quantity: qty,
       addons: (it.addons || []).map((ad) => ({
         name: ad.name,
-        price: Number(ad.price || 0),
-        qty: Number(ad.qty || 1)
+        price: int(ad.price || 0),
+        qty: int(ad.qty || 1)
       })),
       unit_price: unit_before_tax,
       line_before_tax
     };
   });
-
-  // totals for display
-  const raw_total_before_rounding =
-    items_subtotal +
-    service_fee +
-    delivery_fee -
-    items_discount -
-    shipping_discount +
-    tax_amount_total;
 
   return {
     id: String(order._id),
@@ -2576,17 +2619,20 @@ const buildOrderReceipt = (order) => {
     payment_method: order.payment_method,
 
     pricing: {
-      // clearly separate before-tax and with-tax values
-      items_subtotal: items_subtotal,
-      service_fee,
-      delivery_fee,
-      items_discount,
-      shipping_discount,
-      tax_amount: tax_amount_total,
-      tax_rate_percent,
-      rounding_delta: Number(order.rounding_delta || 0),
-      grand_total: Number(order.grand_total || 0),
-      raw_total_before_rounding
+      // before-tax and with-tax values
+      items_subtotal: int(items_subtotal),
+      items_subtotal_after_discount: int(items_subtotal_after_discount),
+      items_discount: int(items_discount),
+      service_fee: int(service_fee),
+      delivery_fee: int(delivery_fee),
+      shipping_discount: int(shipping_discount),
+      tax_amount: int(tax_amount),
+      tax_rate_percent: Number(
+        order.tax_rate_percent || Math.round(ppnRate * 100)
+      ),
+      rounding_delta: int(rounding_delta),
+      grand_total: int(rounded),
+      raw_total_before_rounding: int(raw_total_before_rounding)
     },
 
     customer: {
