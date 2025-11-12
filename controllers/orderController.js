@@ -722,9 +722,7 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
 };
 
 exports.getCart = asyncHandler(async (req, res) => {
-  console.log('--- getCart ENTER ---');
   const iden = getIdentity(req);
-  console.log('[getCart] identity:', iden);
 
   /* ========== 0) Baca FT & delivery_mode dari query ========== */
   const hasFtQuery = Object.prototype.hasOwnProperty.call(
@@ -757,13 +755,6 @@ exports.getCart = asyncHandler(async (req, res) => {
       ? 'none'
       : null;
 
-  console.log(
-    '[getCart] query parsed -> fulfillment_type:',
-    qFt,
-    ', delivery_mode:',
-    qDeliveryMode
-  );
-
   /* ========== 1) Ambil / auto-create cart aktif ========== */
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreate: true,
@@ -771,19 +762,7 @@ exports.getCart = asyncHandler(async (req, res) => {
     skipAttach: true
   });
 
-  console.log(
-    '[getCart] cartObj (from getActiveCartForIdentity):',
-    cartObj
-      ? {
-          _id: cartObj._id,
-          fulfillment_type: cartObj.fulfillment_type,
-          delivery: cartObj.delivery
-        }
-      : null
-  );
-
   if (!cartObj) {
-    console.log('[getCart] no cartObj -> returning empty UI totals');
     const empty = {
       items_subtotal: 0,
       service_fee: 0,
@@ -799,18 +778,11 @@ exports.getCart = asyncHandler(async (req, res) => {
       grand_total: 0,
       grand_total_with_delivery: 0
     };
-    console.log('--- getCart EXIT (no cart) ---');
     return res.status(200).json({ cart: null, ui_totals: empty });
   }
 
   /* ========== 2) Update fulfillment_type & delivery_mode jika ada query ========== */
   if (hasFtQuery && qFt && cartObj.fulfillment_type !== qFt) {
-    console.log(
-      '[getCart] updating fulfillment_type from',
-      cartObj.fulfillment_type,
-      'to',
-      qFt
-    );
     await Cart.findByIdAndUpdate(cartObj._id, {
       $set: { fulfillment_type: qFt }
     });
@@ -820,57 +792,35 @@ exports.getCart = asyncHandler(async (req, res) => {
     try {
       const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
 
-      // read existing cart delivery (fresh)
+      // read existing cart delivery_draft (fresh)
       const existing = await Cart.findById(cartObj._id)
-        .select('delivery')
+        .select('delivery_draft')
         .lean();
-      console.log(
-        '[getCart] delivery_mode requested ->',
-        qDeliveryMode,
-        'existing.delivery:',
-        existing?.delivery,
-        'ENV_DELIV:',
-        ENV_DELIV,
-        'cartObj._id:',
-        cartObj._id
-      );
 
-      // Prepare newDelivery object (always set whole subdoc)
-      let newDelivery = existing?.delivery ? { ...existing.delivery } : {};
+      // prepare newDeliveryDraft (always set whole subdoc)
+      let newDeliveryDraft = existing?.delivery_draft
+        ? { ...existing.delivery_draft }
+        : {};
 
       if (qDeliveryMode === 'delivery') {
-        const currentDeliv = Number(existing?.delivery?.delivery_fee || 0);
-        newDelivery.mode = 'delivery';
-        newDelivery.delivery_fee = currentDeliv > 0 ? currentDeliv : ENV_DELIV;
+        const currentDeliv = Number(
+          existing?.delivery_draft?.delivery_fee || 0
+        );
+        newDeliveryDraft.mode = 'delivery';
+        newDeliveryDraft.delivery_fee =
+          currentDeliv > 0 ? currentDeliv : ENV_DELIV;
       } else if (qDeliveryMode === 'pickup') {
-        newDelivery.mode = 'pickup';
+        newDeliveryDraft.mode = 'pickup';
       } else if (qDeliveryMode === 'none') {
-        newDelivery.mode = 'none';
+        newDeliveryDraft.mode = 'none';
       }
 
-      console.log('[getCart] about to write newDelivery:', newDelivery);
-
-      // write entire subdoc (overwrite delivery)
-      const updated = await Cart.findByIdAndUpdate(
+      // write entire subdoc (overwrite delivery_draft)
+      await Cart.findByIdAndUpdate(
         cartObj._id,
-        { $set: { delivery: newDelivery } },
-        { new: true, lean: true }
+        { $set: { delivery_draft: newDeliveryDraft } },
+        { new: true }
       );
-
-      console.log(
-        '[getCart] after update delivery (from DB):',
-        updated?.delivery
-      );
-
-      // As extra check, do updateOne and then re-read (to get update counts)
-      const updRes = await Cart.updateOne(
-        { _id: cartObj._id },
-        { $set: { delivery: newDelivery } }
-      );
-      console.log('[getCart] updateOne result:', updRes);
-
-      const after2 = await Cart.findById(cartObj._id).select('delivery').lean();
-      console.log('[getCart] after2 (fresh read):', after2?.delivery);
     } catch (err) {
       console.error(
         '[getCart] failed to set delivery_mode:',
@@ -882,44 +832,26 @@ exports.getCart = asyncHandler(async (req, res) => {
   /* ========== 3) Ambil cart terbaru untuk hitung UI ========== */
   const cart = await Cart.findById(cartObj._id)
     .select(
-      'items total_items total_quantity total_price delivery updatedAt fulfillment_type table_number status member session_id source'
+      'items total_items total_quantity total_price delivery_draft updatedAt fulfillment_type table_number status member session_id source'
     )
     .lean();
 
-  console.log('[getCart] final cart read:', {
-    _id: cart?._id,
-    fulfillment_type: cart?.fulfillment_type,
-    delivery: cart?.delivery,
-    total_price: cart?.total_price,
-    items_count: Array.isArray(cart?.items) ? cart.items.length : 0
-  });
+  // normalize: gunakan delivery alias supaya fungsi lain tetap jalan
+  cart.delivery = cart.delivery_draft || undefined;
 
   /* ========== 4) Build ringkasan awal ========== */
   const ui = buildUiTotalsFromCart(cart);
-  console.log('[getCart] ui from buildUiTotalsFromCart:', ui);
 
   const items_subtotal = Number(ui.items_subtotal || 0);
   const items_discount = Number(ui.items_discount || 0);
   const shipping_discount = Number(ui.shipping_discount || 0);
 
-  console.log(
-    '[getCart] items_subtotal, items_discount, shipping_discount ->',
-    items_subtotal,
-    items_discount,
-    shipping_discount
-  );
-
   const service_fee_on_items = int(
     Math.round(items_subtotal * SERVICE_FEE_RATE)
   );
-  console.log('[getCart] service_fee_on_items:', service_fee_on_items);
 
   const rate = parsePpnRate();
   const taxAmountOnItems = int(Math.round(items_subtotal * rate));
-  console.log(
-    '[getCart] taxAmountOnItems (rate=' + rate + '):',
-    taxAmountOnItems
-  );
 
   const baseBeforeRound = int(items_subtotal);
   const pureBeforeWithService = int(
@@ -929,7 +861,6 @@ exports.getCart = asyncHandler(async (req, res) => {
       items_discount -
       shipping_discount
   );
-  console.log('[getCart] pureBeforeWithService:', pureBeforeWithService);
 
   ui.service_fee = service_fee_on_items;
   ui.tax_amount = taxAmountOnItems;
@@ -937,29 +868,13 @@ exports.getCart = asyncHandler(async (req, res) => {
   const pureRounded = int(roundRupiahCustom(int(pureBeforeWithService)));
   ui.grand_total = pureRounded;
   ui.rounding_delta = int(pureRounded - int(pureBeforeWithService));
-  console.log(
-    '[getCart] grand_total (without delivery):',
-    ui.grand_total,
-    'rounding_delta:',
-    ui.rounding_delta
-  );
 
   /* ========== 5) Delivery fee: hanya jika FT delivery & mode delivery ========== */
   const ft = cart.fulfillment_type || 'dine_in';
   const cartDeliveryMode = (cart?.delivery?.mode || '').toLowerCase() || null;
 
-  console.log(
-    '[getCart] ft:',
-    ft,
-    'cartDeliveryMode:',
-    cartDeliveryMode,
-    'cart.delivery:',
-    cart?.delivery
-  );
-
   const CART_DELIV = Number(cart?.delivery?.delivery_fee || 0);
   const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
-  console.log('[getCart] CART_DELIV:', CART_DELIV, 'ENV_DELIV:', ENV_DELIV);
 
   const shouldChargeDelivery =
     ft === 'delivery' && cartDeliveryMode === 'delivery';
@@ -969,42 +884,27 @@ exports.getCart = asyncHandler(async (req, res) => {
       ? CART_DELIV
       : ENV_DELIV
     : 0;
-  console.log(
-    '[getCart] shouldChargeDelivery:',
-    shouldChargeDelivery,
-    'finalDeliveryFee:',
-    finalDeliveryFee
-  );
 
   if (shouldChargeDelivery && finalDeliveryFee > 0) {
     ui.delivery_fee = finalDeliveryFee;
     const beforeRoundWithDeliv =
       int(pureBeforeWithService) + int(finalDeliveryFee);
     ui.grand_total_with_delivery = int(roundRupiahCustom(beforeRoundWithDeliv));
-    console.log(
-      '[getCart] grand_total_with_delivery:',
-      ui.grand_total_with_delivery
-    );
   } else {
     ui.delivery_fee = 0;
     ui.grand_total_with_delivery = ui.grand_total;
-    console.log('[getCart] no delivery charge. ui.delivery_fee set to 0.');
   }
 
   const items = Array.isArray(cart.items) ? cart.items : [];
 
-  const responseBody = {
+  /* ========== 6) Response ========== */
+  return res.status(200).json({
     ...cart,
     fulfillment_type: ft,
     delivery_mode: cartDeliveryMode,
     items: items,
     ui_totals: ui
-  };
-
-  console.log('[getCart] responseBody.ui_totals:', responseBody.ui_totals);
-  console.log('--- getCart EXIT ---');
-
-  return res.status(200).json(responseBody);
+  });
 });
 
 exports.addItem = asyncHandler(async (req, res) => {
