@@ -724,7 +724,7 @@ const ensureMemberForCheckout = async (req, res, joinChannel) => {
 exports.getCart = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
 
-  /* ========== 0) Baca FT dari query (opsional) ========== */
+  /* ========== 0) Baca FT & delivery_mode dari query ========== */
   const hasFtQuery = Object.prototype.hasOwnProperty.call(
     req.query || {},
     'fulfillment_type'
@@ -739,7 +739,6 @@ exports.getCart = asyncHandler(async (req, res) => {
       ? 'dine_in'
       : null;
 
-  // juga baca delivery_mode dari query (opsional): 'delivery'|'pickup'|'none'
   const hasDeliveryModeQuery = Object.prototype.hasOwnProperty.call(
     req.query || {},
     'delivery_mode'
@@ -758,8 +757,8 @@ exports.getCart = asyncHandler(async (req, res) => {
 
   /* ========== 1) Ambil / auto-create cart aktif ========== */
   const cartObj = await getActiveCartForIdentity(iden, {
-    allowCreate: true, // auto-create jika belum ada
-    defaultFt: hasFtQuery ? qFt : null, // hanya pakai default FT saat create & kalau query ada
+    allowCreate: true,
+    defaultFt: hasFtQuery ? qFt : null,
     skipAttach: true
   });
 
@@ -782,20 +781,40 @@ exports.getCart = asyncHandler(async (req, res) => {
     return res.status(200).json({ cart: null, ui_totals: empty });
   }
 
-  /* ========== 2) Jika ADA query, update FT cart sesuai query ==========
-     Kalau TIDAK ada query: JANGAN ubah FT yang sudah ada. */
+  /* ========== 2) Update fulfillment_type & delivery_mode jika ada query ========== */
   if (hasFtQuery && qFt && cartObj.fulfillment_type !== qFt) {
     await Cart.findByIdAndUpdate(cartObj._id, {
       $set: { fulfillment_type: qFt }
     });
   }
 
-  // Jika ada delivery_mode query, simpan juga ke cart.delivery.mode (agar DB konsisten)
   if (hasDeliveryModeQuery && qDeliveryMode) {
-    // jaga struktur delivery ada
-    await Cart.findByIdAndUpdate(cartObj._id, {
-      $set: { 'delivery.mode': qDeliveryMode }
-    }).catch(() => {}); // jangan crash kalau gagal
+    try {
+      const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
+
+      const existing = await Cart.findById(cartObj._id)
+        .select('delivery')
+        .lean();
+      const updates = { 'delivery.mode': qDeliveryMode };
+
+      if (qDeliveryMode === 'delivery') {
+        const currentDeliv = Number(existing?.delivery?.delivery_fee || 0);
+        if (currentDeliv > 0) {
+          updates['delivery.delivery_fee'] = currentDeliv;
+        } else if (ENV_DELIV > 0) {
+          updates['delivery.delivery_fee'] = ENV_DELIV;
+        } else {
+          updates['delivery.delivery_fee'] = 0;
+        }
+      }
+
+      await Cart.findByIdAndUpdate(cartObj._id, { $set: updates });
+    } catch (err) {
+      console.error(
+        '[getCart] failed to set delivery_mode:',
+        err?.message || err
+      );
+    }
   }
 
   /* ========== 3) Ambil cart terbaru untuk hitung UI ========== */
@@ -819,7 +838,7 @@ exports.getCart = asyncHandler(async (req, res) => {
   const rate = parsePpnRate();
   const taxAmountOnItems = int(Math.round(items_subtotal * rate));
 
-  const baseBeforeRound = int(items_subtotal); // items only, before tax
+  const baseBeforeRound = int(items_subtotal);
   const pureBeforeWithService = int(
     baseBeforeRound +
       taxAmountOnItems +
@@ -828,7 +847,6 @@ exports.getCart = asyncHandler(async (req, res) => {
       shipping_discount
   );
 
-  // Store into ui
   ui.service_fee = service_fee_on_items;
   ui.tax_amount = taxAmountOnItems;
 
@@ -836,43 +854,39 @@ exports.getCart = asyncHandler(async (req, res) => {
   ui.grand_total = pureRounded;
   ui.rounding_delta = int(pureRounded - int(pureBeforeWithService));
 
-  /* ========== 5) Delivery fee: hanya jika FT cart memang delivery AND mode delivery ========== */
+  /* ========== 5) Delivery fee: hanya jika FT delivery & mode delivery ========== */
   const ft = cart.fulfillment_type || 'dine_in';
-  // baca delivery.mode dari cart (bisa 'delivery' | 'pickup' | 'none')
   const cartDeliveryMode = (cart?.delivery?.mode || '').toLowerCase() || null;
 
-  // finalDeliveryFee hanya dihitung kalau fulfillment_type=delivery AND delivery.mode=delivery
   const CART_DELIV = Number(cart?.delivery?.delivery_fee || 0);
   const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
-  const finalDeliveryFee =
-    ft === 'delivery' && cartDeliveryMode !== 'pickup'
-      ? CART_DELIV > 0
-        ? CART_DELIV
-        : ENV_DELIV
-      : 0;
 
-  // set ui.delivery_fee dan grand_total_with_delivery sesuai finalDeliveryFee
-  if (
-    ft === 'delivery' &&
-    cartDeliveryMode === 'delivery' &&
-    finalDeliveryFee > 0
-  ) {
+  const shouldChargeDelivery =
+    ft === 'delivery' && cartDeliveryMode === 'delivery';
+
+  const finalDeliveryFee = shouldChargeDelivery
+    ? CART_DELIV > 0
+      ? CART_DELIV
+      : ENV_DELIV
+    : 0;
+
+  if (shouldChargeDelivery && finalDeliveryFee > 0) {
     ui.delivery_fee = finalDeliveryFee;
     const beforeRoundWithDeliv =
       int(pureBeforeWithService) + int(finalDeliveryFee);
     ui.grand_total_with_delivery = int(roundRupiahCustom(beforeRoundWithDeliv));
   } else {
-    // pickup / dine_in / mode invalid: no delivery fee
     ui.delivery_fee = 0;
     ui.grand_total_with_delivery = ui.grand_total;
   }
 
   const items = Array.isArray(cart.items) ? cart.items : [];
 
+  /* ========== 6) Response ========== */
   return res.status(200).json({
     ...cart,
-    fulfillment_type: ft, // kembalikan FT yang AKTUAL di cart
-    delivery_mode: cartDeliveryMode, // informasikan delivery_mode agar FE tahu
+    fulfillment_type: ft,
+    delivery_mode: cartDeliveryMode,
     items: items,
     ui_totals: ui
   });
@@ -3691,7 +3705,6 @@ exports.listMembers = asyncHandler(async (req, res) => {
     .sort({ name: 1 })
     .limit(limit)
     .lean();
-
   res.status(200).json({
     ok: true,
     count: members.length,
