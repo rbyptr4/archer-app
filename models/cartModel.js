@@ -42,7 +42,18 @@ const deliveryDraftSchema = new mongoose.Schema(
       lat: { type: Number },
       lng: { type: Number }
     },
-    note_to_rider: { type: String, trim: true, default: '' }
+    note_to_rider: { type: String, trim: true, default: '' },
+    delivery_fee: {
+      type: Number,
+      min: 0,
+      default: undefined
+    },
+
+    mode: {
+      type: String,
+      enum: ['delivery', 'pickup', 'none'],
+      default: undefined
+    }
   },
   { _id: false }
 );

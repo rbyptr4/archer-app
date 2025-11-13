@@ -797,48 +797,56 @@ exports.getCart = asyncHandler(async (req, res) => {
     try {
       const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
 
-      // ambil doc mongoose supaya bisa save() (triggers & validators jalan)
       const doc = await Cart.findById(cartObj._id);
       if (!doc) {
-        console.warn('[getCart] cart doc not found for id', cartObj._id);
-      } else {
-        const existingDraft =
-          doc.delivery_draft && typeof doc.delivery_draft === 'object'
-            ? { ...doc.delivery_draft }
-            : {};
+        throwError(`Cart not found for id ${String(cartObj._id)}`, 404);
+      }
 
-        // set sesuai query
-        if (qDeliveryMode === 'delivery') {
-          existingDraft.mode = 'delivery';
-          const cur = Number(existingDraft.delivery_fee || 0);
-          existingDraft.delivery_fee = cur > 0 ? cur : ENV_DELIV;
-          // optional: set fulfillment_type juga supaya charge ongkir terjadi
-          doc.fulfillment_type = 'delivery';
-        } else if (qDeliveryMode === 'pickup') {
-          existingDraft.mode = 'pickup';
-          existingDraft.delivery_fee = 0;
-        } else if (qDeliveryMode === 'none') {
-          existingDraft.mode = 'none';
-          existingDraft.delivery_fee = 0;
+      const existingDraft =
+        doc.delivery_draft && typeof doc.delivery_draft === 'object'
+          ? { ...doc.delivery_draft }
+          : {};
+
+      // set sesuai query
+      if (qDeliveryMode === 'delivery') {
+        existingDraft.mode = 'delivery';
+        // jika sebelumnya sudah ada delivery_fee > 0, pertahankan; else pakai ENV
+        const cur = Number(existingDraft.delivery_fee ?? 0);
+        existingDraft.delivery_fee = cur > 0 ? cur : ENV_DELIV;
+        // optional: set fulfillment_type juga supaya charge ongkir terjadi
+        doc.fulfillment_type = 'delivery';
+      } else if (qDeliveryMode === 'pickup') {
+        existingDraft.mode = 'pickup';
+        if (
+          Object.prototype.hasOwnProperty.call(existingDraft, 'delivery_fee')
+        ) {
+          delete existingDraft.delivery_fee;
         }
-
-        doc.delivery_draft = existingDraft;
-
-        try {
-          const saved = await doc.save();
-          // saved.delivery_draft sudah terpersist
-        } catch (saveErr) {
-          console.error(
-            '[getCart] doc.save() failed when setting delivery_mode:',
-            saveErr?.message || saveErr
-          );
+      } else if (qDeliveryMode === 'none') {
+        existingDraft.mode = 'none';
+        if (
+          Object.prototype.hasOwnProperty.call(existingDraft, 'delivery_fee')
+        ) {
+          delete existingDraft.delivery_fee;
         }
       }
+
+      doc.delivery_draft = existingDraft;
+
+      try {
+        await doc.save();
+      } catch (saveErr) {
+        throwError(
+          `Failed to persist delivery_mode for cart ${String(cartObj._id)}: ${
+            saveErr?.message || saveErr
+          }`,
+          500
+        );
+      }
     } catch (err) {
-      console.error(
-        '[getCart] failed to set delivery_mode:',
-        err?.message || err
-      );
+      // err bisa berasal dari throwError di atas atau error lain — re-throw supaya masuk ke global error handler
+      // Jika err sudah objek yg dihasilkan throwError (mis. punya statusCode), re-throw langsung
+      throw err;
     }
   }
 
@@ -1162,11 +1170,37 @@ exports.setFulfillmentType = asyncHandler(async (req, res) => {
 
     // simpan draft delivery bila ada
     if (req.body?.delivery_draft) {
-      cart.delivery_draft = {
-        address_text: String(req.body.delivery_draft.address_text || ''),
-        location: req.body.delivery_draft.location || null,
-        note_to_rider: String(req.body.delivery_draft.note_to_rider || '')
+      const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
+
+      // normalisasi draft yang masuk
+      const draftIn = req.body.delivery_draft;
+      const newDraft = {
+        address_text: String(draftIn.address_text || ''),
+        location: draftIn.location || null,
+        note_to_rider: String(draftIn.note_to_rider || '')
       };
+
+      // kalau draftIn menyertakan mode, gunakan; else default ke 'delivery'
+      const draftMode =
+        typeof draftIn.mode === 'string'
+          ? String(draftIn.mode).toLowerCase()
+          : 'delivery';
+
+      newDraft.mode =
+        draftMode === 'pickup'
+          ? 'pickup'
+          : draftMode === 'none'
+          ? 'none'
+          : 'delivery';
+
+      // set delivery_fee only when draft mode === 'delivery'
+      if (newDraft.mode === 'delivery') {
+        const cur = Number(draftIn.delivery_fee ?? 0);
+        newDraft.delivery_fee = cur > 0 ? cur : ENV_DELIV;
+      } else {
+      }
+
+      cart.delivery_draft = newDraft;
     }
   } else {
     // Balik ke dine_in → pakai nomor meja dari body ATAU cache
@@ -1734,7 +1768,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     // emit ke staff/kasir/kitchen
     emitToStaff('order:new', summary);
     emitToCashier('order:new', summary); // opsional: khusus kasir jika ingin
-    emitToKitchen('order:new', summary);
 
     // emit ke member atau guest
     if (MemberDoc) {
