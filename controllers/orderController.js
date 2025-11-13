@@ -1608,6 +1608,22 @@ exports.checkout = asyncHandler(async (req, res) => {
     payment_status = 'unpaid';
   }
 
+  // === Build uiTotals (dipakai oleh UI & disimpan di order) ===
+  const uiTotals = {
+    items_subtotal: int(baseItemsSubtotal),
+    items_discount: int(items_discount || 0),
+    delivery_fee: int(baseDelivery || 0),
+    shipping_discount: int(shipping_discount || 0),
+    service_fee: int(service_fee || 0),
+    tax_rate_percent: Number(taxRatePercent || 0),
+    tax_amount: int(taxAmount || 0),
+    rounding_delta: int(rounding_delta || 0),
+    grand_total: int(requested_bvt || 0),
+    // tambahan informasi untuk debugging / snapshot
+    items_subtotal_after_discount: int(items_subtotal_after_discount || 0),
+    discounts: priced.breakdown || []
+  };
+
   /* ===== Buat Order ===== */
   const order = await (async () => {
     for (let i = 0; i < 5; i++) {
@@ -1619,64 +1635,64 @@ exports.checkout = asyncHandler(async (req, res) => {
           ? priced.chosenClaimIds
           : [];
 
-          return await Order.create({
-            member: MemberDoc ? MemberDoc._id : null,
-            customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
-            customer_phone: MemberDoc ? MemberDoc.phone || '' : customer_phone,
-            table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
-            source: iden.source || 'online',
-            fulfillment_type: ft,
-            transaction_code: code,
+        return await Order.create({
+          member: MemberDoc ? MemberDoc._id : null,
+          customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
+          customer_phone: MemberDoc ? MemberDoc.phone || '' : customer_phone,
+          table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
+          source: iden.source || 'online',
+          fulfillment_type: ft,
+          transaction_code: code,
 
-            items: cart.items.map((it) => ({
-              menu: it.menu,
-              menu_code: it.menu_code,
-              name: it.name,
-              imageUrl: it.imageUrl,
-              base_price: it.base_price,
-              quantity: it.quantity,
-              addons: it.addons,
-              notes: String(it.notes || '').trim(),
-              category: it.category || null
-            })),
+          items: cart.items.map((it) => ({
+            menu: it.menu,
+            menu_code: it.menu_code,
+            name: it.name,
+            imageUrl: it.imageUrl,
+            base_price: it.base_price,
+            quantity: it.quantity,
+            addons: it.addons,
+            notes: String(it.notes || '').trim(),
+            category: it.category || null
+          })),
 
-            // =========================
-            // MAP DARI buildUiTotalsFromCart()
-            // =========================
-            items_subtotal: int(uiTotals.items_subtotal),
-            items_discount: int(uiTotals.items_discount),
+          // =========================
+          // MAP DARI buildUiTotalsFromCart()
+          // =========================
+          items_subtotal: int(uiTotals.items_subtotal),
+          items_discount: int(uiTotals.items_discount),
+          delivery_fee: int(uiTotals.delivery_fee),
+          shipping_discount: int(uiTotals.shipping_discount),
+
+          // breakdown voucher tetap dari price engine
+          discounts: priced.breakdown || [],
+          applied_voucher_ids: appliedVoucherIds,
+
+          // service fee, pajak, rounding, total dari UI TOTALS
+          service_fee: int(uiTotals.service_fee),
+          tax_rate_percent: Number(uiTotals.tax_rate_percent),
+          tax_amount: int(uiTotals.tax_amount),
+          rounding_delta: int(uiTotals.rounding_delta),
+          grand_total: int(uiTotals.grand_total),
+
+          // Payment
+          payment_method: method,
+          payment_provider,
+          payment_status,
+          paid_at,
+          payment_proof_url: payment_proof_url || null,
+
+          status: 'created',
+          placed_at: new Date(),
+
+          // nested delivery — pastikan INI DIPAKAI
+          delivery: {
+            ...deliveryObj,
             delivery_fee: int(uiTotals.delivery_fee),
             shipping_discount: int(uiTotals.shipping_discount),
-
-            // breakdown voucher tetap dari price engine
-            discounts: priced.breakdown || [],
-
-            // service fee, pajak, rounding, total dari UI TOTLAS
-            service_fee: int(uiTotals.service_fee),
-            tax_rate_percent: Number(uiTotals.tax_rate_percent),
-            tax_amount: int(uiTotals.tax_amount),
-            rounding_delta: int(uiTotals.rounding_delta),
-            grand_total: int(uiTotals.grand_total),
-
-            // Payment
-            payment_method: method,
-            payment_provider,
-            payment_status,
-            paid_at,
-            payment_proof_url: payment_proof_url || null,
-
-            status: 'created',
-            placed_at: new Date(),
-
-            // nested delivery — pastikan INI DIPAKAI
-            delivery: {
-              ...deliveryObj,
-              delivery_fee: int(uiTotals.delivery_fee),
-              shipping_discount: int(uiTotals.shipping_discount),
-              delivery_fee_raw: int(deliveryObj.delivery_fee_raw || 0)
-            }
-          });
-          
+            delivery_fee_raw: int(deliveryObj.delivery_fee_raw || 0)
+          }
+        });
       } catch (e) {
         if (e?.code === 11000 && /transaction_code/.test(String(e.message)))
           continue;
@@ -1778,19 +1794,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   }
 
   try {
-    const uiTotals = {
-      items_subtotal: order.items_subtotal || 0,
-      delivery_fee: order.delivery_fee || (order.delivery?.delivery_fee ?? 0),
-      service_fee: order.service_fee || 0,
-      items_discount: order.items_discount || 0,
-      shipping_discount: order.shipping_discount || 0,
-      discounts: order.discounts || [],
-      tax_rate_percent: order.tax_rate_percent || 0,
-      tax_amount: order.tax_amount || 0,
-      grand_total: order.grand_total || 0,
-      rounding_delta: order.rounding_delta || 0
-    };
-
+    // gunakan uiTotals yang sudah dibuat di atas untuk snapshot
     await snapshotOrder(order._id, { uiTotals }).catch(() => {});
   } catch (e) {
     console.error('[OrderHistory][checkout]', e?.message || e);
@@ -2728,7 +2732,6 @@ const buildOrderReceipt = (order) => {
     }
   };
 };
-
 
 exports.getOrderReceipt = asyncHandler(async (req, res) => {
   const { id } = req.params;
