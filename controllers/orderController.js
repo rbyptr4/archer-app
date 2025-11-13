@@ -1254,58 +1254,25 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
 
 /* ===================== CHECKOUT ===================== */
 exports.checkout = asyncHandler(async (req, res) => {
-  // helper local untuk logging aman / atomik
+  // helper logging minimal
   const util = require('util');
-  const seenForLog = new WeakSet();
-  function safeForJSON(key, value) {
-    // ObjectId (mongoose) handling
-    if (value && typeof value === 'object' && value._bsontype === 'ObjectID') {
-      return String(value);
-    }
-    if (value instanceof Date) return value.toISOString();
-    if (typeof value === 'function')
-      return `[Function: ${value.name || 'anonymous'}]`;
-    // Prevent circular
-    if (value && typeof value === 'object') {
-      if (seenForLog.has(value)) return '[Circular]';
-      seenForLog.add(value);
-    }
-    return value;
-  }
-  function logDebug(label, obj) {
+  function log(label, obj) {
     try {
-      // clear seen for each top-level log so nested objects reused in different logs still shown
-      seenForLog.clear?.();
+      console.log(
+        `>>> ${label}: ${JSON.stringify(
+          obj,
+          (k, v) => {
+            if (v && typeof v === 'object' && v._bsontype === 'ObjectID')
+              return String(v);
+            if (v instanceof Date) return v.toISOString();
+            return v;
+          },
+          2
+        )}`
+      );
     } catch (e) {
-      // ignore if WeakSet doesn't have clear (older Node) — recreate instead
+      console.log(`>>> ${label}:`, util.inspect(obj, { depth: null }));
     }
-    // recreate WeakSet to ensure fresh per-log in older runtimes
-    const _seen = new WeakSet();
-    function replacer(k, v) {
-      // ObjectId
-      if (v && typeof v === 'object' && v._bsontype === 'ObjectID')
-        return String(v);
-      if (v instanceof Date) return v.toISOString();
-      if (typeof v === 'function')
-        return `[Function: ${v.name || 'anonymous'}]`;
-      if (v && typeof v === 'object') {
-        if (_seen.has(v)) return '[Circular]';
-        _seen.add(v);
-      }
-      return v;
-    }
-    let serialized;
-    try {
-      serialized = JSON.stringify(obj, replacer, 2);
-    } catch (e) {
-      // fallback to util.inspect if stringify fails
-      serialized = util.inspect(obj, {
-        depth: null,
-        colors: false,
-        compact: false
-      });
-    }
-    console.log(`>>> ${label}: ${serialized}`);
   }
 
   const iden0 = getIdentity(req);
@@ -1314,44 +1281,24 @@ exports.checkout = asyncHandler(async (req, res) => {
     phone,
     fulfillment_type,
     payment_method,
-    address_text,
-    lat,
-    lng,
-    note_to_rider,
     idempotency_key,
     voucherClaimIds = [],
     register_decision = 'register'
   } = req.body || {};
 
-  logDebug('REQ_BODY', {
-    fulfillment_type,
-    payment_method,
-    address_text,
-    lat,
-    lng,
-    note_to_rider,
-    idempotency_key,
-    voucherClaimIds,
-    register_decision
-  });
-
   const ft =
     iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
-  if (!['dine_in', 'delivery'].includes(ft)) {
+  if (!['dine_in', 'delivery'].includes(ft))
     throwError('fulfillment_type tidak valid', 400);
-  }
 
   const method = String(payment_method || '').toLowerCase();
   if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method)) {
     throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
   }
 
-  const methodIsGateway = method === PM.QRIS && !QRIS_USE_STATIC;
-  const requiresProof = needProof(method);
-
+  // identitas / member
   const originallyLoggedIn = !!iden0.memberId;
   const wantRegister = String(register_decision || 'register') === 'register';
-
   let MemberDoc = null;
   let customer_name = '';
   let customer_phone = '';
@@ -1359,14 +1306,11 @@ exports.checkout = asyncHandler(async (req, res) => {
   if (originallyLoggedIn || wantRegister) {
     const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
     MemberDoc = await ensureMemberForCheckout(req, res, joinChannel);
-    logDebug('MEMBER_DOC', MemberDoc || null);
   } else {
     customer_name = String(name || '').trim();
     const rawPhone = String(phone || '').trim();
-
-    if (!customer_name && !rawPhone) {
+    if (!customer_name && !rawPhone)
       throwError('Tanpa member: isi minimal nama atau no. telp', 400);
-    }
     if (rawPhone) {
       const digits = rawPhone.replace(/\D+/g, '');
       if (!digits) throwError('Nomor telepon harus berupa angka', 400);
@@ -1386,63 +1330,25 @@ exports.checkout = asyncHandler(async (req, res) => {
       null
   };
 
-  logDebug('IDENTITY', iden);
-
+  // ambil cart
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
-
-  logDebug('CART_OBJ', cartObj || null);
-
   if (!cartObj) throwError('Cart tidak ditemukan / kosong', 404);
-
-  const cart = await Cart.findById(cartObj._id);
+  const cart = await Cart.findById(cartObj._1 || cartObj._id); // accommodate different shapes
   if (!cart) throwError('Cart tidak ditemukan / kosong', 404);
   if (!cart.items?.length) throwError('Cart kosong', 400);
 
-  logDebug('CART_BEFORE', { id: cart._id, items_count: cart.items.length });
-
-  if (
-    ft === 'dine_in' &&
-    (iden.source || 'online') === 'qr' &&
-    !cart.table_number
-  ) {
-    throwError('Silakan assign nomor meja terlebih dahulu', 400);
-  }
-
+  // --- simplified delivery / slot handling (as before) ---
   const delivery_mode =
     ft === 'dine_in'
       ? 'none'
       : String(req.body?.delivery_mode || 'delivery').toLowerCase();
-
   const providedSlot = (req.body?.delivery_slot || '').trim();
   const providedScheduledAtRaw = req.body?.scheduled_at || null;
   const providedScheduledAt = providedScheduledAtRaw
     ? dayjs(providedScheduledAtRaw).tz(LOCAL_TZ)
     : null;
-
-  const pickup_from_iso = req.body?.pickup_from || null;
-  const pickup_to_iso = req.body?.pickup_to || null;
-
-  if (ft !== 'dine_in') {
-    if (delivery_mode === 'delivery') {
-      if (
-        !providedSlot &&
-        (!providedScheduledAt || !providedScheduledAt.isValid())
-      ) {
-        throwError(
-          'Untuk delivery: delivery_slot atau scheduled_at wajib',
-          400
-        );
-      }
-    } else if (delivery_mode === 'pickup') {
-      if (!pickup_from_iso || !pickup_to_iso) {
-        throwError('Untuk pickup: pickup_from dan pickup_to (ISO) wajib', 400);
-      }
-    } else {
-      throwError('delivery_mode tidak valid', 400);
-    }
-  }
 
   let slotLabel = null;
   let slotDt = null;
@@ -1455,12 +1361,10 @@ exports.checkout = asyncHandler(async (req, res) => {
     slotLabel = slotDt.format('HH:mm');
   } else if (delivery_mode === 'delivery' && providedSlot) {
     const maybeDt = parseSlotLabelToDate(providedSlot);
-    if (!maybeDt || !maybeDt.isValid()) {
+    if (!maybeDt || !maybeDt.isValid())
       throwError('delivery_slot tidak valid', 400);
-    } else {
-      slotDt = maybeDt;
-      slotLabel = providedSlot;
-    }
+    slotDt = maybeDt;
+    slotLabel = providedSlot;
   }
 
   if (
@@ -1479,58 +1383,26 @@ exports.checkout = asyncHandler(async (req, res) => {
     status: 'pending'
   };
 
-  let pickupWindowFrom = null;
-  let pickupWindowTo = null;
-
-  if (delivery_mode === 'pickup' && ft !== 'dine_in') {
-    const f = dayjs(pickup_from_iso).tz(LOCAL_TZ);
-    const t = dayjs(pickup_to_iso).tz(LOCAL_TZ);
-    if (!f.isValid() || !t.isValid()) {
-      throwError('pickup_from/pickup_to tidak valid ISO', 400);
-    }
-    pickupWindowFrom = f;
-    pickupWindowTo = t;
-
-    if (!pickupWindowFrom.isBefore(pickupWindowTo))
-      throwError('pickup_window: from harus < to', 400);
-
-    deliveryObj.pickup_window = {
-      from: pickupWindowFrom.toDate(),
-      to: pickupWindowTo.toDate()
-    };
-
-    if (!deliveryObj.scheduled_at) {
-      deliveryObj.scheduled_at = pickupWindowFrom.toDate();
-      deliveryObj.slot_label = pickupWindowFrom.format('HH:mm');
-    }
-  }
-
-  // Delivery-specific: alamat & radius
-  let delivery_fee = 0;
-  if (ft !== 'dine_in' && delivery_mode === 'delivery') {
+  if (delivery_mode === 'delivery' && ft !== 'dine_in') {
     const latN = Number(req.body?.lat);
     const lngN = Number(req.body?.lng);
-    if (!Number.isFinite(latN) || !Number.isFinite(lngN)) {
+    if (!Number.isFinite(latN) || !Number.isFinite(lngN))
       throwError('Lokasi (lat,lng) wajib untuk delivery', 400);
-    }
     const distance_km = haversineKm(CAFE_COORD, { lat: latN, lng: lngN });
-    if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0)) {
-      throwError(`Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`, 400);
-    }
+    if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0))
+      throwError(`Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`);
     deliveryObj.address_text = String(req.body?.address_text || '').trim();
     deliveryObj.location = { lat: latN, lng: lngN };
     deliveryObj.distance_km = Number(distance_km.toFixed(2));
-
-    delivery_fee = calcDeliveryFee();
-    deliveryObj.delivery_fee = delivery_fee;
-    deliveryObj.delivery_fee_raw = delivery_fee;
+    // calc local raw delivery as fallback
+    const localDeliveryCalc = calcDeliveryFee(); // asumsi ada
+    deliveryObj.delivery_fee = localDeliveryCalc;
+    deliveryObj.delivery_fee_raw = localDeliveryCalc;
   } else {
     deliveryObj.note_to_rider = String(req.body?.note_to_rider || '');
   }
 
-  logDebug('DELIVERY_OBJ_AFTER_INPUT', deliveryObj);
-
-  // normalize items
+  // normalisasi item seperti sebelumnya
   cart.items = (Array.isArray(cart.items) ? cart.items : [])
     .filter(Boolean)
     .map((it) => {
@@ -1543,7 +1415,6 @@ exports.checkout = asyncHandler(async (req, res) => {
           qty: clamp(int(a.qty || 1), 1, 999),
           ...(typeof a.isActive === 'boolean' ? { isActive: !!a.isActive } : {})
         }));
-
       return {
         ...it,
         addons: safeAddons,
@@ -1554,7 +1425,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   try {
     recomputeTotals(cart);
     await cart.save();
-    logDebug('CART_AFTER_RECOMPUTE', { id: cart._id, items: cart.items });
   } catch (err) {
     throwError(
       err?.message
@@ -1564,7 +1434,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
-  // Voucher filter
+  // ===== VOUCHER: filter eligibleClaimIds untuk engine =====
   let eligibleClaimIds = [];
   if (MemberDoc) {
     if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
@@ -1582,8 +1452,13 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Voucher hanya untuk member. Silakan daftar/login.', 400);
   }
 
-  logDebug('ELIGIBLE_VOUCHER_IDS', eligibleClaimIds);
+  // LOG penting: input voucher ke engine
+  log('VOUCHER_INPUT', {
+    req_voucherClaimIds: voucherClaimIds,
+    eligibleClaimIds
+  });
 
+  // ===== Hit price engine =====
   let priced;
   try {
     priced = await validateAndPrice({
@@ -1597,10 +1472,9 @@ exports.checkout = asyncHandler(async (req, res) => {
         }))
       },
       fulfillmentType: ft,
-      deliveryFee: delivery_fee,
+      deliveryFee: deliveryObj.delivery_fee || 0,
       voucherClaimIds: eligibleClaimIds
     });
-    logDebug('PRICE_ENGINE_RAW', priced);
   } catch (err) {
     throwError(
       err?.message
@@ -1610,17 +1484,37 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
-  // ambil totals dari price engine
-  const baseItemsSubtotal = int(priced.totals.baseSubtotal);
-  const items_discount = int(priced.totals.itemsDiscount || 0);
-  const shipping_discount = int(priced.totals.shippingDiscount || 0);
-  const baseDelivery = int(priced.totals.deliveryFee || 0);
+  // LOG penting: hasil engine
+  log('PRICE_ENGINE_RESULT', {
+    totals: priced?.totals || null,
+    chosenClaimIds: priced?.chosenClaimIds || null,
+    breakdown: priced?.breakdown || null
+  });
 
-  // sinkronisasi deliveryObj
-  if (typeof deliveryObj.delivery_fee_raw === 'undefined') {
-    deliveryObj.delivery_fee_raw = int(deliveryObj.delivery_fee || 0);
+  // ===== Ambil totals dari engine (safe read) =====
+  const baseItemsSubtotal = int(priced.totals?.baseSubtotal || 0);
+  const items_discount = int(priced.totals?.itemsDiscount || 0); // diskon item
+  const shipping_discount = int(priced.totals?.shippingDiscount || 0); // diskon ongkir
+  const reportedDelivery = int(priced.totals?.deliveryFee || 0); // engine deliveryFee (biasanya net or gross)
+  const engineGrand = priced.totals?.grandTotal ?? null;
+
+  // Tentukan delivery net: jika engine laporkan shipping_discount, kurangi reportedDelivery
+  // beberapa engine jadi: reportedDelivery = gross, shipping_discount terpisah => net = max(0, reportedDelivery - shipping_discount)
+  const delivery_fee_net = Math.max(0, reportedDelivery - shipping_discount);
+
+  // pastikan kita menyimpan juga delivery_fee_raw untuk audit (nilai sebelum voucher)
+  if (
+    typeof deliveryObj.delivery_fee_raw === 'undefined' ||
+    deliveryObj.delivery_fee_raw === null
+  ) {
+    // fallback: gunakan reportedDelivery + shipping_discount (anggap reportedDelivery mungkin sudah net)
+    deliveryObj.delivery_fee_raw = int(
+      reportedDelivery + shipping_discount || deliveryObj.delivery_fee || 0
+    );
   }
-  deliveryObj.delivery_fee = int(baseDelivery);
+
+  // set deliveryObj ke net yang akan disimpan
+  deliveryObj.delivery_fee = int(delivery_fee_net);
   deliveryObj.shipping_discount = int(shipping_discount || 0);
 
   // items subtotal after discount (dipakai utk service & tax)
@@ -1628,72 +1522,38 @@ exports.checkout = asyncHandler(async (req, res) => {
     0,
     baseItemsSubtotal - items_discount
   );
-
   const service_fee = int(
     Math.round(items_subtotal_after_discount * SERVICE_FEE_RATE)
   );
-
   const rateForTax = parsePpnRate();
   const taxAmount = int(Math.round(items_subtotal_after_discount * rateForTax));
   const taxRatePercent = Math.round(rateForTax * 100 * 100) / 100;
 
+  // Perhitungan beforeRound: gunakan delivery net
   const beforeRound = int(
     items_subtotal_after_discount +
       service_fee +
-      baseDelivery -
-      shipping_discount +
+      deliveryObj.delivery_fee -
+      shipping_discount + // tetap kurangi shipping_discount bila engine mengembalikannya terpisah (aman)
       taxAmount
   );
 
-  const requested_bvt = int(roundRupiahCustom(beforeRound));
+  // Prioritaskan grand total dari engine jika tersedia; jika tidak pakai rounding lokal
+  const requested_bvt = engineGrand
+    ? int(engineGrand)
+    : int(roundRupiahCustom(beforeRound));
   const rounding_delta = int(requested_bvt - beforeRound);
 
-  if (requested_bvt <= 0) {
-    throwError('Total pembayaran tidak valid.', 400);
-  }
+  if (requested_bvt <= 0) throwError('Total pembayaran tidak valid.', 400);
 
-  logDebug('PRICE_COMPUTED', {
-    baseItemsSubtotal,
-    items_discount,
-    shipping_discount,
-    baseDelivery,
-    items_subtotal_after_discount,
-    service_fee,
-    taxRatePercent,
-    taxAmount,
-    beforeRound,
-    requested_bvt,
-    rounding_delta
-  });
-
-  // ambil bukti transfer jika ada (akan disimpan ke order nanti)
+  // ambil bukti transfer jika ada
   const payment_proof_url = await handleTransferProofIfAny(req, method);
-  logDebug('PAYMENT_PROOF_URL', { payment_proof_url });
 
-  let payment_status = 'unpaid';
-  let payment_provider = null;
-  let paid_at = null;
-
-  if (methodIsGateway) {
-    payment_provider = 'xendit';
-    payment_status = 'unpaid';
-  } else if (
-    (method === 'transfer' || method === PM.QRIS) &&
-    payment_proof_url
-  ) {
-    payment_provider =
-      method === 'transfer' ? 'bank_transfer' : payment_provider;
-    payment_status = 'paid';
-    paid_at = new Date();
-  } else {
-    payment_status = 'unpaid';
-  }
-
-  // === Build uiTotals (dipakai oleh UI & disimpan di order) ===
+  // build uiTotals dari nilai engine / perhitungan konsisten
   const uiTotals = {
     items_subtotal: int(baseItemsSubtotal),
     items_discount: int(items_discount || 0),
-    delivery_fee: int(baseDelivery || 0),
+    delivery_fee: int(deliveryObj.delivery_fee || 0), // net delivery
     shipping_discount: int(shipping_discount || 0),
     service_fee: int(service_fee || 0),
     tax_rate_percent: Number(taxRatePercent || 0),
@@ -1704,50 +1564,19 @@ exports.checkout = asyncHandler(async (req, res) => {
     discounts: priced.breakdown || []
   };
 
-  logDebug('UI_TOTALS', uiTotals);
-  logDebug('DELIVERY_OBJ_FINAL', deliveryObj);
+  // simpan applied voucher ids dari engine (bila ada)
+  const appliedVoucherIds = Array.isArray(priced.chosenClaimIds)
+    ? priced.chosenClaimIds
+    : [];
 
-  /* ===== Buat Order ===== */
+  // LOG penting: uiTotals + applied vouchers
+  log('UI_TOTALS_FINAL', { uiTotals, appliedVoucherIds, deliveryObj });
+
+  // ===== Buat Order (mapping voucher & totals secara konsisten) =====
   const order = await (async () => {
     for (let i = 0; i < 5; i++) {
       try {
         const code = await nextDailyTxCode('ARCH');
-        logDebug('GENERATED_TX_CODE', { code });
-
-        const payloadPreview = {
-          member: MemberDoc ? MemberDoc._id : null,
-          customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
-          customer_phone: MemberDoc ? MemberDoc.phone || '' : customer_phone,
-          table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
-          source: iden.source || 'online',
-          fulfillment_type: ft,
-          transaction_code: code,
-          items: cart.items.map((it) => ({
-            menu: it.menu,
-            menu_code: it.menu_code,
-            name: it.name,
-            base_price: it.base_price,
-            quantity: it.quantity,
-            addons: it.addons,
-            notes: String(it.notes || '').trim()
-          })),
-          totals: uiTotals,
-          delivery: {
-            ...deliveryObj,
-            delivery_fee: uiTotals.delivery_fee,
-            shipping_discount: uiTotals.shipping_discount,
-            delivery_fee_raw: deliveryObj.delivery_fee_raw || 0
-          },
-          payment: {
-            method,
-            provider: payment_provider,
-            status: payment_status,
-            paid_at: paid_at ? paid_at.toISOString() : null,
-            proof: payment_proof_url || null
-          }
-        };
-
-        logDebug('ORDER_PAYLOAD_PRECREATE', payloadPreview);
 
         return await Order.create({
           member: MemberDoc ? MemberDoc._id : null,
@@ -1770,31 +1599,41 @@ exports.checkout = asyncHandler(async (req, res) => {
             category: it.category || null
           })),
 
+          // SIMPAN nilai surcharge/discount dari uiTotals (yang bersumber dari engine)
           items_subtotal: int(uiTotals.items_subtotal),
           items_discount: int(uiTotals.items_discount),
-          delivery_fee: int(uiTotals.delivery_fee),
+          delivery_fee: int(uiTotals.delivery_fee), // net delivery
           shipping_discount: int(uiTotals.shipping_discount),
 
-          discounts: priced.breakdown || [],
-          applied_voucher_ids: Array.isArray(priced.chosenClaimIds)
-            ? priced.chosenClaimIds
-            : [],
+          // breakdown voucher & applied voucher ids
+          discounts: uiTotals.discounts || priced.breakdown || [],
+          applied_voucher_ids: appliedVoucherIds || [],
 
+          // fees & totals
           service_fee: int(uiTotals.service_fee),
           tax_rate_percent: Number(uiTotals.tax_rate_percent),
           tax_amount: int(uiTotals.tax_amount),
           rounding_delta: int(uiTotals.rounding_delta),
           grand_total: int(uiTotals.grand_total),
 
+          // Payment
           payment_method: method,
-          payment_provider,
-          payment_status,
-          paid_at,
+          payment_provider:
+            method === PM.QRIS && !QRIS_USE_STATIC ? 'xendit' : null,
+          payment_status:
+            (method === 'transfer' || method === PM.QRIS) && payment_proof_url
+              ? 'paid'
+              : 'unpaid',
+          paid_at:
+            (method === 'transfer' || method === PM.QRIS) && payment_proof_url
+              ? new Date()
+              : null,
           payment_proof_url: payment_proof_url || null,
 
           status: 'created',
           placed_at: new Date(),
 
+          // nested delivery — gunakan deliveryObj yang sudah disinkronkan ke net
           delivery: {
             ...deliveryObj,
             delivery_fee: int(uiTotals.delivery_fee),
@@ -1803,11 +1642,6 @@ exports.checkout = asyncHandler(async (req, res) => {
           }
         });
       } catch (e) {
-        logDebug('ORDER_CREATE_ERROR', {
-          message: e?.message,
-          stack: e?.stack,
-          code: e?.code
-        });
         if (e?.code === 11000 && /transaction_code/.test(String(e.message)))
           continue;
         throwError(
@@ -1821,12 +1655,13 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Gagal generate transaction_code unik', 500);
   })();
 
-  logDebug('ORDER_CREATED', {
+  // LOG ringkas: order dibuat
+  log('ORDER_CREATED', {
     id: order._id,
     transaction_code: order.transaction_code
   });
 
-  /* ===== Konsumsi voucher ===== */
+  // konsumsi voucher (kurangi remainingUse jika perlu)
   if (MemberDoc) {
     for (const claimId of priced.chosenClaimIds || []) {
       try {
@@ -1851,7 +1686,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  /* ===== Tandai cart selesai ===== */
+  // set cart checked_out
   try {
     await Cart.findByIdAndUpdate(cart._id, {
       $set: {
@@ -1865,10 +1700,6 @@ exports.checkout = asyncHandler(async (req, res) => {
         total_price: 0
       }
     });
-    logDebug('CART_MARKED_CHECKED_OUT', {
-      cartId: cart._id,
-      orderId: order._id
-    });
   } catch (err) {
     throwError(
       err?.message
@@ -1878,7 +1709,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
-  /* ===== Statistik member ===== */
+  // update member stats (non-fatal)
   if (MemberDoc) {
     try {
       await Member.findByIdAndUpdate(MemberDoc._id, {
@@ -1890,56 +1721,18 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  /* ===== Emit realtime & guest token handling ===== */
-  try {
-    if (!MemberDoc) {
-      const guestToken = uuidv4();
-      order.guestToken = guestToken;
-      await Order.findByIdAndUpdate(
-        order._id,
-        { $set: { guestToken } },
-        { new: true }
-      ).catch(() => {});
-    }
-
-    const summary = makeOrderSummary(order);
-
-    emitToStaff('order:new', summary);
-    emitToCashier('order:new', summary);
-
-    if (MemberDoc) {
-      emitToMember(String(MemberDoc._id), 'order:created', summary);
-    } else if (order.guestToken) {
-      emitToGuest(order.guestToken, 'order:created', summary);
-    }
-  } catch (err) {
-    console.error('[emit][checkout] error', err?.message || err);
-  }
-
+  // snapshot order utk histori (non-fatal)
   try {
     await snapshotOrder(order._id, { uiTotals }).catch(() => {});
-    logDebug('SNAPSHOT_SAVED', { orderId: order._id });
   } catch (e) {
     console.error('[OrderHistory][checkout]', e?.message || e);
   }
 
+  // response: kembalikan order + uiTotals agar frontend pasti punya angka yang sama
   res.status(201).json({
     order: order.toObject(),
-    totals: {
-      items_subtotal: order.items_subtotal,
-      service_fee: order.service_fee,
-      items_discount: order.items_discount,
-      delivery_fee: order.delivery_fee,
-      shipping_discount: order.shipping_discount,
-      tax_rate_percent: order.tax_rate_percent,
-      tax_amount: order.tax_amount,
-      rounding_delta: order.rounding_delta,
-      grand_total: order.grand_total
-    },
-    message:
-      payment_status === 'unpaid'
-        ? 'Checkout berhasil. Silakan lanjutkan pembayaran.'
-        : 'Checkout berhasil.'
+    uiTotals,
+    message: 'Checkout berhasil.'
   });
 });
 
