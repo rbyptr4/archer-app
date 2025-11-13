@@ -1,6 +1,5 @@
 // utils/voucherEngine.js
 const mongoose = require('mongoose');
-const Voucher = require('../models/voucherModel');
 const VoucherClaim = require('../models/voucherClaimModel');
 const throwError = require('./throwError');
 
@@ -20,6 +19,7 @@ function subtotalFromItems(items = []) {
 }
 
 function filterItemsByScope(items, appliesTo) {
+  // safe: jika appliesTo hilang atau null => berlaku ke semua item
   if (!appliesTo || appliesTo.mode === 'all') return items;
   if (appliesTo.mode === 'menus') {
     const set = new Set((appliesTo.menuIds || []).map(String));
@@ -29,6 +29,7 @@ function filterItemsByScope(items, appliesTo) {
     const set = new Set((appliesTo.categories || []).map(String));
     return items.filter((it) => set.has(String(it.category)));
   }
+  // fallback: jika unknown mode, treat as all
   return items;
 }
 
@@ -37,8 +38,17 @@ function calcPercent(val, pct) {
   return Math.max(0, Math.round((Number(val || 0) * Number(pct || 0)) / 100));
 }
 
+function applyVoucherMaxCap(amount, voucher) {
+  // voucher.maxDiscount: hanya dihormati jika bernilai number > 0
+  if (typeof voucher.maxDiscount === 'number' && voucher.maxDiscount > 0) {
+    return Math.min(amount, Number(voucher.maxDiscount || 0));
+  }
+  return amount;
+}
+
 function computeVoucherDiscount(voucher, items, deliveryFee) {
-  const scoped = filterItemsByScope(items, voucher.appliesTo);
+  // safe: voucher.appliesTo mungkin undefined
+  const scoped = filterItemsByScope(items, voucher.appliesTo || null);
   const scopedSubtotal = subtotalFromItems(scoped);
 
   const computeShippingDiscount = () => {
@@ -55,11 +65,8 @@ function computeVoucherDiscount(voucher, items, deliveryFee) {
       const pct = Number(voucher.percent || 0);
       let itemsDisc = calcPercent(scopedSubtotal, pct);
 
-      // APPLY GLOBAL CAP jika ada
-      if (Number.isFinite(Number(voucher.maxDiscount))) {
-        const cap = Number(voucher.maxDiscount);
-        if (cap >= 0) itemsDisc = Math.min(itemsDisc, cap);
-      }
+      // APPLY PER-VOUCHER CAP jika ada
+      itemsDisc = applyVoucherMaxCap(itemsDisc, voucher);
 
       itemsDisc = Math.min(itemsDisc, scopedSubtotal);
 
@@ -77,9 +84,10 @@ function computeVoucherDiscount(voucher, items, deliveryFee) {
 
     case 'amount': {
       let d = Number(voucher.amount || 0);
-      if (Number.isFinite(Number(voucher.maxDiscount))) {
-        d = Math.min(d, Number(voucher.maxDiscount));
-      }
+
+      // cap per-voucher
+      d = applyVoucherMaxCap(d, voucher);
+
       d = Math.max(0, Math.min(d, scopedSubtotal));
       const shippingDisc =
         voucher.shipping && voucher.usage?.stackableWithShipping
@@ -92,47 +100,15 @@ function computeVoucherDiscount(voucher, items, deliveryFee) {
       };
     }
 
-    case 'free_item': {
-      const cheapest = scoped.reduce(
-        (m, it) => (m && m.price < it.price ? m : it),
-        null
-      );
-      const d = Math.min(cheapest ? cheapest.price : 0, scopedSubtotal);
-      return { itemsDiscount: d, shippingDiscount: 0, note: 'free_item' };
-    }
-
-    case 'bundling': {
-      const need = voucher.appliesTo?.bundling?.buyQty || 0;
-      if (!need)
-        return {
-          itemsDiscount: 0,
-          shippingDiscount: 0,
-          note: 'bundling(no config)'
-        };
-      const qtyTotal = scoped.reduce((q, it) => q + it.qty, 0);
-      if (qtyTotal < need)
-        return {
-          itemsDiscount: 0,
-          shippingDiscount: 0,
-          note: 'bundling(not enough qty)'
-        };
-      const pct = voucher.appliesTo?.bundling?.getPercent || 0;
-      let d = calcPercent(scopedSubtotal, pct);
-
-      if (Number.isFinite(Number(voucher.maxDiscount))) {
-        d = Math.min(d, Number(voucher.maxDiscount));
-      }
-      d = Math.min(d, scopedSubtotal);
-
-      return { itemsDiscount: d, shippingDiscount: 0, note: 'bundling' };
-    }
-
     case 'shipping': {
       const d = computeShippingDiscount();
-      return { itemsDiscount: 0, shippingDiscount: d, note: 'shipping' };
+      // cap per-voucher (jika owner ingin cap ongkir via maxDiscount)
+      const capped = applyVoucherMaxCap(d, voucher);
+      return { itemsDiscount: 0, shippingDiscount: capped, note: 'shipping' };
     }
 
     default:
+      // tipe voucher tidak dikenali -> no effect
       return { itemsDiscount: 0, shippingDiscount: 0, note: 'unknown' };
   }
 }
@@ -146,7 +122,6 @@ async function validateAndPrice(
   { session } = {}
 ) {
   const items = cart.items || [];
-  // baseSubtotal: sum(price * qty). Pastikan price tiap item sudah termasuk addon per-unit.
   const baseSubtotal = subtotalFromItems(items);
 
   // load claims+voucher
@@ -198,31 +173,50 @@ async function validateAndPrice(
     validClaims.push(c);
   }
 
-  // stacking rule
+  // separate shipping vs non-shipping
   const shippingClaims = validClaims.filter(
     (c) => c.voucher.type === 'shipping'
   );
   const nonShipping = validClaims.filter((c) => c.voucher.type !== 'shipping');
 
   const chosen = [];
-  if (nonShipping.length > 1) {
-    let best = null,
-      bestValue = -1;
-    for (const c of nonShipping) {
-      const est = computeVoucherDiscount(c.voucher, items, deliveryFee);
-      const val = est.itemsDiscount + est.shippingDiscount;
-      if (val > bestValue) {
-        bestValue = val;
-        best = c;
-      }
-    }
-    chosen.push(best);
-    reasons.push(
-      `Hanya satu voucher non-ongkir yang bisa dipakai, dipilih: ${best.voucher.name}`
+
+  // NON-SHIPPING stacking policy:
+  // - Jika ada minimal satu voucher non-shipping yang TIDAK stackableWithOthers => pilih 1 terbaik.
+  // - Jika semua non-shipping vouchers memiliki stackableWithOthers === true => izinkan semua.
+  if (nonShipping.length > 0) {
+    const anyNonStackable = nonShipping.some(
+      (c) => c.voucher.usage && c.voucher.usage.stackableWithOthers === false
     );
-  } else if (nonShipping.length === 1) {
-    chosen.push(nonShipping[0]);
+
+    if (anyNonStackable) {
+      // pilih 1 terbaik
+      let best = null,
+        bestValue = -1;
+      for (const c of nonShipping) {
+        const est = computeVoucherDiscount(c.voucher, items, deliveryFee);
+        const val = est.itemsDiscount + est.shippingDiscount;
+        if (val > bestValue) {
+          bestValue = val;
+          best = c;
+        }
+      }
+      if (best) {
+        chosen.push(best);
+        reasons.push(
+          `Hanya satu voucher non-ongkir yang bisa dipakai (ada yg non-stackable). Dipilih: ${best.voucher.name}`
+        );
+      }
+    } else {
+      // semua stackable => pakai semuanya (hormati per-voucher cap di computeVoucherDiscount)
+      for (const c of nonShipping) chosen.push(c);
+      reasons.push(
+        `Beberapa voucher non-ongkir diizinkan menumpuk (semua stackable).`
+      );
+    }
   }
+
+  // SHIPPING: pilih yang paling menguntungkan (shipping discount)
   if (shippingClaims.length > 0) {
     let best = null,
       bestValue = -1;
@@ -234,7 +228,7 @@ async function validateAndPrice(
         best = c;
       }
     }
-    chosen.push(best);
+    if (best) chosen.push(best);
   }
 
   // compute chosen voucher effects
@@ -253,6 +247,13 @@ async function validateAndPrice(
     itemsDiscount += r.itemsDiscount;
     shippingDiscount += r.shippingDiscount;
   }
+
+  // Guard: jangan melebihi subtotal item atau ongkir
+  itemsDiscount = Math.max(0, Math.min(itemsDiscount, baseSubtotal));
+  shippingDiscount = Math.max(
+    0,
+    Math.min(shippingDiscount, Number(deliveryFee || 0))
+  );
 
   // subtotal setelah diskon item
   const items_subtotal_after_discount = Math.max(

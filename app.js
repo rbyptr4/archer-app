@@ -22,6 +22,7 @@ const expenseRoutes = require('./routers/expenseRoutes');
 const closingShiftRoutes = require('./routers/closingShiftRoutes');
 const orderRoutes = require('./routers/orderRoutes'); // order list/detail/kitchen/pay/status/cancel (punyamu yg sudah dirapikan)
 const paymentRoutes = require('./routers/paymentRoutes');
+const guestSession = require('./routers/guestSessionRouter');
 
 // Models (load sekali di awal)
 require('./models/orderModel');
@@ -73,6 +74,7 @@ app.use((req, res, next) => {
 });
 
 /* ==== Public/Auth/Owner ==== */
+app.use('/guest', guestSession);
 app.use('/auth', authRoutes);
 app.use('/employees', employeeRoutes);
 app.use('/closing-shift', closingShiftRoutes);

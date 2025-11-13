@@ -1755,7 +1755,6 @@ exports.checkout = asyncHandler(async (req, res) => {
 
   res.status(201).json({
     order: order.toObject(),
-    guestToken: order.guestToken || null,
     totals: {
       items_subtotal: order.items_subtotal,
       service_fee: order.service_fee,
@@ -3687,5 +3686,111 @@ exports.listMembers = asyncHandler(async (req, res) => {
       name: m.name,
       phone: m.phone
     }))
+  });
+});
+
+exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
+  // ambil identitas dari token/cookie (gunakan getIdentity seperti di checkout)
+  const iden = getIdentity(req);
+
+  // coba temukan user id — support beberapa key yang mungkin digunakan di proyek
+  const userId =
+    iden.userId ||
+    (iden.user && iden.user._id) ||
+    iden.courierId ||
+    iden.id ||
+    iden._id;
+
+  if (!userId) {
+    throwError('Harus login sebagai kurir untuk mengakses endpoint ini', 401);
+  }
+
+  // pagination
+  const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+  const limit = Math.min(
+    100,
+    Math.max(1, parseInt(String(req.query.limit || '20'), 10) || 20)
+  );
+  const skip = (page - 1) * limit;
+
+  // optional: filter by delivery.status jika dikirim query ?status=assigned
+  const deliveryStatus = req.query.status
+    ? String(req.query.status).toLowerCase()
+    : null;
+
+  // buat query dasar: hanya delivery orders yang assigned ke kurir ini
+  const q = {
+    fulfillment_type: 'delivery',
+    'delivery.mode': 'delivery',
+    'delivery.assignee.user': userId,
+    // exclude cancelled orders by default
+    status: { $ne: 'cancelled' }
+  };
+
+  if (deliveryStatus) {
+    q['delivery.status'] = deliveryStatus;
+  }
+
+  // optional filter: only active payment statuses (hindari void/expired) — bisa disesuaikan
+  // q.payment_status = { $in: ['unpaid','paid','verified'] };
+
+  // count & fetch
+  const [total, orders] = await Promise.all([
+    Order.countDocuments(q),
+    Order.find(q)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      // populate ringan agar FE bisa tampilkan nama customer / menu names
+      .populate('member', 'name phone')
+      .populate('items.menu', 'name') // kalau schema menu ada
+      .lean()
+  ]);
+
+  // map/sederhanakan payload bila perlu (tapi kembalikan apa adanya juga oke)
+  const mapped = (orders || []).map((o) => ({
+    _id: o._id,
+    transaction_code: o.transaction_code,
+    placed_at: o.placed_at,
+    fulfillment_type: o.fulfillment_type,
+    payment_method: o.payment_method,
+    payment_status: o.payment_status,
+    status: o.status,
+    grand_total: o.grand_total,
+    delivery: {
+      mode: o.delivery?.mode,
+      status: o.delivery?.status,
+      slot_label: o.delivery?.slot_label,
+      scheduled_at: o.delivery?.scheduled_at,
+      address_text: o.delivery?.address_text,
+      location: o.delivery?.location,
+      distance_km: o.delivery?.distance_km,
+      delivery_fee: o.delivery?.delivery_fee,
+      assignee: o.delivery?.assignee || {}
+    },
+    customer: {
+      member: o.member || null,
+      name: o.customer_name || null,
+      phone: o.customer_phone || null
+    },
+    items: (o.items || []).map((it) => ({
+      name: it.name,
+      qty: it.quantity,
+      base_price: it.base_price,
+      line_subtotal: it.line_subtotal,
+      menu: it.menu ? (typeof it.menu === 'object' ? it.menu : it.menu) : null,
+      addons: it.addons || []
+    }))
+  }));
+
+  res.json({
+    ok: true,
+    meta: {
+      total,
+      page,
+      limit,
+      pages: Math.ceil(total / limit)
+    },
+    data: mapped
   });
 });

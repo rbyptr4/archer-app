@@ -18,7 +18,7 @@ const VoucherClaimSchema = new mongoose.Schema(
       type: String,
       enum: ['claimed', 'used', 'expired', 'revoked'],
       default: 'claimed',
-      index: true // 🔎 membantu query wallet
+      index: true
     },
     remainingUse: { type: Number, min: 0, default: 1 },
 

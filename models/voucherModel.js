@@ -4,37 +4,21 @@ const mongoose = require('mongoose');
 const VoucherSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
-    // percent | amount | free_item | bundling | shipping
     type: {
       type: String,
-      enum: ['percent', 'amount', 'free_item', 'bundling', 'shipping'],
+      enum: ['percent', 'amount', 'shipping'],
       required: true
     },
 
     // ---- konfigurasi nilai ----
     percent: { type: Number, min: 0, max: 100 }, // untuk type=percent
     amount: { type: Number, min: 0 }, // untuk type=amount/ongkir flat
+    maxDiscount: { type: Number, min: 0, default: null },
+
     // gratis ongkir: pakai type='shipping'. amount optional (bisa cap). percent optional juga (misal 100% ongkir)
     shipping: {
       percent: { type: Number, min: 0, max: 100, default: 100 }, // 100% = free ongkir
       maxAmount: { type: Number, min: 0, default: 0 } // 0 = no cap
-    },
-
-    // ---- scope menu yang kena voucher ----
-    appliesTo: {
-      mode: {
-        type: String,
-        enum: ['all', 'menus', 'category'],
-        default: 'all'
-      },
-      menuIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Menu' }],
-      categories: [{ type: String }] // kalau kamu punya field category di Menu
-      // untuk bundling: beli X item dari set ini => diskon Y (atau free_item)
-      // bundling: {
-      //   buyQty: { type: Number, min: 0, default: 0 },
-      //   getPercent: { type: Number, min: 0, max: 100, default: 0 }, // contoh "beli X, diskon Y%"
-      //   targetMenuIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Menu' }] // menu yang kena diskon
-      // }
     },
 
     // ---- periode & stok ----
@@ -72,8 +56,7 @@ const VoucherSchema = new mongoose.Schema(
         { type: mongoose.Schema.Types.ObjectId, ref: 'Member' }
       ], // opsional blacklist
       minTransaction: { type: Number, min: 0, default: 0 },
-      requiredPoints: { type: Number, min: 0, default: 0 }, // point untuk claim (redeem)
-      oneTimePerPeriod: { type: Boolean, default: false } // “Per-member 1x pakai” selama period
+      requiredPoints: { type: Number, min: 0, default: 0 } // point untuk claim (redeem)
     },
 
     // ---- status ----

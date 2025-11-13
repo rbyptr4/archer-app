@@ -60,6 +60,15 @@ router.get(
   requirePageAccess('orders'),
   order.deliveryBoard
 );
+
+router.get(
+  '/courier/assigned',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
+  order.getAssignedDeliveries
+);
+
 router.get(
   '/list-employee',
   validateToken,
