@@ -1619,50 +1619,64 @@ exports.checkout = asyncHandler(async (req, res) => {
           ? priced.chosenClaimIds
           : [];
 
-        return await Order.create({
-          member: MemberDoc ? MemberDoc._id : null,
-          customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
-          customer_phone: MemberDoc ? MemberDoc.phone || '' : customer_phone,
-          table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
-          source: iden.source || 'online',
-          fulfillment_type: ft,
-          transaction_code: code,
-          items: cart.items.map((it) => ({
-            menu: it.menu,
-            menu_code: it.menu_code,
-            name: it.name,
-            imageUrl: it.imageUrl,
-            base_price: it.base_price,
-            quantity: it.quantity,
-            addons: it.addons,
-            notes: String(it.notes || '').trim(),
-            category: it.category || null
-          })),
+          return await Order.create({
+            member: MemberDoc ? MemberDoc._id : null,
+            customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
+            customer_phone: MemberDoc ? MemberDoc.phone || '' : customer_phone,
+            table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
+            source: iden.source || 'online',
+            fulfillment_type: ft,
+            transaction_code: code,
 
-          // Totals (ambil dari price engine agar konsisten)
-          items_subtotal: int(priced.totals.baseSubtotal),
-          items_discount: int(priced.totals.itemsDiscount),
-          delivery_fee: int(priced.totals.deliveryFee),
-          shipping_discount: int(priced.totals.shippingDiscount),
-          discounts: priced.breakdown || [],
-          applied_vouchers: appliedVoucherIds,
+            items: cart.items.map((it) => ({
+              menu: it.menu,
+              menu_code: it.menu_code,
+              name: it.name,
+              imageUrl: it.imageUrl,
+              base_price: it.base_price,
+              quantity: it.quantity,
+              addons: it.addons,
+              notes: String(it.notes || '').trim(),
+              category: it.category || null
+            })),
 
-          // Pajak & service & pembulatan
-          service_fee: service_fee,
-          tax_rate_percent: taxRatePercent,
-          tax_amount: taxAmount,
-          rounding_delta: rounding_delta,
-          grand_total: requested_bvt,
+            // =========================
+            // MAP DARI buildUiTotalsFromCart()
+            // =========================
+            items_subtotal: int(uiTotals.items_subtotal),
+            items_discount: int(uiTotals.items_discount),
+            delivery_fee: int(uiTotals.delivery_fee),
+            shipping_discount: int(uiTotals.shipping_discount),
 
-          payment_method: method,
-          payment_provider,
-          payment_status,
-          paid_at,
-          payment_proof_url: payment_proof_url || null,
-          status: 'created',
-          placed_at: new Date(),
-          delivery: deliveryObj
-        });
+            // breakdown voucher tetap dari price engine
+            discounts: priced.breakdown || [],
+
+            // service fee, pajak, rounding, total dari UI TOTLAS
+            service_fee: int(uiTotals.service_fee),
+            tax_rate_percent: Number(uiTotals.tax_rate_percent),
+            tax_amount: int(uiTotals.tax_amount),
+            rounding_delta: int(uiTotals.rounding_delta),
+            grand_total: int(uiTotals.grand_total),
+
+            // Payment
+            payment_method: method,
+            payment_provider,
+            payment_status,
+            paid_at,
+            payment_proof_url: payment_proof_url || null,
+
+            status: 'created',
+            placed_at: new Date(),
+
+            // nested delivery — pastikan INI DIPAKAI
+            delivery: {
+              ...deliveryObj,
+              delivery_fee: int(uiTotals.delivery_fee),
+              shipping_discount: int(uiTotals.shipping_discount),
+              delivery_fee_raw: int(deliveryObj.delivery_fee_raw || 0)
+            }
+          });
+          
       } catch (e) {
         if (e?.code === 11000 && /transaction_code/.test(String(e.message)))
           continue;
@@ -2573,7 +2587,7 @@ const buildOrderReceipt = (order) => {
 
   const items = Array.isArray(order.items) ? order.items : [];
 
-  // compute items_subtotal from items (menu base + addons * qty) — authoritative
+  // compute items_subtotal from items (fallback jika order.items_subtotal tidak ada)
   const computeLineSubtotal = (it) => {
     const unitBase = Number(it.base_price || 0);
     const addonsUnit = (it.addons || []).reduce(
@@ -2584,70 +2598,49 @@ const buildOrderReceipt = (order) => {
     return int((unitBase + addonsUnit) * qty);
   };
 
-  const items_subtotal = items.reduce(
+  const items_subtotal_fallback = items.reduce(
     (s, it) => s + computeLineSubtotal(it),
     0
   );
 
-  // items_discount: prefer explicit field order.items_discount, fallback to sum of breakdown itemsDiscount
-  let items_discount = Number(order.items_discount || 0);
-  if (!items_discount || items_discount === 0) {
-    const discounts = Array.isArray(order.discounts) ? order.discounts : [];
-    const sumFromBreakdown = discounts.reduce(
-      (sum, d) => sum + Number(d.itemsDiscount || d.items_discount || 0),
-      0
-    );
-    // choose max of explicit or breakdown-sum (defensive)
-    items_discount = Math.max(items_discount, sumFromBreakdown);
-  }
-
-  // shipping discount: prefer explicit, fallback to sum of shippingDiscount from breakdown
-  let shipping_discount = Number(order.shipping_discount || 0);
-  if (!shipping_discount || shipping_discount === 0) {
-    const discounts = Array.isArray(order.discounts) ? order.discounts : [];
-    const sumShip = discounts.reduce(
-      (sum, d) => sum + Number(d.shippingDiscount || d.shipping_discount || 0),
-      0
-    );
-    shipping_discount = Math.max(shipping_discount, sumShip);
-  }
-
-  const delivery_fee = Number(
-    order.delivery?.delivery_fee ?? order.delivery_fee ?? 0
+  // Ambil dari order attributes (checkout sudah memasukkan hasil buildUiTotals)
+  const items_subtotal = int(order.items_subtotal ?? items_subtotal_fallback);
+  const items_discount = int(order.items_discount ?? 0);
+  const delivery_fee = int(
+    // prefer root delivery_fee; fallback nested delivery.delivery_fee; else 0
+    order.delivery_fee ?? order.delivery?.delivery_fee ?? 0
   );
-
-  // items subtotal after discount (taxable base)
-  const items_subtotal_after_discount = Math.max(
-    0,
-    items_subtotal - items_discount
+  const delivery_fee_raw = int(
+    order.delivery?.delivery_fee_raw ??
+      order.delivery_fee ?? // jika tidak punya raw, samain dengan delivery_fee
+      0
   );
-
-  // service fee & tax (use project helpers for exact same logic as checkout)
+  const shipping_discount = int(order.shipping_discount ?? 0);
   const service_fee = int(
-    Math.round(items_subtotal_after_discount * Number(SERVICE_FEE_RATE))
+    order.service_fee ??
+      Math.round((items_subtotal - items_discount) * SERVICE_FEE_RATE)
+  );
+  const tax_amount = int(
+    order.tax_amount ??
+      Math.round((items_subtotal - items_discount) * parsePpnRate())
+  );
+  const tax_rate_percent = Number(
+    order.tax_rate_percent ?? Math.round(parsePpnRate() * 100)
+  );
+  const rounding_delta = int(order.rounding_delta ?? 0);
+  const grand_total = int(
+    order.grand_total ??
+      roundRupiahCustom(
+        items_subtotal -
+          items_discount +
+          service_fee +
+          (delivery_fee_raw || delivery_fee) -
+          shipping_discount +
+          tax_amount
+      )
   );
 
-  const ppnRate = parsePpnRate();
-  const tax_amount = int(Math.round(items_subtotal_after_discount * ppnRate));
-
-  // raw total before rounding (same formula as checkout)
-  const raw_total_before_rounding =
-    items_subtotal_after_discount +
-    service_fee +
-    Number(delivery_fee || 0) -
-    shipping_discount +
-    tax_amount;
-
-  // rounding delta and grand total: prefer stored order.grand_total if present (checkout source of truth)
-  const grand_total_from_order =
-    typeof order.grand_total !== 'undefined' ? int(order.grand_total) : null;
-  const rounded =
-    grand_total_from_order !== null
-      ? grand_total_from_order
-      : int(roundRupiahCustom(raw_total_before_rounding));
-  const rounding_delta = int(rounded - int(raw_total_before_rounding));
-
-  // Build detailed items list (unit price incl. addons, line subtotal)
+  // Build detailed items
   const detailedItems = items.map((it) => {
     const qty = Number(it.quantity || it.qty || 0);
     const unit_base = Number(it.base_price || 0);
@@ -2680,20 +2673,27 @@ const buildOrderReceipt = (order) => {
     payment_method: order.payment_method,
 
     pricing: {
-      // before-tax and with-tax values
-      items_subtotal: int(items_subtotal),
-      items_subtotal_after_discount: int(items_subtotal_after_discount),
-      items_discount: int(items_discount),
-      service_fee: int(service_fee),
-      delivery_fee: int(delivery_fee),
-      shipping_discount: int(shipping_discount),
-      tax_amount: int(tax_amount),
-      tax_rate_percent: Number(
-        order.tax_rate_percent || Math.round(ppnRate * 100)
+      items_subtotal: items_subtotal,
+      items_subtotal_after_discount: int(
+        Math.max(0, items_subtotal - items_discount)
       ),
-      rounding_delta: int(rounding_delta),
-      grand_total: int(rounded),
-      raw_total_before_rounding: int(raw_total_before_rounding)
+      items_discount: items_discount,
+      service_fee: service_fee,
+      delivery_fee: delivery_fee, // NET
+      delivery_fee_raw: delivery_fee_raw,
+      shipping_discount: shipping_discount,
+      tax_amount: tax_amount,
+      tax_rate_percent: tax_rate_percent,
+      rounding_delta: rounding_delta,
+      grand_total: grand_total,
+      raw_total_before_rounding: int(
+        items_subtotal -
+          items_discount +
+          service_fee +
+          (delivery_fee_raw || delivery_fee) -
+          shipping_discount +
+          tax_amount
+      )
     },
 
     customer: {
@@ -2712,7 +2712,10 @@ const buildOrderReceipt = (order) => {
           ? {
               address_text: order.delivery.address_text || '',
               distance_km: order.delivery.distance_km || null,
-              note_to_rider: order.delivery.note_to_rider || ''
+              note_to_rider: order.delivery.note_to_rider || '',
+              delivery_fee: int(delivery_fee),
+              delivery_fee_raw: int(delivery_fee_raw),
+              shipping_discount: int(shipping_discount)
             }
           : null
     },
@@ -2725,6 +2728,7 @@ const buildOrderReceipt = (order) => {
     }
   };
 };
+
 
 exports.getOrderReceipt = asyncHandler(async (req, res) => {
   const { id } = req.params;
