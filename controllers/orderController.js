@@ -2488,6 +2488,7 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
     },
     fulfillment_type: order.fulfillment_type || null,
     table_number: order.table_number ?? null,
+    payment_status: order.payment_status ?? null,
     // items: show base price, addons and line_subtotal (no per-item tax/service)
     items: (order.items || []).map((it) => {
       const qty = safeNumber(it.quantity || 0);
