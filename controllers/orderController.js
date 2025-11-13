@@ -1550,7 +1550,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   // set deliveryObj.delivery_fee menjadi net (hasil engine)
   deliveryObj.delivery_fee = int(baseDelivery);
   deliveryObj.shipping_discount = int(shipping_discount || 0);
-
+  console.log('>>> DELIVERY OBJ (raw):', deliveryObj);
   // items subtotal after discount (dipakai utk service & tax)
   const items_subtotal_after_discount = Math.max(
     0,
@@ -1607,7 +1607,22 @@ exports.checkout = asyncHandler(async (req, res) => {
     // untuk semua metode lain (termasuk cash-on-delivery / manual tanpa bukti) tetap unpaid sampai kasir verifikasi
     payment_status = 'unpaid';
   }
-
+  // DEBUG
+  console.log('>>> PRICE ENGINE OUTPUT:', {
+    baseItemsSubtotal,
+    items_discount,
+    shipping_discount,
+    baseDelivery
+  });
+  console.log('>>> SERVICE / TAX:', {
+    items_subtotal_after_discount,
+    service_fee,
+    taxRatePercent,
+    taxAmount,
+    beforeRound,
+    requested_bvt,
+    rounding_delta
+  });
   // === Build uiTotals (dipakai oleh UI & disimpan di order) ===
   const uiTotals = {
     items_subtotal: int(baseItemsSubtotal),
@@ -1623,7 +1638,26 @@ exports.checkout = asyncHandler(async (req, res) => {
     items_subtotal_after_discount: int(items_subtotal_after_discount || 0),
     discounts: priced.breakdown || []
   };
+  console.log('>>> UI TOTALS:', uiTotals);
 
+  // =========================
+  // CREATE ORDER
+  // =========================
+  console.log('>>> DELIVERY OBJ FINAL:', deliveryObj);
+
+  console.log('>>> ORDER PAYLOAD (before create):', {
+    member: MemberDoc ? MemberDoc._id : null,
+    table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
+    fulfillment_type: ft,
+    transaction_code_preview: '(will generate)',
+    totals: uiTotals,
+    delivery: {
+      ...deliveryObj,
+      delivery_fee: uiTotals.delivery_fee,
+      shipping_discount: uiTotals.shipping_discount,
+      delivery_fee_raw: deliveryObj.delivery_fee_raw || 0
+    }
+  });
   /* ===== Buat Order ===== */
   const order = await (async () => {
     for (let i = 0; i < 5; i++) {
