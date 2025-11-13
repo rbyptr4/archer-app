@@ -1449,8 +1449,12 @@ exports.checkout = asyncHandler(async (req, res) => {
     deliveryObj.address_text = String(req.body?.address_text || '').trim();
     deliveryObj.location = { lat: latN, lng: lngN };
     deliveryObj.distance_km = Number(distance_km.toFixed(2));
+
+    // delivery fee kalkulasi lokal (raw) — akan kita simpan juga sebagai raw
     delivery_fee = calcDeliveryFee();
+    // simpan sebagai raw dulu
     deliveryObj.delivery_fee = delivery_fee;
+    deliveryObj.delivery_fee_raw = delivery_fee;
   } else {
     deliveryObj.note_to_rider = String(req.body?.note_to_rider || '');
   }
@@ -1480,7 +1484,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     recomputeTotals(cart);
     await cart.save();
   } catch (err) {
-    // gunakan throwError agar error konsisten
     throwError(
       err?.message
         ? `Gagal menyimpan cart: ${String(err.message)}`
@@ -1532,11 +1535,23 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
+  // ambil totals dari price engine
   const baseItemsSubtotal = int(priced.totals.baseSubtotal);
   const items_discount = int(priced.totals.itemsDiscount || 0);
   const shipping_discount = int(priced.totals.shippingDiscount || 0);
   const baseDelivery = int(priced.totals.deliveryFee || 0);
 
+  // === sinkronisasi: pastikan nested deliveryObj mencerminkan hasil engine (net after voucher)
+  // simpan raw fee sebelumnya (kalau ada) sebagai delivery_fee_raw agar audit bisa lihat nilai sebelum voucher
+  if (typeof deliveryObj.delivery_fee_raw === 'undefined') {
+    // jika tidak ada raw, set sama dengan calc value (atau 0)
+    deliveryObj.delivery_fee_raw = int(deliveryObj.delivery_fee || 0);
+  }
+  // set deliveryObj.delivery_fee menjadi net (hasil engine)
+  deliveryObj.delivery_fee = int(baseDelivery);
+  deliveryObj.shipping_discount = int(shipping_discount || 0);
+
+  // items subtotal after discount (dipakai utk service & tax)
   const items_subtotal_after_discount = Math.max(
     0,
     baseItemsSubtotal - items_discount
@@ -1565,17 +1580,31 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Total pembayaran tidak valid.', 400);
   }
 
+  // ambil bukti transfer jika ada (akan disimpan ke order nanti)
   const payment_proof_url = await handleTransferProofIfAny(req, method);
 
+  // ===== keputusan status pembayaran:
+  // - Jika gateway (mis. xendit) => unpaid (gateway akan notify)
+  // - Jika metode transfer atau qris AND bukti pembayaran diupload => bayar langsung (paid)
+  // - Semua metode lain => unpaid (diverifikasi kasir)
   let payment_status = 'unpaid';
   let payment_provider = null;
+  let paid_at = null;
 
   if (methodIsGateway) {
     payment_provider = 'xendit';
     payment_status = 'unpaid';
-  } else if (requiresProof) {
-    payment_status = 'unpaid';
+  } else if (
+    (method === 'transfer' || method === PM.QRIS) &&
+    payment_proof_url
+  ) {
+    // langsung mark paid jika bukti ada untuk transfer / qris
+    payment_provider =
+      method === 'transfer' ? 'bank_transfer' : payment_provider;
+    payment_status = 'paid';
+    paid_at = new Date();
   } else {
+    // untuk semua metode lain (termasuk cash-on-delivery / manual tanpa bukti) tetap unpaid sampai kasir verifikasi
     payment_status = 'unpaid';
   }
 
@@ -1584,6 +1613,12 @@ exports.checkout = asyncHandler(async (req, res) => {
     for (let i = 0; i < 5; i++) {
       try {
         const code = await nextDailyTxCode('ARCH');
+
+        // pilih applied vouchers dari price engine supaya konsisten
+        const appliedVoucherIds = Array.isArray(priced.chosenClaimIds)
+          ? priced.chosenClaimIds
+          : [];
+
         return await Order.create({
           member: MemberDoc ? MemberDoc._id : null,
           customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
@@ -1603,12 +1638,14 @@ exports.checkout = asyncHandler(async (req, res) => {
             notes: String(it.notes || '').trim(),
             category: it.category || null
           })),
-          // Totals
+
+          // Totals (ambil dari price engine agar konsisten)
           items_subtotal: int(priced.totals.baseSubtotal),
           items_discount: int(priced.totals.itemsDiscount),
           delivery_fee: int(priced.totals.deliveryFee),
           shipping_discount: int(priced.totals.shippingDiscount),
           discounts: priced.breakdown || [],
+          applied_vouchers: appliedVoucherIds,
 
           // Pajak & service & pembulatan
           service_fee: service_fee,
@@ -1620,6 +1657,7 @@ exports.checkout = asyncHandler(async (req, res) => {
           payment_method: method,
           payment_provider,
           payment_status,
+          paid_at,
           payment_proof_url: payment_proof_url || null,
           status: 'created',
           placed_at: new Date(),
@@ -1628,7 +1666,6 @@ exports.checkout = asyncHandler(async (req, res) => {
       } catch (e) {
         if (e?.code === 11000 && /transaction_code/.test(String(e.message)))
           continue;
-        // gunakan throwError untuk konsistensi pesan
         throwError(
           e?.message
             ? `Gagal membuat order: ${String(e.message)}`
@@ -1637,7 +1674,6 @@ exports.checkout = asyncHandler(async (req, res) => {
         );
       }
     }
-    // gagal setelah retry
     throwError('Gagal generate transaction_code unik', 500);
   })();
 
@@ -1661,7 +1697,6 @@ exports.checkout = asyncHandler(async (req, res) => {
           await c.save();
         }
       } catch (_) {
-        // jangan crash order kalau voucher gagal diupdate; log saja
         console.error('[voucher][consume] gagal update', _?.message || _);
       }
     }
@@ -1698,16 +1733,13 @@ exports.checkout = asyncHandler(async (req, res) => {
         $set: { last_visit_at: new Date() }
       });
     } catch (err) {
-      // jangan gagalkan checkout kalau statistik gagal; log saja
       console.error('[member][stats] gagal update', err?.message || err);
     }
   }
 
   /* ===== Emit realtime & guest token handling ===== */
   try {
-    // jika guest (bukan member), buat guestToken dan simpan di order
     if (!MemberDoc) {
-      // jika order belum punya guestToken, buat
       const guestToken = uuidv4();
       order.guestToken = guestToken;
       await Order.findByIdAndUpdate(
@@ -1717,14 +1749,11 @@ exports.checkout = asyncHandler(async (req, res) => {
       ).catch(() => {});
     }
 
-    // payload ringkas (sudah ada di variabel payload sebelumnya — tapi lebih konsisten gunakan makeOrderSummary)
     const summary = makeOrderSummary(order);
 
-    // emit ke staff/kasir/kitchen
     emitToStaff('order:new', summary);
-    emitToCashier('order:new', summary); // opsional: khusus kasir jika ingin
+    emitToCashier('order:new', summary);
 
-    // emit ke member atau guest
     if (MemberDoc) {
       emitToMember(String(MemberDoc._id), 'order:created', summary);
     } else if (order.guestToken) {

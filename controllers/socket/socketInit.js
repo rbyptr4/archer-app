@@ -3,6 +3,8 @@ const { Server } = require('socket.io');
 const cookie = require('cookie');
 const jwt = require('jsonwebtoken');
 const User = require('../../models/userModel');
+const Order = require('../../models/orderModel'); // pastikan path sesuai
+const GuestSession = require('../../models/guestSessionModel'); // model guest session (DB TTL)
 const { setIO, rooms } = require('./socketBus');
 
 const {
@@ -69,6 +71,46 @@ function verifyMemberAccessJWT(raw) {
 
 function normalizeCookies(socket) {
   return cookie.parse(socket.handshake.headers.cookie || '');
+}
+
+/**
+ * Helper kecil: ubah order doc ke OrderSummary ringkas (sesuai kontrak)
+ * Jangan memuat fields besar; cukup fields untuk list/preview.
+ */
+function toOrderSummary(orderDoc) {
+  if (!orderDoc) return null;
+  return {
+    id: String(orderDoc._id),
+    transaction_code: orderDoc.transaction_code || null,
+    fulfillment_type: orderDoc.fulfillment_type || null,
+    table_number: orderDoc.table_number ?? null,
+    placed_at: orderDoc.placed_at
+      ? new Date(orderDoc.placed_at).toISOString()
+      : null,
+    items_preview: Array.isArray(orderDoc.items)
+      ? orderDoc.items
+          .slice(0, 3)
+          .map((i) => ({ name: i.name, qty: i.quantity }))
+      : [],
+    total_quantity:
+      orderDoc.total_quantity ??
+      (Array.isArray(orderDoc.items)
+        ? orderDoc.items.reduce((s, it) => s + (it.quantity || 0), 0)
+        : 0),
+    items_total: orderDoc.items_subtotal || 0,
+    grand_total: orderDoc.grand_total || 0,
+    payment_status: orderDoc.payment_status || 'unpaid',
+    status: orderDoc.status || 'created',
+    delivery: orderDoc.delivery || null,
+    member: orderDoc.member
+      ? {
+          id: String(orderDoc.member),
+          name: orderDoc.customer_name || null,
+          phone: orderDoc.customer_phone || null
+        }
+      : null,
+    guestToken: orderDoc.guestToken || null
+  };
 }
 
 function initSocket(httpServer) {
@@ -145,13 +187,59 @@ function initSocket(httpServer) {
     socket.on('join:guest', async (payload, ack) => {
       try {
         const token = payload && payload.guestToken;
-        if (!token)
+        if (!token) {
           return typeof ack === 'function'
             ? ack({ ok: false, error: 'guestToken required' })
             : null;
+        }
+
+        // VALIDASI menggunakan DB (GuestSession)
+        try {
+          const session = await GuestSession.findOne({ token }).lean();
+          if (!session) {
+            return typeof ack === 'function'
+              ? ack({ ok: false, error: 'invalid_guest' })
+              : null;
+          }
+          if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
+            return typeof ack === 'function'
+              ? ack({ ok: false, error: 'expired' })
+              : null;
+          }
+        } catch (dbErr) {
+          console.error('[join:guest][db]', dbErr?.message || dbErr);
+          return typeof ack === 'function'
+            ? ack({ ok: false, error: 'server_error' })
+            : null;
+        }
+
+        // semua ok -> join room
         socket.join(rooms.guest(token));
+
+        // ACK success
         if (typeof ack === 'function') ack({ ok: true });
+
+        // Optional: kirim initial recent orders untuk guest agar FE sinkron cepat
+        // Batasi limit agar payload kecil
+        try {
+          const limit = 30;
+          const orders = await Order.find({ guestToken: token })
+            .sort({ placed_at: -1 })
+            .limit(limit)
+            .lean();
+          if (Array.isArray(orders) && orders.length) {
+            const items = orders.map(toOrderSummary);
+            socket.emit('orders:initial', { items });
+          }
+        } catch (emitErr) {
+          // jangan crash jika gagal emit initial
+          console.error(
+            '[join:guest][orders:initial] emit failed',
+            emitErr?.message || emitErr
+          );
+        }
       } catch (err) {
+        console.error('[join:guest] unexpected', err?.message || err);
         if (typeof ack === 'function') ack({ ok: false, error: 'failed' });
       }
     });
