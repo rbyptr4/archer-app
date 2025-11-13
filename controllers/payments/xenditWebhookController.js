@@ -15,11 +15,7 @@ const { awardPointsIfEligible } = require('../../utils/loyalty');
 const { nextDailyTxCode } = require('../../utils/txCode');
 const throwError = require('../../utils/throwError');
 const { int } = require('../../utils/money');
-const {
-  emitToMember,
-  emitToStaff,
-  emitToTable
-} = require('../socket/socketBus');
+const { emitToMember, emitToStaff } = require('../socket/socketBus');
 
 /* ====== Helper: apply payment success (idempotent) ====== */
 async function applyPaymentSuccess(session, rawEvent) {

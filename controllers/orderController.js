@@ -1273,18 +1273,17 @@ exports.checkout = asyncHandler(async (req, res) => {
   const {
     name,
     phone,
-    fulfillment_type, // 'dine_in' | 'delivery'
-    payment_method, // 'qris' | 'transfer' | 'card' | 'cash'
+    fulfillment_type,
+    payment_method,
     address_text,
     lat,
     lng,
     note_to_rider,
     idempotency_key,
     voucherClaimIds = [],
-    register_decision = 'register' // 'register' | 'skip'
+    register_decision = 'register'
   } = req.body || {};
 
-  /* ===== Resolve fulfillment type (ft) & method ===== */
   const ft =
     iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
   if (!['dine_in', 'delivery'].includes(ft)) {
@@ -1298,7 +1297,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   const methodIsGateway = method === PM.QRIS;
   const requiresProof = needProof(method);
 
-  /* ===== Guest vs Member resolve ===== */
   const originallyLoggedIn = !!iden0.memberId;
   const wantRegister = String(register_decision || 'register') === 'register';
 
@@ -1325,7 +1323,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  /* ===== Ambil cart aktif ===== */
   const iden = {
     ...iden0,
     memberId: MemberDoc?._id || iden0.memberId || null,
@@ -1357,9 +1354,8 @@ exports.checkout = asyncHandler(async (req, res) => {
   const delivery_mode =
     ft === 'dine_in'
       ? 'none'
-      : String(req.body?.delivery_mode || 'delivery').toLowerCase(); // 'delivery'|'pickup'|'none'
+      : String(req.body?.delivery_mode || 'delivery').toLowerCase();
 
-  // ambil input slot/scheduled/pickup window (tetap baca kalau ada, tapi validasi dipisah berdasarkan delivery_mode)
   const providedSlot = (req.body?.delivery_slot || '').trim();
   const providedScheduledAtRaw = req.body?.scheduled_at || null;
   const providedScheduledAt = providedScheduledAtRaw
@@ -1369,7 +1365,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   const pickup_from_iso = req.body?.pickup_from || null;
   const pickup_to_iso = req.body?.pickup_to || null;
 
-  // VALIDASI HANYA JIKA BUKAN DINE_IN
   if (ft !== 'dine_in') {
     if (delivery_mode === 'delivery') {
       if (
@@ -1390,7 +1385,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // --- proses slot untuk delivery (jika ada) ---
+  // proses slot
   let slotLabel = null;
   let slotDt = null;
   if (
@@ -1426,7 +1421,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     status: 'pending'
   };
 
-  // pickup window handling
   let pickupWindowFrom = null;
   let pickupWindowTo = null;
 
@@ -1474,7 +1468,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     deliveryObj.note_to_rider = String(req.body?.note_to_rider || '');
   }
 
-  // ==== Normalisasi items & addons ====
+  // normalize items
   cart.items = (Array.isArray(cart.items) ? cart.items : [])
     .filter(Boolean)
     .map((it) => {
@@ -1495,21 +1489,6 @@ exports.checkout = asyncHandler(async (req, res) => {
       };
     });
 
-  // ==== snapshot cart ====
-  const cartPreview = short(cart.items).map((it, idx) => ({
-    i: idx,
-    menu: String(it.menu || ''),
-    qty: it.quantity,
-    addonsCount: Array.isArray(it.addons) ? it.addons.length : 0,
-    addonPreview: short(it.addons).map((a) => ({
-      name: a?.name,
-      price: a?.price,
-      qty: a?.qty,
-      hasIsActive: Object.prototype.hasOwnProperty.call(a || {}, 'isActive')
-    }))
-  }));
-
-  // ==== recomputeTotals (guarded) ====
   try {
     recomputeTotals(cart);
     await cart.save();
@@ -1517,7 +1496,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     throw err;
   }
 
-  /* ===== Voucher claim filtering ===== */
+  // Voucher filter
   let eligibleClaimIds = [];
   if (MemberDoc) {
     if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
@@ -1535,7 +1514,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Voucher hanya untuk member. Silakan daftar/login.', 400);
   }
 
-  // ==== validateAndPrice (guarded) ====
   let priced;
   try {
     priced = await validateAndPrice({
@@ -1555,60 +1533,17 @@ exports.checkout = asyncHandler(async (req, res) => {
   } catch (err) {
     throw err;
   }
-  console.log('[VOUCHER][PRICED]', JSON.stringify(priced, null, 2));
 
-  // tambahan: per-item inspect untuk setiap breakdown entry
-  for (const b of priced.breakdown || []) {
-    try {
-      const v = b.voucher || b.voucherId || {}; // depending on shape
-      console.log(
-        '[VOUCHER][BREAK]',
-        b.name,
-        'note=',
-        b.note,
-        'itemsDiscount=',
-        b.itemsDiscount
-      );
-      // jika mau lihat scoped items, compute again quickly:
-      // (hanya untuk debug — jangan simpan di prod)
-      const voucherDoc = await Voucher.findById(
-        b.voucherId || b.voucher
-      ).lean();
-      const scoped = filterItemsByScope(
-        cart.items.map((it) => ({
-          menuId: it.menu,
-          qty: it.quantity,
-          price: it.base_price,
-          category: it.category
-        })),
-        voucherDoc.appliesTo
-      );
-      console.log(
-        '[VOUCHER][SCOPE]',
-        voucherDoc.appliesTo,
-        'scopedSubtotal=',
-        scoped.reduce((s, i) => s + i.price * i.qty, 0),
-        'scopedItems=',
-        scoped
-      );
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
-  // base harga menu (pre-discount) — simpan di order sebagai reference
   const baseItemsSubtotal = int(priced.totals.baseSubtotal);
   const items_discount = int(priced.totals.itemsDiscount || 0);
   const shipping_discount = int(priced.totals.shippingDiscount || 0);
   const baseDelivery = int(priced.totals.deliveryFee || 0);
 
-  // items subtotal setelah diskon voucher (taxable base)
   const items_subtotal_after_discount = Math.max(
     0,
     baseItemsSubtotal - items_discount
   );
 
-  // SERVICE FEE: 2% dari items AFTER discount (sesuai permintaan)
   const service_fee = int(
     Math.round(items_subtotal_after_discount * SERVICE_FEE_RATE)
   );
@@ -1632,10 +1567,8 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Total pembayaran tidak valid.', 400);
   }
 
-  /* ===== Bukti transfer (kalau perlu) ===== */
   const payment_proof_url = await handleTransferProofIfAny(req, method);
 
-  /* ===== Payment status awal ===== */
   let payment_status = 'unpaid';
   let payment_provider = null;
 
@@ -1797,8 +1730,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   } catch (e) {
     console.error('[OrderHistory][checkout]', e?.message || e);
   }
-
-  /* ===== Response ===== */
   res.status(201).json({
     order: order.toObject(),
     guestToken: order.guestToken || null,
@@ -1838,7 +1769,7 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
     const ft =
       iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
     if (!['dine_in', 'delivery'].includes(ft))
-      return res.status(400).json({ message: 'fulfillment_type tidak valid' });
+      throwError('fulfillment_type tidak valid', 400);
 
     // Member / guest resolution
     const originallyLoggedIn = !!iden0.memberId;
@@ -1862,9 +1793,7 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
       customer_name = String(name || '').trim();
       customer_phone = String(phone || '').trim();
       if (!customer_name && !customer_phone) {
-        return res
-          .status(400)
-          .json({ message: 'Tanpa member: isi minimal nama atau no. telp' });
+        throwError('Tanpa member: isi minimal nama atau no. telp', 400);
       }
     }
 
@@ -1883,21 +1812,18 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
     const cartObj = await getActiveCartForIdentity(iden, {
       allowCreateOnline: false
     });
-    if (!cartObj)
-      return res.status(404).json({ message: 'Cart tidak ditemukan / kosong' });
+    if (!cartObj) throwError('Cart tidak ditemukan / kosong', 404);
 
-    const cart = await Cart.findById(cartObj._id);
-    if (!cart || !cart.items?.length)
-      return res.status(404).json({ message: 'Cart kosong' });
+    const cart = await Cart.findById(cartObj._1d || cartObj._id);
+    // (di beberapa codebase ada typo _1d; pastikan pakai cartObj._id)
+    if (!cart || !cart.items?.length) throwError('Cart kosong', 404);
 
     if (
       ft === 'dine_in' &&
       (iden.source || 'online') === 'qr' &&
       !cart.table_number
     ) {
-      return res
-        .status(400)
-        .json({ message: 'Silakan assign nomor meja terlebih dahulu' });
+      throwError('Silakan assign nomor meja terlebih dahulu', 400);
     }
 
     if (finalMemberId && !cart.member) {
@@ -1910,7 +1836,7 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
         ? 'none'
         : String(req.body?.delivery_mode || 'delivery').toLowerCase();
 
-    // --- slot/pickup validation (reuse your existing logic if present) ---
+    // --- slot/pickup validation ---
     const providedSlot = (req.body?.delivery_slot || '').trim();
     const providedScheduledAtRaw = req.body?.scheduled_at || null;
     const providedScheduledAt = providedScheduledAtRaw
@@ -1981,16 +1907,13 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
           .map((c) => String(c._id));
       }
     } else if (voucherClaimIds?.length) {
-      return res
-        .status(400)
-        .json({ message: 'Voucher hanya untuk member. Silakan daftar/login.' });
+      throwError('Voucher hanya untuk member. Silakan daftar/login.', 400);
     }
 
     const priced = await validateAndPrice({
       memberId: finalMemberId,
       cart: {
         items: cart.items.map((it) => {
-          // hitung price per unit termasuk addon per-unit (addon.qty dianggap qty addon per item)
           const addonsTotalPerItem = (
             Array.isArray(it.addons) ? it.addons : []
           ).reduce((s, a) => {
@@ -2014,22 +1937,9 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
       voucherClaimIds: eligibleClaimIds
     });
 
-    console.log('[VOUCHER][PRICED]', JSON.stringify(priced, null, 2));
-
-    // tambahan: per-item inspect untuk setiap breakdown entry
+    // jika ada error saat inspect voucher, surfacing ke FE
     for (const b of priced.breakdown || []) {
       try {
-        const v = b.voucher || b.voucherId || {}; // depending on shape
-        console.log(
-          '[VOUCHER][BREAK]',
-          b.name,
-          'note=',
-          b.note,
-          'itemsDiscount=',
-          b.itemsDiscount
-        );
-        // jika mau lihat scoped items, compute again quickly:
-        // (hanya untuk debug — jangan simpan di prod)
         const voucherDoc = await Voucher.findById(
           b.voucherId || b.voucher
         ).lean();
@@ -2042,33 +1952,34 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
           })),
           voucherDoc.appliesTo
         );
-        console.log(
-          '[VOUCHER][SCOPE]',
-          voucherDoc.appliesTo,
-          'scopedSubtotal=',
-          scoped.reduce((s, i) => s + i.price * i.qty, 0),
-          'scopedItems=',
-          scoped
-        );
+        // (tidak ada console.log)
       } catch (e) {
-        console.error(e);
+        throwError(
+          `Voucher inspection failed: ${e?.message || String(e)}`,
+          500
+        );
       }
     }
 
     // --- KEY: use cart UI totals as authoritative for payment amount ---
-    // build uiTotals FROM priced (authoritative)
+    // IMPORTANT FIX: sertakan mode:'delivery' kalau memang delivery agar buildUiTotalsFromCart menghitung delivery_fee
+    const deliveryForUi =
+      (priced.totals.deliveryFee || 0) > 0
+        ? { delivery_fee: priced.totals.deliveryFee || 0, mode: 'delivery' }
+        : { delivery_fee: 0, mode: ft === 'dine_in' ? 'none' : delivery_mode };
+
     const uiTotals = buildUiTotalsFromCart({
       total_price: priced.totals.baseSubtotal, // pre-discount
       items_discount: priced.totals.itemsDiscount || 0,
       shipping_discount: priced.totals.shippingDiscount || 0,
-      delivery: { delivery_fee: priced.totals.deliveryFee || 0 }
+      delivery: deliveryForUi
     });
 
     const requested_bvt = int(Number(uiTotals.grand_total || 0));
     const rounding_delta = int(Number(uiTotals.rounding_delta || 0));
 
     if (!requested_bvt || requested_bvt <= 0) {
-      return res.status(400).json({ message: 'Total pembayaran tidak valid.' });
+      throwError('Total pembayaran tidak valid.', 400);
     }
 
     // create payment session and attach uiTotals so FE can render identical numbers
@@ -2094,8 +2005,8 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
         category: it.category || null
       })),
 
-      items_subtotal: int(priced.totals.baseSubtotal), // pre-discount reference
-      items_discount: int(priced.totals.itemsDiscount || 0), // vouchers on items
+      items_subtotal: int(priced.totals.baseSubtotal),
+      items_discount: int(priced.totals.itemsDiscount || 0),
       delivery_fee: int(priced.totals.deliveryFee || 0),
       shipping_discount: int(priced.totals.shippingDiscount || 0),
 
@@ -2104,7 +2015,7 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
 
       discounts: priced.breakdown || [],
 
-      requested_amount: requested_bvt, // authoritative amount (from uiTotals.grand_total)
+      requested_amount: requested_bvt,
       rounding_delta,
       ui_totals: uiTotals,
       delivery_snapshot: cart.delivery || {},
@@ -2131,14 +2042,6 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
       metadata: { payment_session_id: String(session._id) }
     };
 
-    // optional debug log (remove later)
-    console.log(
-      '[QR][DEBUG] amount->',
-      xenditPayload.amount,
-      'uiTotals.grand_total=',
-      uiTotals.grand_total
-    );
-
     const resp = await axios.post(`${X_BASE}/qr_codes`, xenditPayload, {
       auth: { username: X_KEY, password: '' },
       headers: { ...HDRS, 'api-version': '2022-07-31' },
@@ -2160,7 +2063,7 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
       data: {
         sessionId: String(session._id),
         channel: 'QRIS',
-        amount: requested_bvt, // authoritative: taken from cart UI totals
+        amount: requested_bvt,
         qris: {
           qr_id: qr.id,
           qr_string: qr.qr_string,
