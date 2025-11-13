@@ -1254,6 +1254,60 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
 
 /* ===================== CHECKOUT ===================== */
 exports.checkout = asyncHandler(async (req, res) => {
+  // helper local untuk logging aman / atomik
+  const util = require('util');
+  const seenForLog = new WeakSet();
+  function safeForJSON(key, value) {
+    // ObjectId (mongoose) handling
+    if (value && typeof value === 'object' && value._bsontype === 'ObjectID') {
+      return String(value);
+    }
+    if (value instanceof Date) return value.toISOString();
+    if (typeof value === 'function')
+      return `[Function: ${value.name || 'anonymous'}]`;
+    // Prevent circular
+    if (value && typeof value === 'object') {
+      if (seenForLog.has(value)) return '[Circular]';
+      seenForLog.add(value);
+    }
+    return value;
+  }
+  function logDebug(label, obj) {
+    try {
+      // clear seen for each top-level log so nested objects reused in different logs still shown
+      seenForLog.clear?.();
+    } catch (e) {
+      // ignore if WeakSet doesn't have clear (older Node) — recreate instead
+    }
+    // recreate WeakSet to ensure fresh per-log in older runtimes
+    const _seen = new WeakSet();
+    function replacer(k, v) {
+      // ObjectId
+      if (v && typeof v === 'object' && v._bsontype === 'ObjectID')
+        return String(v);
+      if (v instanceof Date) return v.toISOString();
+      if (typeof v === 'function')
+        return `[Function: ${v.name || 'anonymous'}]`;
+      if (v && typeof v === 'object') {
+        if (_seen.has(v)) return '[Circular]';
+        _seen.add(v);
+      }
+      return v;
+    }
+    let serialized;
+    try {
+      serialized = JSON.stringify(obj, replacer, 2);
+    } catch (e) {
+      // fallback to util.inspect if stringify fails
+      serialized = util.inspect(obj, {
+        depth: null,
+        colors: false,
+        compact: false
+      });
+    }
+    console.log(`>>> ${label}: ${serialized}`);
+  }
+
   const iden0 = getIdentity(req);
   const {
     name,
@@ -1269,6 +1323,18 @@ exports.checkout = asyncHandler(async (req, res) => {
     register_decision = 'register'
   } = req.body || {};
 
+  logDebug('REQ_BODY', {
+    fulfillment_type,
+    payment_method,
+    address_text,
+    lat,
+    lng,
+    note_to_rider,
+    idempotency_key,
+    voucherClaimIds,
+    register_decision
+  });
+
   const ft =
     iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
   if (!['dine_in', 'delivery'].includes(ft)) {
@@ -1280,7 +1346,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
   }
 
-  // Jika QRIS dipakai sebagai static (fallback), treat as NON-gateway
   const methodIsGateway = method === PM.QRIS && !QRIS_USE_STATIC;
   const requiresProof = needProof(method);
 
@@ -1294,6 +1359,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   if (originallyLoggedIn || wantRegister) {
     const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
     MemberDoc = await ensureMemberForCheckout(req, res, joinChannel);
+    logDebug('MEMBER_DOC', MemberDoc || null);
   } else {
     customer_name = String(name || '').trim();
     const rawPhone = String(phone || '').trim();
@@ -1320,15 +1386,21 @@ exports.checkout = asyncHandler(async (req, res) => {
       null
   };
 
+  logDebug('IDENTITY', iden);
+
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
+
+  logDebug('CART_OBJ', cartObj || null);
 
   if (!cartObj) throwError('Cart tidak ditemukan / kosong', 404);
 
   const cart = await Cart.findById(cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan / kosong', 404);
   if (!cart.items?.length) throwError('Cart kosong', 400);
+
+  logDebug('CART_BEFORE', { id: cart._id, items_count: cart.items.length });
 
   if (
     ft === 'dine_in' &&
@@ -1372,7 +1444,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // proses slot
   let slotLabel = null;
   let slotDt = null;
   if (
@@ -1450,14 +1521,14 @@ exports.checkout = asyncHandler(async (req, res) => {
     deliveryObj.location = { lat: latN, lng: lngN };
     deliveryObj.distance_km = Number(distance_km.toFixed(2));
 
-    // delivery fee kalkulasi lokal (raw) — akan kita simpan juga sebagai raw
     delivery_fee = calcDeliveryFee();
-    // simpan sebagai raw dulu
     deliveryObj.delivery_fee = delivery_fee;
     deliveryObj.delivery_fee_raw = delivery_fee;
   } else {
     deliveryObj.note_to_rider = String(req.body?.note_to_rider || '');
   }
+
+  logDebug('DELIVERY_OBJ_AFTER_INPUT', deliveryObj);
 
   // normalize items
   cart.items = (Array.isArray(cart.items) ? cart.items : [])
@@ -1483,6 +1554,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   try {
     recomputeTotals(cart);
     await cart.save();
+    logDebug('CART_AFTER_RECOMPUTE', { id: cart._id, items: cart.items });
   } catch (err) {
     throwError(
       err?.message
@@ -1510,6 +1582,8 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Voucher hanya untuk member. Silakan daftar/login.', 400);
   }
 
+  logDebug('ELIGIBLE_VOUCHER_IDS', eligibleClaimIds);
+
   let priced;
   try {
     priced = await validateAndPrice({
@@ -1526,6 +1600,7 @@ exports.checkout = asyncHandler(async (req, res) => {
       deliveryFee: delivery_fee,
       voucherClaimIds: eligibleClaimIds
     });
+    logDebug('PRICE_ENGINE_RAW', priced);
   } catch (err) {
     throwError(
       err?.message
@@ -1541,16 +1616,13 @@ exports.checkout = asyncHandler(async (req, res) => {
   const shipping_discount = int(priced.totals.shippingDiscount || 0);
   const baseDelivery = int(priced.totals.deliveryFee || 0);
 
-  // === sinkronisasi: pastikan nested deliveryObj mencerminkan hasil engine (net after voucher)
-  // simpan raw fee sebelumnya (kalau ada) sebagai delivery_fee_raw agar audit bisa lihat nilai sebelum voucher
+  // sinkronisasi deliveryObj
   if (typeof deliveryObj.delivery_fee_raw === 'undefined') {
-    // jika tidak ada raw, set sama dengan calc value (atau 0)
     deliveryObj.delivery_fee_raw = int(deliveryObj.delivery_fee || 0);
   }
-  // set deliveryObj.delivery_fee menjadi net (hasil engine)
   deliveryObj.delivery_fee = int(baseDelivery);
   deliveryObj.shipping_discount = int(shipping_discount || 0);
-  console.log('>>> DELIVERY OBJ (raw):', deliveryObj);
+
   // items subtotal after discount (dipakai utk service & tax)
   const items_subtotal_after_discount = Math.max(
     0,
@@ -1580,13 +1652,24 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Total pembayaran tidak valid.', 400);
   }
 
+  logDebug('PRICE_COMPUTED', {
+    baseItemsSubtotal,
+    items_discount,
+    shipping_discount,
+    baseDelivery,
+    items_subtotal_after_discount,
+    service_fee,
+    taxRatePercent,
+    taxAmount,
+    beforeRound,
+    requested_bvt,
+    rounding_delta
+  });
+
   // ambil bukti transfer jika ada (akan disimpan ke order nanti)
   const payment_proof_url = await handleTransferProofIfAny(req, method);
+  logDebug('PAYMENT_PROOF_URL', { payment_proof_url });
 
-  // ===== keputusan status pembayaran:
-  // - Jika gateway (mis. xendit) => unpaid (gateway akan notify)
-  // - Jika metode transfer atau qris AND bukti pembayaran diupload => bayar langsung (paid)
-  // - Semua metode lain => unpaid (diverifikasi kasir)
   let payment_status = 'unpaid';
   let payment_provider = null;
   let paid_at = null;
@@ -1598,31 +1681,14 @@ exports.checkout = asyncHandler(async (req, res) => {
     (method === 'transfer' || method === PM.QRIS) &&
     payment_proof_url
   ) {
-    // langsung mark paid jika bukti ada untuk transfer / qris
     payment_provider =
       method === 'transfer' ? 'bank_transfer' : payment_provider;
     payment_status = 'paid';
     paid_at = new Date();
   } else {
-    // untuk semua metode lain (termasuk cash-on-delivery / manual tanpa bukti) tetap unpaid sampai kasir verifikasi
     payment_status = 'unpaid';
   }
-  // DEBUG
-  console.log('>>> PRICE ENGINE OUTPUT:', {
-    baseItemsSubtotal,
-    items_discount,
-    shipping_discount,
-    baseDelivery
-  });
-  console.log('>>> SERVICE / TAX:', {
-    items_subtotal_after_discount,
-    service_fee,
-    taxRatePercent,
-    taxAmount,
-    beforeRound,
-    requested_bvt,
-    rounding_delta
-  });
+
   // === Build uiTotals (dipakai oleh UI & disimpan di order) ===
   const uiTotals = {
     items_subtotal: int(baseItemsSubtotal),
@@ -1634,40 +1700,54 @@ exports.checkout = asyncHandler(async (req, res) => {
     tax_amount: int(taxAmount || 0),
     rounding_delta: int(rounding_delta || 0),
     grand_total: int(requested_bvt || 0),
-    // tambahan informasi untuk debugging / snapshot
     items_subtotal_after_discount: int(items_subtotal_after_discount || 0),
     discounts: priced.breakdown || []
   };
-  console.log('>>> UI TOTALS:', uiTotals);
 
-  // =========================
-  // CREATE ORDER
-  // =========================
-  console.log('>>> DELIVERY OBJ FINAL:', deliveryObj);
+  logDebug('UI_TOTALS', uiTotals);
+  logDebug('DELIVERY_OBJ_FINAL', deliveryObj);
 
-  console.log('>>> ORDER PAYLOAD (before create):', {
-    member: MemberDoc ? MemberDoc._id : null,
-    table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
-    fulfillment_type: ft,
-    transaction_code_preview: '(will generate)',
-    totals: uiTotals,
-    delivery: {
-      ...deliveryObj,
-      delivery_fee: uiTotals.delivery_fee,
-      shipping_discount: uiTotals.shipping_discount,
-      delivery_fee_raw: deliveryObj.delivery_fee_raw || 0
-    }
-  });
   /* ===== Buat Order ===== */
   const order = await (async () => {
     for (let i = 0; i < 5; i++) {
       try {
         const code = await nextDailyTxCode('ARCH');
+        logDebug('GENERATED_TX_CODE', { code });
 
-        // pilih applied vouchers dari price engine supaya konsisten
-        const appliedVoucherIds = Array.isArray(priced.chosenClaimIds)
-          ? priced.chosenClaimIds
-          : [];
+        const payloadPreview = {
+          member: MemberDoc ? MemberDoc._id : null,
+          customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
+          customer_phone: MemberDoc ? MemberDoc.phone || '' : customer_phone,
+          table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
+          source: iden.source || 'online',
+          fulfillment_type: ft,
+          transaction_code: code,
+          items: cart.items.map((it) => ({
+            menu: it.menu,
+            menu_code: it.menu_code,
+            name: it.name,
+            base_price: it.base_price,
+            quantity: it.quantity,
+            addons: it.addons,
+            notes: String(it.notes || '').trim()
+          })),
+          totals: uiTotals,
+          delivery: {
+            ...deliveryObj,
+            delivery_fee: uiTotals.delivery_fee,
+            shipping_discount: uiTotals.shipping_discount,
+            delivery_fee_raw: deliveryObj.delivery_fee_raw || 0
+          },
+          payment: {
+            method,
+            provider: payment_provider,
+            status: payment_status,
+            paid_at: paid_at ? paid_at.toISOString() : null,
+            proof: payment_proof_url || null
+          }
+        };
+
+        logDebug('ORDER_PAYLOAD_PRECREATE', payloadPreview);
 
         return await Order.create({
           member: MemberDoc ? MemberDoc._id : null,
@@ -1690,26 +1770,22 @@ exports.checkout = asyncHandler(async (req, res) => {
             category: it.category || null
           })),
 
-          // =========================
-          // MAP DARI buildUiTotalsFromCart()
-          // =========================
           items_subtotal: int(uiTotals.items_subtotal),
           items_discount: int(uiTotals.items_discount),
           delivery_fee: int(uiTotals.delivery_fee),
           shipping_discount: int(uiTotals.shipping_discount),
 
-          // breakdown voucher tetap dari price engine
           discounts: priced.breakdown || [],
-          applied_voucher_ids: appliedVoucherIds,
+          applied_voucher_ids: Array.isArray(priced.chosenClaimIds)
+            ? priced.chosenClaimIds
+            : [],
 
-          // service fee, pajak, rounding, total dari UI TOTALS
           service_fee: int(uiTotals.service_fee),
           tax_rate_percent: Number(uiTotals.tax_rate_percent),
           tax_amount: int(uiTotals.tax_amount),
           rounding_delta: int(uiTotals.rounding_delta),
           grand_total: int(uiTotals.grand_total),
 
-          // Payment
           payment_method: method,
           payment_provider,
           payment_status,
@@ -1719,7 +1795,6 @@ exports.checkout = asyncHandler(async (req, res) => {
           status: 'created',
           placed_at: new Date(),
 
-          // nested delivery — pastikan INI DIPAKAI
           delivery: {
             ...deliveryObj,
             delivery_fee: int(uiTotals.delivery_fee),
@@ -1728,6 +1803,11 @@ exports.checkout = asyncHandler(async (req, res) => {
           }
         });
       } catch (e) {
+        logDebug('ORDER_CREATE_ERROR', {
+          message: e?.message,
+          stack: e?.stack,
+          code: e?.code
+        });
         if (e?.code === 11000 && /transaction_code/.test(String(e.message)))
           continue;
         throwError(
@@ -1740,6 +1820,11 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
     throwError('Gagal generate transaction_code unik', 500);
   })();
+
+  logDebug('ORDER_CREATED', {
+    id: order._id,
+    transaction_code: order.transaction_code
+  });
 
   /* ===== Konsumsi voucher ===== */
   if (MemberDoc) {
@@ -1779,6 +1864,10 @@ exports.checkout = asyncHandler(async (req, res) => {
         total_quantity: 0,
         total_price: 0
       }
+    });
+    logDebug('CART_MARKED_CHECKED_OUT', {
+      cartId: cart._id,
+      orderId: order._id
     });
   } catch (err) {
     throwError(
@@ -1828,8 +1917,8 @@ exports.checkout = asyncHandler(async (req, res) => {
   }
 
   try {
-    // gunakan uiTotals yang sudah dibuat di atas untuk snapshot
     await snapshotOrder(order._id, { uiTotals }).catch(() => {});
+    logDebug('SNAPSHOT_SAVED', { orderId: order._id });
   } catch (e) {
     console.error('[OrderHistory][checkout]', e?.message || e);
   }
