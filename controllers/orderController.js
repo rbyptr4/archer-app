@@ -2281,7 +2281,11 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   const {
     cart,
     fulfillmentType = 'dine_in',
-    deliveryFee = fulfillmentType === 'delivery' ? 0 : 0,
+    // jangan pake default rumit di sini — terima apa pun FE kirim, kita normalisasi setelah
+    deliveryFee = 0,
+    delivery = null, // optional: FE bisa kirim { mode, delivery_fee } atau delivery_draft
+    delivery_draft = null,
+    delivery_mode: deliveryModeFromBody = null,
     voucherClaimIds = []
   } = req.body || {};
 
@@ -2301,17 +2305,34 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       .map((c) => String(c._id));
   }
 
-  // ===== NORMALISASI CART ITEMS untuk validateAndPrice =====
-  // PENTING: price harus sudah termasuk addons. Pastikan front-end mengirim price per unit yang sudah
-  // mencakup harga addons (atau kamu hitung di sini jika struktur cart mengandung addons detail).
+  const deliveryMode =
+    (typeof deliveryModeFromBody === 'string' && deliveryModeFromBody.trim()) ||
+    (delivery && typeof delivery.mode === 'string' && delivery.mode) ||
+    (delivery_draft &&
+      typeof delivery_draft.mode === 'string' &&
+      delivery_draft.mode) ||
+    (fulfillmentType === 'delivery' ? 'delivery' : 'none');
+
+  const rawDeliveryFeeFromBody =
+    Number(
+      (delivery && delivery.delivery_fee) ??
+        (delivery_draft && delivery_draft.delivery_fee) ??
+        deliveryFee ??
+        0
+    ) || 0;
+
+  const effectiveDeliveryFee =
+    fulfillmentType === 'delivery' &&
+    String(deliveryMode).toLowerCase() === 'delivery'
+      ? Math.max(0, rawDeliveryFeeFromBody)
+      : 0;
+
   const normalizedCart = {
     items: (Array.isArray(cart.items) ? cart.items : []).map((it) => {
-      // Jika cart item punya addons detail, hitung price per unit termasuk addons:
       const addons = Array.isArray(it.addons) ? it.addons : [];
       const addonsPerUnit = addons.reduce((s, a) => {
         const ap = Number(a?.price || 0);
         const aq = Number(a?.qty || 1);
-        // asumsi: a.qty adalah qty PER UNIT item. Jika strukturmu berbeda, sesuaikan.
         return s + ap * aq;
       }, 0);
       const unitBase = Number(it.base_price ?? it.price ?? it.unit_price ?? 0);
@@ -2329,11 +2350,11 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     memberId: req.member.id,
     cart: normalizedCart,
     fulfillmentType,
-    deliveryFee: fulfillmentType === 'delivery' ? Number(deliveryFee || 0) : 0,
+    deliveryFee:
+      fulfillmentType === 'delivery' ? Number(effectiveDeliveryFee || 0) : 0,
     voucherClaimIds: eligible
   });
 
-  // build ui_totals mirip getCart
   const t = result.totals || {};
   const ui_totals = {
     items_subtotal: Number(t.baseSubtotal || 0),
@@ -2341,11 +2362,12 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     items_discount: Number(t.itemsDiscount || 0),
     service_fee: Number(t.service_fee || 0),
     tax_amount: Number(t.tax_amount || 0),
-    delivery_fee: Number(t.deliveryFee || 0),
+    // pastikan delivery_fee sesuai effectiveDeliveryFee / totals dari engine
+    delivery_fee: Number(t.deliveryFee ?? effectiveDeliveryFee ?? 0),
     shipping_discount: Number(t.shippingDiscount || 0),
     rounding_delta: Number(t.rounding_delta || 0),
     grand_total: Number(t.grandTotal || 0),
-    grand_total_with_delivery: Number(t.grandTotal || 0) // delivery sudah ikut di grandTotal per implementasi di atas
+    grand_total_with_delivery: Number(t.grandTotal || 0)
   };
 
   return res.status(200).json({
