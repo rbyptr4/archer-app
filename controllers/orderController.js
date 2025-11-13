@@ -3690,16 +3690,12 @@ exports.listMembers = asyncHandler(async (req, res) => {
 });
 
 exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
-  // ambil identitas dari token/cookie (gunakan getIdentity seperti di checkout)
-  const iden = getIdentity(req);
-
-  // coba temukan user id — support beberapa key yang mungkin digunakan di proyek
   const userId =
-    iden.userId ||
-    (iden.user && iden.user._id) ||
-    iden.courierId ||
-    iden.id ||
-    iden._id;
+    req.user?.id ||
+    req.user?._id ||
+    req.user?._doc?._id || // defensif kalau mongoose doc
+    req.user?.userId ||
+    null;
 
   if (!userId) {
     throwError('Harus login sebagai kurir untuk mengakses endpoint ini', 401);
@@ -3718,11 +3714,16 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     ? String(req.query.status).toLowerCase()
     : null;
 
-  // buat query dasar: hanya delivery orders yang assigned ke kurir ini
+  // query dasar: hanya delivery orders yang assigned ke kurir ini
   const q = {
     fulfillment_type: 'delivery',
     'delivery.mode': 'delivery',
-    'delivery.assignee.user': userId,
+    // support dua pola: assignee.user bisa string id atau object with id
+    $or: [
+      { 'delivery.assignee.user': userId },
+      { 'delivery.assignee.user.id': userId },
+      { 'delivery.courier.id': userId } // fallback jika disimpan di courier
+    ],
     // exclude cancelled orders by default
     status: { $ne: 'cancelled' }
   };
@@ -3731,9 +3732,6 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     q['delivery.status'] = deliveryStatus;
   }
 
-  // optional filter: only active payment statuses (hindari void/expired) — bisa disesuaikan
-  // q.payment_status = { $in: ['unpaid','paid','verified'] };
-
   // count & fetch
   const [total, orders] = await Promise.all([
     Order.countDocuments(q),
@@ -3741,13 +3739,11 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
-      // populate ringan agar FE bisa tampilkan nama customer / menu names
       .populate('member', 'name phone')
-      .populate('items.menu', 'name') // kalau schema menu ada
+      .populate('items.menu', 'name')
       .lean()
   ]);
 
-  // map/sederhanakan payload bila perlu (tapi kembalikan apa adanya juga oke)
   const mapped = (orders || []).map((o) => ({
     _id: o._id,
     transaction_code: o.transaction_code,
@@ -3766,7 +3762,7 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
       location: o.delivery?.location,
       distance_km: o.delivery?.distance_km,
       delivery_fee: o.delivery?.delivery_fee,
-      assignee: o.delivery?.assignee || {}
+      assignee: o.delivery?.assignee || o.delivery?.courier || {}
     },
     customer: {
       member: o.member || null,
