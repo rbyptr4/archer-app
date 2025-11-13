@@ -2281,17 +2281,13 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   const {
     cart,
     fulfillmentType = 'dine_in',
-    // jangan pake default rumit di sini — terima apa pun FE kirim, kita normalisasi setelah
-    deliveryFee = 0,
-    delivery = null, // optional: FE bisa kirim { mode, delivery_fee } atau delivery_draft
-    delivery_draft = null,
-    delivery_mode: deliveryModeFromBody = null,
-    voucherClaimIds = []
+    voucherClaimIds = [],
+    delivery_mode: deliveryModeFromBody = null
   } = req.body || {};
 
   if (!cart?.items?.length) throwError('Cart kosong', 400);
 
-  // filter klaim milik member & masih valid
+  // ===== filter voucher milik member & masih valid =====
   let eligible = [];
   if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
     const raw = await VoucherClaim.find({
@@ -2305,28 +2301,20 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       .map((c) => String(c._id));
   }
 
+  // ===== tentukan delivery_mode efektif (FE wajib kirim delivery_mode supaya jelas) =====
   const deliveryMode =
-    (typeof deliveryModeFromBody === 'string' && deliveryModeFromBody.trim()) ||
-    (delivery && typeof delivery.mode === 'string' && delivery.mode) ||
-    (delivery_draft &&
-      typeof delivery_draft.mode === 'string' &&
-      delivery_draft.mode) ||
+    (typeof deliveryModeFromBody === 'string' &&
+      deliveryModeFromBody.trim().toLowerCase()) ||
     (fulfillmentType === 'delivery' ? 'delivery' : 'none');
 
-  const rawDeliveryFeeFromBody =
-    Number(
-      (delivery && delivery.delivery_fee) ??
-        (delivery_draft && delivery_draft.delivery_fee) ??
-        deliveryFee ??
-        0
-    ) || 0;
-
+  // ===== delivery fee policy: kalau mode === 'delivery' pakai ENV DELIVERY_FLAT_FEE, else 0 =====
+  const envDeliveryFee = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
   const effectiveDeliveryFee =
-    fulfillmentType === 'delivery' &&
-    String(deliveryMode).toLowerCase() === 'delivery'
-      ? Math.max(0, rawDeliveryFeeFromBody)
+    fulfillmentType === 'delivery' && deliveryMode === 'delivery'
+      ? envDeliveryFee
       : 0;
 
+  // ===== NORMALISASI CART ITEMS untuk validateAndPrice =====
   const normalizedCart = {
     items: (Array.isArray(cart.items) ? cart.items : []).map((it) => {
       const addons = Array.isArray(it.addons) ? it.addons : [];
@@ -2346,6 +2334,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     })
   };
 
+  // ===== panggil price engine =====
   const result = await validateAndPrice({
     memberId: req.member.id,
     cart: normalizedCart,
@@ -2355,19 +2344,21 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     voucherClaimIds: eligible
   });
 
+  // ===== bangun ui_totals (fallback ke effectiveDeliveryFee kalau engine tidak mengembalikan deliveryFee) =====
   const t = result.totals || {};
   const ui_totals = {
     items_subtotal: Number(t.baseSubtotal || 0),
-    items_subtotal_after_discount: Number(t.items_subtotal_after_discount || 0),
+    items_subtotal_after_discount: Number(
+      t.items_subtotal_after_discount || t.baseSubtotalAfterDiscount || 0
+    ),
     items_discount: Number(t.itemsDiscount || 0),
     service_fee: Number(t.service_fee || 0),
     tax_amount: Number(t.tax_amount || 0),
-    // pastikan delivery_fee sesuai effectiveDeliveryFee / totals dari engine
     delivery_fee: Number(t.deliveryFee ?? effectiveDeliveryFee ?? 0),
     shipping_discount: Number(t.shippingDiscount || 0),
     rounding_delta: Number(t.rounding_delta || 0),
-    grand_total: Number(t.grandTotal || 0),
-    grand_total_with_delivery: Number(t.grandTotal || 0)
+    grand_total: Number(t.grandTotal || t.grand_total || 0),
+    grand_total_with_delivery: Number(t.grandTotal || t.grand_total || 0)
   };
 
   return res.status(200).json({
