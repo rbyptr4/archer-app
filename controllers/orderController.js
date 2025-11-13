@@ -77,6 +77,11 @@ const {
   hashToken
 } = require('../utils/memberToken');
 
+const QRIS_USE_STATIC =
+  String(process.env.QRIS_USE_STATIC || 'false').toLowerCase() === 'true';
+const QRIS_REQUIRE_PROOF =
+  String(process.env.QRIS_REQUIRE_PROOF || 'true').toLowerCase() === 'true';
+
 const {
   DELIVERY_MAX_RADIUS_KM,
   CAFE_COORD,
@@ -97,40 +102,6 @@ const ALLOWED_STATUSES = ['created', 'accepted', 'completed', 'cancelled'];
 const ALLOWED_PAY_STATUS = ['verified', 'paid', 'refunded', 'void'];
 
 const DELIVERY_ALLOWED = ['pending', 'assigned', 'delivered', 'failed'];
-
-// helper delivery slots (letakkan di top file controller)
-// helper: parse "HH:mm-HH:mm" with optional dateHint (YYYY-MM-DD) -> { fromDayjs, toDayjs } or null
-function parseTimeRangeToDayjs(rangeStr, dateHint = null) {
-  if (!rangeStr || typeof rangeStr !== 'string') return null;
-  const parts = rangeStr.split('-').map((s) => (s || '').trim());
-  if (parts.length !== 2) return null;
-  const [a, b] = parts;
-  // reuse parseIsoOrHhmmToDayjs from previous helper style - implement small helper:
-  const parseHhmmWithDate = (hhmm, date) => {
-    if (!hhmm) return null;
-    // if contains 'T' or date then parse ISO
-    if (hhmm.includes('T') || /\d{4}-\d{2}-\d{2}/.test(hhmm)) {
-      const d = dayjs(hhmm).tz(LOCAL_TZ);
-      return d.isValid() ? d : null;
-    }
-    // else HH:mm
-    const base = date
-      ? dayjs(date).tz(LOCAL_TZ).startOf('day')
-      : dayjs().tz(LOCAL_TZ).startOf('day');
-    const p = hhmm.split(':');
-    if (p.length < 2) return null;
-    const hh = parseInt(p[0], 10),
-      mm = parseInt(p[1], 10);
-    if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
-    return base.hour(hh).minute(mm).second(0).millisecond(0);
-  };
-
-  const date = dateHint ? String(dateHint).trim() : null;
-  const fromD = parseHhmmWithDate(a, date);
-  const toD = parseHhmmWithDate(b, date);
-  if (!fromD || !fromD.isValid() || !toD || !toD.isValid()) return null;
-  return { from: fromD, to: toD };
-}
 
 function parseSlotLabelToDate(slotLabel, day = null) {
   const base = (day ? day : dayjs().tz(LOCAL_TZ)).startOf('day');
@@ -301,9 +272,11 @@ function isPaymentMethodAllowed(source, fulfillment, method) {
   return method === PM.QRIS || method === PM.TRANSFER;
 }
 
-// Bukti hanya untuk transfer
 function needProof(method) {
-  return method === PM.TRANSFER;
+  if (!method) return false;
+  if (method === PM.TRANSFER) return true;
+  if (method === PM.QRIS && QRIS_USE_STATIC && QRIS_REQUIRE_PROOF) return true;
+  return false;
 }
 
 /* =============== Upload bukti transfer =============== */
@@ -312,12 +285,24 @@ async function handleTransferProofIfAny(req, method) {
 
   const file = req.file;
   if (!file) {
-    throwError('Bukti transfer wajib diunggah untuk metode transfer', 400);
+    // pesan disesuaikan berdasarkan method supaya FE jelas
+    if (method === PM.TRANSFER) {
+      throwError('Bukti transfer wajib diunggah untuk metode transfer', 400);
+    } else if (method === PM.QRIS) {
+      throwError(
+        'Bukti pembayaran QRIS wajib diunggah (screenshot/scan) untuk metode QRIS statis',
+        400
+      );
+    } else {
+      throwError('Bukti pembayaran wajib diunggah', 400);
+    }
   }
 
   const folderId = getDriveFolder('invoice');
+  const prefix =
+    method === PM.TRANSFER ? 'TRF_' : method === PM.QRIS ? 'QRIS_' : 'PAY_';
   const filename =
-    'TRF_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    prefix + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
 
   const uploaded = await uploadBuffer(
     file.buffer,
@@ -328,7 +313,7 @@ async function handleTransferProofIfAny(req, method) {
 
   const id = uploaded?.id;
   if (!id) {
-    throwError('Gagal menyimpan bukti transfer', 500);
+    throwError('Gagal menyimpan bukti pembayaran', 500);
   }
 
   return `https://drive.google.com/uc?export=view&id=${id}`;
@@ -1294,7 +1279,9 @@ exports.checkout = asyncHandler(async (req, res) => {
   if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method)) {
     throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
   }
-  const methodIsGateway = method === PM.QRIS;
+
+  // Jika QRIS dipakai sebagai static (fallback), treat as NON-gateway
+  const methodIsGateway = method === PM.QRIS && !QRIS_USE_STATIC;
   const requiresProof = needProof(method);
 
   const originallyLoggedIn = !!iden0.memberId;
@@ -1493,7 +1480,13 @@ exports.checkout = asyncHandler(async (req, res) => {
     recomputeTotals(cart);
     await cart.save();
   } catch (err) {
-    throw err;
+    // gunakan throwError agar error konsisten
+    throwError(
+      err?.message
+        ? `Gagal menyimpan cart: ${String(err.message)}`
+        : 'Gagal menyimpan cart',
+      err?.status || 500
+    );
   }
 
   // Voucher filter
@@ -1531,7 +1524,12 @@ exports.checkout = asyncHandler(async (req, res) => {
       voucherClaimIds: eligibleClaimIds
     });
   } catch (err) {
-    throw err;
+    throwError(
+      err?.message
+        ? `Gagal menghitung harga: ${String(err.message)}`
+        : 'Gagal menghitung harga',
+      err?.status || 500
+    );
   }
 
   const baseItemsSubtotal = int(priced.totals.baseSubtotal);
@@ -1630,10 +1628,17 @@ exports.checkout = asyncHandler(async (req, res) => {
       } catch (e) {
         if (e?.code === 11000 && /transaction_code/.test(String(e.message)))
           continue;
-        throw e;
+        // gunakan throwError untuk konsistensi pesan
+        throwError(
+          e?.message
+            ? `Gagal membuat order: ${String(e.message)}`
+            : 'Gagal membuat order',
+          e?.status || 500
+        );
       }
     }
-    throw new Error('Gagal generate transaction_code unik');
+    // gagal setelah retry
+    throwError('Gagal generate transaction_code unik', 500);
   })();
 
   /* ===== Konsumsi voucher ===== */
@@ -1655,30 +1660,47 @@ exports.checkout = asyncHandler(async (req, res) => {
           });
           await c.save();
         }
-      } catch (_) {}
+      } catch (_) {
+        // jangan crash order kalau voucher gagal diupdate; log saja
+        console.error('[voucher][consume] gagal update', _?.message || _);
+      }
     }
   }
 
   /* ===== Tandai cart selesai ===== */
-  await Cart.findByIdAndUpdate(cart._id, {
-    $set: {
-      status: 'checked_out',
-      checked_out_at: new Date(),
-      order_id: order._id,
-      last_idempotency_key: idempotency_key || null,
-      items: [],
-      total_items: 0,
-      total_quantity: 0,
-      total_price: 0
-    }
-  });
+  try {
+    await Cart.findByIdAndUpdate(cart._id, {
+      $set: {
+        status: 'checked_out',
+        checked_out_at: new Date(),
+        order_id: order._id,
+        last_idempotency_key: idempotency_key || null,
+        items: [],
+        total_items: 0,
+        total_quantity: 0,
+        total_price: 0
+      }
+    });
+  } catch (err) {
+    throwError(
+      err?.message
+        ? `Gagal update cart saat checkout: ${String(err.message)}`
+        : 'Gagal update cart saat checkout',
+      err?.status || 500
+    );
+  }
 
   /* ===== Statistik member ===== */
   if (MemberDoc) {
-    await Member.findByIdAndUpdate(MemberDoc._id, {
-      $inc: { total_spend: order.grand_total || 0 },
-      $set: { last_visit_at: new Date() }
-    });
+    try {
+      await Member.findByIdAndUpdate(MemberDoc._id, {
+        $inc: { total_spend: order.grand_total || 0 },
+        $set: { last_visit_at: new Date() }
+      });
+    } catch (err) {
+      // jangan gagalkan checkout kalau statistik gagal; log saja
+      console.error('[member][stats] gagal update', err?.message || err);
+    }
   }
 
   /* ===== Emit realtime & guest token handling ===== */
@@ -1730,6 +1752,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   } catch (e) {
     console.error('[OrderHistory][checkout]', e?.message || e);
   }
+
   res.status(201).json({
     order: order.toObject(),
     guestToken: order.guestToken || null,
