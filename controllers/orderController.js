@@ -2382,10 +2382,7 @@ exports.listOrders = asyncHandler(async (req, res) => {
     grand_total: Number(o.grand_total || 0),
     fulfillment_type: o.fulfillment_type || null, // 'dine_in' | 'delivery'
     customer_name: (o.member && o.member.name) || o.customer_name || '',
-    // perbaikan: gunakan customer_phone fallback ke field yg benar
-    customer_phone:
-      (o.member && o.member.phone) || o.customer_phone || '',
-    // gunakan createdAt karena kamu sort by createdAt
+    customer_phone: (o.member && o.member.phone) || o.customer_phone || '',
     placed_at: o.placed_at || o.createdAt || null,
     table_number:
       o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
@@ -2402,14 +2399,16 @@ exports.listOrders = asyncHandler(async (req, res) => {
     delivery_slot_label: o.delivery ? o.delivery.slot_label || null : null,
     member_id: o.member ? String(o.member._id) : null
   }));
-  
+
   return res.status(200).json({
     items,
-    // next_cursor harus konsisten: kamu sort({ createdAt: -1 }) -> ambil last createdAt
     next_cursor: items.length
-      ? new Date(items[items.length - 1].placed_at || raw[items.length - 1].createdAt).toISOString()
+      ? new Date(
+          items[items.length - 1].placed_at || raw[items.length - 1].createdAt
+        ).toISOString()
       : null
   });
+});
 
 exports.getDetailOrder = asyncHandler(async (req, res) => {
   const id = req.params.id;
