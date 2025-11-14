@@ -2363,7 +2363,7 @@ exports.listOrders = asyncHandler(async (req, res) => {
   // note: include member.name via populate (light)
   const raw = await Order.find(q)
     .select(
-      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt delivery_mode'
+      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt delivery.mode'
     )
     .sort({ createdAt: -1 })
     .limit(lim)
