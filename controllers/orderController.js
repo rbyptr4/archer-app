@@ -2503,13 +2503,21 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
           delivery_fee: order.delivery.delivery_fee ?? null,
           slot_label: order.delivery.slot_label || null,
           scheduled_at: order.delivery.scheduled_at || null,
-          status: order.delivery.status || null
+          status: order.delivery.status || null,
+          // <-- pickup_window ditambahkan di sini (safe check)
+          pickup_window: order.delivery.pickup_window
+            ? {
+                from: order.delivery.pickup_window.from || null,
+                to: order.delivery.pickup_window.to || null
+              }
+            : null
         }
       : null
   };
 
   return res.status(200).json({ success: true, order: slim });
 });
+
 
 const buildOrderReceipt = (order) => {
   if (!order) return null;
