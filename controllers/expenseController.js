@@ -99,8 +99,8 @@ exports.getExpenses = asyncHandler(async (req, res) => {
     q,
     min,
     max,
-    page = 1,
     limit = 20,
+    cursor,
     summary
   } = req.query;
 
@@ -123,19 +123,33 @@ exports.getExpenses = asyncHandler(async (req, res) => {
   if (max !== undefined)
     filter.amount = Object.assign(filter.amount || {}, { $lte: +max });
 
-  const skip = (Math.max(1, +page) - 1) * Math.max(1, +limit);
+  const lim = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 200);
 
-  const [items, total] = await Promise.all([
-    Expense.find(filter)
-      .populate('type', 'name')
-      .sort({ date: -1, _id: -1 })
-      .skip(skip)
-      .limit(Math.max(1, +limit))
-      .lean(),
-    Expense.countDocuments(filter)
-  ]);
+  // cursor by createdAt descending
+  if (cursor) {
+    const d = new Date(cursor);
+    if (!isNaN(d.getTime())) {
+      filter.createdAt = { $lt: d };
+    }
+  }
 
-  const payload = { data: items, total, page: +page, limit: +limit };
+  const items = await Expense.find(filter)
+    .populate('type', 'name')
+    .sort({ createdAt: -1 })
+    .limit(lim + 1)
+    .lean();
+
+  const next_cursor =
+    items.length > lim
+      ? new Date(items[lim - 1].createdAt).toISOString()
+      : null;
+
+  const payload = {
+    data: items.slice(0, lim),
+    next_cursor,
+    page: 0,
+    limit: lim
+  };
 
   if (String(summary).toLowerCase() === 'true' || summary === '1') {
     const aggr = await Expense.aggregate([

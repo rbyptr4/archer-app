@@ -72,24 +72,286 @@ async function safeExpenseAggregate(pipeline) {
  *  - total_cancelled (jumlah order batal pada range)
  *  - omzet_paid (sum grand_total pada order paid)
  */
-exports.orderSummary = asyncHandler(async (req, res) => {
-  const rs = rangeFromQuery(req.query);
+exports.transactionSummary = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
 
-  const [paidCountAgg, paidAmtAgg, cancelledCount] = await Promise.all([
-    Order.countDocuments(matchPaid(rs)),
-    Order.aggregate([
-      { $match: matchPaid(rs) },
-      { $group: { _id: null, omzet: { $sum: '$grand_total' } } }
-    ]),
-    Order.countDocuments(matchCancelled(rs))
-  ]);
+  const period = String(req.query?.period || 'day'); // day|month|year|range
+  const dateQ = String(req.query?.date || '').trim(); // YYYY-MM-DD
+  const monthQ = String(req.query?.month || '').trim(); // YYYY-MM
+  const yearQ = String(req.query?.year || '').trim(); // YYYY
+  const fromQ = req.query?.from || null; // ISO
+  const toQ = req.query?.to || null; // ISO
 
-  const omzet_paid = paidAmtAgg?.[0]?.omzet || 0;
+  // shift override (optional)
+  const defaultShift1 = '00:00-14:59';
+  const defaultShift2 = '15:00-23:59';
+  const shift1Str = String(req.query?.shift1 || defaultShift1).trim();
+  const shift2Str = String(req.query?.shift2 || defaultShift2).trim();
 
-  res.json({
-    total_paid: paidCountAgg,
-    total_cancelled: cancelledCount,
-    omzet_paid
+  // helper to parse base range based on period
+  let rangeFrom, rangeTo;
+  const now = dayjs().tz(LOCAL_TZ);
+
+  if (period === 'day') {
+    const base = dateQ ? dayjs(dateQ).tz(LOCAL_TZ) : now;
+    if (!base.isValid()) throwError('date tidak valid (YYYY-MM-DD)', 400);
+    rangeFrom = base.startOf('day');
+    rangeTo = base.endOf('day');
+  } else if (period === 'month') {
+    const base = monthQ ? dayjs(monthQ + '-01').tz(LOCAL_TZ) : now;
+    if (!base.isValid()) throwError('month tidak valid (YYYY-MM)', 400);
+    rangeFrom = base.startOf('month');
+    rangeTo = base.endOf('month');
+  } else if (period === 'year') {
+    const base = yearQ ? dayjs(String(yearQ) + '-01-01').tz(LOCAL_TZ) : now;
+    if (!base.isValid()) throwError('year tidak valid (YYYY)', 400);
+    rangeFrom = base.startOf('year');
+    rangeTo = base.endOf('year');
+  } else if (period === 'range') {
+    if (!fromQ || !toQ)
+      throwError('Untuk period=range, kirimkan from & to (ISO).', 400);
+    const f = dayjs(fromQ).tz(LOCAL_TZ);
+    const t = dayjs(toQ).tz(LOCAL_TZ);
+    if (!f.isValid() || !t.isValid())
+      throwError('from/to tidak valid (ISO).', 400);
+    rangeFrom = f.startOf('minute');
+    rangeTo = t.endOf('minute');
+  } else {
+    throwError('period tidak valid. Gunakan day|month|year|range', 400);
+  }
+
+  // If shift override is provided (user may want to see only shift1 or shift2)
+  // support query param `only_shift=1|2` to restrict to only that shift.
+  const onlyShift = String(req.query?.only_shift || '').trim(); // '1' or '2' or ''
+
+  const toRangeDayjs = (rangeStr, baseDay) => {
+    const parsed = parseTimeRangeToDayjs(
+      rangeStr,
+      baseDay.format('YYYY-MM-DD')
+    );
+    if (!parsed) return null;
+    return { from: parsed.from, to: parsed.to };
+  };
+
+  // Build ranges to compute: full period + shift1 + shift2 (shift ranges inside the same day)
+  // For monthly/yearly/range, shift1/shift2 will be interpreted per-day if period === 'day'
+  // If period !== day and onlyShift set, we will apply shift time-of-day across all days in range (aggregate by paid_at)
+  // Simpler approach: when period === 'day' calculate shifts with same baseDay; else if onlyShift provided, restrict paid_at time-of-day across whole range.
+
+  const ranges = [];
+
+  // full range
+  ranges.push({ id: 'full', from: rangeFrom, to: rangeTo });
+
+  // For day: compute shift1 & shift2 as provided
+  if (period === 'day') {
+    const shift1 = toRangeDayjs(shift1Str, rangeFrom);
+    const shift2 = toRangeDayjs(shift2Str, rangeFrom);
+    if (!shift1 || !shift2)
+      throwError('Format shift tidak valid. Gunakan "HH:mm-HH:mm".', 400);
+    ranges.push({ id: 'shift1', from: shift1.from, to: shift1.to });
+    ranges.push({ id: 'shift2', from: shift2.from, to: shift2.to });
+  } else if (onlyShift === '1' || onlyShift === '2') {
+    // interpret shift times-of-day across entire date range
+    const baseForShift = rangeFrom; // we'll use only HH:mm parts
+    const shift1 = toRangeDayjs(shift1Str, baseForShift);
+    const shift2 = toRangeDayjs(shift2Str, baseForShift);
+    if (!shift1 || !shift2)
+      throwError('Format shift tidak valid. Gunakan "HH:mm-HH:mm".', 400);
+
+    // create a function to test time-of-day instead of building many ranges
+    ranges.push({
+      id: onlyShift === '1' ? 'shift1' : 'shift2',
+      from: shift1.from,
+      to: shift1.to,
+      applyDaily: true,
+      which: onlyShift === '1' ? shift1 : shift2
+    });
+  } else {
+    // not day and no onlyShift -> still include shift summaries but not apply them (optional)
+    // We'll still try to compute aggregated by_payment_method for full range only.
+  }
+
+  // helper builder: match for paid orders in a given from/to (dayjs objects)
+  const buildOrderMatchFor = (fromD, toD) => ({
+    payment_status: { $in: ['paid', 'verified'] },
+    paid_at: { $gte: fromD.toDate(), $lte: toD.toDate() },
+    status: { $ne: 'cancelled' }
+  });
+
+  // helper aggregation to get omzet + count + by payment method
+  const aggregateOrdersForRange = async (fromD, toD, applyDailyTimeWindow) => {
+    // If applyDailyTimeWindow === {fromDayjs,toDayjs, daily:true} we need to match based on time-of-day across days.
+    if (!applyDailyTimeWindow) {
+      const match = buildOrderMatchFor(fromD, toD);
+      const pipeline = [
+        { $match: match },
+        {
+          $group: {
+            _id: { $ifNull: ['$payment_method', 'unknown'] },
+            omzet: { $sum: { $ifNull: ['$grand_total', 0] } },
+            count: { $sum: 1 }
+          }
+        }
+      ];
+      const rows = await Order.aggregate(pipeline).allowDiskUse(true);
+      // normalize
+      const methods = { transfer: 0, qris: 0, cash: 0, card: 0, unknown: 0 };
+      let total = 0;
+      let totalCount = 0;
+      for (const r of rows || []) {
+        const m = String(r._id || 'unknown');
+        const amt = Number(r.omzet || 0);
+        const cnt = Number(r.count || 0);
+        if (Object.prototype.hasOwnProperty.call(methods, m)) methods[m] = amt;
+        else methods.unknown += amt;
+        total += amt;
+        totalCount += cnt;
+      }
+      return {
+        total_amount: total,
+        total_count: totalCount,
+        by_payment_method: methods
+      };
+    }
+
+    // applyDailyTimeWindow: select orders in [fromD_global, toD_global] AND where paid_at time-of-day within window
+    // We'll query by paid_at between global from/to, then filter in JS by time-of-day (safe for moderate data sizes).
+    const globalMatch = {
+      payment_status: { $in: ['paid', 'verified'] },
+      paid_at: { $gte: fromD.toDate(), $lte: toD.toDate() },
+      status: { $ne: 'cancelled' }
+    };
+    const docs = await Order.find(globalMatch)
+      .select('payment_method grand_total paid_at')
+      .lean();
+    const methods = { transfer: 0, qris: 0, cash: 0, card: 0, unknown: 0 };
+    let total = 0;
+    let totalCount = 0;
+
+    const dayWindowFrom = applyDailyTimeWindow.from; // dayjs with a sample date, we use HH:mm
+    const dayWindowTo = applyDailyTimeWindow.to;
+
+    for (const d of docs || []) {
+      if (!d.paid_at) continue;
+      const p = dayjs(d.paid_at).tz(LOCAL_TZ);
+      // build day-local window for this date
+      const dayStr = p.format('YYYY-MM-DD');
+      const winFrom = dayWindowFrom
+        .clone()
+        .set('year', p.year())
+        .set('month', p.month())
+        .set('date', p.date());
+      const winTo = dayWindowTo
+        .clone()
+        .set('year', p.year())
+        .set('month', p.month())
+        .set('date', p.date());
+      // if windowTo < windowFrom, assume window crosses midnight -> add 1 day to winTo
+      if (winTo.isBefore(winFrom)) winTo.add(1, 'day');
+      if (p.isBetween(winFrom, winTo, null, '[]')) {
+        const m = String(d.payment_method || 'unknown');
+        const amt = Number(d.grand_total || 0);
+        if (Object.prototype.hasOwnProperty.call(methods, m)) methods[m] += amt;
+        else methods.unknown += amt;
+        total += amt;
+        totalCount += 1;
+      }
+    }
+
+    return {
+      total_amount: total,
+      total_count: totalCount,
+      by_payment_method: methods
+    };
+  };
+
+  // compute pengeluaran: attempt to use Expense model if available
+  let pengeluaran = 0;
+  try {
+    let ExpenseModel = null;
+    try {
+      ExpenseModel = require('../models/expenseModel');
+    } catch (e) {
+      ExpenseModel = null;
+    }
+    if (ExpenseModel) {
+      const expAgg = await ExpenseModel.aggregate([
+        {
+          $match: {
+            createdAt: { $gte: rangeFrom.toDate(), $lte: rangeTo.toDate() }
+          }
+        },
+        { $group: { _id: null, total: { $sum: { $ifNull: ['$amount', 0] } } } }
+      ]);
+      pengeluaran = expAgg?.[0]?.total || 0;
+    } else {
+      // no expense model found in project, default 0
+      pengeluaran = 0;
+    }
+  } catch (err) {
+    console.error('[transactionSummary][expense]', err?.message || err);
+    pengeluaran = 0;
+  }
+
+  // run aggregations for ranges
+  const results = {};
+  for (const r of ranges) {
+    if (r.applyDaily) {
+      const agg = await aggregateOrdersForRange(rangeFrom, rangeTo, {
+        from: r.which.from,
+        to: r.which.to
+      });
+      results[r.id] = agg;
+    } else {
+      const agg = await aggregateOrdersForRange(r.from, r.to, null);
+      results[r.id] = agg;
+    }
+  }
+
+  // prepare response: full, shift1, shift2 (if present)
+  const omzet = results.full?.total_amount || 0;
+  const total_transactions = results.full?.total_count || 0;
+  const by_payment_method = results.full?.by_payment_method || {
+    transfer: 0,
+    qris: 0,
+    cash: 0,
+    card: 0,
+    unknown: 0
+  };
+
+  const shift1_summary = results.shift1 || null;
+  const shift2_summary = results.shift2 || null;
+
+  const pendapatan = omzet - pengeluaran;
+
+  return res.json({
+    success: true,
+    period: period,
+    range: { from: rangeFrom.toISOString(), to: rangeTo.toISOString() },
+    totals: {
+      pengeluaran,
+      omzet,
+      pendapatan,
+      total_transactions
+    },
+    by_payment_method,
+    shifts: {
+      shift1: shift1_summary
+        ? {
+            total_amount: shift1_summary.total_amount,
+            total_count: shift1_summary.total_count,
+            by_payment_method: shift1_summary.by_payment_method
+          }
+        : null,
+      shift2: shift2_summary
+        ? {
+            total_amount: shift2_summary.total_amount,
+            total_count: shift2_summary.total_count,
+            by_payment_method: shift2_summary.by_payment_method
+          }
+        : null
+    }
   });
 });
 

@@ -77,15 +77,13 @@ exports.createEmployee = asyncHandler(async (req, res) => {
 
 exports.listEmployees = asyncHandler(async (req, res) => {
   let {
-    page = 1,
     limit = 10,
     search = '',
     sortBy = 'createdAt',
-    sortDir = 'desc'
+    sortDir = 'desc',
+    cursor
   } = req.query;
-
-  page = Math.max(1, parseInt(page) || 1);
-  limit = Math.min(100, Math.max(1, parseInt(limit) || 10));
+  limit = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 100);
 
   const filter = { role: 'employee' };
   if (search) {
@@ -93,27 +91,36 @@ exports.listEmployees = asyncHandler(async (req, res) => {
     filter.$or = [{ name: re }, { email: re }, { phone: re }];
   }
 
-  const total = await User.countDocuments(filter);
-  const sort = { [sortBy]: String(sortDir).toLowerCase() === 'asc' ? 1 : -1 };
+  const sortDirection = String(sortDir).toLowerCase() === 'asc' ? 1 : -1;
+  // we'll still use createdAt cursor even jika sortBy berbeda, for consistency
+  const matchCursor = {};
+  if (cursor) {
+    const d = new Date(cursor);
+    if (!isNaN(d.getTime())) matchCursor.createdAt = { $lt: d };
+  }
 
-  const items = await User.find(filter)
+  const q = { ...filter, ...matchCursor };
+
+  const items = await User.find(q)
     .select('name email phone role pages createdAt updatedAt')
-    .sort(sort)
-    .skip((page - 1) * limit)
-    .limit(limit)
+    .sort({ createdAt: -1, _id: -1 }) // keep stable order for cursor
+    .limit(limit + 1)
     .lean();
 
-  const normalized = items.map((u) => ({
+  const normalized = items.slice(0, limit).map((u) => ({
     ...u,
     pages: normalizePagesOut(u.pages)
   }));
 
+  const next_cursor =
+    items.length > limit
+      ? new Date(items[limit - 1].createdAt).toISOString()
+      : null;
+
   res.json({
     message: 'Daftar karyawan',
-    total,
-    page,
     limit,
-    totalPages: Math.ceil(total / limit),
+    next_cursor,
     items: normalized
   });
 });

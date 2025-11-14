@@ -40,14 +40,13 @@ function getRangeFromQuery(q = {}, fallbackMode = 'calendar') {
  *  - sort: 'spend' | 'orders' | 'last_visit' | 'created' | 'lifetime_spend'
  * =========================================================== */
 exports.listMemberSummary = asyncHandler(async (req, res) => {
-  let { page = 1, limit = 10, search = '', sort = 'created' } = req.query;
-  page = asInt(page, 1);
-  limit = Math.min(asInt(limit, 10), 200);
+  let { limit = 10, search = '', sort = 'created', cursor } = req.query;
+  limit = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 200);
 
   const { start, end } = getRangeFromQuery(req.query);
   const baseMatch = buildMemberMatch({ search });
 
-  // Sorting akhir dilakukan di pipeline setelah enrich
+  // sorting setelah enrich tetap seperti sebelumnya
   const sortStage =
     sort === 'spend'
       ? { period_spend: -1 }
@@ -59,15 +58,21 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
       ? { total_spend: -1 }
       : { createdAt: -1 };
 
-  const total = await Member.countDocuments(baseMatch);
+  // cursor based on createdAt: expect cursor = ISO date string
+  const matchCursor = {};
+  if (cursor) {
+    const d = new Date(cursor);
+    if (!isNaN(d.getTime())) {
+      matchCursor.createdAt = { $lt: d };
+    }
+  }
 
-  const items = await Member.aggregate([
-    { $match: baseMatch },
-    { $sort: { createdAt: -1, _id: 1 } },
-    { $skip: (page - 1) * limit },
-    { $limit: limit },
+  const pipeline = [
+    { $match: { $and: [baseMatch, matchCursor] } },
+    { $sort: { createdAt: -1, _id: -1 } },
+    { $limit: limit + 1 }, // ambil 1 lebih untuk deteksi next_cursor
 
-    // gabung ke OrderHistory untuk metrik periode (paid)
+    // lookup orders paid in period
     {
       $lookup: {
         from: 'orderhistories',
@@ -75,9 +80,14 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
         pipeline: [
           {
             $match: {
-              $expr: { $eq: ['$member.id', '$$mid'] },
-              payment_status: 'paid',
-              paid_at: { $gte: start, $lte: end }
+              $expr: {
+                $and: [
+                  { $eq: ['$member.id', '$$mid'] },
+                  { $eq: ['$payment_status', 'paid'] },
+                  { $gte: ['$paid_at', start] },
+                  { $lte: ['$paid_at', end] }
+                ]
+              }
             }
           },
           { $project: { grand_total: 1, paid_at: 1 } }
@@ -94,7 +104,6 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
     },
     {
       $project: {
-        // keep only useful fields
         name: 1,
         phone: 1,
         join_channel: 1,
@@ -102,7 +111,7 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
         createdAt: 1,
         last_visit_at: 1,
         visit_count: 1,
-        total_spend: 1, // lifetime from Member
+        total_spend: 1,
         points: 1,
         period_orders: 1,
         period_spend: 1,
@@ -110,16 +119,30 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
       }
     },
     { $sort: sortStage }
-  ]);
+  ];
+
+  const raw = await Member.aggregate(pipeline).allowDiskUse(true);
+
+  // next_cursor logic
+  let next_cursor = null;
+  if (raw.length > limit) {
+    const last = raw[limit - 1];
+    next_cursor = last?.createdAt
+      ? new Date(last.createdAt).toISOString()
+      : null;
+    raw.splice(limit); // remove extra
+  }
+
+  // total count: optional (costly). Jika FE hanya butuh infinite scroll, skip total.
+  const total = await Member.countDocuments(baseMatch);
 
   res.json({
     message: 'Ringkasan pelanggan',
     period: { start, end },
     total,
-    page,
     limit,
-    totalPages: Math.ceil(total / limit),
-    data: items
+    next_cursor,
+    data: raw
   });
 });
 

@@ -448,23 +448,22 @@ exports.getPackageMenuById = asyncHandler(async (req, res) => {
 // GET /packages/list
 // Query: q, subId, isActive, page, limit, sortBy(name|createdAt|price.original|isRecommended), sortDir(asc|desc)
 exports.listPackageMenus = asyncHandler(async (req, res) => {
-  const page = Math.max(parseInt(req.query.page || '1', 10), 1);
   const limit = Math.min(
     Math.max(parseInt(req.query.limit || '20', 10), 1),
     100
   );
-  const skip = (page - 1) * limit;
-
-  const isBackoffice =
-    !!req.user && ['owner', 'employee'].includes(req.user.role);
-  const filter = { bigCategory: 'package' };
-  if (!isBackoffice) filter.isActive = true;
-
+  const skip = 0;
   const q = String(req.query.q || '').trim();
   const isActiveParam = String(req.query.isActive || '').toLowerCase();
   const sortBy = String(req.query.sortBy || 'name');
   const sortDir =
     String(req.query.sortDir || 'asc').toLowerCase() === 'desc' ? -1 : 1;
+  const cursor = req.query.cursor;
+
+  const isBackoffice =
+    !!req.user && ['owner', 'employee'].includes(req.user.role);
+  const filter = { bigCategory: 'package' };
+  if (!isBackoffice) filter.isActive = true;
 
   if (q) {
     filter.$or = [
@@ -477,7 +476,12 @@ exports.listPackageMenus = asyncHandler(async (req, res) => {
   if (isActiveParam === 'true') filter.isActive = true;
   else if (isActiveParam === 'false') filter.isActive = false;
 
-  const sort = {};
+  if (cursor) {
+    const d = new Date(cursor);
+    if (!isNaN(d.getTime())) filter.createdAt = { $lt: d };
+  }
+
+  const sortObj = {};
   if (
     [
       'name',
@@ -487,24 +491,25 @@ exports.listPackageMenus = asyncHandler(async (req, res) => {
       'isRecommended'
     ].includes(sortBy)
   ) {
-    sort[sortBy] = sortDir;
+    sortObj[sortBy] = sortDir;
   } else {
-    sort['name'] = 1;
+    sortObj['name'] = 1;
   }
 
-  const [items, total] = await Promise.all([
-    Menu.find(filter)
-      .sort(sort)
-      .skip(skip)
-      .limit(limit)
-      .lean({ virtuals: true }),
-    Menu.countDocuments(filter)
-  ]);
+  const items = await Menu.find(filter)
+    .sort({ createdAt: -1 })
+    .limit(limit + 1)
+    .lean({ virtuals: true });
+
+  const next_cursor =
+    items.length > limit
+      ? new Date(items[limit - 1].createdAt).toISOString()
+      : null;
 
   res.json({
     success: true,
-    data: items,
-    paging: { page, limit, total, pages: Math.ceil(total / limit) || 1 }
+    data: items.slice(0, limit),
+    paging: { limit, next_cursor }
   });
 });
 

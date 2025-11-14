@@ -560,57 +560,26 @@ exports.listMenuForMember = asyncHandler(async (req, res) => {
 
 /* ========== LIST MENUS (admin/public general) ========== */
 exports.listMenus = asyncHandler(async (req, res) => {
-  const page = Math.max(parseInt(req.query.page || '1', 10), 1);
   const limit = Math.min(
     Math.max(parseInt(req.query.limit || '20', 10), 1),
     100
   );
-
-  const isBackoffice =
-    !!req.user && ['owner', 'employee'].includes(req.user.role);
-  if (!isBackoffice) req.query.isActive = 'true';
-
-  const skip = (page - 1) * limit;
   const q = (req.query.q || '').trim();
   const big = (req.query.big || '').trim().toLowerCase();
   const subId = (req.query.subId || '').trim();
   const subName = (req.query.subName || '').trim();
   const recommendedParam = (req.query.recommended || '').toLowerCase();
-
   const sortBy = String(req.query.sortBy || 'name');
   const sortDir =
     String(req.query.sortDir || 'asc').toLowerCase() === 'desc' ? -1 : 1;
-
   const isActiveParam = (req.query.isActive || '').toLowerCase();
+  const cursor = req.query.cursor; // ISO date
+
+  const isBackoffice =
+    !!req.user && ['owner', 'employee'].includes(req.user.role);
+  if (!isBackoffice) req.query.isActive = 'true';
+
   const filter = {};
-
-  const calcFinalPrice = (price = {}) => {
-    const original = Number(price.original || 0);
-    const mode = price.discountMode || 'none';
-    const discPercent = Number(price.discountPercent || 0);
-    const manualPromo = Number(price.manualPromoPrice || 0);
-
-    if (mode === 'manual' && manualPromo > 0) return manualPromo;
-    if (mode === 'percent' && discPercent > 0 && discPercent < 100) {
-      return Math.round(original * (1 - discPercent / 100));
-    }
-    return original;
-  };
-
-  const ppnRateRaw = typeof parsePpnRate === 'function' ? parsePpnRate() : 0.11;
-  const ppnRate =
-    Number.isFinite(ppnRateRaw) && ppnRateRaw >= 0 ? ppnRateRaw : 0.11;
-
-  const attachDisplayPrices = (items) =>
-    items.map((m) => {
-      const baseFinal =
-        typeof m.price_final === 'number'
-          ? m.price_final
-          : calcFinalPrice(m.price || {});
-      const taxAmount = Math.round(Math.max(0, baseFinal * ppnRate));
-      const priceWithTax = baseFinal + taxAmount;
-      return { ...m, price_final: baseFinal, price_with_tax: priceWithTax };
-    });
 
   if (q) {
     filter.$or = [
@@ -648,12 +617,19 @@ exports.listMenus = asyncHandler(async (req, res) => {
       return res.json({
         success: true,
         data: [],
-        paging: { page, limit, total: 0, pages: 1 }
+        paging: { next_cursor: null, limit, total: 0, pages: 1 }
       });
     }
     filter.subcategory = sub._id;
   }
 
+  // cursor: createdAt < cursor
+  if (cursor) {
+    const d = new Date(cursor);
+    if (!isNaN(d.getTime())) filter.createdAt = { $lt: d };
+  }
+
+  // if sorting by price.final we still compute price_final in aggregation but we will still paginate by createdAt
   if (sortBy === 'price.final') {
     const pipeline = [
       { $match: filter },
@@ -702,27 +678,39 @@ exports.listMenus = asyncHandler(async (req, res) => {
           }
         }
       },
-      { $sort: { price_final: sortDir, isRecommended: -1, name: 1, _id: 1 } },
-      { $skip: skip },
-      { $limit: limit }
+      {
+        $sort: {
+          price_final: sortDir,
+          isRecommended: -1,
+          name: 1,
+          createdAt: -1
+        }
+      },
+      { $limit: limit + 1 }
     ];
 
-    const [rawItems, total] = await Promise.all([
-      Menu.aggregate(pipeline),
-      Menu.countDocuments(filter)
-    ]);
-
-    const rawWithSubs = await attachSubcategoriesToRawItems(rawItems);
+    const rawItems = await Menu.aggregate(pipeline).allowDiskUse(true);
+    const rawWithSubs = await attachSubcategoriesToRawItems(
+      rawItems.slice(0, limit)
+    );
     const items = attachDisplayPrices(rawWithSubs);
+
+    const next_cursor =
+      rawItems.length > limit
+        ? rawItems[limit - 1].createdAt
+          ? new Date(rawItems[limit - 1].createdAt).toISOString()
+          : null
+        : null;
 
     return res.json({
       success: true,
       data: items,
-      paging: { page, limit, total, pages: Math.ceil(total / limit) || 1 }
+      paging: { limit, next_cursor }
     });
   }
 
-  const sort = {};
+  // other sorts: use simple find with createdAt cursor
+  const sortObj = {};
   if (
     [
       'name',
@@ -732,30 +720,33 @@ exports.listMenus = asyncHandler(async (req, res) => {
       'isRecommended'
     ].includes(sortBy)
   ) {
-    sort[sortBy] = sortDir;
+    sortObj[sortBy] = sortDir;
   } else {
-    sort['name'] = 1;
+    sortObj['name'] = 1;
   }
 
-  const [rawItems, total] = await Promise.all([
+  const [rawItems] = await Promise.all([
     Menu.find(filter)
       .populate({
         path: 'subcategory',
         select: '_id name nameLower bigCategory sortOrder'
       })
-      .sort(sort)
-      .skip(skip)
-      .limit(limit)
-      .lean({ virtuals: true }),
-    Menu.countDocuments(filter)
+      .sort({ createdAt: -1 })
+      .limit(limit + 1)
+      .lean({ virtuals: true })
   ]);
 
-  const items = attachDisplayPrices(rawItems);
+  const slice = rawItems.slice(0, limit);
+  const items = attachDisplayPrices(slice);
+  const next_cursor =
+    rawItems.length > limit
+      ? new Date(rawItems[limit - 1].createdAt).toISOString()
+      : null;
 
   res.json({
     success: true,
     data: items,
-    paging: { page, limit, total, pages: Math.ceil(total / limit) || 1 }
+    paging: { limit, next_cursor }
   });
 });
 
