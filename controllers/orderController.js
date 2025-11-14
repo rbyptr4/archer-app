@@ -2367,7 +2367,7 @@ exports.listOrders = asyncHandler(async (req, res) => {
     )
     .sort({ createdAt: -1 })
     .limit(lim)
-    .populate({ path: 'member', select: 'name' })
+    .populate({ path: 'member', select: 'name phone' })
     .lean();
 
   // Map ke bentuk yang lebih frontend-friendly / kecil
@@ -2378,7 +2378,7 @@ exports.listOrders = asyncHandler(async (req, res) => {
     grand_total: Number(o.grand_total || 0),
     fulfillment_type: o.fulfillment_type || null, // 'dine_in' | 'delivery'
     customer_name: (o.member && o.member.name) || o.customer_name || '',
-    customer_phone: o.customer_phone || '',
+    customer_phone: (o.member && o.member.phone) || o.customer_name || '',
     placed_at: o.placed_at || o.createdAt || null,
     table_number:
       o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
@@ -2395,9 +2395,6 @@ exports.listOrders = asyncHandler(async (req, res) => {
         : null,
     // delivery slot label / scheduled_at
     delivery_slot_label: o.delivery ? o.delivery.slot_label || null : null,
-    delivery_scheduled_at: o.delivery ? o.delivery.scheduled_at || null : null,
-    // lightweight delivery status (for Delivery Board)
-    delivery_status: o.delivery ? o.delivery.status || null : null,
     // minimal member reference for UI linking (if needed)
     member_id: o.member ? String(o.member._id) : null
   }));
