@@ -2374,7 +2374,7 @@ exports.listOrders = asyncHandler(async (req, res) => {
   const items = (Array.isArray(raw) ? raw : []).map((o) => ({
     id: String(o._id),
     transaction_code: o.transaction_code || '',
-    delivery_mode: o.delivery_mode || '',
+    delivery_mode: o.delivery.mode || '',
     grand_total: Number(o.grand_total || 0),
     fulfillment_type: o.fulfillment_type || null, // 'dine_in' | 'delivery'
     customer_name: (o.member && o.member.name) || o.customer_name || '',
@@ -2930,7 +2930,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           verified_by: req.user?.id || null,
           verified_at: now,
 
-          status: 'created',
+          status: 'accepted',
           placed_at: now
         });
       } catch (e) {
