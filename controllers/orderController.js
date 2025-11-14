@@ -2374,18 +2374,24 @@ exports.listOrders = asyncHandler(async (req, res) => {
   const items = (Array.isArray(raw) ? raw : []).map((o) => ({
     id: String(o._id),
     transaction_code: o.transaction_code || '',
-    delivery_mode: o.delivery.mode || '',
+    // aman: pakai optional chaining, fallback berdasarkan fulfillment_type
+    delivery_mode:
+      (o.delivery && o.delivery.mode) ||
+      o.delivery?.mode ||
+      (o.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
     grand_total: Number(o.grand_total || 0),
     fulfillment_type: o.fulfillment_type || null, // 'dine_in' | 'delivery'
     customer_name: (o.member && o.member.name) || o.customer_name || '',
-    customer_phone: (o.member && o.member.phone) || o.customer_name || '',
+    // perbaikan: gunakan customer_phone fallback ke field yg benar
+    customer_phone:
+      (o.member && o.member.phone) || o.customer_phone || '',
+    // gunakan createdAt karena kamu sort by createdAt
     placed_at: o.placed_at || o.createdAt || null,
     table_number:
       o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
     payment_status: o.payment_status || null,
     status: o.status || null, // created|accepted|completed|cancelled
     total_quantity: Number(o.total_quantity || 0),
-    // pickup window (if exists)
     pickup_window:
       o.delivery && o.delivery.pickup_window
         ? {
@@ -2393,17 +2399,17 @@ exports.listOrders = asyncHandler(async (req, res) => {
             to: o.delivery.pickup_window.to || null
           }
         : null,
-    // delivery slot label / scheduled_at
     delivery_slot_label: o.delivery ? o.delivery.slot_label || null : null,
-    // minimal member reference for UI linking (if needed)
     member_id: o.member ? String(o.member._id) : null
   }));
-
+  
   return res.status(200).json({
     items,
-    next_cursor: items.length ? items[items.length - 1].placed_at : null
+    // next_cursor harus konsisten: kamu sort({ createdAt: -1 }) -> ambil last createdAt
+    next_cursor: items.length
+      ? new Date(items[items.length - 1].placed_at || raw[items.length - 1].createdAt).toISOString()
+      : null
   });
-});
 
 exports.getDetailOrder = asyncHandler(async (req, res) => {
   const id = req.params.id;
