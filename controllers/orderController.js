@@ -1254,28 +1254,6 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
 
 /* ===================== CHECKOUT ===================== */
 exports.checkout = asyncHandler(async (req, res) => {
-  // helper logging minimal
-  const util = require('util');
-  function log(label, obj) {
-    try {
-      console.log(
-        `>>> ${label}: ${JSON.stringify(
-          obj,
-          (k, v) => {
-            if (v && typeof v === 'object' && v._bsontype === 'ObjectID')
-              return String(v);
-            if (v instanceof Date) return v.toISOString();
-            return v;
-          },
-          2
-        )}`
-      );
-    } catch (e) {
-      console.log(`>>> ${label}:`, util.inspect(obj, { depth: null }));
-    }
-  }
-
-  const iden0 = getIdentity(req);
   const {
     name,
     phone,
@@ -1285,6 +1263,8 @@ exports.checkout = asyncHandler(async (req, res) => {
     voucherClaimIds = [],
     register_decision = 'register'
   } = req.body || {};
+
+  const iden0 = getIdentity(req);
 
   const ft =
     iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
@@ -1335,15 +1315,16 @@ exports.checkout = asyncHandler(async (req, res) => {
     allowCreateOnline: false
   });
   if (!cartObj) throwError('Cart tidak ditemukan / kosong', 404);
-  const cart = await Cart.findById(cartObj._1 || cartObj._id); // accommodate different shapes
+  const cart = await Cart.findById(cartObj._1 || cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan / kosong', 404);
   if (!cart.items?.length) throwError('Cart kosong', 400);
 
-  // --- simplified delivery / slot handling (as before) ---
+  // delivery / slot / pickup handling
   const delivery_mode =
     ft === 'dine_in'
       ? 'none'
       : String(req.body?.delivery_mode || 'delivery').toLowerCase();
+
   const providedSlot = (req.body?.delivery_slot || '').trim();
   const providedScheduledAtRaw = req.body?.scheduled_at || null;
   const providedScheduledAt = providedScheduledAtRaw
@@ -1383,6 +1364,33 @@ exports.checkout = asyncHandler(async (req, res) => {
     status: 'pending'
   };
 
+  // HANDLE PICKUP WINDOW (baru)
+  // frontend bisa kirim: pickup_from, pickup_to (string dates) atau pickupWindow: {from,to}
+  const pickupFromRaw =
+    req.body?.pickup_from || req.body?.pickupWindow?.from || null;
+  const pickupToRaw = req.body?.pickup_to || req.body?.pickupWindow?.to || null;
+
+  if (delivery_mode === 'pickup') {
+    deliveryObj.mode = 'pickup';
+    deliveryObj.status = 'pending';
+    // parse pickup window jika ada
+    if (pickupFromRaw) {
+      const pf = dayjs(pickupFromRaw).tz(LOCAL_TZ);
+      if (!pf.isValid()) throwError('pickup_from tidak valid', 400);
+      deliveryObj.pickup_window = deliveryObj.pickup_window || {};
+      deliveryObj.pickup_window.from = pf.toDate();
+    }
+    if (pickupToRaw) {
+      const pt = dayjs(pickupToRaw).tz(LOCAL_TZ);
+      if (!pt.isValid()) throwError('pickup_to tidak valid', 400);
+      deliveryObj.pickup_window = deliveryObj.pickup_window || {};
+      deliveryObj.pickup_window.to = pt.toDate();
+    }
+    // jika frontend kirim slot_label untuk pickup, pertahankan slot_label
+    if (providedSlot) deliveryObj.slot_label = slotLabel || providedSlot;
+    if (slotDt) deliveryObj.scheduled_at = slotDt.toDate();
+  }
+
   if (delivery_mode === 'delivery' && ft !== 'dine_in') {
     const latN = Number(req.body?.lat);
     const lngN = Number(req.body?.lng);
@@ -1394,15 +1402,14 @@ exports.checkout = asyncHandler(async (req, res) => {
     deliveryObj.address_text = String(req.body?.address_text || '').trim();
     deliveryObj.location = { lat: latN, lng: lngN };
     deliveryObj.distance_km = Number(distance_km.toFixed(2));
-    // calc local raw delivery as fallback
-    const localDeliveryCalc = calcDeliveryFee(); // asumsi ada
+    const localDeliveryCalc = calcDeliveryFee();
     deliveryObj.delivery_fee = localDeliveryCalc;
     deliveryObj.delivery_fee_raw = localDeliveryCalc;
   } else {
     deliveryObj.note_to_rider = String(req.body?.note_to_rider || '');
   }
 
-  // normalisasi item seperti sebelumnya
+  // normalisasi item
   cart.items = (Array.isArray(cart.items) ? cart.items : [])
     .filter(Boolean)
     .map((it) => {
@@ -1434,7 +1441,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
-  // ===== VOUCHER: filter eligibleClaimIds untuk engine =====
+  // VOUCHER filtering seperti sebelumnya
   let eligibleClaimIds = [];
   if (MemberDoc) {
     if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
@@ -1452,13 +1459,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Voucher hanya untuk member. Silakan daftar/login.', 400);
   }
 
-  // LOG penting: input voucher ke engine
-  log('VOUCHER_INPUT', {
-    req_voucherClaimIds: voucherClaimIds,
-    eligibleClaimIds
-  });
-
-  // ===== Hit price engine =====
+  // price engine
   let priced;
   try {
     priced = await validateAndPrice({
@@ -1484,40 +1485,27 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
-  // LOG penting: hasil engine
-  log('PRICE_ENGINE_RESULT', {
-    totals: priced?.totals || null,
-    chosenClaimIds: priced?.chosenClaimIds || null,
-    breakdown: priced?.breakdown || null
-  });
-
-  // ===== Ambil totals dari engine (safe read) =====
+  // ambil totals dari engine
   const baseItemsSubtotal = int(priced.totals?.baseSubtotal || 0);
-  const items_discount = int(priced.totals?.itemsDiscount || 0); // diskon item
-  const shipping_discount = int(priced.totals?.shippingDiscount || 0); // diskon ongkir
-  const reportedDelivery = int(priced.totals?.deliveryFee || 0); // engine deliveryFee (biasanya net or gross)
+  const items_discount = int(priced.totals?.itemsDiscount || 0);
+  const shipping_discount = int(priced.totals?.shippingDiscount || 0);
+  const reportedDelivery = int(priced.totals?.deliveryFee || 0);
   const engineGrand = priced.totals?.grandTotal ?? null;
 
-  // Tentukan delivery net: jika engine laporkan shipping_discount, kurangi reportedDelivery
-  // beberapa engine jadi: reportedDelivery = gross, shipping_discount terpisah => net = max(0, reportedDelivery - shipping_discount)
   const delivery_fee_net = Math.max(0, reportedDelivery - shipping_discount);
 
-  // pastikan kita menyimpan juga delivery_fee_raw untuk audit (nilai sebelum voucher)
   if (
     typeof deliveryObj.delivery_fee_raw === 'undefined' ||
     deliveryObj.delivery_fee_raw === null
   ) {
-    // fallback: gunakan reportedDelivery + shipping_discount (anggap reportedDelivery mungkin sudah net)
     deliveryObj.delivery_fee_raw = int(
       reportedDelivery + shipping_discount || deliveryObj.delivery_fee || 0
     );
   }
 
-  // set deliveryObj ke net yang akan disimpan
   deliveryObj.delivery_fee = int(delivery_fee_net);
   deliveryObj.shipping_discount = int(shipping_discount || 0);
 
-  // items subtotal after discount (dipakai utk service & tax)
   const items_subtotal_after_discount = Math.max(
     0,
     baseItemsSubtotal - items_discount
@@ -1529,16 +1517,14 @@ exports.checkout = asyncHandler(async (req, res) => {
   const taxAmount = int(Math.round(items_subtotal_after_discount * rateForTax));
   const taxRatePercent = Math.round(rateForTax * 100 * 100) / 100;
 
-  // Perhitungan beforeRound: gunakan delivery net
   const beforeRound = int(
     items_subtotal_after_discount +
       service_fee +
       deliveryObj.delivery_fee -
-      shipping_discount + // tetap kurangi shipping_discount bila engine mengembalikannya terpisah (aman)
+      shipping_discount +
       taxAmount
   );
 
-  // Prioritaskan grand total dari engine jika tersedia; jika tidak pakai rounding lokal
   const requested_bvt = engineGrand
     ? int(engineGrand)
     : int(roundRupiahCustom(beforeRound));
@@ -1546,14 +1532,13 @@ exports.checkout = asyncHandler(async (req, res) => {
 
   if (requested_bvt <= 0) throwError('Total pembayaran tidak valid.', 400);
 
-  // ambil bukti transfer jika ada
+  // payment proof
   const payment_proof_url = await handleTransferProofIfAny(req, method);
 
-  // build uiTotals dari nilai engine / perhitungan konsisten
   const uiTotals = {
     items_subtotal: int(baseItemsSubtotal),
     items_discount: int(items_discount || 0),
-    delivery_fee: int(deliveryObj.delivery_fee || 0), // net delivery
+    delivery_fee: int(deliveryObj.delivery_fee || 0),
     shipping_discount: int(shipping_discount || 0),
     service_fee: int(service_fee || 0),
     tax_rate_percent: Number(taxRatePercent || 0),
@@ -1564,15 +1549,11 @@ exports.checkout = asyncHandler(async (req, res) => {
     discounts: priced.breakdown || []
   };
 
-  // simpan applied voucher ids dari engine (bila ada)
   const appliedVoucherIds = Array.isArray(priced.chosenClaimIds)
     ? priced.chosenClaimIds
     : [];
 
-  // LOG penting: uiTotals + applied vouchers
-  log('UI_TOTALS_FINAL', { uiTotals, appliedVoucherIds, deliveryObj });
-
-  // ===== Buat Order (mapping voucher & totals secara konsisten) =====
+  // create order (sama seperti sebelumnya), pastikan deliveryObj termasuk pickup_window jika ada
   const order = await (async () => {
     for (let i = 0; i < 5; i++) {
       try {
@@ -1598,24 +1579,20 @@ exports.checkout = asyncHandler(async (req, res) => {
             category: it.category || null
           })),
 
-          // SIMPAN nilai surcharge/discount dari uiTotals (yang bersumber dari engine)
           items_subtotal: int(uiTotals.items_subtotal),
           items_discount: int(uiTotals.items_discount),
-          delivery_fee: int(uiTotals.delivery_fee), // net delivery
+          delivery_fee: int(uiTotals.delivery_fee),
           shipping_discount: int(uiTotals.shipping_discount),
 
-          // breakdown voucher & applied voucher ids
           discounts: uiTotals.discounts || priced.breakdown || [],
           applied_voucher_ids: appliedVoucherIds || [],
 
-          // fees & totals
           service_fee: int(uiTotals.service_fee),
           tax_rate_percent: Number(uiTotals.tax_rate_percent),
           tax_amount: int(uiTotals.tax_amount),
           rounding_delta: int(uiTotals.rounding_delta),
           grand_total: int(uiTotals.grand_total),
 
-          // Payment
           payment_method: method,
           payment_provider:
             method === PM.QRIS && !QRIS_USE_STATIC ? 'xendit' : null,
@@ -1632,7 +1609,6 @@ exports.checkout = asyncHandler(async (req, res) => {
           status: 'created',
           placed_at: new Date(),
 
-          // nested delivery — gunakan deliveryObj yang sudah disinkronkan ke net
           delivery: {
             ...deliveryObj,
             delivery_fee: int(uiTotals.delivery_fee),
@@ -1654,13 +1630,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Gagal generate transaction_code unik', 500);
   })();
 
-  // LOG ringkas: order dibuat
-  log('ORDER_CREATED', {
-    id: order._id,
-    transaction_code: order.transaction_code
-  });
-
-  // konsumsi voucher (kurangi remainingUse jika perlu)
+  // konsumsi voucher (non-fatal)
   if (MemberDoc) {
     for (const claimId of priced.chosenClaimIds || []) {
       try {
@@ -1720,14 +1690,13 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // snapshot order utk histori (non-fatal)
+  // snapshot order (non-fatal)
   try {
     await snapshotOrder(order._id, { uiTotals }).catch(() => {});
   } catch (e) {
     console.error('[OrderHistory][checkout]', e?.message || e);
   }
 
-  // response: kembalikan order + uiTotals agar frontend pasti punya angka yang sama
   res.status(201).json({
     order: order.toObject(),
     uiTotals,
