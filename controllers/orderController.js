@@ -2363,7 +2363,7 @@ exports.listOrders = asyncHandler(async (req, res) => {
   // note: include member.name via populate (light)
   const raw = await Order.find(q)
     .select(
-      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt'
+      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt delivery_mode'
     )
     .sort({ createdAt: -1 })
     .limit(lim)
@@ -2682,19 +2682,26 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
   const { limit = 100, cursor } = req.query || {};
+  const lim = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 200);
+
   const q = {
     status: 'accepted',
     payment_status: 'verified'
   };
 
-  if (cursor) q.createdAt = { $lt: new Date(cursor) };
-
-  const lim = Math.min(parseInt(limit, 10) || 100, 200);
+  // gunakan placed_at konsisten untuk cursor (karena kita sort berdasarkan placed_at)
+  if (cursor) {
+    const cDate = new Date(cursor);
+    if (isNaN(cDate.getTime()))
+      throwError('cursor tidak valid (harus ISO date)', 400);
+    // sort ascending (oldest first) => untuk halaman berikutnya ambil yang lebih baru
+    q.placed_at = { $gt: cDate };
+  }
 
   // Ambil field ringkas + full items
   const raw = await Order.find(q)
     .select(
-      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt items delivery'
+      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label delivery.scheduled_at delivery.status status member createdAt items'
     )
     .sort({ placed_at: 1 }) // kitchen: oldest orders first (FIFO)
     .limit(lim)
@@ -2702,14 +2709,8 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
     .lean();
 
   const items = (Array.isArray(raw) ? raw : []).map((o) => {
-    const deliveryMode =
-      o.delivery_mode !== undefined && o.delivery_mode !== null
-        ? o.delivery_mode
-        : o.delivery
-        ? o.delivery.mode || null
-        : null;
+    const deliveryMode = o.delivery ? o.delivery.mode || null : null;
 
-    // Map full items: include semua detail yang kitchen butuh
     const orderItems = (Array.isArray(o.items) ? o.items : []).map((it) => ({
       menu: it.menu ? String(it.menu) : null,
       name: it.name || '',
@@ -2731,7 +2732,7 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
       id: String(o._id),
       transaction_code: o.transaction_code || '',
       grand_total: Number(o.grand_total || 0),
-      fulfillment_type: o.fulfillment_type || null, // 'dine_in' | 'delivery'
+      fulfillment_type: o.fulfillment_type || null,
       delivery_mode:
         deliveryMode ||
         (o.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
@@ -2741,7 +2742,7 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
       table_number:
         o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
       payment_status: o.payment_status || null,
-      status: o.status || null, // created|accepted|completed|cancelled
+      status: o.status || null,
       total_quantity: Number(o.total_quantity || 0),
       pickup_window:
         o.delivery && o.delivery.pickup_window
@@ -2756,15 +2757,16 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
         : null,
       delivery_status: o.delivery ? o.delivery.status || null : null,
       member_id: o.member ? String(o.member._id) : null,
-
-      // full items payload untuk kitchen
       items: orderItems
     };
   });
 
+  // next_cursor: last item placed_at (as ISO) — frontend harus pakai value ini di request selanjutnya
   return res.status(200).json({
     items,
-    next_cursor: items.length ? items[items.length - 1].placed_at : null
+    next_cursor: items.length
+      ? new Date(items[items.length - 1].placed_at).toISOString()
+      : null
   });
 });
 
