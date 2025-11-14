@@ -1586,7 +1586,6 @@ exports.checkout = asyncHandler(async (req, res) => {
           source: iden.source || 'online',
           fulfillment_type: ft,
           transaction_code: code,
-
           items: cart.items.map((it) => ({
             menu: it.menu,
             menu_code: it.menu_code,
@@ -2357,6 +2356,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
 /* ===================== STAFF / OWNER ENDPOINTS ===================== */
 exports.listOrders = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
+
   const {
     status,
     payment_status,
@@ -2387,14 +2387,55 @@ exports.listOrders = asyncHandler(async (req, res) => {
   }
   if (cursor) q.createdAt = { ...(q.createdAt || {}), $lt: new Date(cursor) };
 
-  const items = await Order.find(q)
+  // safety cap limit
+  const lim = Math.min(parseInt(limit, 10) || 50, 200);
+
+  // Pilih hanya field yang diperlukan untuk response ringkas
+  // note: include member.name via populate (light)
+  const raw = await Order.find(q)
+    .select(
+      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt'
+    )
     .sort({ createdAt: -1 })
-    .limit(Math.min(parseInt(limit, 10) || 50, 200))
+    .limit(lim)
+    .populate({ path: 'member', select: 'name' })
     .lean();
 
-  res.status(200).json({
+  // Map ke bentuk yang lebih frontend-friendly / kecil
+  const items = (Array.isArray(raw) ? raw : []).map((o) => ({
+    id: String(o._id),
+    transaction_code: o.transaction_code || '',
+    delivery_mode: o.delivery_mode || '',
+    grand_total: Number(o.grand_total || 0),
+    fulfillment_type: o.fulfillment_type || null, // 'dine_in' | 'delivery'
+    customer_name: (o.member && o.member.name) || o.customer_name || '',
+    customer_phone: o.customer_phone || '',
+    placed_at: o.placed_at || o.createdAt || null,
+    table_number:
+      o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
+    payment_status: o.payment_status || null,
+    status: o.status || null, // created|accepted|completed|cancelled
+    total_quantity: Number(o.total_quantity || 0),
+    // pickup window (if exists)
+    pickup_window:
+      o.delivery && o.delivery.pickup_window
+        ? {
+            from: o.delivery.pickup_window.from || null,
+            to: o.delivery.pickup_window.to || null
+          }
+        : null,
+    // delivery slot label / scheduled_at
+    delivery_slot_label: o.delivery ? o.delivery.slot_label || null : null,
+    delivery_scheduled_at: o.delivery ? o.delivery.scheduled_at || null : null,
+    // lightweight delivery status (for Delivery Board)
+    delivery_status: o.delivery ? o.delivery.status || null : null,
+    // minimal member reference for UI linking (if needed)
+    member_id: o.member ? String(o.member._id) : null
+  }));
+
+  return res.status(200).json({
     items,
-    next_cursor: items.length ? items[items.length - 1].createdAt : null
+    next_cursor: items.length ? items[items.length - 1].placed_at : null
   });
 });
 
@@ -2671,14 +2712,94 @@ exports.getOrderReceipt = asyncHandler(async (req, res) => {
   });
 });
 
-exports.listKitchenOrders = asyncHandler(async (_req, res) => {
-  const items = await Order.find({
+exports.listKitchenOrders = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const { limit = 100, cursor } = req.query || {};
+  const q = {
     status: 'accepted',
     payment_status: 'verified'
-  })
-    .sort({ placed_at: 1 })
+  };
+
+  if (cursor) q.createdAt = { $lt: new Date(cursor) };
+
+  const lim = Math.min(parseInt(limit, 10) || 100, 200);
+
+  // Ambil field ringkas + full items
+  const raw = await Order.find(q)
+    .select(
+      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt items delivery'
+    )
+    .sort({ placed_at: 1 }) // kitchen: oldest orders first (FIFO)
+    .limit(lim)
+    .populate({ path: 'member', select: 'name' })
     .lean();
-  res.status(200).json({ items });
+
+  const items = (Array.isArray(raw) ? raw : []).map((o) => {
+    const deliveryMode =
+      o.delivery_mode !== undefined && o.delivery_mode !== null
+        ? o.delivery_mode
+        : o.delivery
+        ? o.delivery.mode || null
+        : null;
+
+    // Map full items: include semua detail yang kitchen butuh
+    const orderItems = (Array.isArray(o.items) ? o.items : []).map((it) => ({
+      menu: it.menu ? String(it.menu) : null,
+      name: it.name || '',
+      menu_code: it.menu_code || '',
+      quantity: Number(it.quantity || 0),
+      base_price: Number(it.base_price || 0),
+      addons: Array.isArray(it.addons)
+        ? it.addons.map((a) => ({
+            name: a.name || '',
+            price: Number(a.price || 0),
+            qty: Number(a.qty || 1)
+          }))
+        : [],
+      notes: it.notes || '',
+      line_subtotal: Number(it.line_subtotal || 0)
+    }));
+
+    return {
+      id: String(o._id),
+      transaction_code: o.transaction_code || '',
+      grand_total: Number(o.grand_total || 0),
+      fulfillment_type: o.fulfillment_type || null, // 'dine_in' | 'delivery'
+      delivery_mode:
+        deliveryMode ||
+        (o.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
+      customer_name: (o.member && o.member.name) || o.customer_name || '',
+      customer_phone: o.customer_phone || '',
+      placed_at: o.placed_at || o.createdAt || null,
+      table_number:
+        o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
+      payment_status: o.payment_status || null,
+      status: o.status || null, // created|accepted|completed|cancelled
+      total_quantity: Number(o.total_quantity || 0),
+      pickup_window:
+        o.delivery && o.delivery.pickup_window
+          ? {
+              from: o.delivery.pickup_window.from || null,
+              to: o.delivery.pickup_window.to || null
+            }
+          : null,
+      delivery_slot_label: o.delivery ? o.delivery.slot_label || null : null,
+      delivery_scheduled_at: o.delivery
+        ? o.delivery.scheduled_at || null
+        : null,
+      delivery_status: o.delivery ? o.delivery.status || null : null,
+      member_id: o.member ? String(o.member._id) : null,
+
+      // full items payload untuk kitchen
+      items: orderItems
+    };
+  });
+
+  return res.status(200).json({
+    items,
+    next_cursor: items.length ? items[items.length - 1].placed_at : null
+  });
 });
 
 /* ===================== POS DINE-IN (staff) ===================== */
@@ -3012,6 +3133,7 @@ exports.completeOrder = asyncHandler(async (req, res) => {
   const order = await Order.findById(req.params.id);
   if (!order) throwError('Data order tidak ditemukan', 404);
 
+  // hanya pesanan yang sudah diterima yang bisa diselesaikan
   if (order.status !== 'accepted') {
     throwError(
       'Hanya pesanan dengan status diterima yang bisa diselesaikan',
@@ -3019,8 +3141,27 @@ exports.completeOrder = asyncHandler(async (req, res) => {
     );
   }
 
+  // Khusus untuk delivery: pastikan delivery.status sudah 'delivered'
+  if (
+    order.fulfillment_type === 'delivery' &&
+    order.delivery.mode === 'delivery'
+  ) {
+    if (!order.delivery) {
+      throwError('Order ini tidak memiliki informasi delivery', 409);
+    }
+    const dStatus = order.delivery.status || 'pending';
+    if (dStatus !== 'delivered') {
+      throwError(
+        'Untuk order delivery, status pengantaran harus "delivered" sebelum menandai pesanan selesai',
+        409
+      );
+    }
+  }
+
+  // Jika lolos semua validasi, ubah status menjadi completed
   order.status = 'completed';
   await order.save();
+
   // history: order completed
   try {
     await recordOrderHistory(order._id, 'order_status', req.user, {
@@ -3042,6 +3183,7 @@ exports.completeOrder = asyncHandler(async (req, res) => {
     transaction_code: order.transaction_code,
     status: order.status
   };
+
   try {
     emitToStaff('order:completed', payload);
     emitToCashier('order:completed', payload);
@@ -3055,7 +3197,10 @@ exports.completeOrder = asyncHandler(async (req, res) => {
     console.error('[emit][completeOrder]', err?.message || err);
   }
 
-  res.status(200).json({ message: 'Pesanan selesai', order });
+  // return up-to-date order object
+  return res
+    .status(200)
+    .json({ message: 'Pesanan selesai', order: order.toObject() });
 });
 
 exports.acceptAndVerify = asyncHandler(async (req, res) => {
@@ -3181,13 +3326,18 @@ exports.assignDelivery = asyncHandler(async (req, res) => {
   }
 
   const now = new Date();
+  // build courier subdoc following new schema: courier.user, courier.name, courier.phone
+  const courierObj = {
+    user: courier_id || null,
+    name: String(courier_name || '').trim(),
+    phone: toWa62(courier_phone)
+  };
+
+  // set both timestamps.assigned_at and keep legacy assigned_at for compatibility
   const $set = {
     'delivery.status': 'assigned',
-    'delivery.courier': {
-      id: courier_id || null,
-      name: String(courier_name || '').trim(),
-      phone: toWa62(courier_phone)
-    },
+    'delivery.courier': courierObj,
+    'delivery.timestamps.assigned_at': now,
     'delivery.assigned_at': now
   };
   if (note) $set['delivery.assign_note'] = String(note).trim();
@@ -3204,7 +3354,11 @@ exports.assignDelivery = asyncHandler(async (req, res) => {
     delivery: {
       status: updated.delivery?.status,
       courier: updated.delivery?.courier,
-      assigned_at: updated.delivery?.assigned_at
+      assigned_at:
+        (updated.delivery?.timestamps &&
+          updated.delivery.timestamps.assigned_at) ||
+        updated.delivery?.assigned_at ||
+        null
     }
   };
 
@@ -3217,13 +3371,10 @@ exports.assignDelivery = asyncHandler(async (req, res) => {
     if (updated.guestToken)
       emitToGuest(updated.guestToken, 'order:delivery_assigned', payload);
 
-    // emit ke kurir personal kalau ada id
-    if (updated.delivery?.courier?.id) {
-      emitToCourier(
-        String(updated.delivery.courier.id),
-        'order:assign:courier',
-        payload
-      );
+    // emit ke kurir personal kalau ada courier.user (ObjectId/string)
+    const courierUserId = updated.delivery?.courier?.user;
+    if (courierUserId) {
+      emitToCourier(String(courierUserId), 'order:assign:courier', payload);
     }
   } catch (err) {
     console.error('[emit][assignDelivery]', err?.message || err);
@@ -3235,8 +3386,6 @@ exports.assignDelivery = asyncHandler(async (req, res) => {
   });
 });
 
-// POST /orders/assign-batch
-// body: { slot_label: "12:00", scheduled_at?: "2025-11-09T12:00:00+07:00", courier_id, courier_name, courier_phone, limit?: number }
 exports.assignBatch = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
@@ -3294,13 +3443,16 @@ exports.assignBatch = asyncHandler(async (req, res) => {
   }
 
   const now = new Date();
+  const courierObj = {
+    user: courier_id || null,
+    name: String(courier_name || '').trim(),
+    phone: toWa62(courier_phone)
+  };
+
   const setObj = {
     'delivery.status': 'assigned',
-    'delivery.courier': {
-      id: courier_id || null,
-      name: String(courier_name || '').trim(),
-      phone: toWa62(courier_phone)
-    },
+    'delivery.courier': courierObj,
+    'delivery.timestamps.assigned_at': now,
     'delivery.assigned_at': now
   };
   if (note) setObj['delivery.assign_note'] = String(note).trim();
@@ -3316,8 +3468,13 @@ exports.assignBatch = asyncHandler(async (req, res) => {
   emitToStaff('orders:batch_assigned', {
     slot_label,
     scheduled_at: slotDt.toISOString(),
-    courier: setObj['delivery.courier'],
-    count: updateRes.nModified || updateRes.modifiedCount || updateRes.n || 0
+    courier: courierObj,
+    count:
+      updateRes.nModified ||
+      updateRes.modifiedCount ||
+      updateRes.n ||
+      updateRes.modified ||
+      0
   });
 
   for (const u of updatedOrders) {
@@ -3327,13 +3484,16 @@ exports.assignBatch = asyncHandler(async (req, res) => {
       delivery: {
         status: u.delivery?.status,
         courier: u.delivery?.courier,
-        assigned_at: u.delivery?.assigned_at
+        assigned_at:
+          (u.delivery?.timestamps && u.delivery.timestamps.assigned_at) ||
+          u.delivery?.assigned_at ||
+          null
       }
     };
     if (u.member) emitToMember(String(u.member), 'order:delivery_assigned', p);
     if (u.guestToken) emitToGuest(u.guestToken, 'order:delivery_assigned', p);
-    if (u.delivery?.courier?.id)
-      emitToCourier(String(u.delivery.courier.id), 'order:assign:courier', p);
+    if (u.delivery?.courier?.user)
+      emitToCourier(String(u.delivery.courier.user), 'order:assign:courier', p);
   }
 
   res.json({
@@ -3651,31 +3811,42 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     null;
 
   if (!userId) {
-    throwError('Harus login sebagai kurir untuk mengakses endpoint ini', 401);
+    throwError('Harus login untuk mengakses halaman ini', 401);
   }
 
-  // pagination
-  const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+  // cursor-based (infinite scroll)
+  // cursor = ISO datetime string yang merepresentasikan last seen delivery.scheduled_at (or placed_at fallback)
+  const cursorRaw = req.query.cursor || null;
   const limit = Math.min(
     100,
-    Math.max(1, parseInt(String(req.query.limit || '20'), 10) || 20)
+    Math.max(1, parseInt(String(req.query.limit || '50'), 10) || 50)
   );
-  const skip = (page - 1) * limit;
 
   // optional: filter by delivery.status jika dikirim query ?status=assigned
   const deliveryStatus = req.query.status
     ? String(req.query.status).toLowerCase()
     : null;
 
-  // query dasar: hanya delivery orders yang assigned ke kurir ini
+  // slot filters
+  const slotLabel = req.query.slot_label
+    ? String(req.query.slot_label).trim()
+    : null;
+  const scheduledFromRaw = req.query.scheduled_from || null;
+  const scheduledToRaw = req.query.scheduled_to || null;
+  const scheduledDate = req.query.scheduled_date || null; // YYYY-MM-DD
+
+  // query dasar: hanya delivery orders yang assigned to this courier (or past assigned)
+  // support both new field delivery.courier.user and possible legacy shapes
   const q = {
     fulfillment_type: 'delivery',
     'delivery.mode': 'delivery',
-    // support dua pola: assignee.user bisa string id atau object with id
+    // search courier.user or legacy courier.id or legacy assignee.user
     $or: [
-      { 'delivery.assignee.user': userId },
-      { 'delivery.assignee.user.id': userId },
-      { 'delivery.courier.id': userId } // fallback jika disimpan di courier
+      { 'delivery.courier.user': userId },
+      { 'delivery.courier.user.id': userId },
+      { 'delivery.courier.id': userId },
+      { 'delivery.assignee.user': userId }, // legacy (if still present)
+      { 'delivery.assignee.user.id': userId }
     ],
     // exclude cancelled orders by default
     status: { $ne: 'cancelled' }
@@ -3685,18 +3856,70 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     q['delivery.status'] = deliveryStatus;
   }
 
-  // count & fetch
-  const [total, orders] = await Promise.all([
-    Order.countDocuments(q),
-    Order.find(q)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .populate('member', 'name phone')
-      .populate('items.menu', 'name')
-      .lean()
-  ]);
+  // slot_label exact match
+  if (slotLabel) {
+    q['delivery.slot_label'] = slotLabel;
+  }
 
+  // scheduled_from / scheduled_to (ISO strings accepted)
+  if (scheduledFromRaw || scheduledToRaw) {
+    q['delivery.scheduled_at'] = {};
+    if (scheduledFromRaw) {
+      const d = new Date(scheduledFromRaw);
+      if (!isNaN(d.getTime())) q['delivery.scheduled_at'].$gte = d;
+    }
+    if (scheduledToRaw) {
+      const d2 = new Date(scheduledToRaw);
+      if (!isNaN(d2.getTime())) q['delivery.scheduled_at'].$lte = d2;
+    }
+    if (Object.keys(q['delivery.scheduled_at']).length === 0) {
+      delete q['delivery.scheduled_at'];
+    }
+  }
+
+  // scheduled_date convenience: treat as full-day range in UTC (00:00 - 23:59:59.999)
+  if (scheduledDate) {
+    const dayStart = new Date(`${scheduledDate}T00:00:00.000Z`);
+    const dayEnd = new Date(`${scheduledDate}T23:59:59.999Z`);
+    if (!isNaN(dayStart.getTime()) && !isNaN(dayEnd.getTime())) {
+      q['delivery.scheduled_at'] = {
+        $gte: dayStart,
+        $lte: dayEnd
+      };
+    }
+  }
+
+  // cursor: ambil records setelah cursor (ascending by delivery.scheduled_at)
+  // cursor expected: ISO string; fallback to placed_at if scheduled_at missing on docs is handled by using $and
+  if (cursorRaw) {
+    const cursorDate = new Date(cursorRaw);
+    if (!isNaN(cursorDate.getTime())) {
+      // select docs where delivery.scheduled_at > cursorDate
+      // also include docs without scheduled_at but placed_at > cursorDate (fallback)
+      q.$and = q.$and || [];
+      q.$and.push({
+        $or: [
+          { 'delivery.scheduled_at': { $gt: cursorDate } },
+          {
+            $and: [
+              { 'delivery.scheduled_at': { $exists: false } },
+              { placed_at: { $gt: cursorDate } }
+            ]
+          }
+        ]
+      });
+    }
+  }
+
+  // fetch: sort by scheduled_at asc, then createdAt asc
+  const orders = await Order.find(q)
+    .sort({ 'delivery.scheduled_at': 1, createdAt: 1 })
+    .limit(limit)
+    .populate('member', 'name phone')
+    .populate('items.menu', 'name')
+    .lean();
+
+  // map response
   const mapped = (orders || []).map((o) => ({
     _id: o._id,
     transaction_code: o.transaction_code,
@@ -3707,7 +3930,6 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     status: o.status,
     grand_total: o.grand_total,
     delivery: {
-      mode: o.delivery?.mode,
       status: o.delivery?.status,
       slot_label: o.delivery?.slot_label,
       scheduled_at: o.delivery?.scheduled_at,
@@ -3715,7 +3937,8 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
       location: o.delivery?.location,
       distance_km: o.delivery?.distance_km,
       delivery_fee: o.delivery?.delivery_fee,
-      assignee: o.delivery?.assignee || o.delivery?.courier || {}
+      // prefer new courier field, fallback to legacy assignee if present
+      courier: o.delivery?.courier || o.delivery?.assignee || {}
     },
     customer: {
       member: o.member || null,
@@ -3732,14 +3955,288 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     }))
   }));
 
+  // next_cursor: delivery.scheduled_at (or placed_at) of last item
+  let next_cursor = null;
+  if (mapped.length) {
+    const last = mapped[mapped.length - 1];
+    next_cursor =
+      last.delivery && last.delivery.scheduled_at
+        ? new Date(last.delivery.scheduled_at).toISOString()
+        : last.placed_at
+        ? new Date(last.placed_at).toISOString()
+        : null;
+  }
+
   res.json({
     ok: true,
     meta: {
-      total,
-      page,
+      count: mapped.length,
       limit,
-      pages: Math.ceil(total / limit)
+      next_cursor
     },
     data: mapped
+  });
+});
+
+exports.getPickupOrders = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const allowed = ['accepted', 'completed'];
+  const statusQ = req.query.status
+    ? String(req.query.status).toLowerCase()
+    : 'accepted';
+  if (!allowed.includes(statusQ)) {
+    throwError(
+      `Invalid status filter. Hanya diperbolehkan: ${allowed.join(', ')}`,
+      400
+    );
+  }
+
+  const cursorRaw = req.query.cursor || null;
+  const limit = Math.min(
+    100,
+    Math.max(1, parseInt(String(req.query.limit || '50'), 10) || 50)
+  );
+
+  // dasar query: fulfillment delivery + mode pickup + order.status sesuai filter
+  const q = {
+    fulfillment_type: 'delivery',
+    'delivery.mode': 'pickup',
+    status: statusQ
+    // exclude cancelled just in case
+    // note: status already restricts to accepted/completed, but keep safety
+    // explicitly exclude cancelled if statusQ not cancelled
+    // (not strictly necessary but explicit)
+    // status: statusQ
+  };
+
+  // cursor logic: cursor titik referensi = delivery.pickup_window.from OR placed_at fallback
+  if (cursorRaw) {
+    const cursorDate = new Date(cursorRaw);
+    if (!isNaN(cursorDate.getTime())) {
+      q.$and = q.$and || [];
+      q.$and.push({
+        $or: [
+          { 'delivery.pickup_window.from': { $gt: cursorDate } },
+          {
+            $and: [
+              { 'delivery.pickup_window.from': { $exists: false } },
+              { placed_at: { $gt: cursorDate } }
+            ]
+          }
+        ]
+      });
+    }
+  }
+
+  // Ambil dokumen — include full items kalau frontend butuh; ubah .select jika mau ringkas
+  const orders = await Order.find(q)
+    .select(
+      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt items'
+    )
+    .sort({ 'delivery.pickup_window.from': 1, createdAt: 1 })
+    .limit(limit)
+    .populate({ path: 'member', select: 'name' })
+    .lean();
+
+  const mapped = (orders || []).map((o) => ({
+    id: String(o._id),
+    transaction_code: o.transaction_code || '',
+    grand_total: Number(o.grand_total || 0),
+    fulfillment_type: o.fulfillment_type || null,
+    // delivery_mode not strictly needed (we know it's pickup) but include for completeness
+    delivery_mode:
+      o.delivery_mode !== undefined && o.delivery_mode !== null
+        ? o.delivery_mode
+        : o.delivery
+        ? o.delivery.mode || 'pickup'
+        : 'pickup',
+    customer_name: (o.member && o.member.name) || o.customer_name || '',
+    customer_phone: o.customer_phone || '',
+    placed_at: o.placed_at || o.createdAt || null,
+    table_number:
+      o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
+    payment_status: o.payment_status || null,
+    status: o.status || null, // accepted | completed
+    total_quantity: Number(o.total_quantity || 0),
+    pickup_window:
+      o.delivery && o.delivery.pickup_window
+        ? {
+            from: o.delivery.pickup_window.from || null,
+            to: o.delivery.pickup_window.to || null
+          }
+        : null,
+    delivery_slot_label: o.delivery ? o.delivery.slot_label || null : null,
+    // minimal delivery details useful for pickup page
+    delivery: {
+      slot_label: o.delivery?.slot_label || null,
+      pickup_window: o.delivery?.pickup_window || null,
+      note_to_rider: o.delivery?.note_to_rider || ''
+    },
+    // include items (full) as requested earlier for kitchen; frontend can ignore if not needed
+    items: (o.items || []).map((it) => ({
+      menu: it.menu ? (typeof it.menu === 'object' ? it.menu : it.menu) : null,
+      name: it.name || '',
+      menu_code: it.menu_code || '',
+      quantity: Number(it.quantity || 0),
+      base_price: Number(it.base_price || 0),
+      addons: Array.isArray(it.addons)
+        ? it.addons.map((a) => ({
+            name: a.name || '',
+            price: Number(a.price || 0),
+            qty: Number(a.qty || 1)
+          }))
+        : [],
+      notes: it.notes || '',
+      line_subtotal: Number(it.line_subtotal || 0)
+    })),
+    member_id: o.member ? String(o.member._id) : null
+  }));
+
+  // next_cursor: pickup_window.from (or placed_at) dari item terakhir
+  let next_cursor = null;
+  if (mapped.length) {
+    const last = mapped[mapped.length - 1];
+    next_cursor =
+      last.pickup_window && last.pickup_window.from
+        ? new Date(last.pickup_window.from).toISOString()
+        : last.placed_at
+        ? new Date(last.placed_at).toISOString()
+        : null;
+  }
+
+  return res.status(200).json({
+    ok: true,
+    meta: {
+      count: mapped.length,
+      limit,
+      next_cursor
+    },
+    data: mapped
+  });
+});
+
+// handlers closing shift — tambahkan di controllers/orderController.js
+// Memakai asyncHandler & throwError yang sudah ada di file
+
+/**
+ * GET /closing-shift/summary?date=YYYY-MM-DD&shift1=08:00-14:59&shift2=15:00-23:59
+ * Response: ringkasan full day + shift1 + shift2
+ */
+exports.closingShiftSummary = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  // date: YYYY-MM-DD (optional) — default hari ini di LOCAL_TZ
+  const dateQuery = String(req.query?.date || '').trim();
+  const baseDay = dateQuery
+    ? dayjs(dateQuery).tz(LOCAL_TZ)
+    : dayjs().tz(LOCAL_TZ);
+  if (!baseDay.isValid())
+    throwError('date tidak valid (gunakan YYYY-MM-DD)', 400);
+
+  // default shifts kalau tidak dikirim
+  const defaultShift1 = '00:00-14:59';
+  const defaultShift2 = '15:00-23:59';
+
+  const shift1RangeStr = String(req.query?.shift1 || defaultShift1).trim();
+  const shift2RangeStr = String(req.query?.shift2 || defaultShift2).trim();
+
+  const toRangeDayjs = (rangeStr) => {
+    const parsed = parseTimeRangeToDayjs(
+      rangeStr,
+      baseDay.format('YYYY-MM-DD')
+    );
+    if (!parsed) return null;
+    return { from: parsed.from, to: parsed.to };
+  };
+
+  const shift1 = toRangeDayjs(shift1RangeStr);
+  const shift2 = toRangeDayjs(shift2RangeStr);
+
+  if (!shift1 || !shift2)
+    throwError('Format shift tidak valid. Gunakan "HH:mm-HH:mm".', 400);
+
+  // Full day range (startOfDay..endOfDay)
+  const startOfDay = baseDay.startOf('day');
+  const endOfDay = baseDay.endOf('day');
+
+  // helper: agregasi sum per payment_method untuk suatu range (paid money)
+  const buildSummaryForRange = async (fromD, toD) => {
+    const match = {
+      payment_status: { $in: ['paid', 'verified'] },
+      paid_at: { $gte: fromD.toDate(), $lte: toD.toDate() },
+      status: { $ne: 'cancelled' }
+    };
+
+    const pipeline = [
+      { $match: match },
+      {
+        $group: {
+          _id: { $ifNull: ['$payment_method', 'unknown'] },
+          total_amount: { $sum: { $ifNull: ['$grand_total', 0] } },
+          count: { $sum: 1 }
+        }
+      }
+    ];
+
+    const rows = await Order.aggregate(pipeline).allowDiskUse(true);
+
+    // normalize result into map + compute totals
+    const methods = { transfer: 0, qris: 0, cash: 0, card: 0, unknown: 0 };
+    let total_amount = 0;
+    let total_orders = 0;
+    for (const r of rows || []) {
+      const m = String(r._id || 'unknown');
+      const amt = Number(r.total_amount || 0);
+      const cnt = Number(r.count || 0);
+      if (Object.prototype.hasOwnProperty.call(methods, m)) {
+        methods[m] = amt;
+      } else {
+        // anything else go to unknown
+        methods.unknown += amt;
+      }
+      total_amount += amt;
+      total_orders += cnt;
+    }
+
+    return {
+      range_from: fromD.toISOString(),
+      range_to: toD.toISOString(),
+      total_orders,
+      total_amount,
+      by_payment_method: methods
+    };
+  };
+
+  // compute three ranges
+  const fullDaySummary = await buildSummaryForRange(startOfDay, endOfDay);
+  const shift1Summary = await buildSummaryForRange(shift1.from, shift1.to);
+  const shift2Summary = await buildSummaryForRange(shift2.from, shift2.to);
+
+  return res.json({
+    success: true,
+    date: baseDay.format('YYYY-MM-DD'),
+    shift_definitions: {
+      shift1: shift1RangeStr,
+      shift2: shift2RangeStr,
+      // sertakan ISO ranges juga supaya jelas
+      shift1_iso: {
+        from: shift1.from.toISOString(),
+        to: shift1.to.toISOString()
+      },
+      shift2_iso: {
+        from: shift2.from.toISOString(),
+        to: shift2.to.toISOString()
+      },
+      full_day_iso: {
+        from: startOfDay.toISOString(),
+        to: endOfDay.toISOString()
+      }
+    },
+    summary: {
+      full_day: fullDaySummary,
+      shift1: shift1Summary,
+      shift2: shift2Summary
+    }
   });
 });

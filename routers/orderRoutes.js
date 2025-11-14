@@ -65,7 +65,7 @@ router.get(
   '/courier/assigned',
   validateToken,
   requireRole('owner', 'employee'),
-  requirePageAccess('orders'),
+  requirePageAccess('courier'),
   order.getAssignedDeliveries
 );
 
@@ -84,12 +84,21 @@ router.get(
   requirePageAccess('orders'),
   order.listMembers
 );
+
 router.get(
   '/today',
   validateToken,
   requireRole('owner', 'employee'),
   requirePageAccess('orders'),
   order.listTodayOrders
+);
+
+router.get(
+  '/transactions-summary',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('orders'),
+  order.closingShiftSummary
 );
 
 router.get('/my-order', authMemberRequired, order.listMyOrders);
@@ -124,6 +133,14 @@ router.get(
   requireRole('owner', 'employee'),
   requirePageAccess('kitchen'),
   order.listKitchenOrders
+);
+
+router.get(
+  '/pickup',
+  validateToken,
+  requireRole('owner', 'employee'),
+  requirePageAccess('kitchen'),
+  order.getPickupOrders
 );
 
 router.get(

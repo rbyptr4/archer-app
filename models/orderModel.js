@@ -31,7 +31,7 @@ const DeliverySchema = new mongoose.Schema(
     },
     slot_label: { type: String, trim: true, default: null },
     scheduled_at: { type: Date, default: null, index: true },
-    assignee: {
+    courier: {
       user: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'User',
@@ -101,7 +101,6 @@ const discountBreakdownSchema = new mongoose.Schema(
 const orderSchema = new mongoose.Schema(
   {
     transaction_code: { type: String, trim: true },
-
     member: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Member',
