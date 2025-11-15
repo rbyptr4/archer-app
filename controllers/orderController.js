@@ -44,6 +44,7 @@ const {
   int
 } = require('../utils/money');
 const { baseCookie } = require('../utils/authCookies');
+const { buildOrderProofFileName } = require('../utils/makeFileName');
 const {
   uploadBuffer,
   deleteFile,
@@ -274,12 +275,12 @@ function needProof(method) {
 }
 
 /* =============== Upload bukti transfer =============== */
-async function handleTransferProofIfAny(req, method) {
+async function handleTransferProofIfAny(req, method, opts = {}) {
   if (!needProof(method)) return '';
 
   const file = req.file;
   if (!file) {
-    // pesan disesuaikan berdasarkan method supaya FE jelas
+    // pesan disesuaikan supaya FE tahu kenapa gagal
     if (method === PM.TRANSFER) {
       throwError('Bukti transfer wajib diunggah untuk metode transfer', 400);
     } else if (method === PM.QRIS) {
@@ -292,20 +293,59 @@ async function handleTransferProofIfAny(req, method) {
     }
   }
 
+  const mime = (file.mimetype || '').toLowerCase();
+
   const folderId = getDriveFolder('invoice');
-  const prefix =
-    method === PM.TRANSFER ? 'TRF_' : method === PM.QRIS ? 'QRIS_' : 'PAY_';
-  const filename =
-    prefix + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
 
-  const uploaded = await uploadBuffer(
-    file.buffer,
-    filename,
-    file.mimetype || 'image/jpeg',
-    folderId
-  );
+  const tx =
+    (opts && opts.transactionCode) ||
+    (req.body && req.body.transaction_code) ||
+    '';
+  let filename;
+  if (tx) {
+    filename = buildOrderProofFileName(
+      tx,
+      file.originalname || '',
+      file.mimetype || ''
+    );
+  } else {
+    // fallback: prefix + timestamp + random
+    const prefix =
+      method === PM.TRANSFER ? 'TRF' : method === PM.QRIS ? 'QRIS' : 'PAY';
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const yyyyMMdd = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(
+      now.getDate()
+    )}`;
+    const hhmmss = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(
+      now.getSeconds()
+    )}`;
+    const rand = Math.random().toString(36).slice(2, 8);
+    // sertakan original extension jika tersedia
+    const extMatch = (file.originalname || '')
+      .toLowerCase()
+      .match(/\.([a-z0-9]+)$/);
+    const ext = extMatch
+      ? extMatch[1]
+      : (file.mimetype || '').split('/').pop() || 'jpg';
+    filename = `${prefix}_${yyyyMMdd}_${hhmmss}_${rand}.${ext}`;
+  }
 
-  const id = uploaded?.id;
+  // upload
+  let uploaded;
+  try {
+    uploaded = await uploadBuffer(
+      file.buffer,
+      filename,
+      file.mimetype || 'image/jpeg',
+      folderId
+    );
+  } catch (err) {
+    console.error('[handleTransferProofIfAny][uploadBuffer]', err);
+    throwError('Gagal menyimpan bukti pembayaran', 500);
+  }
+
+  const id = uploaded && (uploaded.id || uploaded.fileId || uploaded._id);
   if (!id) {
     throwError('Gagal menyimpan bukti pembayaran', 500);
   }
@@ -1359,7 +1399,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   };
 
   // HANDLE PICKUP WINDOW (baru)
-  // frontend bisa kirim: pickup_from, pickup_to (string dates) atau pickupWindow: {from,to}
   const pickupFromRaw =
     req.body?.pickup_from || req.body?.pickupWindow?.from || null;
   const pickupToRaw = req.body?.pickup_to || req.body?.pickupWindow?.to || null;
@@ -1367,7 +1406,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   if (delivery_mode === 'pickup') {
     deliveryObj.mode = 'pickup';
     deliveryObj.status = 'pending';
-    // parse pickup window jika ada
     if (pickupFromRaw) {
       const pf = dayjs(pickupFromRaw).tz(LOCAL_TZ);
       if (!pf.isValid()) throwError('pickup_from tidak valid', 400);
@@ -1380,7 +1418,6 @@ exports.checkout = asyncHandler(async (req, res) => {
       deliveryObj.pickup_window = deliveryObj.pickup_window || {};
       deliveryObj.pickup_window.to = pt.toDate();
     }
-    // jika frontend kirim slot_label untuk pickup, pertahankan slot_label
     if (providedSlot) deliveryObj.slot_label = slotLabel || providedSlot;
     if (slotDt) deliveryObj.scheduled_at = slotDt.toDate();
   }
@@ -1435,7 +1472,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
-  // VOUCHER filtering seperti sebelumnya
+  // VOUCHER filtering
   let eligibleClaimIds = [];
   if (MemberDoc) {
     if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
@@ -1526,9 +1563,6 @@ exports.checkout = asyncHandler(async (req, res) => {
 
   if (requested_bvt <= 0) throwError('Total pembayaran tidak valid.', 400);
 
-  // payment proof
-  const payment_proof_url = await handleTransferProofIfAny(req, method);
-
   const uiTotals = {
     items_subtotal: int(baseItemsSubtotal),
     items_discount: int(items_discount || 0),
@@ -1547,7 +1581,11 @@ exports.checkout = asyncHandler(async (req, res) => {
     ? priced.chosenClaimIds
     : [];
 
-  // create order (sama seperti sebelumnya), pastikan deliveryObj termasuk pickup_window jika ada
+  // --- create order ---
+  const initialIsPaid = !needProof(method); // true jika metode tidak butuh bukti => langsung paid
+  const initialPaymentStatus = initialIsPaid ? 'paid' : 'unpaid';
+  const initialPaidAt = initialIsPaid ? new Date() : null;
+
   const order = await (async () => {
     for (let i = 0; i < 5; i++) {
       try {
@@ -1590,15 +1628,11 @@ exports.checkout = asyncHandler(async (req, res) => {
           payment_method: method,
           payment_provider:
             method === PM.QRIS && !QRIS_USE_STATIC ? 'xendit' : null,
-          payment_status:
-            (method === 'transfer' || method === PM.QRIS) && payment_proof_url
-              ? 'paid'
-              : 'unpaid',
-          paid_at:
-            (method === 'transfer' || method === PM.QRIS) && payment_proof_url
-              ? new Date()
-              : null,
-          payment_proof_url: payment_proof_url || null,
+
+          // initial payment status
+          payment_status: initialPaymentStatus,
+          paid_at: initialPaidAt,
+          payment_proof_url: null,
 
           status: 'created',
           placed_at: new Date(),
@@ -1623,6 +1657,47 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
     throwError('Gagal generate transaction_code unik', 500);
   })();
+
+  // HANDLE UPLOAD BUKTI (jika diperlukan)
+  try {
+    if (needProof(method)) {
+      // metode butuh bukti: wajib ada file
+      if (!req.file) {
+        await Order.deleteOne({ _id: order._id }).catch(() => {});
+        throwError('Bukti pembayaran wajib diunggah untuk metode ini', 400);
+      }
+
+      const proofUrl = await handleTransferProofIfAny(req, method, {
+        transactionCode: order.transaction_code
+      });
+
+      if (proofUrl) {
+        order.payment_proof_url = proofUrl;
+        order.payment_status = 'paid';
+        order.paid_at = new Date();
+        await order.save();
+      } else {
+        // unexpected: fungsi tidak melempar error tapi tidak mengembalikan url
+        await Order.deleteOne({ _id: order._id }).catch(() => {});
+        throwError('Gagal mengunggah bukti pembayaran', 500);
+      }
+    } else {
+      // metode tidak butuh bukti -> sudah diset paid di create
+    }
+  } catch (err) {
+    // rollback order kalau gagal upload / validasi bukti
+    try {
+      await Order.deleteOne({ _id: order._id });
+    } catch (ee) {
+      console.error('[checkout][rollback][deleteOrder]', ee?.message || ee);
+    }
+    throwError(
+      err?.message
+        ? `Gagal upload bukti pembayaran: ${String(err.message)}`
+        : 'Gagal upload bukti pembayaran',
+      err?.status || 500
+    );
+  }
 
   // konsumsi voucher (non-fatal)
   if (MemberDoc) {
@@ -1690,6 +1765,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   } catch (e) {
     console.error('[OrderHistory][checkout]', e?.message || e);
   }
+
   // EMIT SOCKET (non-fatal) — checkout created
   try {
     const summary = {
@@ -1708,12 +1784,10 @@ exports.checkout = asyncHandler(async (req, res) => {
       guestToken: order.guestToken || null
     };
 
-    // toast singkat ke kasir (dimanapun)
     emitToCashier('staff:notify', {
       message: 'Ada pesanan yang masuk, silakan cek halaman pesanan Anda'
     });
 
-    // update realtime list order di kasir
     emitOrdersStream({ target: 'cashier', action: 'insert', item: summary });
 
     emitToStaff('staff:notify', { message: 'Pesanan baru dibuat.' });
@@ -2476,6 +2550,7 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
         name: it.name,
         menu: String(it.menu || ''),
         menu_code: it.menu_code || '',
+        imageUrl: it.imageUrl || '',
         qty,
         base_price: basePrice,
         addons: (it.addons || []).map((a) => ({

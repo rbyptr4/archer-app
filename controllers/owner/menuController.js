@@ -633,6 +633,105 @@ exports.listMenus = asyncHandler(async (req, res) => {
     if (!isNaN(d.getTime())) filter.createdAt = { $lt: d };
   }
 
+  // Helper lokal: attach subcategory docs ke raw aggregation/find results
+  // (return array baru, tidak memodifikasi input)
+  async function attachSubcategoriesToRawItems(items = []) {
+    if (!Array.isArray(items) || items.length === 0) return items;
+
+    try {
+      // Kumpulkan semua subcategory ids yang ada
+      const subIds = Array.from(
+        new Set(
+          items
+            .map((it) => {
+              const s = it.subcategory;
+              return s && s._id ? String(s._id) : String(s || '');
+            })
+            .filter(Boolean)
+        )
+      ).filter((x) => isValidId(x));
+
+      let subsMap = {};
+      if (subIds.length) {
+        const subs = await MenuSubcategory.find({
+          _id: { $in: subIds }
+        })
+          .select('_id name nameLower bigCategory sortOrder')
+          .lean();
+        subsMap = subs.reduce((acc, s) => {
+          acc[String(s._id)] = s;
+          return acc;
+        }, {});
+      }
+
+      return items.map((it) => {
+        const subIdLocal =
+          it.subcategory && it.subcategory._id
+            ? String(it.subcategory._id)
+            : String(it.subcategory || '');
+        const subDoc = subsMap[subIdLocal] || null;
+        return {
+          ...it,
+          subcategory: subDoc
+            ? {
+                _id: subDoc._id,
+                name: subDoc.name,
+                nameLower: subDoc.nameLower,
+                bigCategory: subDoc.bigCategory,
+                sortOrder: subDoc.sortOrder
+              }
+            : it.subcategory // biarkan apa adanya kalau tidak ditemukan
+        };
+      });
+    } catch (e) {
+      // Jika gagal fetch subcategories jangan crash seluruh endpoint — return items apa adanya
+      console.error('[attachSubcategoriesToRawItems] gagal:', e?.message || e);
+      return items;
+    }
+  }
+
+  // Helper lokal: hitung display prices (price_final & price_with_tax)
+  // Menggunakan ppnRate atau fallback 0.11; prefer fungsi calcFinalPrice jika tersedia
+  function attachDisplayPrices(items = []) {
+    const rate =
+      typeof ppnRate !== 'undefined' && Number.isFinite(Number(ppnRate))
+        ? Number(ppnRate)
+        : typeof parsePpnRate === 'function'
+        ? parsePpnRate()
+        : 0.11;
+
+    // fallback calc final price if not present
+    const localCalcFinal = (priceObj) => {
+      try {
+        if (typeof calcFinalPrice === 'function')
+          return calcFinalPrice(priceObj);
+      } catch (_) {}
+      // fallback simple local implementation: mirror priceFinal logic
+      const orig = Number(priceObj?.original || 0);
+      const mode = String(priceObj?.discountMode || 'none');
+      if (mode === 'percent') {
+        const pct = Math.min(
+          100,
+          Math.max(0, Number(priceObj?.discountPercent || 0))
+        );
+        return Math.max(0, Math.round(orig * (1 - pct / 100)));
+      }
+      if (mode === 'manual')
+        return Math.max(0, Number(priceObj?.manualPromoPrice || 0));
+      return orig;
+    };
+
+    return (items || []).map((m) => {
+      const baseFinal =
+        typeof m.price_final === 'number'
+          ? m.price_final
+          : localCalcFinal(m.price || m.priceObj || {});
+      const taxAmount = Math.round(Math.max(0, baseFinal * rate));
+      const priceWithTax = baseFinal + taxAmount;
+      return { ...m, price_final: baseFinal, price_with_tax: priceWithTax };
+    });
+  }
+
   // if sorting by price.final we still compute price_final in aggregation but we will still paginate by createdAt
   if (sortBy === 'price.final') {
     const pipeline = [
@@ -697,17 +796,6 @@ exports.listMenus = asyncHandler(async (req, res) => {
     const rawWithSubs = await attachSubcategoriesToRawItems(
       rawItems.slice(0, limit)
     );
-
-    const attachDisplayPrices = (items) =>
-      items.map((m) => {
-        const baseFinal =
-          typeof m.price_final === 'number'
-            ? m.price_final
-            : calcFinalPrice(m.price);
-        const taxAmount = Math.round(Math.max(0, baseFinal * ppnRate));
-        const priceWithTax = baseFinal + taxAmount;
-        return { ...m, price_final: baseFinal, price_with_tax: priceWithTax };
-      });
 
     const items = attachDisplayPrices(rawWithSubs);
 
