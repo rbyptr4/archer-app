@@ -17,7 +17,7 @@ const pkg = require('../../controllers/owner/packageMenuController');
 
 router.use(
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('menu')
 );
 

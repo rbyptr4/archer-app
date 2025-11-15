@@ -6,28 +6,28 @@ const requirePageAccess = require('../../utils/requirePageAccess');
 
 router.get(
   '/all-sub',
-  requireRole('owner', 'employee'), // atau tambahkan 'member'
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('menu'), // atau 'menuManagement' sesuai key-mu
   category.listSubcategories
 );
 
 router.post(
   '/create-sub',
-  requireRole('owner'),
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('menu'),
   category.createSubcategory
 );
 
 router.patch(
   '/update/:id',
-  requireRole('owner'),
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('menu'),
   category.updateSubcategory
 );
 
 router.delete(
   '/remove/:id',
-  requireRole('owner'),
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('menu'),
   category.deleteSubcategory
 );

@@ -5,7 +5,10 @@ const requireRole = require('../utils/requireRole');
 const requirePageAccess = require('../utils/requirePageAccess');
 const ctrl = require('../controllers/closingShiftController');
 
-router.use(validateToken, requireRole('owner', 'employee'));
+router.use(
+  validateToken,
+  requireRole('owner', 'courier', 'kitchen', 'cashier')
+);
 requirePageAccess('closing');
 
 router.get('/open', ctrl.findOpen);

@@ -16,7 +16,7 @@ router.use(validateToken);
 
 router.post(
   '/create-employee',
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('employees'),
   validate(registerSchema),
   emp.createEmployee
@@ -24,21 +24,21 @@ router.post(
 
 router.get(
   '/all-employee',
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('employees'),
   emp.listEmployees
 );
 
 router.get(
   '/:id',
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('employees'),
   emp.getEmployee
 );
 
 router.patch(
   '/update/:id',
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('employees'),
   validate(updateEmployeeSchema),
   emp.updateEmployee

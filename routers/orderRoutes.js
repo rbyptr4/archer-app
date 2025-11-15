@@ -38,7 +38,7 @@ router.get('/delivery/estimate', order.estimateDelivery);
 router.post(
   '/assign-batch',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'cashier'),
   requirePageAccess('orders'),
   order.assignBatch
 );
@@ -56,7 +56,7 @@ router.post('/checkout/qris', authMemberOptional, order.createQrisFromCart);
 router.get(
   '/delivery-board',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'cashier'),
   requirePageAccess('orders'),
   order.deliveryBoard
 );
@@ -64,7 +64,7 @@ router.get(
 router.get(
   '/courier/assigned',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'courier'),
   requirePageAccess('courier'),
   order.getAssignedDeliveries
 );
@@ -72,7 +72,7 @@ router.get(
 router.get(
   '/list-employee',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'cashier'),
   requirePageAccess('orders'),
   order.listEmployeesDropdown
 );
@@ -80,23 +80,15 @@ router.get(
 router.get(
   '/list-member',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'cashier'),
   requirePageAccess('orders'),
   order.listMembers
 );
 
 router.get(
-  '/today',
-  validateToken,
-  requireRole('owner', 'employee'),
-  requirePageAccess('orders'),
-  order.listTodayOrders
-);
-
-router.get(
   '/transactions-summary',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('orders'),
   order.closingShiftSummary
 );
@@ -107,14 +99,14 @@ router.post('/price-preview', authMemberRequired, order.previewPrice);
 router.post(
   '/dine-in/cashier',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'cashier'),
   requirePageAccess('orders'),
   order.createPosDineIn
 );
 router.post(
   '/dine-in/cashier/preview',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'cashier'),
   requirePageAccess('orders'),
   order.previewPosOrder
 );
@@ -122,7 +114,7 @@ router.post(
 router.get(
   '/list-order',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'cashier'),
   requirePageAccess('orders'),
   order.listOrders
 );
@@ -130,7 +122,7 @@ router.get(
 router.get(
   '/kitchen',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'kitchen'),
   requirePageAccess('kitchen'),
   order.listKitchenOrders
 );
@@ -138,7 +130,7 @@ router.get(
 router.get(
   '/pickup',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'cashier'),
   requirePageAccess('kitchen'),
   order.getPickupOrders
 );
@@ -146,7 +138,7 @@ router.get(
 router.get(
   '/dashboard',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('kitchen'),
   order.homeDashboard
 );
@@ -154,7 +146,7 @@ router.get(
 router.get(
   '/:id',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('orders'),
   order.getDetailOrder
 );
@@ -164,7 +156,7 @@ router.get('/:id/receipt', order.getOrderReceipt);
 router.post(
   '/:id/verify-payment',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'cashier'),
   requirePageAccess('orders'),
   order.acceptAndVerify
 );
@@ -172,7 +164,7 @@ router.post(
 router.post(
   '/:id/complete-order',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'cashier'),
   requirePageAccess('orders'),
   order.completeOrder
 );
@@ -180,7 +172,7 @@ router.post(
 router.post(
   '/:id/delivery/assign',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'cashier'),
   requirePageAccess('orders'),
   order.assignDelivery
 );
@@ -188,7 +180,7 @@ router.post(
 router.patch(
   '/:id/delivery/status',
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'courier'),
   requirePageAccess('orders'),
   order.updateDeliveryStatus
 );

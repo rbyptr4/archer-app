@@ -8,7 +8,7 @@ const requireRole = require('../../utils/requireRole');
 const requirePageAccess = require('../../utils/requirePageAccess');
 const validateToken = require('../../utils/tokenHandler'); // staff token middleware
 
-const guard = requireRole('owner', 'employee');
+const guard = requireRole('owner', 'courier', 'kitchen', 'cashier');
 
 router.use(validateToken, requirePageAccess('reports'));
 // ===== Laporan Order / Transaksi =====

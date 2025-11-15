@@ -4,8 +4,11 @@ const requireRole = require('../utils/requireRole');
 const requirePageAccess = require('../utils/requirePageAccess');
 const ctl = require('../controllers/expenseController');
 
-router.use(validateToken, requireRole('owner', 'employee'));
-requirePageAccess('expense');
+router.use(
+  validateToken,
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
+  requirePageAccess('expense')
+);
 /* ====== Expense Types (subpath: /expenses/types) ====== */
 router.post('/types/create', ctl.createType);
 router.get('/types/list', ctl.listTypes);

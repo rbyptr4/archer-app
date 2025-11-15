@@ -7,7 +7,7 @@ const rpt = require('../../controllers/owner/reportController');
 
 router.use(
   validateToken,
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('report')
 );
 

@@ -28,14 +28,16 @@ const {
   makeOrderSummary
 } = require('./socket/emitHelpers'); // sesuaikan path
 // tambahkan di atas file
+// di bagian atas controllers/orderController.js (sesuaikan path)
 const {
-  emitToStaff,
   emitToCashier,
   emitToKitchen,
-  emitToCourier,
+  emitToStaff,
   emitToMember,
-  emitToGuest
-} = require('./socket/socketBus'); // sesuaikan path
+  emitToGuest,
+  emitToCourier,
+  emitOrdersStream
+} = require('./socket/socketBus'); // <-- sesuaikan path relatif kalau perlu
 
 // jika belum ada, untuk generate guest token
 const { v4: uuidv4 } = require('uuid');
@@ -1696,6 +1698,36 @@ exports.checkout = asyncHandler(async (req, res) => {
   } catch (e) {
     console.error('[OrderHistory][checkout]', e?.message || e);
   }
+  // EMIT SOCKET (non-fatal) — checkout created
+  try {
+    const summary = {
+      id: String(order._id),
+      transaction_code: order.transaction_code,
+      fulfillment_type: order.fulfillment_type,
+      table_number: order.table_number || null,
+      items_total: order.items_subtotal,
+      grand_total: order.grand_total,
+      total_quantity: order.total_quantity,
+      source: order.source,
+      status: order.status,
+      payment_status: order.payment_status,
+      placed_at: order.placed_at,
+      member: order.member ? String(order.member) : null,
+      guestToken: order.guestToken || null
+    };
+
+    // toast singkat ke kasir (dimanapun)
+    emitToCashier('staff:notify', {
+      message: 'Ada pesanan yang masuk, silakan cek halaman pesanan Anda'
+    });
+
+    // update realtime list order di kasir
+    emitOrdersStream({ target: 'cashier', action: 'insert', item: summary });
+
+    emitToStaff('staff:notify', { message: 'Pesanan baru dibuat.' });
+  } catch (e) {
+    console.error('[emit][checkout]', e?.message || e);
+  }
 
   res.status(201).json({
     order: order.toObject(),
@@ -2518,7 +2550,6 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
   return res.status(200).json({ success: true, order: slim });
 });
 
-
 const buildOrderReceipt = (order) => {
   if (!order) return null;
 
@@ -2955,29 +2986,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     throw new Error('Gagal generate transaction_code unik');
   })();
 
-  const payload = {
-    id: String(order._id),
-    transaction_code: order.transaction_code,
-    member: member
-      ? { id: String(member._id), name: member.name, phone: member.phone }
-      : null,
-    customer: !member ? { name: customer_name, phone: customer_phone } : null,
-    table_number: order.table_number,
-    items_total: order.items_subtotal,
-    grand_total: order.grand_total,
-    total_quantity: order.total_quantity,
-    line_count: order.items?.length || 0,
-    source: order.source,
-    fulfillment_type: order.fulfillment_type,
-    status: order.status,
-    payment_status: order.payment_status,
-    payment_method: order.payment_method,
-    paid_at: order.paid_at || null,
-    payment_proof_url: order.payment_proof_url || '',
-    placed_at: order.placed_at,
-    cashier: req.user ? { id: String(req.user.id), name: req.user.name } : null
-  };
-
   try {
     const uiTotals = {
       items_subtotal: order.items_subtotal,
@@ -3001,24 +3009,15 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   }
 
   try {
-    const summary = makeOrderSummary(order);
-
-    emitToStaff('order:new', summary);
-    emitToCashier('order:new', summary); // kasir khusus
-    emitToKitchen('order:new', summary);
-
-    if (member) {
-      emitToMember(String(member._id), 'order:created', summary);
-    } else {
-      // POS guest: buat guestToken agar device pelanggan bisa rejoin/terima notifikasi
-      const guestToken = uuidv4();
-      await Order.findByIdAndUpdate(order._id, { $set: { guestToken } }).catch(
-        () => {}
-      );
-      emitToGuest(guestToken, 'order:created', summary);
-    }
-  } catch (err) {
-    console.error('[emit][createPosDineIn]', err?.message || err);
+    emitToCashier('staff:notify', {
+      message: 'Ada pesanan baru, cek halaman pesanan.'
+    });
+    emitOrdersStream({ target: 'cashier', action: 'insert', item: summary });
+    emitToKitchen('staff:notify', {
+      message: 'Pesanan baru diterima, cek halaman kitchen.'
+    });
+  } catch (e) {
+    console.error('[emit][createPosDineIn]', e?.message || e);
   }
 
   res.status(201).json({
@@ -3247,14 +3246,38 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     at: doc.verified_at
   };
   try {
-    emitToStaff('order:accepted_verified', payload);
-    emitToKitchen('order:accepted_verified', payload);
-    emitToCashier('order:accepted_verified', payload);
+    // existing toasts
+    emitToCashier('staff:notify', {
+      message: 'Pesanan telah diterima & diverifikasi.'
+    });
+    emitToKitchen('staff:notify', {
+      message: 'Pesanan baru telah diterima kasir, silakan cek kitchen.'
+    });
 
-    if (doc.member)
-      emitToMember(String(doc.member), 'order:accepted_verified', payload);
-    if (doc.guestToken)
-      emitToGuest(doc.guestToken, 'order:accepted_verified', payload);
+    // stream update (kasir & kitchen)
+    const summaryUpdate = {
+      id: payload.id,
+      status: payload.status,
+      payment_status: payload.payment_status
+    };
+    emitOrdersStream({
+      target: 'cashier',
+      action: 'update',
+      item: summaryUpdate
+    });
+    emitOrdersStream({
+      target: 'kitchen',
+      action: 'insert',
+      item: summaryUpdate
+    });
+
+    // member/guest already emitted below
+    emitToStaff('order:accepted', payload);
+    emitToKitchen('order:accepted', payload);
+    emitToCashier('order:accepted', payload);
+
+    if (doc.member) emitToMember(String(doc.member), 'order:accepted', payload);
+    if (doc.guestToken) emitToGuest(doc.guestToken, 'order:accepted', payload);
   } catch (err) {
     console.error('[emit][acceptAndVerify]', err?.message || err);
   }
@@ -3344,18 +3367,31 @@ exports.assignDelivery = asyncHandler(async (req, res) => {
   };
 
   try {
-    emitToStaff('order:delivery_assigned', payload);
-    emitToCashier('order:delivery_assigned', payload);
+    // toast ke staff/kasir
+    emitToStaff('staff:notify', {
+      message: 'Pesanan delivery telah ditugaskan ke kurir.'
+    });
+    emitToCashier('staff:notify', {
+      message: 'Pesanan delivery telah ditugaskan.'
+    });
+
+    // update realtime list (kasir & courier role)
+    emitOrdersStream({ target: 'cashier', action: 'update', item: payload });
+    emitOrdersStream({ target: 'courier', action: 'insert', item: payload });
 
     if (updated.member)
       emitToMember(String(updated.member), 'order:delivery_assigned', payload);
     if (updated.guestToken)
       emitToGuest(updated.guestToken, 'order:delivery_assigned', payload);
 
-    // emit ke kurir personal kalau ada courier.user (ObjectId/string)
+    // emit ke kurir personal kalau ada courier.user
     const courierUserId = updated.delivery?.courier?.user;
     if (courierUserId) {
       emitToCourier(String(courierUserId), 'order:assign:courier', payload);
+      // tambahan: kurir juga dapat notifikasi toast
+      emitToCourier(String(courierUserId), 'courier:notify', {
+        message: 'Anda ditugaskan untuk pengantaran pesanan. Cek halaman kurir.'
+      });
     }
   } catch (err) {
     console.error('[emit][assignDelivery]', err?.message || err);
@@ -3471,10 +3507,18 @@ exports.assignBatch = asyncHandler(async (req, res) => {
           null
       }
     };
+    // update orders stream (kasir role)
+    emitOrdersStream({ target: 'cashier', action: 'update', item: p });
+
+    // notifikasi ke courier personal
+    if (u.delivery?.courier?.user)
+      emitToCourier(String(u.delivery.courier.user), 'courier:notify', {
+        message: 'Pesanan baru telah diassign ke Anda',
+        orderId: p.id
+      });
+
     if (u.member) emitToMember(String(u.member), 'order:delivery_assigned', p);
     if (u.guestToken) emitToGuest(u.guestToken, 'order:delivery_assigned', p);
-    if (u.delivery?.courier?.user)
-      emitToCourier(String(u.delivery.courier.user), 'order:assign:courier', p);
   }
 
   res.json({
@@ -3568,6 +3612,153 @@ exports.updateDeliveryStatus = asyncHandler(async (req, res) => {
   });
 });
 
+exports.markAssignedToDelivered = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const id = req.params.id;
+  if (!id || !mongoose.Types.ObjectId.isValid(id))
+    throwError('ID tidak valid', 400);
+
+  const order = await Order.findById(id);
+  if (!order) throwError('Order tidak ditemukan', 404);
+
+  // hanya untuk delivery orders
+  if (order.fulfillment_type !== 'delivery') {
+    throwError('Order ini bukan delivery', 400);
+  }
+
+  // validasi requirement: order sudah accepted & payment verified
+  if (order.status !== 'accepted') {
+    throwError(
+      'Order harus berstatus "accepted" sebelum menandai delivered',
+      409
+    );
+  }
+  if (order.payment_status !== 'verified') {
+    throwError(
+      'Order harus berstatus payment "verified" sebelum menandai delivered',
+      409
+    );
+  }
+
+  if (!order.delivery)
+    throwError('Order ini tidak memiliki informasi delivery', 409);
+
+  // pastikan delivery saat ini assigned
+  const currentDeliveryStatus = order.delivery.status || 'pending';
+  if (currentDeliveryStatus !== 'assigned') {
+    throwError(
+      'Hanya order dengan delivery status "assigned" yang bisa ditandai "delivered"',
+      409
+    );
+  }
+
+  if (
+    order.delivery.courier?.user &&
+    String(order.delivery.courier.user) !== String(req.user._id)
+  ) {
+    throwError('Tidak berhak: order ini bukan ditugaskan ke Anda', 403);
+  }
+
+  const now = new Date();
+
+  // update delivery status & timestamps (jaga compatibility legacy fields jika ada)
+  order.delivery.status = 'delivered';
+  order.delivery.timestamps = order.delivery.timestamps || {};
+  order.delivery.timestamps.delivered_at = now;
+  // some schemas had top-level delivery.delivered_at legacy field — set kalau ada
+  if ('delivered_at' in (order.delivery || {})) {
+    order.delivery.delivered_at = now;
+  }
+
+  // order.status = 'completed';
+
+  // simpan
+  const updatedOrder = await order.save();
+
+  // record history & snapshot (non-fatal)
+  try {
+    if (typeof recordOrderHistory === 'function') {
+      await recordOrderHistory(order._id, 'delivery_status', req.user, {
+        from: currentDeliveryStatus,
+        to: 'delivered',
+        note: 'Kurir menandai pengantaran selesai',
+        at: now
+      });
+    }
+  } catch (e) {
+    console.error(
+      '[recordOrderHistory][markAssignedToDelivered]',
+      e?.message || e
+    );
+  }
+
+  try {
+    if (typeof snapshotOrder === 'function') {
+      await snapshotOrder(order._id, { updatedBy: req.user._id }).catch(
+        () => {}
+      );
+    }
+  } catch (e) {
+    console.error('[snapshotOrder][markAssignedToDelivered]', e?.message || e);
+  }
+
+  // === EMIT SOCKETS sesuai contoh kamu ===
+  try {
+    const payload = {
+      id: String(updatedOrder._id),
+      transaction_code: updatedOrder.transaction_code,
+      delivery: {
+        status: updatedOrder.delivery?.status,
+        courier: updatedOrder.delivery?.courier,
+        delivered_at:
+          (updatedOrder.delivery?.timestamps &&
+            updatedOrder.delivery.timestamps.delivered_at) ||
+          updatedOrder.delivery?.delivered_at ||
+          now
+      }
+    };
+
+    // beri tahu kasir (toast singkat)
+    if (typeof emitToCashier === 'function') {
+      emitToCashier('staff:notify', {
+        message:
+          'Kurir menandai pesanan sebagai sudah diantar. Silakan cek untuk konfirmasi.'
+      });
+    }
+
+    // update stream supaya kasir bisa tampilkan pending-complete
+    if (typeof emitOrdersStream === 'function') {
+      emitOrdersStream({ target: 'cashier', action: 'update', item: payload });
+    }
+
+    // beri tahu member/guest
+    if (updatedOrder.member && typeof emitToMember === 'function') {
+      emitToMember(String(updatedOrder.member), 'order:delivered', payload);
+    }
+    if (updatedOrder.guestToken && typeof emitToGuest === 'function') {
+      emitToGuest(updatedOrder.guestToken, 'order:delivered', payload);
+    }
+
+    // beri tahu courier personal (konfirmasi)
+    const courierUserId = updatedOrder.delivery?.courier?.user;
+    if (courierUserId && typeof emitToCourier === 'function') {
+      emitToCourier(String(courierUserId), 'courier:notify', {
+        message:
+          'Status pengantaran: delivered. Silakan klik Complete pada aplikasi kasir jika perlu.'
+      });
+    }
+  } catch (e) {
+    console.error('[emit][markAssignedToDelivered]', e?.message || e);
+  }
+
+  // response
+  return res.status(200).json({
+    message: 'Delivery berhasil ditandai delivered',
+    order: updatedOrder.toObject()
+  });
+});
+
 exports.deliveryBoard = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
@@ -3619,83 +3810,6 @@ exports.listEmployeesDropdown = asyncHandler(async (req, res) => {
 
   res.json({
     items
-  });
-});
-
-exports.listTodayOrders = asyncHandler(async (req, res) => {
-  // Hitung range hari ini di timezone lokal
-  const startOfDay = dayjs().tz(LOCAL_TZ).startOf('day').toDate();
-  const endOfDay = dayjs().tz(LOCAL_TZ).endOf('day').toDate();
-
-  const filter = {
-    placed_at: { $gte: startOfDay, $lte: endOfDay },
-    status: { $ne: 'cancelled' } // kalau mau termasuk cancelled, hapus baris ini
-  };
-
-  const orders = await Order.find(filter)
-    .sort({ placed_at: -1, createdAt: -1 })
-    .select({
-      transaction_code: 1,
-      fulfillment_type: 1,
-      table_number: 1,
-      source: 1,
-
-      customer_name: 1,
-      customer_phone: 1,
-
-      items_subtotal: 1,
-      service_fee: 1,
-      delivery_fee: 1,
-      items_discount: 1,
-      shipping_discount: 1,
-      tax_amount: 1,
-      rounding_delta: 1,
-      grand_total: 1,
-
-      payment_method: 1,
-      payment_status: 1,
-
-      status: 1,
-      placed_at: 1,
-      paid_at: 1
-    })
-    .lean({ virtuals: true });
-
-  // Kalau mau sekalian kasih ringkasan item tanpa detail panjang, bisa embed dikit:
-  const mapped = orders.map((o) => ({
-    id: String(o._id),
-    transaction_code: o.transaction_code,
-    status: o.status,
-    payment_status: o.payment_status,
-    payment_method: o.payment_method,
-
-    fulfillment_type: o.fulfillment_type,
-    table_number:
-      o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
-
-    customer: {
-      name: o.customer_name || '',
-      phone: o.customer_phone || ''
-    },
-
-    totals: {
-      items_subtotal: o.items_subtotal,
-      service_fee: o.service_fee,
-      delivery_fee: o.delivery_fee,
-      items_discount: o.items_discount,
-      shipping_discount: o.shipping_discount,
-      tax_amount: o.tax_amount,
-      rounding_delta: o.rounding_delta,
-      grand_total: o.grand_total
-    },
-
-    placed_at: o.placed_at,
-    paid_at: o.paid_at || null
-  }));
-
-  return res.json({
-    success: true,
-    data: mapped
   });
 });
 
@@ -4097,13 +4211,6 @@ exports.getPickupOrders = asyncHandler(async (req, res) => {
   });
 });
 
-// handlers closing shift — tambahkan di controllers/orderController.js
-// Memakai asyncHandler & throwError yang sudah ada di file
-
-/**
- * GET /closing-shift/summary?date=YYYY-MM-DD&shift1=08:00-14:59&shift2=15:00-23:59
- * Response: ringkasan full day + shift1 + shift2
- */
 exports.closingShiftSummary = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 

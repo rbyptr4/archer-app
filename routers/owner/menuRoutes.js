@@ -28,19 +28,24 @@ router.post(
 
 router.get(
   '/list',
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('menu'),
   menu.listMenus
 );
 
 router.get(
   '/sub-options',
-  requireRole('owner', 'employee'),
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('menu'),
   menu.subcategoryOptions
 );
 
-router.get('/:id', requirePageAccess('menu'), menu.getMenuById);
+router.get(
+  '/:id',
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
+  requirePageAccess('menu'),
+  menu.getMenuById
+);
 
 router.patch(
   '/update/:id',
@@ -55,11 +60,13 @@ router.delete('/remove/:id', requireRole('owner'), menu.deleteMenu);
 
 router.patch(
   '/:id/deactivate-menu',
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('menu'),
   menu.deactivateMenu
 );
 router.patch(
   '/:id/activate-menu',
+  requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('menu'),
   menu.activateMenu
 );
