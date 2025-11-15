@@ -29,21 +29,29 @@ const validatePages = (pagesObj) => {
   }
 };
 
+const ROLES = ['owner', 'courier', 'kitchen', 'cashier'];
 exports.createEmployee = asyncHandler(async (req, res) => {
-  const { name, email, password, phone, pages } = req.body || {};
-  if (!name || !email || !password)
-    throwError('name, email, password wajib diisi', 400);
+  const { name, email, password, phone, role, pages } = req.body || {};
+
+  if (!name || !email || !password || !phone || !role)
+    throwError('name, email, password, phone, role wajib diisi', 400);
+
+  // validasi role
+  if (!ROLES.includes(role))
+    throwError(
+      `Role tidak valid. Gunakan salah satu: ${ROLES.join(', ')}`,
+      400
+    );
 
   const lower = String(email).toLowerCase();
 
   const emailUsed = await User.exists({ email: lower });
   if (emailUsed) throwError('Email sudah terpakai', 409);
 
-  if (phone) {
-    const phoneUsed = await User.exists({ phone });
-    if (phoneUsed) throwError('Nomor telepon sudah terpakai', 409);
-  }
+  const phoneUsed = await User.exists({ phone });
+  if (phoneUsed) throwError('Nomor telepon sudah terpakai', 409);
 
+  // pages optional
   let initialPages = {};
   if (isPlainObject(pages)) {
     validatePages(pages);
@@ -55,10 +63,10 @@ exports.createEmployee = asyncHandler(async (req, res) => {
   const emp = await User.create({
     name,
     email: lower,
-    role: 'employee',
+    role, // <--- yang baru
     password: hash,
-    phone: phone || undefined,
-    pages: initialPages // boleh kosong
+    phone,
+    pages: initialPages
   });
 
   res.status(201).json({
@@ -136,34 +144,49 @@ exports.getEmployee = asyncHandler(async (req, res) => {
 });
 
 exports.updateEmployee = asyncHandler(async (req, res) => {
-  const { name, email, phone, newPassword } = req.body || {};
+  const { name, email, phone, role, newPassword } = req.body || {};
 
   const emp = await User.findOne({
-    _id: req.params.id,
-    role: 'employee'
+    _id: req.params.id
+    // kalau role bukan "employee" lagi, jangan pakai filter role di sini
+    // agar courier / kitchen / cashier bisa diupdate juga
   }).select('+password');
 
   if (!emp) throwError('Karyawan tidak ditemukan', 404);
 
+  // update email
   if (email && email.toLowerCase() !== emp.email) {
     const lower = String(email).toLowerCase();
     const used = await User.exists({ email: lower, _id: { $ne: emp._id } });
-    if (used) throwError('Email sudah digunakan', 409, 'email');
+    if (used) throwError('Email sudah digunakan', 409);
     emp.email = lower;
   }
 
+  // update name
   if (name) emp.name = name;
 
+  // update phone
   if (phone !== undefined) {
-    if (phone) {
-      const usedPhone = await User.exists({ phone, _id: { $ne: emp._id } });
-      if (usedPhone) throwError('Nomor telepon sudah digunakan', 409, 'phone');
-      emp.phone = phone;
-    } else {
-      emp.phone = undefined;
-    }
+    if (!phone) throwError('Nomor telepon wajib diisi', 400);
+
+    const usedPhone = await User.exists({ phone, _id: { $ne: emp._id } });
+    if (usedPhone) throwError('Nomor telepon sudah digunakan', 409);
+
+    emp.phone = phone;
   }
 
+  // update role
+  if (role !== undefined) {
+    if (!ROLES.includes(role))
+      throwError(
+        `Role tidak valid. Gunakan salah satu: ${ROLES.join(', ')}`,
+        400
+      );
+
+    emp.role = role;
+  }
+
+  // update password
   if (newPassword) {
     const hash = await bcrypt.hash(newPassword, 10);
     emp.password = hash;
@@ -172,7 +195,7 @@ exports.updateEmployee = asyncHandler(async (req, res) => {
   await emp.save();
 
   const out = emp.toObject();
-  delete out.password; // jangan expose password
+  delete out.password;
 
   res.json({ message: 'Profil karyawan diperbarui', employee: out });
 });
