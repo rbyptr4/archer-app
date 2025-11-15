@@ -131,7 +131,7 @@ router.get(
   '/pickup',
   validateToken,
   requireRole('owner', 'cashier'),
-  requirePageAccess('kitchen'),
+  requirePageAccess('orders'),
   order.getPickupOrders
 );
 
@@ -159,6 +159,14 @@ router.post(
   requireRole('owner', 'cashier'),
   requirePageAccess('orders'),
   order.acceptAndVerify
+);
+
+router.patch(
+  '/:id/mark-delivered',
+  validateToken,
+  requireRole('owner', 'courier'),
+  requirePageAccess('courier'),
+  order.markAssignedToDelivered
 );
 
 router.post(
