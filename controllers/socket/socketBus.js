@@ -5,8 +5,8 @@ function setIO(io) {
 
 const rooms = {
   staff: 'staff',
-  cashier: 'staff:cashier',
-  kitchen: 'staff:kitchen',
+  // page-based rooms: 'page:<pageKey>'
+  page: (pageKey) => `page:${pageKey}`,
   courier: (id) => `courier:${id}`,
   member: (id) => `member:${id}`,
   guest: (token) => `guest:${token}`
@@ -20,11 +20,9 @@ function safeEmit(room, event, payload) {
 function emitToStaff(event, payload) {
   safeEmit(rooms.staff, event, payload);
 }
-function emitToCashier(event, payload) {
-  safeEmit(rooms.cashier, event, payload);
-}
-function emitToKitchen(event, payload) {
-  safeEmit(rooms.kitchen, event, payload);
+function emitToPage(pageKey, event, payload) {
+  if (!pageKey) return;
+  safeEmit(rooms.page(pageKey), event, payload);
 }
 function emitToCourier(courierId, event, payload) {
   if (!courierId) return;
@@ -43,8 +41,7 @@ module.exports = {
   setIO,
   rooms,
   emitToStaff,
-  emitToCashier,
-  emitToKitchen,
+  emitToPage,
   emitToCourier,
   emitToMember,
   emitToGuest

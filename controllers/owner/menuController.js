@@ -693,6 +693,18 @@ exports.listMenus = asyncHandler(async (req, res) => {
     const rawWithSubs = await attachSubcategoriesToRawItems(
       rawItems.slice(0, limit)
     );
+
+    const attachDisplayPrices = (items) =>
+      items.map((m) => {
+        const baseFinal =
+          typeof m.price_final === 'number'
+            ? m.price_final
+            : calcFinalPrice(m.price);
+        const taxAmount = Math.round(Math.max(0, baseFinal * ppnRate));
+        const priceWithTax = baseFinal + taxAmount;
+        return { ...m, price_final: baseFinal, price_with_tax: priceWithTax };
+      });
+
     const items = attachDisplayPrices(rawWithSubs);
 
     const next_cursor =

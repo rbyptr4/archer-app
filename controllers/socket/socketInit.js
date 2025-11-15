@@ -41,10 +41,20 @@ async function resolveStaffFromCookie(cookies) {
     if (!userId) return null;
     const user = await User.findById(userId).select('role pages name').lean();
     if (!user) return null;
-    const pages =
-      user.pages instanceof Map
-        ? Object.fromEntries(user.pages)
-        : user.pages || {};
+
+    // Normalisasi pages: Map -> plain object, undefined -> {}
+    let pages = {};
+    if (user.pages instanceof Map) {
+      pages = Object.fromEntries(user.pages);
+    } else if (user.pages && typeof user.pages === 'object') {
+      pages = user.pages;
+    }
+
+    // Pastikan semua values boolean
+    Object.keys(pages).forEach((k) => {
+      pages[k] = !!pages[k];
+    });
+
     return {
       id: String(user._id),
       role: user.role,
@@ -110,6 +120,119 @@ function toOrderSummary(orderDoc) {
     guestToken: orderDoc.guestToken || null
   };
 }
+
+async function emitMissedOrdersOnJoin(socket, pageKeys) {
+  try {
+    const LIMIT = 50;
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    for (const pk of pageKeys) {
+      if (pk === 'orders') {
+        const q = { status: 'created', createdAt: { $gte: oneDayAgo } };
+        const count = await Order.countDocuments(q);
+        const raw = await Order.find(q)
+          .select(
+            'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery slot_label status member createdAt'
+          )
+          .sort({ createdAt: -1 })
+          .limit(LIMIT)
+          .populate({ path: 'member', select: 'name phone' })
+          .lean();
+        const items = raw.map((o) => ({
+          id: String(o._id),
+          transaction_code: o.transaction_code || '',
+          delivery_mode:
+            (o.delivery && o.delivery.mode) || o.fulfillment_type === 'dine_in'
+              ? 'none'
+              : 'delivery',
+          grand_total: Number(o.grand_total || 0),
+          fulfillment_type: o.fulfillment_type || null,
+          customer_name: (o.member && o.member.name) || o.customer_name || '',
+          customer_phone:
+            (o.member && o.member.phone) || o.customer_phone || '',
+          placed_at: o.placed_at || o.createdAt || null,
+          table_number:
+            o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
+          payment_status: o.payment_status || null,
+          status: o.status || null,
+          total_quantity: Number(o.total_quantity || 0)
+        }));
+        socket.emit('orders:missed', {
+          page: pk,
+          role: 'orders',
+          count,
+          items
+        });
+      } else if (pk === 'kitchen') {
+        const q = {
+          status: 'accepted',
+          payment_status: 'verified',
+          placed_at: { $gte: oneDayAgo }
+        };
+        const count = await Order.countDocuments(q);
+        const raw = await Order.find(q)
+          .select('transaction_code items placed_at status total_quantity')
+          .sort({ placed_at: 1 })
+          .limit(LIMIT)
+          .lean();
+        const items = raw.map((o) => ({
+          id: String(o._id),
+          transaction_code: o.transaction_code || '',
+          placed_at: o.placed_at || null,
+          items: (o.items || [])
+            .slice(0, 10)
+            .map((it) => ({ name: it.name || '', qty: it.quantity || 0 }))
+        }));
+        socket.emit('orders:missed', {
+          page: pk,
+          role: 'kitchen',
+          count,
+          items
+        });
+      } else if (pk === 'delivery' || pk === 'courier') {
+        const q = {
+          fulfillment_type: 'delivery',
+          status: { $nin: ['cancelled'] },
+          'delivery.status': { $in: ['pending', 'assigned'] },
+          placed_at: { $gte: oneDayAgo }
+        };
+        const count = await Order.countDocuments(q);
+        const raw = await Order.find(q)
+          .select(
+            'transaction_code grand_total placed_at delivery.status customer_name customer_phone'
+          )
+          .sort({ placed_at: -1 })
+          .limit(LIMIT)
+          .lean();
+        const items = raw.map((o) => ({
+          id: String(o._id),
+          transaction_code: o.transaction_code || '',
+          placed_at: o.placed_at || null,
+          delivery_status: o.delivery?.status || null,
+          customer_name: o.customer_name || '',
+          customer_phone: o.customer_phone || ''
+        }));
+        socket.emit('orders:missed', {
+          page: pk,
+          role: 'courier',
+          count,
+          items
+        });
+      } else {
+        // fallback: kirim count 0 agar FE tahu tidak ada missed (atau implement custom logic per page)
+        socket.emit('orders:missed', {
+          page: pk,
+          role: pk,
+          count: 0,
+          items: []
+        });
+      }
+    }
+  } catch (e) {
+    console.error('[emitMissedOrdersOnJoin] error', e?.message || e);
+  }
+}
+
 
 function initSocket(httpServer) {
   const allowedOrigins = parseAllowedOrigins();
@@ -185,19 +308,28 @@ function initSocket(httpServer) {
 
     // Staff resolve
     const staff = await resolveStaffFromCookie(cookies);
-    if (
-      staff &&
-      (staff.role === 'owner' ||
-        staff.role === 'employee' ||
-        staff.role === 'courier')
-    ) {
-      socket.join(rooms.staff);
-      if (staff.role === 'owner' || staff.pages?.cashier === true)
+    // Staff resolve (setelah mendapatkan `staff` dari resolveStaffFromCookie)
+    if (staff && (staff.role === 'owner' || staff.role === 'employee')) {
+      // Owner dapat akses semua staff rooms
+      if (staff.role === 'owner') {
+        socket.join(rooms.staff);
         socket.join(rooms.cashier);
-      if (staff.role === 'owner' || staff.pages?.kitchen === true)
         socket.join(rooms.kitchen);
-      if (staff.role === 'courier' || staff.pages?.courier === true)
-        socket.join(rooms.courier(staff.id));
+        socket.join(rooms.courier(staff.id)); // owner may view courier rooms if desired
+      } else {
+        // Untuk employee: cek halaman yang diizinkan
+        if (staff.pages && Object.keys(staff.pages).length) {
+          if (staff.pages.orders) socket.join(rooms.cashier);
+          if (staff.pages.kitchen) socket.join(rooms.kitchen);
+          if (staff.pages.courier) socket.join(rooms.courier(staff.id));
+          // jika ada page "employees" atau lain2 yang butuh staff-wide channel:
+          if (staff.pages.employees) socket.join(rooms.staff);
+        } else {
+          // fallback: kalau pages kosong, jangan auto-join sensitive rooms
+          // namun bisa bergantung kebijakan: misal join staff minimal
+          // socket.join(rooms.staff);
+        }
+      }
     }
 
     // welcome
