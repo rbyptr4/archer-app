@@ -382,6 +382,21 @@ exports.listMenuForMember = asyncHandler(async (req, res) => {
 
   const isActiveParam = (req.query.isActive || '').toLowerCase();
   const filter = {};
+  const attachDisplayPrices = (items) =>
+    items.map((m) => {
+      // gunakan price_final jika sudah tersedia (dari aggregation),
+      // kalau nggak ada, hitung pakai calcFinalPrice(m.price)
+      const baseFinal =
+        typeof m.price_final === 'number'
+          ? m.price_final
+          : calcFinalPrice(m.price);
+
+      // ppnRate diasumsikan sudah tersedia di file (sama seperti di kode asli)
+      const taxAmount = Math.round(Math.max(0, baseFinal * ppnRate));
+      const priceWithTax = baseFinal + taxAmount;
+
+      return { ...m, price_final: baseFinal, price_with_tax: priceWithTax };
+    });
 
   const calcFinalPrice = (price = {}) => {
     const original = Number(price.original || 0);
@@ -402,17 +417,6 @@ exports.listMenuForMember = asyncHandler(async (req, res) => {
   const ppnRateRaw = typeof parsePpnRate === 'function' ? parsePpnRate() : 0.11;
   const ppnRate =
     Number.isFinite(ppnRateRaw) && ppnRateRaw >= 0 ? ppnRateRaw : 0.11;
-
-  const attachDisplayPrices = (items) =>
-    items.map((m) => {
-      const baseFinal =
-        typeof m.price_final === 'number'
-          ? m.price_final
-          : calcFinalPrice(m.price);
-      const taxAmount = Math.round(Math.max(0, baseFinal * ppnRate));
-      const priceWithTax = baseFinal + taxAmount;
-      return { ...m, price_final: baseFinal, price_with_tax: priceWithTax };
-    });
 
   if (q) {
     filter.$or = [

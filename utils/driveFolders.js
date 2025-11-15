@@ -2,7 +2,8 @@ require('dotenv').config();
 
 const DRIVE_FOLDERS = {
   menu: process.env.MENU,
-  invoice: process.env.INVOICE
+  invoice: process.env.INVOICE,
+  expense: process.env.EXPENSE
 };
 
 function getDriveFolder(type) {

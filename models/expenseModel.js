@@ -10,6 +10,7 @@ const ExpenseSchema = new mongoose.Schema(
     },
     amount: { type: Number, required: true, min: 0 },
     note: { type: String, trim: true, default: '' },
+    imageUrl: { type: String, trim: true, required: true },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',

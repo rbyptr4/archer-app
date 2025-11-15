@@ -4,11 +4,14 @@ const mongoose = require('mongoose');
 const Expense = require('../models/expenseModel');
 const ExpenseType = require('../models/expenseTypeModel');
 const throwError = require('../utils/throwError');
+const {
+  uploadBuffer,
+  deleteFile,
+  extractDriveIdFromUrl
+} = require('../utils/googleDrive');
+const { buildExpenseProofFileName } = require('../utils/makeFileName');
 const { parsePeriod } = require('../utils/periodRange');
 
-/* =========================
- * ===== EXPENSE TYPE ======
- * ========================= */
 exports.createType = asyncHandler(async (req, res) => {
   const { name, description } = req.body || {};
   if (!name?.trim()) throwError('Nama jenis pengeluaran wajib diisi', 400);
@@ -78,11 +81,46 @@ exports.createExpense = asyncHandler(async (req, res) => {
   if (!Number.isFinite(+amount) || +amount <= 0)
     throwError('Nominal tidak valid', 400);
 
+  // wajibkan ada file bukti (karena schema Expense.imageUrl required)
+  if (!req.file) throwError('Bukti pengeluaran (file) wajib diunggah', 400);
+
+  // hitung tanggal expense
+  const dateObj = date ? new Date(date) : new Date();
+  if (isNaN(dateObj.getTime())) throwError('Tanggal tidak valid', 400);
+
+  // upload file bukti terlebih dahulu
+  let imageUrl = '';
+  try {
+    const folderId = getDriveFolder('expense'); // folder untuk expense
+    const desiredName = buildExpenseProofFileName(
+      // tipe pengeluaran: bisa ambil dari ExpenseType jika ingin nama yang friendly,
+      // di sini kita pakai string dari body atau fallback ke id
+      req.body.typeName || typeId, // kalau kamu punya nama type di body bisa pakai itu; kalau tidak gunakan typeId
+      dateObj,
+      req.file.originalname,
+      req.file.mimetype
+    );
+
+    const uploaded = await uploadBuffer(
+      req.file.buffer,
+      desiredName,
+      req.file.mimetype,
+      folderId
+    );
+
+    imageUrl = `https://drive.google.com/uc?export=view&id=${uploaded.id}`;
+  } catch (err) {
+    console.error('[createExpense][upload]', err);
+    throwError('Gagal mengunggah bukti pengeluaran', 500);
+  }
+
+  // buat expense dengan imageUrl
   const expense = await Expense.create({
     type: typeId,
     amount: +amount,
     note: note || '',
-    date: date ? new Date(date) : new Date(),
+    date: dateObj,
+    imageUrl,
     createdBy: req.user.id
   });
 
@@ -198,6 +236,60 @@ exports.updateExpense = asyncHandler(async (req, res) => {
 
   if (typeof note === 'string') doc.note = note;
   if (date) doc.date = new Date(date);
+
+  // jika ada file baru: upload, set imageUrl baru, hapus file lama
+  if (req.file) {
+    // upload dulu
+    let uploaded;
+    try {
+      const folderId = getDriveFolder('expense'); // pastikan ada folder ini
+      const desiredName = buildExpenseProofFileName(
+        // ambil nama tipe kalau mau: bisa ambil dari ExpenseType document,
+        // di sini kita pakai tipeId jika ada, fallback 'expense'
+        req.body.typeName || doc.type || 'expense',
+        doc.date || new Date(),
+        req.file.originalname,
+        req.file.mimetype
+      );
+
+      uploaded = await uploadBuffer(
+        req.file.buffer,
+        desiredName,
+        req.file.mimetype || 'image/jpeg',
+        folderId
+      );
+    } catch (err) {
+      console.error('[updateExpense][uploadBuffer]', err);
+      throwError('Gagal mengunggah bukti pengeluaran', 500);
+    }
+
+    const newId = uploaded && (uploaded.id || uploaded.fileId || uploaded._id);
+    if (!newId) throwError('Gagal mendapatkan file id setelah upload', 500);
+    const newUrl = `https://drive.google.com/uc?export=view&id=${newId}`;
+
+    // simpan url baru ke doc, commit ke DB
+    const oldUrl = doc.imageUrl;
+    doc.imageUrl = newUrl;
+    await doc.save();
+
+    // hapus file lama (jika ada) — jangan blokir response kalau gagal, cukup log
+    if (oldUrl) {
+      const oldFileId = extractDriveIdFromUrl(oldUrl);
+      if (oldFileId) {
+        try {
+          await deleteFile(oldFileId);
+        } catch (err) {
+          console.error('[updateExpense][delete old file]', err);
+          // optional: laporkan ke monitoring, tapi jangan throw agar user tidak kehilangan perubahan
+        }
+      }
+    }
+
+    // return dengan doc terbaru
+    return res.json({ data: doc });
+  }
+
+  // jika tidak ada file baru, simpan perubahan biasa
   await doc.save();
   res.json({ data: doc });
 });
@@ -206,6 +298,20 @@ exports.removeExpense = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const doc = await Expense.findById(id);
   if (!doc) throwError('Data pengeluaran tidak ditemukan', 404);
+
+  // hapus file terkait di Drive jika ada
+  if (doc.imageUrl) {
+    const fileId = extractDriveIdFromUrl(doc.imageUrl);
+    if (fileId) {
+      try {
+        await deleteFile(fileId);
+      } catch (err) {
+        console.error('[removeExpense][deleteFile]', err);
+        // kita tetap lanjut hapus dokumen agar tidak tersisa data, tapi log error
+      }
+    }
+  }
+
   await doc.deleteOne();
   res.json({ ok: true });
 });

@@ -185,6 +185,14 @@ router.patch(
   order.updateDeliveryStatus
 );
 
+router.delete(
+  '/:id/cancel',
+  validateToken,
+  requireRole('owner', 'cashier'),
+  requirePageAccess('orders'),
+  order.cancelOrder
+);
+
 router.get('/member/my-order/:id', authMemberRequired, order.getMyOrder);
 
 router.patch('/update/:itemId', order.updateItem);

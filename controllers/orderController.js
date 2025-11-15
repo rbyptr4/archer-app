@@ -24,12 +24,6 @@ const {
 } = require('../controllers/owner/orderHistoryController');
 
 const {
-  afterCreateOrderEmit,
-  makeOrderSummary
-} = require('./socket/emitHelpers'); // sesuaikan path
-// tambahkan di atas file
-// di bagian atas controllers/orderController.js (sesuaikan path)
-const {
   emitToCashier,
   emitToKitchen,
   emitToStaff,
@@ -38,9 +32,6 @@ const {
   emitToCourier,
   emitOrdersStream
 } = require('./socket/socketBus'); // <-- sesuaikan path relatif kalau perlu
-
-// jika belum ada, untuk generate guest token
-const { v4: uuidv4 } = require('uuid');
 
 const throwError = require('../utils/throwError');
 const { DELIVERY_SLOTS } = require('../config/onlineConfig'); // import
@@ -53,15 +44,16 @@ const {
   int
 } = require('../utils/money');
 const { baseCookie } = require('../utils/authCookies');
-const { uploadBuffer } = require('../utils/googleDrive');
+const {
+  uploadBuffer,
+  deleteFile,
+  extractDriveIdFromUrl
+} = require('../utils/googleDrive');
 const { getDriveFolder } = require('../utils/driveFolders');
 
 const { haversineKm } = require('../utils/distance');
 const { nextDailyTxCode } = require('../utils/txCode');
-const {
-  validateAndPrice,
-  filterItemsByScope
-} = require('../utils/voucherEngine');
+const { validateAndPrice } = require('../utils/voucherEngine');
 const { awardPointsIfEligible } = require('../utils/loyalty');
 
 dayjs.extend(utc);
@@ -4326,5 +4318,44 @@ exports.closingShiftSummary = asyncHandler(async (req, res) => {
       shift1: shift1Summary,
       shift2: shift2Summary
     }
+  });
+});
+
+exports.cancelOrder = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const id = req.params.id;
+  if (!id || !mongoose.Types.ObjectId.isValid(id))
+    throwError('ID tidak valid', 400);
+
+  // ambil field imageUrl/paymentProofUrl (atau nama field yang kalian pakai)
+  const order = await Order.findById(id).select(
+    'status transaction_code member guestToken imageUrl paymentProofUrl'
+  );
+  if (!order) throwError('Order tidak ditemukan', 404);
+
+  if (order.status !== 'created')
+    throwError('Hanya order dengan status "created" yang bisa dibatalkan', 409);
+
+  // hapus file bukti jika ada (coba hapus tapi jangan block kalau gagal)
+  const candidates = [order.imageUrl, order.paymentProofUrl].filter(Boolean);
+  for (const url of candidates) {
+    const fileId = extractDriveIdFromUrl(url);
+    if (fileId) {
+      try {
+        await deleteFile(fileId);
+      } catch (err) {
+        console.error('[cancelOrder][deleteFile]', err);
+        // jangan throw supaya proses cancel tetap jalan; ubah sesuai kebijakanmu
+      }
+    }
+  }
+
+  await Order.deleteOne({ _id: id });
+
+  return res.status(200).json({
+    message: 'Order dibatalkan & dihapus',
+    id: String(id),
+    transaction_code: order.transaction_code || null
   });
 });

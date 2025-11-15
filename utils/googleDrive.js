@@ -15,6 +15,22 @@ oauth2Client.setCredentials({
 
 const drive = google.drive({ version: 'v3', auth: oauth2Client });
 
+function extractDriveIdFromUrl(url = '') {
+  if (!url || typeof url !== 'string') return null;
+  try {
+    const u = new URL(url);
+    if (u.searchParams && u.searchParams.get('id'))
+      return u.searchParams.get('id');
+    const seg = u.pathname.split('/').filter(Boolean);
+    return seg.length ? seg[seg.length - 1] : null;
+  } catch (err) {
+    const m = url.match(/(?:id=)([a-zA-Z0-9_-]+)/);
+    if (m) return m[1];
+    const parts = url.split('/').filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : null;
+  }
+}
+
 async function uploadBuffer(fileBuffer, fileName, mimeType, folderId) {
   if (!folderId) throw new Error('Missing folderId');
 
@@ -63,4 +79,10 @@ async function streamFile(res, fileId) {
   dl.data.pipe(res);
 }
 
-module.exports = { uploadBuffer, getFile, deleteFile, streamFile };
+module.exports = {
+  uploadBuffer,
+  getFile,
+  deleteFile,
+  streamFile,
+  extractDriveIdFromUrl
+};

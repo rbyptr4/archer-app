@@ -1,6 +1,6 @@
 module.exports = (req, res, next) => {
-  const ct = String(req.headers['content-type'] || '');
-  const isMultipart = ct.includes('multipart/form-data');
+  const ct = String(req.headers['content-type'] || '').toLowerCase();
+  const isMultipart = ct.indexOf('multipart/form-data') !== -1;
 
   if (process.env.DEBUG_NORMALIZE === '1') {
     console.error('[normalizeBody] hit', {
@@ -22,16 +22,18 @@ module.exports = (req, res, next) => {
     req.body = {};
   }
 
-  /* ===== Helpers ===== */
+  // parseMaybeJSON: tambahkan logging debug saat JSON invalid
   const parseMaybeJSON = (v, fallback) => {
     if (v == null) return fallback;
-    if (typeof v === 'object') return v; // sudah object
+    if (typeof v === 'object') return v;
     const s = String(v).trim();
     if (!s) return fallback;
     if (s.startsWith('{') || s.startsWith('[')) {
       try {
         return JSON.parse(s);
-      } catch {
+      } catch (err) {
+        if (process.env.DEBUG_NORMALIZE === '1')
+          console.error('[normalizeBody] JSON parse failed', err, s);
         return fallback;
       }
     }
