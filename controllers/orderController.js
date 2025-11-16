@@ -4206,26 +4206,6 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
 
   q.$or = courierOr;
 
-  // --- Toleransi delivery.mode: jika ada dokumen yang memang pakai field delivery.mode === 'delivery', baru tambahkan filter ---
-  try {
-    const hasMode = await Order.exists({ 'delivery.mode': 'delivery' });
-    if (hasMode) {
-      q['delivery.mode'] = 'delivery';
-      console.log(
-        '[getAssignedDeliveries] delivery.mode detected in DB, adding filter delivery.mode=delivery'
-      );
-    } else {
-      console.log(
-        '[getAssignedDeliveries] delivery.mode not found in sample documents, skipping filter'
-      );
-    }
-  } catch (e) {
-    console.error(
-      '[getAssignedDeliveries] error checking delivery.mode existance:',
-      e?.message || e
-    );
-  }
-
   // --- DEBUG: tampilkan final query sebelum eksekusi (hati-hati jangan print data sensitif di prod) ---
   console.log('[getAssignedDeliveries] final mongo query:', JSON.stringify(q));
 
