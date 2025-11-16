@@ -29,6 +29,7 @@ require('./models/orderModel');
 require('./models/menuModel');
 require('./models/memberModel');
 require('./models/cartModel');
+const VoucherClaim = require('./models/voucherClaimModel');
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -71,6 +72,17 @@ app.use(
 app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
+});
+
+// GET /dev/inspect-claim/:id
+app.get('/dev/inspect-claim/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const doc = await VoucherClaim.findOne({ _id: id }).lean();
+    return res.json({ ok: true, doc });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
 });
 
 /* ==== Public/Auth/Owner ==== */

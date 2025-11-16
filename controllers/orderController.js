@@ -1539,132 +1539,116 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
+  // --- VOUCHER filtering (robust fallback + diagnostics) ---
   let eligibleClaimIds = [];
 
   if (MemberDoc) {
-    if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
-      console.log('[checkout][voucher-check] start detailed diagnostics');
+    try {
       console.log(
         '[checkout][voucher-check] incoming voucherClaimIds (raw):',
         voucherClaimIds
       );
       console.log(
-        '[checkout][voucher-check] voucherClaimIds types:',
-        voucherClaimIds.map((v) => typeof v)
-      );
-      console.log(
-        '[checkout][voucher-check] MemberDoc._id type/value:',
-        typeof MemberDoc._id,
-        String(MemberDoc._id)
+        '[checkout][voucher-check] types:',
+        voucherClaimIds?.map?.((v) => typeof v)
       );
 
-      // 1) ambil semua dokumen sesuai id yg dikirim FE (NO filters) -> untuk diagnosis + fallback
-      const rawById = await VoucherClaim.find({ _id: { $in: voucherClaimIds } })
-        .lean()
-        .catch((e) => {
+      if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
+        // ambil semua doc sesuai id yg diminta (no filters) -> buat diagnosa + fallback
+        const rawById = await VoucherClaim.find({
+          _id: { $in: voucherClaimIds }
+        })
+          .lean()
+          .catch((e) => {
+            console.error(
+              '[checkout][voucher-check] find rawById error',
+              e?.message || e
+            );
+            return [];
+          });
+
+        console.log('[checkout][voucher-check] rawById count:', rawById.length);
+        rawById.forEach((d) => {
+          console.log('[checkout][voucher-check][rawDoc]', {
+            id: String(d._id),
+            member: String(d.member || null),
+            status: d.status || null,
+            remainingUse: d.remainingUse ?? null,
+            validUntil: d.validUntil || null,
+            voucher: String(d.voucher || null),
+            createdAt: d.createdAt || null
+          });
+        });
+
+        // Build eligibleClaimIds dari rawById (manual checks)
+        const now = new Date();
+        eligibleClaimIds = (rawById || [])
+          .filter((d) => {
+            const memberMatch =
+              String(d.member || '') === String(MemberDoc._id || '');
+            const statusOk = d.status === 'claimed';
+            const notExpired = !d.validUntil || new Date(d.validUntil) > now;
+            if (!memberMatch || !statusOk || !notExpired) {
+              console.log('[checkout][voucher-check][rawDoc-rejected]', {
+                id: String(d._id),
+                memberMatch,
+                status: d.status,
+                statusOk,
+                validUntil: d.validUntil || null,
+                notExpired
+              });
+            }
+            return memberMatch && statusOk && notExpired;
+          })
+          .map((d) => String(d._id));
+
+        console.log(
+          '[checkout][voucher-check] eligibleClaimIds after rawById processing:',
+          eligibleClaimIds
+        );
+
+        // Optional: compare with query-by-filter (for diagnosis)
+        try {
+          const rawClaimsQuery = await VoucherClaim.find({
+            _id: { $in: voucherClaimIds },
+            member: MemberDoc._id,
+            status: 'claimed'
+          }).lean();
+          console.log(
+            '[checkout][voucher-check] rawClaimsQuery count (member+status):',
+            rawClaimsQuery.length
+          );
+        } catch (e) {
           console.error(
-            '[checkout][voucher-check] find rawById threw',
+            '[checkout][voucher-check] rawClaimsQuery error',
             e?.message || e
           );
-          return [];
-        });
+        }
 
-      console.log('[checkout][voucher-check] rawById count:', rawById.length);
-      rawById.forEach((d) => {
-        console.log('[checkout][voucher-check][rawDoc]', {
-          id: String(d._id),
-          member: String(d.member || null),
-          status: d.status || null,
-          remainingUse: d.remainingUse ?? null,
-          validUntil: d.validUntil || null,
-          voucher: String(d.voucher || null),
-          createdAt: d.createdAt || null
-        });
-      });
-
-      // 2) Fallback: bangun eligibleClaimIds langsung dari rawById (manual check)
-      const now = new Date();
-      eligibleClaimIds = (rawById || [])
-        .filter((d) => {
-          // explicit comparisons and logs if mismatch
-          const memberMatch =
-            String(d.member || '') === String(MemberDoc._id || '');
-          const statusOk = d.status === 'claimed';
-          const notExpired = !d.validUntil || new Date(d.validUntil) > now;
-          if (!memberMatch || !statusOk || !notExpired) {
-            console.log('[checkout][voucher-check][rawDoc-rejected]', {
-              id: String(d._id),
-              memberMatch,
-              status: d.status,
-              statusOk,
-              validUntil: d.validUntil || null,
-              notExpired
-            });
-          }
-          return memberMatch && statusOk && notExpired;
-        })
-        .map((d) => String(d._id));
-
-      console.log(
-        '[checkout][voucher-check] eligibleClaimIds after rawById processing:',
-        eligibleClaimIds
-      );
-
-      // 3) Additional defensive check: try DB query with member/status (to compare results)
-      let rawClaimsQuery = [];
-      try {
-        rawClaimsQuery = await VoucherClaim.find({
-          _id: { $in: voucherClaimIds },
-          member: MemberDoc._id,
-          status: 'claimed'
-        }).lean();
-        console.log(
-          '[checkout][voucher-check] rawClaimsQuery count:',
-          rawClaimsQuery.length
-        );
-      } catch (e) {
-        console.error(
-          '[checkout][voucher-check] rawClaimsQuery threw',
-          e?.message || e
-        );
+        // If FE requested but none eligible -> fail-fast with friendly message
+        if (
+          Array.isArray(voucherClaimIds) &&
+          voucherClaimIds.length &&
+          eligibleClaimIds.length === 0
+        ) {
+          console.error(
+            '[checkout][voucher-check][FAIL] requested vouchers not eligible. requested:',
+            voucherClaimIds
+          );
+          throwError(
+            'Voucher tidak valid/expired/atau bukan milik member ini. Silakan periksa wallet Anda atau refresh halaman.',
+            400
+          );
+        }
       }
-
-      // 4) If FE requested but none eligible -> fail-fast with diagnostic logs
-      if (
-        Array.isArray(voucherClaimIds) &&
-        voucherClaimIds.length &&
-        eligibleClaimIds.length === 0
-      ) {
-        const diag = (voucherClaimIds || []).map((id) => {
-          const doc = rawById.find((d) => String(d._id) === String(id));
-          if (!doc) return { id, found: false };
-          return {
-            id: String(doc._id),
-            found: true,
-            member: String(doc.member || null),
-            status: doc.status || null,
-            remainingUse: doc.remainingUse ?? null,
-            validUntil: doc.validUntil || null,
-            voucher: String(doc.voucher || null)
-          };
-        });
-
-        console.error(
-          '[checkout][voucher-check][FAIL] requested vouchers not eligible. diag:',
-          JSON.stringify(diag, null, 2)
-        );
-        // Beri pesan user-friendly
-        throwError(
-          'Voucher tidak valid/expired/atau bukan milik member ini. Silakan periksa wallet Anda atau refresh halaman.',
-          400
-        );
-      }
-    } // end if voucherClaimIds present
+    } catch (e) {
+      console.error('[checkout][voucher-check][fatal]', e?.message || e);
+      throwError('Kesalahan saat memvalidasi voucher', 500);
+    }
   } else if (voucherClaimIds?.length) {
-    console.error(
-      '[checkout][voucher-check] non-member tried to use vouchers',
-      { voucherClaimIds }
-    );
+    console.error('[checkout] non-member tried to use vouchers', {
+      voucherClaimIds
+    });
     throwError('Voucher hanya untuk member. Silakan daftar/login.', 400);
   }
 
