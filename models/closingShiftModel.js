@@ -10,7 +10,15 @@ const StaffRefSchema = new mongoose.Schema(
 );
 
 const CashierShift1Schema = new mongoose.Schema(
-  { previousTurnover: { type: Number, default: 0 } },
+  {
+    previousTurnover: { type: Number, default: 0 },
+    openingBreakdown: {
+      cash: { type: Number, default: 0 },
+      qris: { type: Number, default: 0 },
+      transfer: { type: Number, default: 0 },
+      card: { type: Number, default: 0 }
+    }
+  },
   { _id: false }
 );
 
@@ -20,6 +28,7 @@ const CashierShift2Schema = new mongoose.Schema(
     closingBreakdown: {
       cash: { type: Number, default: 0 },
       qris: { type: Number, default: 0 },
+      card: { type: Number, default: 0 },
       transfer: { type: Number, default: 0 }
     }
   },

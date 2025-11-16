@@ -72,8 +72,35 @@ exports.createShift1 = asyncHandler(async (req, res) => {
   };
 
   if (type === 'cashier') {
+    // Untuk cashier: wajib ada openingBreakdown (cash, qris, transfer, card)
+    const ob = shift1?.cashier?.openingBreakdown || null;
+    if (!ob || typeof ob !== 'object') {
+      throwError(
+        'Untuk cashier, openingBreakdown wajib diisi pada Shift-1 (fields: cash, qris, transfer, card).',
+        400
+      );
+    }
+
+    const parseNumberField = (v) => {
+      const n = Number(v === undefined || v === null ? 0 : v);
+      return Number.isFinite(n) ? n : NaN;
+    };
+
+    const cash = parseNumberField(ob.cash);
+    const qris = parseNumberField(ob.qris);
+    const transfer = parseNumberField(ob.transfer);
+    const card = parseNumberField(ob.card);
+
+    if ([cash, qris, transfer, card].some((x) => Number.isNaN(x))) {
+      throwError(
+        'openingBreakdown harus berisi angka untuk cash, qris, transfer, dan card (boleh 0).',
+        400
+      );
+    }
+
     payloadS1.cashier = {
-      previousTurnover: Number(shift1?.cashier?.previousTurnover || 0)
+      previousTurnover: Number(shift1?.cashier?.previousTurnover || 0),
+      openingBreakdown: { cash, qris, transfer, card }
     };
   } else {
     payloadS1.stockItemsStart = Array.isArray(shift1?.stockItemsStart)
@@ -108,7 +135,7 @@ exports.fillShift2 = asyncHandler(async (req, res) => {
   if (doc.status === 'locked') throwError('Laporan sudah dikunci', 400);
 
   if (!shift2?.staff?.user || !shift2?.staff?.name) {
-    throwError('staff.user dan staff.name wajib di shift-2', 400);
+    throwError('Nama staff wajib diisi', 400);
   }
 
   const payloadS2 = {
@@ -122,12 +149,41 @@ exports.fillShift2 = asyncHandler(async (req, res) => {
   };
 
   if (doc.type === 'cashier') {
+    // Validasi wajib: shift2.cashier.closingBreakdown harus berisi cash, qris, transfer, card
+    const cb = shift2?.cashier?.closingBreakdown || null;
+    if (!cb || typeof cb !== 'object') {
+      throwError(
+        'Untuk cashier, closingBreakdown wajib diisi (fields: cash, qris, transfer, card).',
+        400
+      );
+    }
+
+    // Cast & validate setiap pecahan jadi number (boleh 0)
+    const parseNumberField = (v) => {
+      const n = Number(v === undefined || v === null ? 0 : v);
+      return Number.isFinite(n) ? n : NaN;
+    };
+
+    const cash = parseNumberField(cb.cash);
+    const qris = parseNumberField(cb.qris);
+    const transfer = parseNumberField(cb.transfer);
+    const card = parseNumberField(cb.card);
+
+    if ([cash, qris, transfer, card].some((x) => Number.isNaN(x))) {
+      throwError(
+        'closingBreakdown harus berisi angka untuk cash, qris, transfer, dan card (boleh 0).',
+        400
+      );
+    }
+
+    // Optionally: kamu bisa menambahkan pemeriksaan sum vs grand_total di sini.
     payloadS2.cashier = {
       diffFromShift1: Number(shift2?.cashier?.diffFromShift1 || 0),
       closingBreakdown: {
-        cash: Number(shift2?.cashier?.closingBreakdown?.cash || 0),
-        qris: Number(shift2?.cashier?.closingBreakdown?.qris || 0),
-        transfer: Number(shift2?.cashier?.closingBreakdown?.transfer || 0)
+        cash,
+        qris,
+        transfer,
+        card
       }
     };
   } else {
