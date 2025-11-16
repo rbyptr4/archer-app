@@ -1716,21 +1716,24 @@ exports.checkout = asyncHandler(async (req, res) => {
   // --- PANGGIL price engine (sumber kebenaran) ---
   let priced;
   try {
+    // --- normalize items for engine: price = menu_base + addonsPerUnit ---
     const normalizedForEngine = {
       items: (cart.items || []).map((it) => {
-        const base = Number(it.base_price ?? it.unit_price ?? it.price ?? 0);
+        const menuBase = Number(
+          it.base_price ?? it.unit_price ?? it.price ?? 0
+        );
         const addons = Array.isArray(it.addons) ? it.addons : [];
-        const addonsPerUnit = addons.reduce((s, a) => {
-          const ap = Number(a?.price || 0);
-          const aq = Number(a?.qty || 1);
-          return s + ap * Math.max(1, aq);
-        }, 0);
-        const unit_price = Math.round(base + addonsPerUnit);
+        const addonsPerUnit = addons.reduce(
+          (s, a) =>
+            s + Number(a?.price || 0) * Math.max(1, Number(a?.qty || 1)),
+          0
+        );
+        const unit_price = Math.round(menuBase + addonsPerUnit);
         return {
           menuId: it.menu,
           name: it.name || null,
           qty: Number(it.quantity ?? it.qty ?? 0),
-          price: unit_price,
+          price: unit_price, // penting: engine harus terima unit_price termasuk addons
           category: it.category || null,
           addons: addons.map((a) => ({
             name: a.name,
@@ -1938,28 +1941,30 @@ exports.checkout = asyncHandler(async (req, res) => {
             fulfillment_type: ft,
             transaction_code: code,
             items: (cart.items || []).map((it) => {
-              const base = Number(
+              const menuBase = Number(
                 it.base_price ?? it.unit_price ?? it.price ?? 0
-              );
+              ); // asumsi: menu base
               const addons = Array.isArray(it.addons) ? it.addons : [];
               const addonsPerUnit = addons.reduce(
                 (s, a) =>
                   s + Number(a?.price || 0) * Math.max(1, Number(a?.qty || 1)),
                 0
               );
-              const unit_price = Math.round(base + addonsPerUnit);
+              const unit_price = Math.round(menuBase + addonsPerUnit);
               const qty = Number(it.quantity ?? it.qty ?? 0) || 0;
+
               return {
                 menu: it.menu,
                 menu_code: it.menu_code,
                 name: it.name,
                 imageUrl: it.imageUrl,
-                base_price: unit_price, // simpan unit price termasuk addons
+                base_price: int(menuBase), // SIMPAN menu base (bukan menu+addon)
                 quantity: qty,
                 addons: it.addons,
                 notes: String(it.notes || '').trim(),
                 category: it.category || null,
-                line_before_tax: int(unit_price * qty) // line total termasuk addons
+                line_before_tax: int(unit_price * qty), // total line = (menu + addon) * qty
+                line_subtotal: int(unit_price * qty) // jika UI/consumer pakai field ini
               };
             }),
 
