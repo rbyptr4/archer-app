@@ -3542,7 +3542,7 @@ exports.assignBatch = asyncHandler(async (req, res) => {
         results.failed.push({ id, reason: 'Order ini bukan delivery' });
         continue;
       }
-      if (order.status === 'cancelled' || order.payment_status !== 'paid') {
+      if (order.status === 'cancelled' || order.payment_status !== 'verified') {
         results.failed.push({
           id,
           reason: 'Order belum layak dikirim (harus paid & tidak cancelled)'
