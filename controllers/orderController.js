@@ -1539,69 +1539,104 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
-  // ---------------------------
-  // Robust voucher claim filtering + diagnostics
-  // ---------------------------
   let eligibleClaimIds = [];
 
   if (MemberDoc) {
     if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
-      // 1) ambil semua yang request sender minta (tanpa filter member/status) -> untuk diagnosa
-      const rawById = await VoucherClaim.find({
-        _id: { $in: voucherClaimIds }
-      }).lean();
+      console.log('[checkout][voucher-check] start detailed diagnostics');
+      console.log(
+        '[checkout][voucher-check] incoming voucherClaimIds (raw):',
+        voucherClaimIds
+      );
+      console.log(
+        '[checkout][voucher-check] voucherClaimIds types:',
+        voucherClaimIds.map((v) => typeof v)
+      );
+      console.log(
+        '[checkout][voucher-check] MemberDoc._id type/value:',
+        typeof MemberDoc._id,
+        String(MemberDoc._id)
+      );
 
-      // map id -> doc
-      const rawMap = rawById.reduce((acc, d) => {
-        acc[String(d._id)] = d;
-        return acc;
-      }, {});
+      // 1) ambil semua dokumen sesuai id yg dikirim FE (NO filters) -> untuk diagnosis + fallback
+      const rawById = await VoucherClaim.find({ _id: { $in: voucherClaimIds } })
+        .lean()
+        .catch((e) => {
+          console.error(
+            '[checkout][voucher-check] find rawById threw',
+            e?.message || e
+          );
+          return [];
+        });
 
       console.log('[checkout][voucher-check] rawById count:', rawById.length);
-      if (rawById.length) {
-        rawById.forEach((d) => {
-          console.log('[checkout][voucher-check][rawDoc]', {
-            id: String(d._id),
-            member: String(d.member || null),
-            status: d.status || null,
-            remainingUse: d.remainingUse ?? null,
-            validUntil: d.validUntil || null,
-            voucher: String(d.voucher || null)
-          });
+      rawById.forEach((d) => {
+        console.log('[checkout][voucher-check][rawDoc]', {
+          id: String(d._id),
+          member: String(d.member || null),
+          status: d.status || null,
+          remainingUse: d.remainingUse ?? null,
+          validUntil: d.validUntil || null,
+          voucher: String(d.voucher || null),
+          createdAt: d.createdAt || null
         });
-      } else {
-        console.log(
-          '[checkout][voucher-check] no voucherclaim rows found for requested ids'
-        );
-      }
+      });
 
-      // 2) hit DB lagi tapi dengan check member & status claimed
-      const rawClaims = await VoucherClaim.find({
-        _id: { $in: voucherClaimIds },
-        member: MemberDoc._id,
-        status: 'claimed'
-      }).lean();
-
-      // 3) final filter: validUntil in the future (if exists)
+      // 2) Fallback: bangun eligibleClaimIds langsung dari rawById (manual check)
       const now = new Date();
-      eligibleClaimIds = (rawClaims || [])
-        .filter((c) => !c.validUntil || new Date(c.validUntil) > now)
-        .map((c) => String(c._id));
+      eligibleClaimIds = (rawById || [])
+        .filter((d) => {
+          // explicit comparisons and logs if mismatch
+          const memberMatch =
+            String(d.member || '') === String(MemberDoc._id || '');
+          const statusOk = d.status === 'claimed';
+          const notExpired = !d.validUntil || new Date(d.validUntil) > now;
+          if (!memberMatch || !statusOk || !notExpired) {
+            console.log('[checkout][voucher-check][rawDoc-rejected]', {
+              id: String(d._id),
+              memberMatch,
+              status: d.status,
+              statusOk,
+              validUntil: d.validUntil || null,
+              notExpired
+            });
+          }
+          return memberMatch && statusOk && notExpired;
+        })
+        .map((d) => String(d._id));
 
       console.log(
-        '[checkout][voucher-check] eligibleClaimIds after filter:',
+        '[checkout][voucher-check] eligibleClaimIds after rawById processing:',
         eligibleClaimIds
       );
 
-      // 4) If FE requested some ids but none are eligible, fail-fast + log diagnostics
+      // 3) Additional defensive check: try DB query with member/status (to compare results)
+      let rawClaimsQuery = [];
+      try {
+        rawClaimsQuery = await VoucherClaim.find({
+          _id: { $in: voucherClaimIds },
+          member: MemberDoc._id,
+          status: 'claimed'
+        }).lean();
+        console.log(
+          '[checkout][voucher-check] rawClaimsQuery count:',
+          rawClaimsQuery.length
+        );
+      } catch (e) {
+        console.error(
+          '[checkout][voucher-check] rawClaimsQuery threw',
+          e?.message || e
+        );
+      }
+
+      // 4) If FE requested but none eligible -> fail-fast with diagnostic logs
       if (
         Array.isArray(voucherClaimIds) &&
         voucherClaimIds.length &&
         eligibleClaimIds.length === 0
       ) {
-        // prepare diagnostic array mapping requested -> found? details
         const diag = (voucherClaimIds || []).map((id) => {
-          const doc = rawMap[String(id)];
+          const doc = rawById.find((d) => String(d._id) === String(id));
           if (!doc) return { id, found: false };
           return {
             id: String(doc._id),
@@ -1613,19 +1648,19 @@ exports.checkout = asyncHandler(async (req, res) => {
             voucher: String(doc.voucher || null)
           };
         });
+
         console.error(
           '[checkout][voucher-check][FAIL] requested vouchers not eligible. diag:',
-          diag
+          JSON.stringify(diag, null, 2)
         );
-        // return friendly error for FE (tidak menampilkan internal diag)
+        // Beri pesan user-friendly
         throwError(
           'Voucher tidak valid/expired/atau bukan milik member ini. Silakan periksa wallet Anda atau refresh halaman.',
           400
         );
       }
-    }
+    } // end if voucherClaimIds present
   } else if (voucherClaimIds?.length) {
-    // non-member cannot use vouchers
     console.error(
       '[checkout][voucher-check] non-member tried to use vouchers',
       { voucherClaimIds }
