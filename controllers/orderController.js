@@ -1288,6 +1288,12 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
 
 /* ===================== CHECKOUT ===================== */
 exports.checkout = asyncHandler(async (req, res) => {
+  console.log('[checkout] start', {
+    path: req.path,
+    member: req.member?.id || null
+  });
+
+  // --- destructure input ---
   const {
     name,
     phone,
@@ -1298,40 +1304,73 @@ exports.checkout = asyncHandler(async (req, res) => {
     register_decision = 'register'
   } = req.body || {};
 
+  console.log('[checkout] incoming body snippet', {
+    fulfillment_type,
+    payment_method,
+    voucherClaimIds_length: Array.isArray(voucherClaimIds)
+      ? voucherClaimIds.length
+      : 0,
+    register_decision
+  });
+
   const iden0 = getIdentity(req);
 
   const ft =
     iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
-  if (!['dine_in', 'delivery'].includes(ft))
+  if (!['dine_in', 'delivery'].includes(ft)) {
+    console.error('[checkout] invalid fulfillment_type', ft);
     throwError('fulfillment_type tidak valid', 400);
+  }
 
   const method = String(payment_method || '').toLowerCase();
   if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method)) {
+    console.error('[checkout] payment method not allowed', {
+      method,
+      source: iden0.source,
+      ft
+    });
     throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
   }
 
-  // identitas / member
+  // --- identitas / member ---
   const originallyLoggedIn = !!iden0.memberId;
   const wantRegister = String(register_decision || 'register') === 'register';
   let MemberDoc = null;
   let customer_name = '';
   let customer_phone = '';
 
-  if (originallyLoggedIn || wantRegister) {
-    const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
-    MemberDoc = await ensureMemberForCheckout(req, res, joinChannel);
-  } else {
-    customer_name = String(name || '').trim();
-    const rawPhone = String(phone || '').trim();
-    if (!customer_name && !rawPhone)
-      throwError('Tanpa member: isi minimal nama atau no. telp', 400);
-    if (rawPhone) {
-      const digits = rawPhone.replace(/\D+/g, '');
-      if (!digits) throwError('Nomor telepon harus berupa angka', 400);
-      customer_phone = normalizePhone(rawPhone);
+  try {
+    if (originallyLoggedIn || wantRegister) {
+      const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
+      MemberDoc = await ensureMemberForCheckout(req, res, joinChannel);
+      console.log('[checkout] Member found/ensured', {
+        memberId: MemberDoc ? MemberDoc._id : null
+      });
     } else {
-      customer_phone = '';
+      customer_name = String(name || '').trim();
+      const rawPhone = String(phone || '').trim();
+      if (!customer_name && !rawPhone) {
+        console.error('[checkout] missing name & phone for guest');
+        throwError('Tanpa member: isi minimal nama atau no. telp', 400);
+      }
+      if (rawPhone) {
+        const digits = rawPhone.replace(/\D+/g, '');
+        if (!digits) {
+          console.error('[checkout] invalid phone format', rawPhone);
+          throwError('Nomor telepon harus berupa angka', 400);
+        }
+        customer_phone = normalizePhone(rawPhone);
+      } else {
+        customer_phone = '';
+      }
+      console.log('[checkout] guest customer', {
+        customer_name,
+        customer_phone
+      });
     }
+  } catch (e) {
+    console.error('[checkout] ensureMemberForCheckout failed', e?.message || e);
+    throw e;
   }
 
   const iden = {
@@ -1344,16 +1383,29 @@ exports.checkout = asyncHandler(async (req, res) => {
       null
   };
 
-  // ambil cart
+  // --- ambil cart aktif ---
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
-  if (!cartObj) throwError('Cart tidak ditemukan / kosong', 404);
+  if (!cartObj) {
+    console.error('[checkout] cartObj not found for identity', iden);
+    throwError('Cart tidak ditemukan / kosong', 404);
+  }
   const cart = await Cart.findById(cartObj._1 || cartObj._id);
-  if (!cart) throwError('Cart tidak ditemukan / kosong', 404);
-  if (!cart.items?.length) throwError('Cart kosong', 400);
+  if (!cart) {
+    console.error('[checkout] cart actual doc not found', cartObj);
+    throwError('Cart tidak ditemukan / kosong', 404);
+  }
+  if (!cart.items?.length) {
+    console.error('[checkout] cart empty', { cartId: cart._id });
+    throwError('Cart kosong', 400);
+  }
+  console.log('[checkout] cart loaded', {
+    cartId: cart._id,
+    items: cart.items.length
+  });
 
-  // delivery / slot / pickup handling
+  // --- delivery / slot / pickup handling ---
   const delivery_mode =
     ft === 'dine_in'
       ? 'none'
@@ -1376,8 +1428,10 @@ exports.checkout = asyncHandler(async (req, res) => {
     slotLabel = slotDt.format('HH:mm');
   } else if (delivery_mode === 'delivery' && providedSlot) {
     const maybeDt = parseSlotLabelToDate(providedSlot);
-    if (!maybeDt || !maybeDt.isValid())
+    if (!maybeDt || !maybeDt.isValid()) {
+      console.error('[checkout] invalid delivery slot', providedSlot);
       throwError('delivery_slot tidak valid', 400);
+    }
     slotDt = maybeDt;
     slotLabel = providedSlot;
   }
@@ -1388,6 +1442,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     delivery_mode === 'delivery' &&
     !isSlotAvailable(slotLabel, null, delivery_mode)
   ) {
+    console.error('[checkout] slot not available', slotLabel);
     throwError('Slot sudah tidak tersedia / sudah lewat', 409);
   }
 
@@ -1398,7 +1453,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     status: 'pending'
   };
 
-  // HANDLE PICKUP WINDOW (baru)
+  // PICKUP window handling
   const pickupFromRaw =
     req.body?.pickup_from || req.body?.pickupWindow?.from || null;
   const pickupToRaw = req.body?.pickup_to || req.body?.pickupWindow?.to || null;
@@ -1408,13 +1463,19 @@ exports.checkout = asyncHandler(async (req, res) => {
     deliveryObj.status = 'pending';
     if (pickupFromRaw) {
       const pf = dayjs(pickupFromRaw).tz(LOCAL_TZ);
-      if (!pf.isValid()) throwError('pickup_from tidak valid', 400);
+      if (!pf.isValid()) {
+        console.error('[checkout] invalid pickup_from', pickupFromRaw);
+        throwError('pickup_from tidak valid', 400);
+      }
       deliveryObj.pickup_window = deliveryObj.pickup_window || {};
       deliveryObj.pickup_window.from = pf.toDate();
     }
     if (pickupToRaw) {
       const pt = dayjs(pickupToRaw).tz(LOCAL_TZ);
-      if (!pt.isValid()) throwError('pickup_to tidak valid', 400);
+      if (!pt.isValid()) {
+        console.error('[checkout] invalid pickup_to', pickupToRaw);
+        throwError('pickup_to tidak valid', 400);
+      }
       deliveryObj.pickup_window = deliveryObj.pickup_window || {};
       deliveryObj.pickup_window.to = pt.toDate();
     }
@@ -1425,11 +1486,15 @@ exports.checkout = asyncHandler(async (req, res) => {
   if (delivery_mode === 'delivery' && ft !== 'dine_in') {
     const latN = Number(req.body?.lat);
     const lngN = Number(req.body?.lng);
-    if (!Number.isFinite(latN) || !Number.isFinite(lngN))
+    if (!Number.isFinite(latN) || !Number.isFinite(lngN)) {
+      console.error('[checkout] missing lat/lng for delivery');
       throwError('Lokasi (lat,lng) wajib untuk delivery', 400);
+    }
     const distance_km = haversineKm(CAFE_COORD, { lat: latN, lng: lngN });
-    if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0))
+    if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0)) {
+      console.error('[checkout] outside delivery radius', { distance_km });
       throwError(`Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`);
+    }
     deliveryObj.address_text = String(req.body?.address_text || '').trim();
     deliveryObj.location = { lat: latN, lng: lngN };
     deliveryObj.distance_km = Number(distance_km.toFixed(2));
@@ -1440,7 +1505,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     deliveryObj.note_to_rider = String(req.body?.note_to_rider || '');
   }
 
-  // normalisasi item
+  // --- normalisasi item dan simpan cart totals ---
   cart.items = (Array.isArray(cart.items) ? cart.items : [])
     .filter(Boolean)
     .map((it) => {
@@ -1463,7 +1528,9 @@ exports.checkout = asyncHandler(async (req, res) => {
   try {
     recomputeTotals(cart);
     await cart.save();
+    console.log('[checkout] cart recompute & saved', { cartId: cart._id });
   } catch (err) {
+    console.error('[checkout] gagal simpan cart', err?.message || err);
     throwError(
       err?.message
         ? `Gagal menyimpan cart: ${String(err.message)}`
@@ -1472,7 +1539,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
-  // VOUCHER filtering
+  // --- FILTER voucherClaimIds jadi eligibleClaimIds (validasi member & expiry) ---
   let eligibleClaimIds = [];
   if (MemberDoc) {
     if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
@@ -1483,14 +1550,21 @@ exports.checkout = asyncHandler(async (req, res) => {
       }).lean();
       const now = new Date();
       eligibleClaimIds = rawClaims
-        .filter((c) => !c.validUntil || c.validUntil > now)
+        .filter((c) => !c.validUntil || new Date(c.validUntil) > now)
         .map((c) => String(c._id));
     }
   } else if (voucherClaimIds?.length) {
+    console.error('[checkout] non-member tried to use vouchers', {
+      voucherClaimIds
+    });
     throwError('Voucher hanya untuk member. Silakan daftar/login.', 400);
   }
 
-  // price engine
+  // DEBUG: log incoming voucher ids & eligible ids
+  console.log('[checkout] incoming voucherClaimIds:', voucherClaimIds);
+  console.log('[checkout] eligibleClaimIds after filter:', eligibleClaimIds);
+
+  // --- PANGGIL price engine (sumber kebenaran) ---
   let priced;
   try {
     priced = await validateAndPrice({
@@ -1507,7 +1581,19 @@ exports.checkout = asyncHandler(async (req, res) => {
       deliveryFee: deliveryObj.delivery_fee || 0,
       voucherClaimIds: eligibleClaimIds
     });
+    console.log('[checkout] price engine returned', {
+      ok: priced?.ok,
+      reasons: priced?.reasons,
+      totals_keys: Object.keys(priced?.totals || {}),
+      breakdown_length: Array.isArray(priced?.breakdown)
+        ? priced.breakdown.length
+        : 0,
+      chosenClaimIds: Array.isArray(priced?.chosenClaimIds)
+        ? priced.chosenClaimIds.length
+        : 0
+    });
   } catch (err) {
+    console.error('[checkout] validateAndPrice threw', err?.message || err);
     throwError(
       err?.message
         ? `Gagal menghitung harga: ${String(err.message)}`
@@ -1516,7 +1602,87 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
-  // ambil totals dari engine
+  if (!priced || !priced.ok) {
+    console.error('[checkout] price engine failed:', priced?.reasons || priced);
+    throwError(
+      (priced && priced.reasons && priced.reasons.join?.(', ')) ||
+        'Gagal menghitung harga (engine)',
+      400
+    );
+  }
+
+  // --- pastikan voucher yang dikirim FE benar-benar diaplikasikan ---
+  const breakdown = Array.isArray(priced.breakdown) ? priced.breakdown : [];
+  const claimedInBreakdown = new Set(
+    breakdown
+      .map((b) => b.claimId || b.claim_id || b.claim)
+      .filter(Boolean)
+      .map(String)
+  );
+
+  if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
+    const anyApplied = eligibleClaimIds.some((cid) =>
+      claimedInBreakdown.has(String(cid))
+    );
+    if (!anyApplied) {
+      console.error(
+        '[checkout] requested voucherClaimIds not applied by engine',
+        { requested: voucherClaimIds, eligible: eligibleClaimIds, breakdown }
+      );
+      const reasonMsg =
+        (priced && priced.reasons && priced.reasons.join?.(', ')) ||
+        'Voucher tidak bisa diterapkan saat checkout';
+      throwError(reasonMsg, 400);
+    }
+  }
+
+  // --- build discounts array & applied_voucher_ids (voucher ids, bukan claim ids) ---
+  const discounts = [];
+  const appliedVoucherIdSet = new Set();
+
+  const claimIdsNeeded = breakdown
+    .map((b) => b.claimId || b.claim_id || b.claim)
+    .filter(Boolean)
+    .map(String);
+  let claimDocsMap = {};
+  if (claimIdsNeeded.length) {
+    const claimDocs = await VoucherClaim.find({
+      _id: { $in: claimIdsNeeded }
+    }).lean();
+    claimDocsMap = claimDocs.reduce((acc, cd) => {
+      acc[String(cd._id)] = cd;
+      return acc;
+    }, {});
+    console.log('[checkout] claimDocsMap built for breakdown', {
+      claimDocsCount: claimDocs.length
+    });
+  }
+
+  for (const b of breakdown) {
+    const claimId = b.claimId || b.claim_id || b.claim || null;
+    let voucherId = b.voucherId || b.voucher_id || b.voucher || null;
+
+    if (!voucherId && claimId && claimDocsMap[claimId]) {
+      voucherId = claimDocsMap[claimId].voucher || null;
+    }
+
+    const item = {
+      claimId: claimId ? String(claimId) : null,
+      voucherId: voucherId ? String(voucherId) : null,
+      name: b.name || b.title || '',
+      itemsDiscount: int(b.itemsDiscount ?? b.items_discount ?? 0),
+      shippingDiscount: int(b.shippingDiscount ?? b.shipping_discount ?? 0),
+      note: b.note || null,
+      raw: b
+    };
+
+    discounts.push(item);
+    if (voucherId) appliedVoucherIdSet.add(String(voucherId));
+  }
+
+  const appliedVoucherIds = Array.from(appliedVoucherIdSet);
+
+  // --- ambil totals engine untuk hitung uiTotals & order pricing ---
   const baseItemsSubtotal = int(priced.totals?.baseSubtotal || 0);
   const items_discount = int(priced.totals?.itemsDiscount || 0);
   const shipping_discount = int(priced.totals?.shippingDiscount || 0);
@@ -1561,7 +1727,13 @@ exports.checkout = asyncHandler(async (req, res) => {
     : int(roundRupiahCustom(beforeRound));
   const rounding_delta = int(requested_bvt - beforeRound);
 
-  if (requested_bvt <= 0) throwError('Total pembayaran tidak valid.', 400);
+  if (requested_bvt <= 0) {
+    console.error('[checkout] invalid total requested_bvt', {
+      requested_bvt,
+      beforeRound
+    });
+    throwError('Total pembayaran tidak valid.', 400);
+  }
 
   const uiTotals = {
     items_subtotal: int(baseItemsSubtotal),
@@ -1574,96 +1746,111 @@ exports.checkout = asyncHandler(async (req, res) => {
     rounding_delta: int(rounding_delta || 0),
     grand_total: int(requested_bvt || 0),
     items_subtotal_after_discount: int(items_subtotal_after_discount || 0),
-    discounts: priced.breakdown || []
+    discounts // langsung dari engine (normalisasi)
   };
 
-  const appliedVoucherIds = Array.isArray(priced.chosenClaimIds)
-    ? priced.chosenClaimIds
-    : [];
-
-  // --- create order ---
-  const initialIsPaid = !needProof(method); // true jika metode tidak butuh bukti => langsung paid
+  // --- create order (trust engine totals & discounts) ---
+  const initialIsPaid = !needProof(method);
   const initialPaymentStatus = initialIsPaid ? 'paid' : 'unpaid';
   const initialPaidAt = initialIsPaid ? new Date() : null;
 
-  const order = await (async () => {
-    for (let i = 0; i < 5; i++) {
-      try {
-        const code = await nextDailyTxCode('ARCH');
+  let order;
+  try {
+    order = await (async () => {
+      for (let i = 0; i < 5; i++) {
+        try {
+          const code = await nextDailyTxCode('ARCH');
 
-        return await Order.create({
-          member: MemberDoc ? MemberDoc._id : null,
-          customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
-          customer_phone: MemberDoc ? MemberDoc.phone || '' : customer_phone,
-          table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
-          source: iden.source || 'online',
-          fulfillment_type: ft,
-          transaction_code: code,
-          items: cart.items.map((it) => ({
-            menu: it.menu,
-            menu_code: it.menu_code,
-            name: it.name,
-            imageUrl: it.imageUrl,
-            base_price: it.base_price,
-            quantity: it.quantity,
-            addons: it.addons,
-            notes: String(it.notes || '').trim(),
-            category: it.category || null
-          })),
+          const created = await Order.create({
+            member: MemberDoc ? MemberDoc._id : null,
+            customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
+            customer_phone: MemberDoc ? MemberDoc.phone || '' : customer_phone,
+            table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
+            source: iden.source || 'online',
+            fulfillment_type: ft,
+            transaction_code: code,
+            items: cart.items.map((it) => ({
+              menu: it.menu,
+              menu_code: it.menu_code,
+              name: it.name,
+              imageUrl: it.imageUrl,
+              base_price: it.base_price,
+              quantity: it.quantity,
+              addons: it.addons,
+              notes: String(it.notes || '').trim(),
+              category: it.category || null
+            })),
 
-          items_subtotal: int(uiTotals.items_subtotal),
-          items_discount: int(uiTotals.items_discount),
-          delivery_fee: int(uiTotals.delivery_fee),
-          shipping_discount: int(uiTotals.shipping_discount),
-
-          discounts: uiTotals.discounts || priced.breakdown || [],
-          applied_voucher_ids: appliedVoucherIds || [],
-
-          service_fee: int(uiTotals.service_fee),
-          tax_rate_percent: Number(uiTotals.tax_rate_percent),
-          tax_amount: int(uiTotals.tax_amount),
-          rounding_delta: int(uiTotals.rounding_delta),
-          grand_total: int(uiTotals.grand_total),
-
-          payment_method: method,
-          payment_provider:
-            method === PM.QRIS && !QRIS_USE_STATIC ? 'xendit' : null,
-
-          // initial payment status
-          payment_status: initialPaymentStatus,
-          paid_at: initialPaidAt,
-          payment_proof_url: null,
-
-          status: 'created',
-          placed_at: new Date(),
-
-          delivery: {
-            ...deliveryObj,
+            items_subtotal: int(uiTotals.items_subtotal),
+            items_discount: int(uiTotals.items_discount),
             delivery_fee: int(uiTotals.delivery_fee),
             shipping_discount: int(uiTotals.shipping_discount),
-            delivery_fee_raw: int(deliveryObj.delivery_fee_raw || 0)
-          }
-        });
-      } catch (e) {
-        if (e?.code === 11000 && /transaction_code/.test(String(e.message)))
-          continue;
-        throwError(
-          e?.message
-            ? `Gagal membuat order: ${String(e.message)}`
-            : 'Gagal membuat order',
-          e?.status || 500
-        );
-      }
-    }
-    throwError('Gagal generate transaction_code unik', 500);
-  })();
 
-  // HANDLE UPLOAD BUKTI (jika diperlukan)
+            discounts: discounts || [],
+            applied_voucher_ids: appliedVoucherIds || [],
+
+            service_fee: int(uiTotals.service_fee),
+            tax_rate_percent: Number(uiTotals.tax_rate_percent),
+            tax_amount: int(uiTotals.tax_amount),
+            rounding_delta: int(uiTotals.rounding_delta),
+            grand_total: int(uiTotals.grand_total),
+
+            payment_method: method,
+            payment_provider:
+              method === PM.QRIS && !QRIS_USE_STATIC ? 'xendit' : null,
+
+            payment_status: initialPaymentStatus,
+            paid_at: initialPaidAt,
+            payment_proof_url: null,
+
+            status: 'created',
+            placed_at: new Date(),
+
+            delivery: {
+              ...deliveryObj,
+              delivery_fee: int(uiTotals.delivery_fee),
+              shipping_discount: int(uiTotals.shipping_discount),
+              delivery_fee_raw: int(deliveryObj.delivery_fee_raw || 0)
+            }
+          });
+
+          console.log('[checkout] order created tentatively', {
+            orderId: created._id,
+            tx: created.transaction_code
+          });
+          return created;
+        } catch (e) {
+          if (e?.code === 11000 && /transaction_code/.test(String(e.message))) {
+            console.warn(
+              '[checkout] tx collision, retrying...',
+              e?.message || e
+            );
+            continue;
+          }
+          console.error('[checkout] failed creating order', e?.message || e);
+          throwError(
+            e?.message
+              ? `Gagal membuat order: ${String(e.message)}`
+              : 'Gagal membuat order',
+            e?.status || 500
+          );
+        }
+      }
+      throwError('Gagal generate transaction_code unik', 500);
+    })();
+  } catch (e) {
+    console.error('[checkout] create order fatal', e?.message || e);
+    throw e;
+  }
+
+  // --- handle upload bukti jika perlu (sama seperti sebelumnya) ---
   try {
     if (needProof(method)) {
-      // metode butuh bukti: wajib ada file
       if (!req.file) {
         await Order.deleteOne({ _id: order._id }).catch(() => {});
+        console.error(
+          '[checkout] missing proof file for method that requires it'
+        );
         throwError('Bukti pembayaran wajib diunggah untuk metode ini', 400);
       }
 
@@ -1676,21 +1863,22 @@ exports.checkout = asyncHandler(async (req, res) => {
         order.payment_status = 'paid';
         order.paid_at = new Date();
         await order.save();
+        console.log('[checkout] proof uploaded, order marked paid', {
+          orderId: order._id
+        });
       } else {
-        // unexpected: fungsi tidak melempar error tapi tidak mengembalikan url
         await Order.deleteOne({ _id: order._id }).catch(() => {});
+        console.error('[checkout] proof upload returned empty url');
         throwError('Gagal mengunggah bukti pembayaran', 500);
       }
-    } else {
-      // metode tidak butuh bukti -> sudah diset paid di create
     }
   } catch (err) {
-    // rollback order kalau gagal upload / validasi bukti
     try {
       await Order.deleteOne({ _id: order._id });
     } catch (ee) {
       console.error('[checkout][rollback][deleteOrder]', ee?.message || ee);
     }
+    console.error('[checkout] handle proof error', err?.message || err);
     throwError(
       err?.message
         ? `Gagal upload bukti pembayaran: ${String(err.message)}`
@@ -1699,8 +1887,11 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
-  // konsumsi voucher (non-fatal)
+  // --- konsumsi voucher claims (non-fatal) berdasarkan priced.chosenClaimIds ---
   if (MemberDoc) {
+    console.log('[checkout] start consuming voucher claims', {
+      chosenClaimIds: priced.chosenClaimIds || []
+    });
     for (const claimId of priced.chosenClaimIds || []) {
       try {
         const c = await VoucherClaim.findById(claimId);
@@ -1709,8 +1900,9 @@ exports.checkout = asyncHandler(async (req, res) => {
           c.status === 'claimed' &&
           String(c.member) === String(MemberDoc._id)
         ) {
-          c.remainingUse -= 1;
+          c.remainingUse = Math.max(0, (c.remainingUse || 1) - 1);
           if (c.remainingUse <= 0) c.status = 'used';
+          c.history = c.history || [];
           c.history.push({
             at: new Date(),
             action: 'USE',
@@ -1718,15 +1910,18 @@ exports.checkout = asyncHandler(async (req, res) => {
             note: 'dipakai pada order'
           });
           await c.save();
+          console.log('[checkout] voucher claim consumed', {
+            claimId: c._id,
+            remainingUse: c.remainingUse,
+            status: c.status
+          });
 
-          // Jika voucher ini punya global_stock mode dan stok sudah 0,
-          // revoke semua klaim 'claimed' lainnya supaya hilang dari wallet.
+          // jika voucher pakai global_stock dan stok = 0 -> revoke klaim lain
           try {
             const v = await Voucher.findById(c.voucher).lean();
             if (v && v.visibility && v.visibility.mode === 'global_stock') {
               const remaining = Number(v.visibility.globalStock || 0);
               if (remaining <= 0) {
-                // revoke all still-claimed claims for this voucher
                 await VoucherClaim.updateMany(
                   { voucher: v._id, status: 'claimed' },
                   {
@@ -1740,21 +1935,34 @@ exports.checkout = asyncHandler(async (req, res) => {
                     }
                   }
                 );
+                console.log(
+                  '[checkout] global stock empty -> revoked other claims',
+                  { voucher: v._id }
+                );
               }
             }
           } catch (ee) {
             console.error(
-              '[voucher][consume][revoke-if-stock-empty]',
+              '[voucher][consume][revoke-if-stock-empty] failed',
               ee?.message || ee
             );
           }
+        } else {
+          console.warn('[checkout] voucher claim not consumable', {
+            claimId,
+            found: !!c,
+            status: c?.status
+          });
         }
-      } catch (_) {
-        console.error('[voucher][consume] gagal update', _?.message || _);
+      } catch (err) {
+        console.error('[voucher][consume] gagal update', err?.message || err);
       }
     }
+  } else {
+    console.log('[checkout] no MemberDoc -> skip consuming vouchers');
   }
 
+  // --- update cart status checked_out ---
   try {
     await Cart.findByIdAndUpdate(cart._id, {
       $set: {
@@ -1768,74 +1976,67 @@ exports.checkout = asyncHandler(async (req, res) => {
         total_price: 0
       }
     });
+    console.log('[checkout] cart updated to checked_out', { cartId: cart._id });
   } catch (err) {
-    throwError(
-      err?.message
-        ? `Gagal update cart saat checkout: ${String(err.message)}`
-        : 'Gagal update cart saat checkout',
-      err?.status || 500
+    console.error(
+      '[checkout] gagal update cart setelah order dibuat',
+      err?.message || err
     );
+    // tidak menggagalkan order — tapi beri warning
   }
 
-  // update member stats (non-fatal)
+  // --- update member stats (non-fatal) ---
   if (MemberDoc) {
     try {
       await Member.findByIdAndUpdate(MemberDoc._id, {
         $inc: { total_spend: order.grand_total || 0 },
         $set: { last_visit_at: new Date() }
       });
+      console.log('[checkout] member stats updated', {
+        memberId: MemberDoc._id
+      });
     } catch (err) {
       console.error('[member][stats] gagal update', err?.message || err);
     }
   }
 
-  // snapshot order (non-fatal)
+  // --- snapshot order (non-fatal) ---
   try {
     await snapshotOrder(order._id, { uiTotals }).catch(() => {});
+    console.log('[checkout] snapshot order done', { orderId: order._id });
   } catch (e) {
     console.error('[OrderHistory][checkout]', e?.message || e);
   }
 
-  // EMIT SOCKET (non-fatal) — checkout created
+  // --- EMIT SOCKET (non-fatal) ---
   try {
     const summary = {
       id: String(order._id),
       transaction_code: order.transaction_code || '',
-
       delivery_mode:
         order.delivery?.mode ||
         (order.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
-
       grand_total: Number(order.grand_total || 0),
       fulfillment_type: order.fulfillment_type || null,
-
       customer_name:
         (order.member && order.member.name) || order.customer_name || '',
-
       customer_phone:
         (order.member && order.member.phone) || order.customer_phone || '',
-
       placed_at: order.placed_at || order.createdAt || null,
-
       table_number:
         order.fulfillment_type === 'dine_in'
           ? order.table_number || null
           : null,
-
       payment_status: order.payment_status || null,
       status: order.status || null,
-
       total_quantity: Number(order.total_quantity || 0),
-
       pickup_window: order.delivery?.pickup_window
         ? {
             from: order.delivery.pickup_window.from || null,
             to: order.delivery.pickup_window.to || null
           }
         : null,
-
       delivery_slot_label: order.delivery?.slot_label || null,
-
       member_id: order.member ? String(order.member) : null,
       items_discount: Number(order.items_discount || 0),
       shipping_discount: Number(order.shipping_discount || 0),
@@ -1855,10 +2056,18 @@ exports.checkout = asyncHandler(async (req, res) => {
     emitOrdersStream({ target: 'cashier', action: 'insert', item: summary });
 
     emitToStaff('staff:notify', { message: 'Pesanan baru dibuat.' });
+    console.log('[checkout] emitted order summary to streams', {
+      orderId: order._id
+    });
   } catch (e) {
     console.error('[emit][checkout]', e?.message || e);
   }
 
+  // --- response ---
+  console.log('[checkout] finished success', {
+    orderId: order._id,
+    grand_total: order.grand_total
+  });
   res.status(201).json({
     order: order.toObject(),
     uiTotals,
