@@ -3473,57 +3473,40 @@ exports.assignDelivery = asyncHandler(async (req, res) => {
 exports.assignBatch = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
+  // terima array order ids: order_ids | orderIds | ids | ids_csv (flexible)
   const {
-    slot_label,
-    scheduled_at, // optional ISO string
+    order_ids,
+    orderIds,
+    ids,
+    ids_csv,
     courier_id,
     courier_name,
     courier_phone,
-    note,
-    limit = 0 // optional safety cap (0 = no cap)
+    note
   } = req.body || {};
 
-  if (!slot_label && !scheduled_at) {
-    throwError('slot_label atau scheduled_at wajib untuk batch assign', 400);
+  // normalize incoming ids into array of strings
+  let idList = Array.isArray(order_ids)
+    ? order_ids
+    : Array.isArray(orderIds)
+    ? orderIds
+    : Array.isArray(ids)
+    ? ids
+    : null;
+
+  if (!idList && typeof ids_csv === 'string') {
+    idList = ids_csv
+      .split(',')
+      .map((s) => String(s || '').trim())
+      .filter(Boolean);
   }
+
+  if (!idList || !idList.length) {
+    throwError('order_ids (array) wajib untuk batch assign', 400);
+  }
+
   if (!courier_name && !courier_id) {
     throwError('courier_name atau courier_id wajib', 400);
-  }
-
-  // Tentukan datetime slot (kalau ada scheduled_at, pakai; kalau tidak, hitung dari slot_label hari ini)
-  let slotDt = null;
-  if (scheduled_at) {
-    slotDt = dayjs(scheduled_at).tz(LOCAL_TZ);
-    if (!slotDt.isValid()) throwError('scheduled_at tidak valid', 400);
-  } else {
-    slotDt = parseSlotLabelToDate(slot_label); // helper yang sudah ada
-    if (!slotDt || !slotDt.isValid()) throwError('slot_label tidak valid', 400);
-  }
-
-  // Match criteria: slot_label dan scheduled_at exact (menghindari ambiguitas hari lain)
-  const match = {
-    fulfillment_type: 'delivery',
-    'delivery.slot_label': slot_label,
-    'delivery.scheduled_at': slotDt.toDate(),
-    payment_status: 'paid',
-    status: { $ne: 'cancelled' },
-    'delivery.status': 'pending' // hanya yang masih pending
-  };
-
-  // Safety check: optional limit
-  if (limit > 0) {
-    const count = await Order.countDocuments(match);
-    if (count === 0) {
-      return res
-        .status(200)
-        .json({ message: 'Tidak ada order pending di slot ini' });
-    }
-    if (count > limit) {
-      throwError(
-        `Jumlah order (${count}) melebihi limit batch (${limit}). Batalkan atau turunkan limit.`,
-        409
-      );
-    }
   }
 
   const now = new Date();
@@ -3533,67 +3516,160 @@ exports.assignBatch = asyncHandler(async (req, res) => {
     phone: toWa62(courier_phone)
   };
 
-  const setObj = {
-    'delivery.status': 'assigned',
-    'delivery.courier': courierObj,
-    'delivery.timestamps.assigned_at': now,
-    'delivery.assigned_at': now
-  };
-  if (note) setObj['delivery.assign_note'] = String(note).trim();
+  const results = { assigned: [], failed: [] };
 
-  const updateRes = await Order.updateMany(match, { $set: setObj });
+  // loop per id, log & collect hasil
+  for (const rawId of idList) {
+    const id = String(rawId || '').trim();
+    if (!id) {
+      results.failed.push({ id: rawId, reason: 'ID kosong' });
+      continue;
+    }
 
-  // ambil semua yang berhasil diassign untuk payload (optional: ambil ringkasan saja)
-  const updatedOrders = await Order.find({
-    ...match
-  }).lean();
+    try {
+      // ambil ringkas untuk validasi (sama seperti assignDelivery)
+      const order = await Order.findById(
+        id,
+        'fulfillment_type status payment_status member transaction_code delivery'
+      );
 
-  // Emit satu event batch plus event per member/order jika perlu
-  emitToStaff('orders:batch_assigned', {
-    slot_label,
-    scheduled_at: slotDt.toISOString(),
-    courier: courierObj,
-    count:
-      updateRes.nModified ||
-      updateRes.modifiedCount ||
-      updateRes.n ||
-      updateRes.modified ||
-      0
-  });
-
-  for (const u of updatedOrders) {
-    const p = {
-      id: String(u._id),
-      transaction_code: u.transaction_code,
-      delivery: {
-        status: u.delivery?.status,
-        courier: u.delivery?.courier,
-        assigned_at:
-          (u.delivery?.timestamps && u.delivery.timestamps.assigned_at) ||
-          u.delivery?.assigned_at ||
-          null
+      if (!order) {
+        results.failed.push({ id, reason: 'Order tidak ditemukan' });
+        continue;
       }
-    };
-    // update orders stream (kasir role)
-    emitOrdersStream({ target: 'cashier', action: 'update', item: p });
 
-    // notifikasi ke courier personal
-    if (u.delivery?.courier?.user)
-      emitToCourier(String(u.delivery.courier.user), 'courier:notify', {
-        message: 'Pesanan baru telah diassign ke Anda',
-        orderId: p.id
+      if (order.fulfillment_type !== 'delivery') {
+        results.failed.push({ id, reason: 'Order ini bukan delivery' });
+        continue;
+      }
+      if (order.status === 'cancelled' || order.payment_status !== 'paid') {
+        results.failed.push({
+          id,
+          reason: 'Order belum layak dikirim (harus paid & tidak cancelled)'
+        });
+        continue;
+      }
+
+      const from = order.delivery?.status || 'pending';
+      if (from !== 'pending') {
+        results.failed.push({
+          id,
+          reason: `Hanya order dengan status pending yang bisa di-assign manual (current=${from})`
+        });
+        continue;
+      }
+
+      // build $set sama seperti assignDelivery
+      const $set = {
+        'delivery.status': 'assigned',
+        'delivery.courier': courierObj,
+        'delivery.timestamps.assigned_at': now,
+        'delivery.assigned_at': now
+      };
+      if (note) $set['delivery.assign_note'] = String(note).trim();
+
+      // update & ambil versi terbaru
+      const updated = await Order.findByIdAndUpdate(
+        id,
+        { $set },
+        { new: true, runValidators: false }
+      );
+
+      if (!updated) {
+        results.failed.push({
+          id,
+          reason: 'Gagal update order (tidak ditemukan setelah update)'
+        });
+        continue;
+      }
+
+      // payload ringkasan sama seperti assignDelivery
+      const payload = {
+        id: String(updated._id),
+        transaction_code: updated.transaction_code,
+        delivery: {
+          status: updated.delivery?.status,
+          courier: updated.delivery?.courier,
+          assigned_at:
+            (updated.delivery?.timestamps &&
+              updated.delivery.timestamps.assigned_at) ||
+            updated.delivery?.assigned_at ||
+            null
+        }
+      };
+
+      // emits / notifs (non-fatal)
+      try {
+        emitToStaff('staff:notify', {
+          message: 'Pesanan delivery telah ditugaskan ke kurir.'
+        });
+        emitToCashier('staff:notify', {
+          message: 'Pesanan delivery telah ditugaskan.'
+        });
+
+        emitOrdersStream({
+          target: 'cashier',
+          action: 'update',
+          item: payload
+        });
+        emitOrdersStream({
+          target: 'courier',
+          action: 'insert',
+          item: payload
+        });
+
+        if (updated.member)
+          emitToMember(
+            String(updated.member),
+            'order:delivery_assigned',
+            payload
+          );
+        if (updated.guestToken)
+          emitToGuest(updated.guestToken, 'order:delivery_assigned', payload);
+
+        const courierUserId = updated.delivery?.courier?.user;
+        if (courierUserId) {
+          emitToCourier(String(courierUserId), 'order:assign:courier', payload);
+          emitToCourier(String(courierUserId), 'courier:notify', {
+            message:
+              'Anda ditugaskan untuk pengantaran pesanan. Cek halaman kurir.'
+          });
+        }
+      } catch (emitErr) {
+        console.error(
+          '[emit][assignBatch][per-order]',
+          emitErr?.message || emitErr
+        );
+      }
+
+      results.assigned.push({
+        id: String(updated._id),
+        transaction_code: updated.transaction_code
       });
-
-    if (u.member) emitToMember(String(u.member), 'order:delivery_assigned', p);
-    if (u.guestToken) emitToGuest(u.guestToken, 'order:delivery_assigned', p);
+    } catch (e) {
+      console.error('[assignBatch] per-order error:', e?.message || e);
+      results.failed.push({ id, reason: e?.message || 'unknown error' });
+    }
   }
 
-  res.json({
+  // satu batch summary emit (non-fatal)
+  try {
+    emitToStaff('orders:batch_assigned', {
+      courier: courierObj,
+      count: results.assigned.length
+    });
+  } catch (e) {
+    console.error('[emit][assignBatch][batch]', e?.message || e);
+  }
+
+  return res.status(200).json({
     success: true,
-    message: `Batch assign selesai. ${
-      updateRes.nModified || updateRes.modifiedCount || 0
-    } order diassign ke kurir.`,
-    affected: updateRes
+    message: `Batch assign selesai. ${results.assigned.length} order diassign ke kurir.`,
+    summary: {
+      assigned: results.assigned.length,
+      failed: results.failed.length
+    },
+    details: results
   });
 });
 
