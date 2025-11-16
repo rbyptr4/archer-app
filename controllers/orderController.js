@@ -4075,108 +4075,78 @@ exports.listMembers = asyncHandler(async (req, res) => {
   });
 });
 
+// GET /orders/assigned
 exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
-  const userId =
+  if (!req.user) throwError('Harus login untuk mengakses halaman ini', 401);
+
+  const userIdRaw =
     req.user?.id ||
     req.user?._id ||
-    req.user?._doc?._id || // defensif kalau mongoose doc
+    req.user?._doc?._id ||
     req.user?.userId ||
     null;
+  if (!userIdRaw) throwError('Harus login untuk mengakses halaman ini', 401);
 
-  if (!userId) {
-    throwError('Harus login untuk mengakses halaman ini', 401);
-  }
+  const isOwner = String(req.user?.role || '').toLowerCase() === 'owner';
 
-  // cursor-based (infinite scroll)
-  const cursorRaw = req.query.cursor || null;
+  // query params
   const limit = Math.min(
     100,
     Math.max(1, parseInt(String(req.query.limit || '50'), 10) || 50)
   );
-
-  // optional: filter by delivery.status jika dikirim query ?status=assigned
   const deliveryStatus = req.query.status
     ? String(req.query.status).toLowerCase()
     : null;
-
-  // slot filters (tetap dukung, optional)
   const slotLabel = req.query.slot_label
     ? String(req.query.slot_label).trim()
     : null;
   const scheduledFromRaw = req.query.scheduled_from || null;
   const scheduledToRaw = req.query.scheduled_to || null;
   const scheduledDate = req.query.scheduled_date || null; // YYYY-MM-DD
+  const cursorRaw = req.query.cursor || null; // ISO datetime for paging
 
-  // --- DEBUG: log info input untuk troubleshooting ---
-  console.log(
-    '[getAssignedDeliveries] userId:',
-    userId,
-    'typeof:',
-    typeof userId
-  );
-  console.log('[getAssignedDeliveries] query params:', {
-    cursorRaw,
-    limit,
-    deliveryStatus,
-    slotLabel,
-    scheduledFromRaw,
-    scheduledToRaw,
-    scheduledDate
-  });
-
-  // Build base query
   const q = {
     fulfillment_type: 'delivery',
-    // jangan set delivery.mode langsung — cek dulu apakah ada dokumen yang pakai field ini
+    'delivery.mode': 'delivery',
     status: { $ne: 'cancelled' }
   };
 
-  if (deliveryStatus) {
-    q['delivery.status'] = deliveryStatus;
-  }
+  if (deliveryStatus) q['delivery.status'] = deliveryStatus;
+  if (slotLabel) q['delivery.slot_label'] = slotLabel;
 
-  if (slotLabel) {
-    q['delivery.slot_label'] = slotLabel;
-  }
-
-  // scheduled_from / scheduled_to (ISO strings accepted)
   if (scheduledFromRaw || scheduledToRaw) {
-    q['delivery.scheduled_at'] = {};
+    const range = {};
     if (scheduledFromRaw) {
       const d = new Date(scheduledFromRaw);
-      if (!isNaN(d.getTime())) q['delivery.scheduled_at'].$gte = d;
+      if (!isNaN(d.getTime())) range.$gte = d;
     }
     if (scheduledToRaw) {
-      const d2 = new Date(scheduledToRaw);
-      if (!isNaN(d2.getTime())) q['delivery.scheduled_at'].$lte = d2;
+      const d = new Date(scheduledToRaw);
+      if (!isNaN(d.getTime())) range.$lte = d;
     }
-    if (Object.keys(q['delivery.scheduled_at']).length === 0) {
-      delete q['delivery.scheduled_at'];
-    }
+    if (Object.keys(range).length) q['delivery.scheduled_at'] = range;
   }
 
   if (scheduledDate) {
     const dayStart = new Date(`${scheduledDate}T00:00:00.000Z`);
     const dayEnd = new Date(`${scheduledDate}T23:59:59.999Z`);
     if (!isNaN(dayStart.getTime()) && !isNaN(dayEnd.getTime())) {
-      q['delivery.scheduled_at'] = {
-        $gte: dayStart,
-        $lte: dayEnd
-      };
+      q['delivery.scheduled_at'] = { $gte: dayStart, $lte: dayEnd };
     }
   }
 
+  // cursor: ambil records dengan scheduled_at > cursor (ascending)
   if (cursorRaw) {
-    const cursorDate = new Date(cursorRaw);
-    if (!isNaN(cursorDate.getTime())) {
+    const c = new Date(cursorRaw);
+    if (!isNaN(c.getTime())) {
       q.$and = q.$and || [];
       q.$and.push({
         $or: [
-          { 'delivery.scheduled_at': { $gt: cursorDate } },
+          { 'delivery.scheduled_at': { $gt: c } },
           {
             $and: [
               { 'delivery.scheduled_at': { $exists: false } },
-              { placed_at: { $gt: cursorDate } }
+              { placed_at: { $gt: c } }
             ]
           }
         ]
@@ -4184,139 +4154,45 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     }
   }
 
-  // --- Perbaiki matching courier.user: dukung string dan ObjectId ---
-  const courierOr = [];
-
-  // selalu match string dulu (karena kadang disimpan string)
-  courierOr.push({ 'delivery.courier.user': String(userId) });
-  courierOr.push({ 'delivery.courier.user.id': String(userId) });
-  courierOr.push({ 'delivery.courier.id': String(userId) });
-  courierOr.push({ 'delivery.assignee.user': String(userId) });
-  courierOr.push({ 'delivery.assignee.user.id': String(userId) });
-
-  // jika id valid ObjectId, match juga tipe ObjectId
-  if (mongoose.isValidObjectId(userId)) {
-    const oid = new mongoose.Types.ObjectId(userId); // <= FIX
-    courierOr.push({ 'delivery.courier.user': oid });
-    courierOr.push({ 'delivery.courier.user.id': oid });
-    courierOr.push({ 'delivery.courier.id': oid });
-    courierOr.push({ 'delivery.assignee.user': oid });
-    courierOr.push({ 'delivery.assignee.user.id': oid });
-  }
-
-  q.$or = courierOr;
-
-  // --- DEBUG: tampilkan final query sebelum eksekusi (hati-hati jangan print data sensitif di prod) ---
-  console.log('[getAssignedDeliveries] final mongo query:', JSON.stringify(q));
-
-  // quick diagnostic: lihat berapa banyak yang cocok & ambil sample 5 untuk inspect
-  try {
-    const matchCount = await Order.countDocuments(q);
-    console.log('[getAssignedDeliveries] countDocuments matching:', matchCount);
-    const sampleMatches = await Order.find(q).limit(5).lean();
-    console.log(
-      '[getAssignedDeliveries] sampleMatches (limit 5):',
-      sampleMatches.map((s) => ({
-        _id: s._id,
-        delivery_status: s.delivery?.status,
-        courier: s.delivery?.courier,
-        scheduled_at: s.delivery?.scheduled_at
-      }))
-    );
-  } catch (diagErr) {
-    console.error(
-      '[getAssignedDeliveries] diag query error:',
-      diagErr?.message || diagErr
-    );
-  }
-
-  // fetch: sort by scheduled_at asc, then createdAt asc
+  // fetch: sort oleh scheduled_at asc lalu createdAt asc
   const orders = await Order.find(q)
     .sort({ 'delivery.scheduled_at': 1, createdAt: 1 })
     .limit(limit)
     .populate('member', 'name phone')
     .populate('items.menu', 'name')
+    .populate({ path: 'delivery.courier.user', select: 'name phone role' }) // hanya berguna kalau ada ref User
     .lean();
 
-  // Jika yang buka adalah owner, kumpulkan semua courier.user Id untuk fetch user data
-  const isOwner = String(req.user?.role || '').toLowerCase() === 'owner';
-  let courierUserMap = {};
-
-  if (isOwner && Array.isArray(orders) && orders.length) {
-    const idsSet = new Set();
-    const extractCourierUserId = (c) => {
-      if (!c) return null;
-      if (typeof c.user === 'string' || typeof c.user === 'number')
-        return String(c.user);
-      if (c.user && (c.user._id || c.user.id))
-        return String(c.user._id || c.user.id);
-      if (c.id) return String(c.id);
-      return null;
+  // map response ringkas
+  const mapped = (orders || []).map((o) => {
+    const courierRaw = o.delivery?.courier || o.delivery?.assignee || {};
+    // untuk owner: sertakan user info jika populate tersedia
+    const courier = {
+      ...courierRaw,
+      user:
+        courierRaw.user && typeof courierRaw.user === 'object'
+          ? courierRaw.user
+          : courierRaw.user
     };
 
-    for (const o of orders) {
-      const c = o.delivery?.courier || o.delivery?.assignee || null;
-      const uid = extractCourierUserId(c);
-      if (uid) idsSet.add(uid);
-    }
-
-    const ids = Array.from(idsSet).filter(Boolean);
-    if (ids.length) {
-      const users = await User.find({ _id: { $in: ids } })
-        .select('_id name email phone role')
-        .lean();
-      courierUserMap = users.reduce((m, u) => {
-        m[String(u._id)] = u;
-        return m;
-      }, {});
-    }
-  }
-
-  // map response
-  const mapped = (orders || []).map((o) => {
-    const courier = o.delivery?.courier || o.delivery?.assignee || {};
-
-    let courier_with_info = { ...courier };
-    if (isOwner) {
-      let courierUserId = null;
-      if (courier) {
-        if (
-          typeof courier.user === 'string' ||
-          typeof courier.user === 'number'
-        )
-          courierUserId = String(courier.user);
-        else if (courier.user && (courier.user._id || courier.user.id))
-          courierUserId = String(courier.user._id || courier.user.id);
-        else if (courier.id) courierUserId = String(courier.id);
-      }
-      if (courierUserId && courierUserMap[courierUserId]) {
-        courier_with_info = {
-          ...courier_with_info,
-          user_info: courierUserMap[courierUserId]
-        };
-      } else {
-        courier_with_info = { ...courier_with_info, user_info: null };
-      }
-    }
-
     return {
-      _id: o._id,
-      transaction_code: o.transaction_code,
-      placed_at: o.placed_at,
-      fulfillment_type: o.fulfillment_type,
-      payment_method: o.payment_method,
-      payment_status: o.payment_status,
-      status: o.status,
-      grand_total: o.grand_total,
+      id: String(o._id),
+      transaction_code: o.transaction_code || '',
+      placed_at: o.placed_at || o.createdAt || null,
+      fulfillment_type: o.fulfillment_type || null,
+      payment_method: o.payment_method || null,
+      payment_status: o.payment_status || null,
+      order_status: o.status || null,
+      grand_total: Number(o.grand_total || 0),
       delivery: {
-        status: o.delivery?.status,
-        slot_label: o.delivery?.slot_label,
-        scheduled_at: o.delivery?.scheduled_at,
-        address_text: o.delivery?.address_text,
-        location: o.delivery?.location,
-        distance_km: o.delivery?.distance_km,
-        delivery_fee: o.delivery?.delivery_fee,
-        courier: courier_with_info
+        status: o.delivery?.status || null,
+        slot_label: o.delivery?.slot_label || null,
+        scheduled_at: o.delivery?.scheduled_at || null,
+        address_text: o.delivery?.address_text || null,
+        location: o.delivery?.location || null,
+        distance_km: o.delivery?.distance_km ?? null,
+        delivery_fee: o.delivery?.delivery_fee ?? null,
+        courier
       },
       customer: {
         member: o.member || null,
@@ -4338,7 +4214,7 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     };
   });
 
-  // next_cursor
+  // next_cursor (scheduled_at or placed_at)
   let next_cursor = null;
   if (mapped.length) {
     const last = mapped[mapped.length - 1];
@@ -4350,7 +4226,7 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
         : null;
   }
 
-  res.json({
+  return res.json({
     ok: true,
     meta: {
       count: mapped.length,
