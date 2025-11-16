@@ -197,17 +197,26 @@ exports.claim = asyncHandler(async (req, res) => {
   }
 });
 
-// GET /member/vouchers/wallet
 exports.myWallet = asyncHandler(async (req, res) => {
   const meId = getMemberId(req);
   if (!meId) throwError('Unauthorized (member)', 401);
 
-  const data = await VoucherClaim.find({
+  // ambil claims yang status = 'claimed'
+  const claims = await VoucherClaim.find({
     member: meId,
     status: 'claimed'
   })
     .populate('voucher')
-    .sort('-createdAt');
+    .sort('-createdAt')
+    .lean();
 
-  res.json({ claims: data });
+  // filter: hanya kembalikan klaim yang voucher-nya aktif & belum dihapus
+  const visible = (claims || []).filter((c) => {
+    if (!c.voucher) return false;
+    if (c.voucher.isDeleted) return false;
+    if (!c.voucher.isActive) return false; // hide sementara kalau voucher dinonaktifkan
+    return true;
+  });
+
+  res.json({ claims: visible });
 });

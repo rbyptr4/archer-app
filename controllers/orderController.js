@@ -1712,11 +1712,42 @@ exports.checkout = asyncHandler(async (req, res) => {
           c.remainingUse -= 1;
           if (c.remainingUse <= 0) c.status = 'used';
           c.history.push({
+            at: new Date(),
             action: 'USE',
             ref: String(order._id),
             note: 'dipakai pada order'
           });
           await c.save();
+
+          // Jika voucher ini punya global_stock mode dan stok sudah 0,
+          // revoke semua klaim 'claimed' lainnya supaya hilang dari wallet.
+          try {
+            const v = await Voucher.findById(c.voucher).lean();
+            if (v && v.visibility && v.visibility.mode === 'global_stock') {
+              const remaining = Number(v.visibility.globalStock || 0);
+              if (remaining <= 0) {
+                // revoke all still-claimed claims for this voucher
+                await VoucherClaim.updateMany(
+                  { voucher: v._id, status: 'claimed' },
+                  {
+                    $set: { status: 'revoked' },
+                    $push: {
+                      history: {
+                        at: new Date(),
+                        action: 'REVOKE',
+                        note: 'stok global habis - otomatis revoke'
+                      }
+                    }
+                  }
+                );
+              }
+            }
+          } catch (ee) {
+            console.error(
+              '[voucher][consume][revoke-if-stock-empty]',
+              ee?.message || ee
+            );
+          }
         }
       } catch (_) {
         console.error('[voucher][consume] gagal update', _?.message || _);
@@ -1724,7 +1755,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // set cart checked_out
   try {
     await Cart.findByIdAndUpdate(cart._id, {
       $set: {
@@ -1806,7 +1836,16 @@ exports.checkout = asyncHandler(async (req, res) => {
 
       delivery_slot_label: order.delivery?.slot_label || null,
 
-      member_id: order.member ? String(order.member) : null
+      member_id: order.member ? String(order.member) : null,
+      items_discount: Number(order.items_discount || 0),
+      shipping_discount: Number(order.shipping_discount || 0),
+      delivery_fee: Number(
+        order.delivery_fee || order.delivery?.delivery_fee || 0
+      ),
+      discounts: Array.isArray(order.discounts) ? order.discounts : [],
+      applied_voucher_ids: Array.isArray(order.applied_voucher_ids)
+        ? order.applied_voucher_ids
+        : []
     };
 
     emitToCashier('staff:notify', {
@@ -2422,6 +2461,10 @@ exports.previewPrice = asyncHandler(async (req, res) => {
 
   // ===== bangun ui_totals (fallback ke effectiveDeliveryFee kalau engine tidak mengembalikan deliveryFee) =====
   const t = result.totals || {};
+  const deliveryFeeFromEngine = t.deliveryFee;
+  const finalDeliveryFee = Number.isFinite(Number(deliveryFeeFromEngine))
+    ? Number(deliveryFeeFromEngine)
+    : Number(effectiveDeliveryFee || 0);
   const ui_totals = {
     items_subtotal: Number(t.baseSubtotal || 0),
     items_subtotal_after_discount: Number(
@@ -2430,7 +2473,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     items_discount: Number(t.itemsDiscount || 0),
     service_fee: Number(t.service_fee || 0),
     tax_amount: Number(t.tax_amount || 0),
-    delivery_fee: Number(t.deliveryFee ?? effectiveDeliveryFee ?? 0),
+    delivery_fee: finalDeliveryFee,
     shipping_discount: Number(t.shippingDiscount || 0),
     rounding_delta: Number(t.rounding_delta || 0),
     grand_total: Number(t.grandTotal || t.grand_total || 0),
@@ -2788,7 +2831,9 @@ const buildOrderReceipt = (order) => {
     timestamps: {
       placed_at: order.placed_at,
       paid_at: order.paid_at || null
-    }
+    },
+    discounts: order.discounts || [],
+    applied_voucher_ids: order.applied_voucher_ids || []
   };
 };
 
@@ -4188,7 +4233,6 @@ exports.listMembers = asyncHandler(async (req, res) => {
   });
 });
 
-// GET /orders/assigned
 exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Harus login untuk mengakses halaman ini', 401);
 

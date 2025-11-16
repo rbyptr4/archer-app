@@ -1,9 +1,9 @@
 // controllers/owner/voucherOwnerController.js
 const asyncHandler = require('express-async-handler');
 const Voucher = require('../../models/voucherModel');
+const VoucherClaim = require('../../models/voucherClaimModel');
 const throwError = require('../../utils/throwError');
 
-/* ===================== Helpers (reused + new) ===================== */
 const asInt = (v, d = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? Math.trunc(n) : d;
@@ -407,6 +407,20 @@ exports.deactivateVoucher = asyncHandler(async (req, res) => {
 exports.removeVoucher = asyncHandler(async (req, res) => {
   const v = await Voucher.findById(req.params.id);
   if (!v) throwError('Voucher tidak ditemukan', 404);
+
+  // Hapus semua voucher claims yang berhubungan (hard delete)
+  try {
+    await VoucherClaim.deleteMany({ voucher: v._id });
+  } catch (e) {
+    // jangan block proses penghapusan voucher walau gagal hapus claim,
+    // tapi log supaya bisa dicek.
+    console.error(
+      '[removeVoucher] gagal hapus VoucherClaim terkait:',
+      e?.message || e
+    );
+  }
+
   await v.deleteOne();
+
   res.json({ ok: true, deleted: true });
 });
