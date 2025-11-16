@@ -1286,14 +1286,7 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
   });
 });
 
-/* ===================== CHECKOUT ===================== */
 exports.checkout = asyncHandler(async (req, res) => {
-  console.log('[checkout] start', {
-    path: req.path,
-    member: req.member?.id || null
-  });
-
-  // --- destructure input ---
   const {
     name,
     phone,
@@ -1303,15 +1296,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     voucherClaimIds = [],
     register_decision = 'register'
   } = req.body || {};
-
-  console.log('[checkout] incoming body snippet', {
-    fulfillment_type,
-    payment_method,
-    voucherClaimIds_length: Array.isArray(voucherClaimIds)
-      ? voucherClaimIds.length
-      : 0,
-    register_decision
-  });
 
   const iden0 = getIdentity(req);
 
@@ -1542,6 +1526,14 @@ exports.checkout = asyncHandler(async (req, res) => {
   // --- VOUCHER filtering (robust fallback + diagnostics) ---
   let eligibleClaimIds = [];
 
+  // prepare safe voucherClaimIds (filter non-valid ObjectId strings)
+  const requestedClaimIds = Array.isArray(voucherClaimIds)
+    ? voucherClaimIds
+        .map((v) => (v ? String(v).trim() : ''))
+        .filter(Boolean)
+        .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    : [];
+
   if (MemberDoc) {
     try {
       console.log(
@@ -1549,14 +1541,14 @@ exports.checkout = asyncHandler(async (req, res) => {
         voucherClaimIds
       );
       console.log(
-        '[checkout][voucher-check] types:',
-        voucherClaimIds?.map?.((v) => typeof v)
+        '[checkout][voucher-check] sanitized requestedClaimIds:',
+        requestedClaimIds
       );
 
-      if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
+      if (requestedClaimIds.length) {
         // ambil semua doc sesuai id yg diminta (no filters) -> buat diagnosa + fallback
         const rawById = await VoucherClaim.find({
-          _id: { $in: voucherClaimIds }
+          _id: { $in: requestedClaimIds }
         })
           .lean()
           .catch((e) => {
@@ -1607,33 +1599,11 @@ exports.checkout = asyncHandler(async (req, res) => {
           eligibleClaimIds
         );
 
-        // Optional: compare with query-by-filter (for diagnosis)
-        try {
-          const rawClaimsQuery = await VoucherClaim.find({
-            _id: { $in: voucherClaimIds },
-            member: MemberDoc._id,
-            status: 'claimed'
-          }).lean();
-          console.log(
-            '[checkout][voucher-check] rawClaimsQuery count (member+status):',
-            rawClaimsQuery.length
-          );
-        } catch (e) {
-          console.error(
-            '[checkout][voucher-check] rawClaimsQuery error',
-            e?.message || e
-          );
-        }
-
         // If FE requested but none eligible -> fail-fast with friendly message
-        if (
-          Array.isArray(voucherClaimIds) &&
-          voucherClaimIds.length &&
-          eligibleClaimIds.length === 0
-        ) {
+        if (requestedClaimIds.length && eligibleClaimIds.length === 0) {
           console.error(
             '[checkout][voucher-check][FAIL] requested vouchers not eligible. requested:',
-            voucherClaimIds
+            requestedClaimIds
           );
           throwError(
             'Voucher tidak valid/expired/atau bukan milik member ini. Silakan periksa wallet Anda atau refresh halaman.',
@@ -1656,6 +1626,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   console.log('[checkout] incoming voucherClaimIds:', voucherClaimIds);
   console.log('[checkout] eligibleClaimIds after filter:', eligibleClaimIds);
 
+  // --- PANGGIL price engine (sumber kebenaran) ---
   let priced;
   try {
     priced = await validateAndPrice({
@@ -1665,6 +1636,7 @@ exports.checkout = asyncHandler(async (req, res) => {
           menuId: it.menu,
           qty: int(it.quantity || it.qty || 0),
           price: int(it.base_price || 0),
+          // kirim addons supaya engine punya kesempatan menghitung subtotal lengkap
           addons: (it.addons || []).map((a) => ({
             name: a.name || '',
             price: int(a.price || 0),
@@ -1677,7 +1649,6 @@ exports.checkout = asyncHandler(async (req, res) => {
       deliveryFee: deliveryObj.delivery_fee || 0,
       voucherClaimIds: eligibleClaimIds
     });
-
     console.log('[checkout] price engine returned', {
       ok: priced?.ok,
       reasons: priced?.reasons,
@@ -1698,6 +1669,7 @@ exports.checkout = asyncHandler(async (req, res) => {
       err?.status || 500
     );
   }
+
   if (!priced || !priced.ok) {
     console.error('[checkout] price engine failed:', priced?.reasons || priced);
     throwError(
@@ -1707,12 +1679,87 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
+  // --- pastikan voucher yang dikirim FE benar-benar diaplikasikan ---
+  const breakdown = Array.isArray(priced.breakdown) ? priced.breakdown : [];
+  const claimedInBreakdown = new Set(
+    breakdown
+      .map((b) => b.claimId || b.claim_id || b.claim)
+      .filter(Boolean)
+      .map(String)
+  );
+
+  if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
+    const anyApplied = eligibleClaimIds.some((cid) =>
+      claimedInBreakdown.has(String(cid))
+    );
+    if (!anyApplied) {
+      console.error(
+        '[checkout] requested voucherClaimIds not applied by engine',
+        { requested: voucherClaimIds, eligible: eligibleClaimIds, breakdown }
+      );
+      const reasonMsg =
+        (priced && priced.reasons && priced.reasons.join?.(', ')) ||
+        'Voucher tidak bisa diterapkan saat checkout';
+      throwError(reasonMsg, 400);
+    }
+  }
+
+  // --- build discounts array & applied_voucher_ids (voucher ids, bukan claim ids) ---
+  let discounts = [];
+  const appliedVoucherIdSet = new Set();
+
+  // prepare claimDocsMap (ambil voucherClaim docs untuk breakdown mapping)
+  const claimIdsNeeded = breakdown
+    .map((b) => b.claimId || b.claim_id || b.claim)
+    .filter(Boolean)
+    .map(String);
+  let claimDocsMap = {};
+  if (claimIdsNeeded.length) {
+    const claimDocs = await VoucherClaim.find({
+      _id: { $in: claimIdsNeeded }
+    }).lean();
+    claimDocsMap = claimDocs.reduce((acc, cd) => {
+      acc[String(cd._id)] = cd;
+      return acc;
+    }, {});
+    console.log('[checkout] claimDocsMap built for breakdown', {
+      claimDocsCount: claimDocs.length
+    });
+  }
+
+  for (const b of breakdown) {
+    const claimId = b.claimId || b.claim_id || b.claim || null;
+    let voucherId = b.voucherId || b.voucher_id || b.voucher || null;
+
+    if (!voucherId && claimId && claimDocsMap[claimId]) {
+      voucherId = claimDocsMap[claimId].voucher || null;
+    }
+
+    const item = {
+      claimId: claimId ? String(claimId) : null,
+      voucherId: voucherId ? String(voucherId) : null,
+      name: b.name || b.title || '',
+      itemsDiscount: int(b.itemsDiscount ?? b.items_discount ?? 0),
+      shippingDiscount: int(b.shippingDiscount ?? b.shipping_discount ?? 0),
+      note: b.note || null,
+      raw: b
+    };
+
+    discounts.push(item);
+    if (voucherId) appliedVoucherIdSet.add(String(voucherId));
+  }
+
+  const appliedVoucherIds = Array.from(appliedVoucherIdSet);
+
+  // --- ambil totals engine untuk hitung uiTotals & order pricing ---
   const baseFromEngine = int(priced.totals?.baseSubtotal || 0);
 
+  // subtotal hasil recompute cart/order (pre-validate memastikan line_subtotal sudah benar)
   const cartComputedSubtotal = int(
     (cart.items || []).reduce((s, it) => s + int(it.line_subtotal || 0), 0)
   );
 
+  // Pilih yang lebih besar: engine atau cart (agar addons tidak luput)
   const baseItemsSubtotal = Math.max(baseFromEngine, cartComputedSubtotal);
   console.log('[checkout] subtotal resolution', {
     baseFromEngine,
@@ -1735,6 +1782,7 @@ exports.checkout = asyncHandler(async (req, res) => {
       reportedDelivery + shipping_discount || deliveryObj.delivery_fee || 0
     );
   }
+
   deliveryObj.delivery_fee = int(delivery_fee_net);
   deliveryObj.shipping_discount = int(shipping_discount || 0);
 
@@ -1742,12 +1790,13 @@ exports.checkout = asyncHandler(async (req, res) => {
     0,
     baseItemsSubtotal - items_discount
   );
-
   const service_fee = int(
     Math.round(items_subtotal_after_discount * SERVICE_FEE_RATE)
   );
   const rateForTax = parsePpnRate();
   const taxAmount = int(Math.round(items_subtotal_after_discount * rateForTax));
+  const taxRatePercent = Math.round(rateForTax * 100 * 100) / 100;
+
   const beforeRound = int(
     items_subtotal_after_discount +
       service_fee +
@@ -1775,12 +1824,12 @@ exports.checkout = asyncHandler(async (req, res) => {
     delivery_fee: int(deliveryObj.delivery_fee || 0),
     shipping_discount: int(shipping_discount || 0),
     service_fee: int(service_fee || 0),
-    tax_rate_percent: Number(Math.round(rateForTax * 100 * 100) / 100 || 0),
+    tax_rate_percent: Number(taxRatePercent || 0),
     tax_amount: int(taxAmount || 0),
     rounding_delta: int(rounding_delta || 0),
     grand_total: int(requested_bvt || 0),
     items_subtotal_after_discount: int(items_subtotal_after_discount || 0),
-    discounts
+    discounts // sudah dideklarasi aman di atas
   };
 
   // --- create order (trust engine totals & discounts) ---
@@ -1812,7 +1861,8 @@ exports.checkout = asyncHandler(async (req, res) => {
               quantity: it.quantity,
               addons: it.addons,
               notes: String(it.notes || '').trim(),
-              category: it.category || null
+              category: it.category || null,
+              line_subtotal: int(it.line_subtotal || 0)
             })),
 
             items_subtotal: int(uiTotals.items_subtotal),
@@ -1877,7 +1927,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     throw e;
   }
 
-  // --- handle upload bukti jika perlu (sama seperti sebelumnya) ---
+  // --- handle upload bukti jika perlu ---
   try {
     if (needProof(method)) {
       if (!req.file) {
