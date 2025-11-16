@@ -152,6 +152,63 @@ function isSlotAvailable(label, dateDay = null) {
   return !!(slot && slot.available);
 }
 
+function computeUnitPriceWithAddons(item) {
+  const base = Number(item.base_price ?? item.unit_price ?? item.price ?? 0);
+  const addons = Array.isArray(item.addons) ? item.addons : [];
+  const addonsPerUnit = addons.reduce((sum, a) => {
+    const ap = Number(a?.price || 0);
+    const aq = Number(a?.qty || 1);
+    return sum + ap * Math.max(1, aq);
+  }, 0);
+  // kalau addon memiliki isActive false abaikan
+  return Math.round(base + addonsPerUnit);
+}
+
+// normalisasi cart buat price engine (pastikan semua panggilan ke engine pakai ini)
+function normalizeCartForEngine(cart) {
+  return {
+    items: (Array.isArray(cart.items) ? cart.items : []).map((it) => {
+      const qty = Number(it.quantity ?? it.qty ?? 0) || 0;
+      const unit_price = computeUnitPriceWithAddons(it); // sudah incl addons
+      return {
+        menuId: it.menu || it.menuId || it.id || null,
+        name: it.name || null,
+        qty,
+        price: unit_price,
+        category: it.category || null,
+        // optional: forward addons raw jika engine butuh detail per-addon
+        addons: Array.isArray(it.addons)
+          ? it.addons.map((a) => ({
+              name: a.name,
+              price: Number(a.price || 0),
+              qty: Number(a.qty || 1)
+            }))
+          : []
+      };
+    })
+  };
+}
+
+// transform cart -> order.items (pakai unit_price yang sama)
+function transformCartToOrderItems(cart) {
+  return (Array.isArray(cart.items) ? cart.items : []).map((it) => {
+    const unit_price = computeUnitPriceWithAddons(it);
+    const qty = Number(it.quantity ?? it.qty ?? 0) || 0;
+    return {
+      menu: it.menu,
+      menu_code: it.menu_code,
+      name: it.name,
+      imageUrl: it.imageUrl,
+      base_price: unit_price, // simpan unit price yang udah include addons
+      quantity: qty,
+      addons: it.addons || [],
+      notes: String(it.notes || '').trim(),
+      category: it.category || null,
+      line_before_tax: int(unit_price * qty)
+    };
+  });
+}
+
 const short = (arr, n = 3) => (Array.isArray(arr) ? arr.slice(0, n) : arr);
 
 const toWa62 = (phone) => {
@@ -1286,7 +1343,9 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
   });
 });
 
+/* ===================== CHECKOUT ===================== */
 exports.checkout = asyncHandler(async (req, res) => {
+  // input
   const {
     name,
     phone,
@@ -1298,63 +1357,38 @@ exports.checkout = asyncHandler(async (req, res) => {
   } = req.body || {};
 
   const iden0 = getIdentity(req);
-
   const ft =
     iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
-  if (!['dine_in', 'delivery'].includes(ft)) {
-    console.error('[checkout] invalid fulfillment_type', ft);
+  if (!['dine_in', 'delivery'].includes(ft))
     throwError('fulfillment_type tidak valid', 400);
-  }
 
   const method = String(payment_method || '').toLowerCase();
   if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method)) {
-    console.error('[checkout] payment method not allowed', {
-      method,
-      source: iden0.source,
-      ft
-    });
     throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
   }
 
-  // --- identitas / member ---
+  // identitas / member
   const originallyLoggedIn = !!iden0.memberId;
   const wantRegister = String(register_decision || 'register') === 'register';
   let MemberDoc = null;
   let customer_name = '';
   let customer_phone = '';
 
-  try {
-    if (originallyLoggedIn || wantRegister) {
-      const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
-      MemberDoc = await ensureMemberForCheckout(req, res, joinChannel);
-      console.log('[checkout] Member found/ensured', {
-        memberId: MemberDoc ? MemberDoc._id : null
-      });
+  if (originallyLoggedIn || wantRegister) {
+    const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
+    MemberDoc = await ensureMemberForCheckout(req, res, joinChannel);
+  } else {
+    customer_name = String(name || '').trim();
+    const rawPhone = String(phone || '').trim();
+    if (!customer_name && !rawPhone)
+      throwError('Tanpa member: isi minimal nama atau no. telp', 400);
+    if (rawPhone) {
+      const digits = rawPhone.replace(/\D+/g, '');
+      if (!digits) throwError('Nomor telepon harus berupa angka', 400);
+      customer_phone = normalizePhone(rawPhone);
     } else {
-      customer_name = String(name || '').trim();
-      const rawPhone = String(phone || '').trim();
-      if (!customer_name && !rawPhone) {
-        console.error('[checkout] missing name & phone for guest');
-        throwError('Tanpa member: isi minimal nama atau no. telp', 400);
-      }
-      if (rawPhone) {
-        const digits = rawPhone.replace(/\D+/g, '');
-        if (!digits) {
-          console.error('[checkout] invalid phone format', rawPhone);
-          throwError('Nomor telepon harus berupa angka', 400);
-        }
-        customer_phone = normalizePhone(rawPhone);
-      } else {
-        customer_phone = '';
-      }
-      console.log('[checkout] guest customer', {
-        customer_name,
-        customer_phone
-      });
+      customer_phone = '';
     }
-  } catch (e) {
-    console.error('[checkout] ensureMemberForCheckout failed', e?.message || e);
-    throw e;
   }
 
   const iden = {
@@ -1367,34 +1401,20 @@ exports.checkout = asyncHandler(async (req, res) => {
       null
   };
 
-  // --- ambil cart aktif ---
+  // ambil cart aktif
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
-  if (!cartObj) {
-    console.error('[checkout] cartObj not found for identity', iden);
-    throwError('Cart tidak ditemukan / kosong', 404);
-  }
+  if (!cartObj) throwError('Cart tidak ditemukan / kosong', 404);
   const cart = await Cart.findById(cartObj._1 || cartObj._id);
-  if (!cart) {
-    console.error('[checkout] cart actual doc not found', cartObj);
-    throwError('Cart tidak ditemukan / kosong', 404);
-  }
-  if (!cart.items?.length) {
-    console.error('[checkout] cart empty', { cartId: cart._id });
-    throwError('Cart kosong', 400);
-  }
-  console.log('[checkout] cart loaded', {
-    cartId: cart._id,
-    items: cart.items.length
-  });
+  if (!cart) throwError('Cart tidak ditemukan / kosong', 404);
+  if (!cart.items?.length) throwError('Cart kosong', 400);
 
-  // --- delivery / slot / pickup handling ---
+  // delivery / slot / pickup handling
   const delivery_mode =
     ft === 'dine_in'
       ? 'none'
       : String(req.body?.delivery_mode || 'delivery').toLowerCase();
-
   const providedSlot = (req.body?.delivery_slot || '').trim();
   const providedScheduledAtRaw = req.body?.scheduled_at || null;
   const providedScheduledAt = providedScheduledAtRaw
@@ -1412,10 +1432,8 @@ exports.checkout = asyncHandler(async (req, res) => {
     slotLabel = slotDt.format('HH:mm');
   } else if (delivery_mode === 'delivery' && providedSlot) {
     const maybeDt = parseSlotLabelToDate(providedSlot);
-    if (!maybeDt || !maybeDt.isValid()) {
-      console.error('[checkout] invalid delivery slot', providedSlot);
+    if (!maybeDt || !maybeDt.isValid())
       throwError('delivery_slot tidak valid', 400);
-    }
     slotDt = maybeDt;
     slotLabel = providedSlot;
   }
@@ -1426,7 +1444,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     delivery_mode === 'delivery' &&
     !isSlotAvailable(slotLabel, null, delivery_mode)
   ) {
-    console.error('[checkout] slot not available', slotLabel);
     throwError('Slot sudah tidak tersedia / sudah lewat', 409);
   }
 
@@ -1437,7 +1454,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     status: 'pending'
   };
 
-  // PICKUP window handling
+  // pickup window handling
   const pickupFromRaw =
     req.body?.pickup_from || req.body?.pickupWindow?.from || null;
   const pickupToRaw = req.body?.pickup_to || req.body?.pickupWindow?.to || null;
@@ -1447,19 +1464,13 @@ exports.checkout = asyncHandler(async (req, res) => {
     deliveryObj.status = 'pending';
     if (pickupFromRaw) {
       const pf = dayjs(pickupFromRaw).tz(LOCAL_TZ);
-      if (!pf.isValid()) {
-        console.error('[checkout] invalid pickup_from', pickupFromRaw);
-        throwError('pickup_from tidak valid', 400);
-      }
+      if (!pf.isValid()) throwError('pickup_from tidak valid', 400);
       deliveryObj.pickup_window = deliveryObj.pickup_window || {};
       deliveryObj.pickup_window.from = pf.toDate();
     }
     if (pickupToRaw) {
       const pt = dayjs(pickupToRaw).tz(LOCAL_TZ);
-      if (!pt.isValid()) {
-        console.error('[checkout] invalid pickup_to', pickupToRaw);
-        throwError('pickup_to tidak valid', 400);
-      }
+      if (!pt.isValid()) throwError('pickup_to tidak valid', 400);
       deliveryObj.pickup_window = deliveryObj.pickup_window || {};
       deliveryObj.pickup_window.to = pt.toDate();
     }
@@ -1470,15 +1481,11 @@ exports.checkout = asyncHandler(async (req, res) => {
   if (delivery_mode === 'delivery' && ft !== 'dine_in') {
     const latN = Number(req.body?.lat);
     const lngN = Number(req.body?.lng);
-    if (!Number.isFinite(latN) || !Number.isFinite(lngN)) {
-      console.error('[checkout] missing lat/lng for delivery');
+    if (!Number.isFinite(latN) || !Number.isFinite(lngN))
       throwError('Lokasi (lat,lng) wajib untuk delivery', 400);
-    }
     const distance_km = haversineKm(CAFE_COORD, { lat: latN, lng: lngN });
-    if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0)) {
-      console.error('[checkout] outside delivery radius', { distance_km });
+    if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0))
       throwError(`Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`);
-    }
     deliveryObj.address_text = String(req.body?.address_text || '').trim();
     deliveryObj.location = { lat: latN, lng: lngN };
     deliveryObj.distance_km = Number(distance_km.toFixed(2));
@@ -1489,7 +1496,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     deliveryObj.note_to_rider = String(req.body?.note_to_rider || '');
   }
 
-  // --- normalisasi item dan simpan cart totals ---
+  // normalisasi item (simpan addons cleaned) + recompute cart totals
   cart.items = (Array.isArray(cart.items) ? cart.items : [])
     .filter(Boolean)
     .map((it) => {
@@ -1512,9 +1519,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   try {
     recomputeTotals(cart);
     await cart.save();
-    console.log('[checkout] cart recompute & saved', { cartId: cart._id });
   } catch (err) {
-    console.error('[checkout] gagal simpan cart', err?.message || err);
     throwError(
       err?.message
         ? `Gagal menyimpan cart: ${String(err.message)}`
@@ -1523,145 +1528,89 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
-  // --- VOUCHER filtering (robust fallback + diagnostics) ---
+  // --- FILTER voucherClaimIds jadi eligibleClaimIds (robust fallback) ---
   let eligibleClaimIds = [];
-
-  // prepare safe voucherClaimIds (filter non-valid ObjectId strings)
-  const requestedClaimIds = Array.isArray(voucherClaimIds)
-    ? voucherClaimIds
-        .map((v) => (v ? String(v).trim() : ''))
-        .filter(Boolean)
-        .filter((id) => mongoose.Types.ObjectId.isValid(id))
-    : [];
-
   if (MemberDoc) {
-    try {
-      console.log(
-        '[checkout][voucher-check] incoming voucherClaimIds (raw):',
-        voucherClaimIds
-      );
-      console.log(
-        '[checkout][voucher-check] sanitized requestedClaimIds:',
-        requestedClaimIds
-      );
+    if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
+      // ambil semua dokumen sesuai id yg diminta (no filters)
+      const rawById = await VoucherClaim.find({ _id: { $in: voucherClaimIds } })
+        .lean()
+        .catch(() => []);
+      const now = new Date();
 
-      if (requestedClaimIds.length) {
-        // ambil semua doc sesuai id yg diminta (no filters) -> buat diagnosa + fallback
-        const rawById = await VoucherClaim.find({
-          _id: { $in: requestedClaimIds }
+      eligibleClaimIds = (rawById || [])
+        .filter((d) => {
+          const memberMatch =
+            String(d.member || '') === String(MemberDoc._id || '');
+          const statusOk = d.status === 'claimed';
+          const notExpired = !d.validUntil || new Date(d.validUntil) > now;
+          return memberMatch && statusOk && notExpired;
         })
-          .lean()
-          .catch((e) => {
-            console.error(
-              '[checkout][voucher-check] find rawById error',
-              e?.message || e
-            );
-            return [];
-          });
+        .map((d) => String(d._id));
 
-        console.log('[checkout][voucher-check] rawById count:', rawById.length);
-        rawById.forEach((d) => {
-          console.log('[checkout][voucher-check][rawDoc]', {
-            id: String(d._id),
-            member: String(d.member || null),
-            status: d.status || null,
-            remainingUse: d.remainingUse ?? null,
-            validUntil: d.validUntil || null,
-            voucher: String(d.voucher || null),
-            createdAt: d.createdAt || null
-          });
-        });
-
-        // Build eligibleClaimIds dari rawById (manual checks)
-        const now = new Date();
-        eligibleClaimIds = (rawById || [])
-          .filter((d) => {
-            const memberMatch =
-              String(d.member || '') === String(MemberDoc._id || '');
-            const statusOk = d.status === 'claimed';
-            const notExpired = !d.validUntil || new Date(d.validUntil) > now;
-            if (!memberMatch || !statusOk || !notExpired) {
-              console.log('[checkout][voucher-check][rawDoc-rejected]', {
-                id: String(d._id),
-                memberMatch,
-                status: d.status,
-                statusOk,
-                validUntil: d.validUntil || null,
-                notExpired
-              });
-            }
-            return memberMatch && statusOk && notExpired;
-          })
-          .map((d) => String(d._id));
-
-        console.log(
-          '[checkout][voucher-check] eligibleClaimIds after rawById processing:',
-          eligibleClaimIds
-        );
-
-        // If FE requested but none eligible -> fail-fast with friendly message
-        if (requestedClaimIds.length && eligibleClaimIds.length === 0) {
-          console.error(
-            '[checkout][voucher-check][FAIL] requested vouchers not eligible. requested:',
-            requestedClaimIds
-          );
-          throwError(
-            'Voucher tidak valid/expired/atau bukan milik member ini. Silakan periksa wallet Anda atau refresh halaman.',
-            400
-          );
-        }
+      // compare with query by filter (defensive)
+      try {
+        await VoucherClaim.find({
+          _id: { $in: voucherClaimIds },
+          member: MemberDoc._id,
+          status: 'claimed'
+        }).lean();
+      } catch (_) {
+        // ignore, just defensive probe
       }
-    } catch (e) {
-      console.error('[checkout][voucher-check][fatal]', e?.message || e);
-      throwError('Kesalahan saat memvalidasi voucher', 500);
+
+      if (
+        Array.isArray(voucherClaimIds) &&
+        voucherClaimIds.length &&
+        eligibleClaimIds.length === 0
+      ) {
+        throwError(
+          'Voucher tidak valid/expired/atau bukan milik member ini. Silakan periksa wallet Anda atau refresh halaman.',
+          400
+        );
+      }
     }
   } else if (voucherClaimIds?.length) {
-    console.error('[checkout] non-member tried to use vouchers', {
-      voucherClaimIds
-    });
     throwError('Voucher hanya untuk member. Silakan daftar/login.', 400);
   }
 
-  // DEBUG: log incoming voucher ids & eligible ids
-  console.log('[checkout] incoming voucherClaimIds:', voucherClaimIds);
-  console.log('[checkout] eligibleClaimIds after filter:', eligibleClaimIds);
+  // --- buat cart payload untuk price engine (unit price termasuk addons) ---
+  const normalizedForEngine = {
+    items: (cart.items || []).map((it) => {
+      const base = Number(it.base_price ?? it.unit_price ?? it.price ?? 0);
+      const addons = Array.isArray(it.addons) ? it.addons : [];
+      const addonsPerUnit = addons.reduce((s, a) => {
+        const ap = Number(a?.price || 0);
+        const aq = Number(a?.qty || 1);
+        return s + ap * Math.max(1, aq);
+      }, 0);
+      const unit_price = Math.round(base + addonsPerUnit);
+      return {
+        menuId: it.menu,
+        name: it.name || null,
+        qty: Number(it.quantity ?? it.qty ?? 0),
+        price: unit_price,
+        category: it.category || null,
+        addons: addons.map((a) => ({
+          name: a.name,
+          price: Number(a.price || 0),
+          qty: Number(a.qty || 1)
+        }))
+      };
+    })
+  };
 
   // --- PANGGIL price engine (sumber kebenaran) ---
   let priced;
   try {
     priced = await validateAndPrice({
       memberId: MemberDoc ? MemberDoc._id : null,
-      cart: {
-        items: cart.items.map((it) => ({
-          menuId: it.menu,
-          qty: int(it.quantity || it.qty || 0),
-          price: int(it.base_price || 0),
-          // kirim addons supaya engine punya kesempatan menghitung subtotal lengkap
-          addons: (it.addons || []).map((a) => ({
-            name: a.name || '',
-            price: int(a.price || 0),
-            qty: int(a.qty || 1)
-          })),
-          category: it.category || null
-        }))
-      },
+      cart: normalizedForEngine,
       fulfillmentType: ft,
       deliveryFee: deliveryObj.delivery_fee || 0,
       voucherClaimIds: eligibleClaimIds
     });
-    console.log('[checkout] price engine returned', {
-      ok: priced?.ok,
-      reasons: priced?.reasons,
-      totals_keys: Object.keys(priced?.totals || {}),
-      breakdown_length: Array.isArray(priced?.breakdown)
-        ? priced.breakdown.length
-        : 0,
-      chosenClaimIds: Array.isArray(priced?.chosenClaimIds)
-        ? priced.chosenClaimIds.length
-        : 0
-    });
   } catch (err) {
-    console.error('[checkout] validateAndPrice threw', err?.message || err);
     throwError(
       err?.message
         ? `Gagal menghitung harga: ${String(err.message)}`
@@ -1671,7 +1620,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   }
 
   if (!priced || !priced.ok) {
-    console.error('[checkout] price engine failed:', priced?.reasons || priced);
     throwError(
       (priced && priced.reasons && priced.reasons.join?.(', ')) ||
         'Gagal menghitung harga (engine)',
@@ -1679,36 +1627,31 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
-  // --- pastikan voucher yang dikirim FE benar-benar diaplikasikan ---
+  // Pastikan voucher yang diminta diaplikasikan (jika FE kirim)
   const breakdown = Array.isArray(priced.breakdown) ? priced.breakdown : [];
-  const claimedInBreakdown = new Set(
-    breakdown
-      .map((b) => b.claimId || b.claim_id || b.claim)
-      .filter(Boolean)
-      .map(String)
-  );
-
+  const chosenClaimIds = Array.isArray(priced.chosenClaimIds)
+    ? priced.chosenClaimIds
+    : [];
   if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
+    const claimedInBreakdown = new Set(
+      breakdown
+        .map((b) => b.claimId || b.claim_id || b.claim)
+        .filter(Boolean)
+        .map(String)
+    );
     const anyApplied = eligibleClaimIds.some((cid) =>
       claimedInBreakdown.has(String(cid))
     );
     if (!anyApplied) {
-      console.error(
-        '[checkout] requested voucherClaimIds not applied by engine',
-        { requested: voucherClaimIds, eligible: eligibleClaimIds, breakdown }
-      );
-      const reasonMsg =
+      throwError(
         (priced && priced.reasons && priced.reasons.join?.(', ')) ||
-        'Voucher tidak bisa diterapkan saat checkout';
-      throwError(reasonMsg, 400);
+          'Voucher tidak bisa diterapkan saat checkout',
+        400
+      );
     }
   }
 
-  // --- build discounts array & applied_voucher_ids (voucher ids, bukan claim ids) ---
-  let discounts = [];
-  const appliedVoucherIdSet = new Set();
-
-  // prepare claimDocsMap (ambil voucherClaim docs untuk breakdown mapping)
+  // Build discounts & applied voucher ids (fallback map from claim->voucher if needed)
   const claimIdsNeeded = breakdown
     .map((b) => b.claimId || b.claim_id || b.claim)
     .filter(Boolean)
@@ -1722,20 +1665,14 @@ exports.checkout = asyncHandler(async (req, res) => {
       acc[String(cd._id)] = cd;
       return acc;
     }, {});
-    console.log('[checkout] claimDocsMap built for breakdown', {
-      claimDocsCount: claimDocs.length
-    });
   }
 
-  for (const b of breakdown) {
+  const discounts = (breakdown || []).map((b) => {
     const claimId = b.claimId || b.claim_id || b.claim || null;
     let voucherId = b.voucherId || b.voucher_id || b.voucher || null;
-
-    if (!voucherId && claimId && claimDocsMap[claimId]) {
+    if (!voucherId && claimId && claimDocsMap[claimId])
       voucherId = claimDocsMap[claimId].voucher || null;
-    }
-
-    const item = {
+    return {
       claimId: claimId ? String(claimId) : null,
       voucherId: voucherId ? String(voucherId) : null,
       name: b.name || b.title || '',
@@ -1744,36 +1681,21 @@ exports.checkout = asyncHandler(async (req, res) => {
       note: b.note || null,
       raw: b
     };
-
-    discounts.push(item);
-    if (voucherId) appliedVoucherIdSet.add(String(voucherId));
-  }
-
-  const appliedVoucherIds = Array.from(appliedVoucherIdSet);
-
-  // --- ambil totals engine untuk hitung uiTotals & order pricing ---
-  const baseFromEngine = int(priced.totals?.baseSubtotal || 0);
-
-  // subtotal hasil recompute cart/order (pre-validate memastikan line_subtotal sudah benar)
-  const cartComputedSubtotal = int(
-    (cart.items || []).reduce((s, it) => s + int(it.line_subtotal || 0), 0)
-  );
-
-  // Pilih yang lebih besar: engine atau cart (agar addons tidak luput)
-  const baseItemsSubtotal = Math.max(baseFromEngine, cartComputedSubtotal);
-  console.log('[checkout] subtotal resolution', {
-    baseFromEngine,
-    cartComputedSubtotal,
-    baseItemsSubtotal
   });
 
+  const appliedVoucherIdSet = new Set(
+    discounts.map((d) => d.voucherId).filter(Boolean)
+  );
+  const appliedVoucherIds = Array.from(appliedVoucherIdSet);
+
+  // ambil totals engine
+  const baseItemsSubtotal = int(priced.totals?.baseSubtotal || 0);
   const items_discount = int(priced.totals?.itemsDiscount || 0);
   const shipping_discount = int(priced.totals?.shippingDiscount || 0);
   const reportedDelivery = int(priced.totals?.deliveryFee || 0);
   const engineGrand = priced.totals?.grandTotal ?? null;
 
   const delivery_fee_net = Math.max(0, reportedDelivery - shipping_discount);
-
   if (
     typeof deliveryObj.delivery_fee_raw === 'undefined' ||
     deliveryObj.delivery_fee_raw === null
@@ -1782,7 +1704,6 @@ exports.checkout = asyncHandler(async (req, res) => {
       reportedDelivery + shipping_discount || deliveryObj.delivery_fee || 0
     );
   }
-
   deliveryObj.delivery_fee = int(delivery_fee_net);
   deliveryObj.shipping_discount = int(shipping_discount || 0);
 
@@ -1804,19 +1725,11 @@ exports.checkout = asyncHandler(async (req, res) => {
       shipping_discount +
       taxAmount
   );
-
   const requested_bvt = engineGrand
     ? int(engineGrand)
     : int(roundRupiahCustom(beforeRound));
   const rounding_delta = int(requested_bvt - beforeRound);
-
-  if (requested_bvt <= 0) {
-    console.error('[checkout] invalid total requested_bvt', {
-      requested_bvt,
-      beforeRound
-    });
-    throwError('Total pembayaran tidak valid.', 400);
-  }
+  if (requested_bvt <= 0) throwError('Total pembayaran tidak valid.', 400);
 
   const uiTotals = {
     items_subtotal: int(baseItemsSubtotal),
@@ -1829,140 +1742,122 @@ exports.checkout = asyncHandler(async (req, res) => {
     rounding_delta: int(rounding_delta || 0),
     grand_total: int(requested_bvt || 0),
     items_subtotal_after_discount: int(items_subtotal_after_discount || 0),
-    discounts // sudah dideklarasi aman di atas
+    discounts
   };
 
-  // --- create order (trust engine totals & discounts) ---
+  // create order (trust engine totals & discounts)
   const initialIsPaid = !needProof(method);
   const initialPaymentStatus = initialIsPaid ? 'paid' : 'unpaid';
   const initialPaidAt = initialIsPaid ? new Date() : null;
 
-  let order;
-  try {
-    order = await (async () => {
-      for (let i = 0; i < 5; i++) {
-        try {
-          const code = await nextDailyTxCode('ARCH');
-
-          const created = await Order.create({
-            member: MemberDoc ? MemberDoc._id : null,
-            customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
-            customer_phone: MemberDoc ? MemberDoc.phone || '' : customer_phone,
-            table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
-            source: iden.source || 'online',
-            fulfillment_type: ft,
-            transaction_code: code,
-            items: cart.items.map((it) => ({
+  const order = await (async () => {
+    for (let i = 0; i < 5; i++) {
+      try {
+        const code = await nextDailyTxCode('ARCH');
+        return await Order.create({
+          member: MemberDoc ? MemberDoc._id : null,
+          customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
+          customer_phone: MemberDoc ? MemberDoc.phone || '' : customer_phone,
+          table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
+          source: iden.source || 'online',
+          fulfillment_type: ft,
+          transaction_code: code,
+          items: (cart.items || []).map((it) => {
+            const base = Number(
+              it.base_price ?? it.unit_price ?? it.price ?? 0
+            );
+            const addons = Array.isArray(it.addons) ? it.addons : [];
+            const addonsPerUnit = addons.reduce(
+              (s, a) =>
+                s + Number(a?.price || 0) * Math.max(1, Number(a?.qty || 1)),
+              0
+            );
+            const unit_price = Math.round(base + addonsPerUnit);
+            const qty = Number(it.quantity ?? it.qty ?? 0);
+            return {
               menu: it.menu,
               menu_code: it.menu_code,
               name: it.name,
               imageUrl: it.imageUrl,
-              base_price: it.base_price,
-              quantity: it.quantity,
+              base_price: unit_price,
+              quantity: qty,
               addons: it.addons,
               notes: String(it.notes || '').trim(),
               category: it.category || null,
-              line_subtotal: int(it.line_subtotal || 0)
-            })),
+              line_before_tax: int(unit_price * qty)
+            };
+          }),
 
-            items_subtotal: int(uiTotals.items_subtotal),
-            items_discount: int(uiTotals.items_discount),
+          items_subtotal: int(uiTotals.items_subtotal),
+          items_discount: int(uiTotals.items_discount),
+          delivery_fee: int(uiTotals.delivery_fee),
+          shipping_discount: int(uiTotals.shipping_discount),
+
+          discounts: discounts || [],
+          applied_voucher_ids: appliedVoucherIds || [],
+
+          service_fee: int(uiTotals.service_fee),
+          tax_rate_percent: Number(uiTotals.tax_rate_percent),
+          tax_amount: int(uiTotals.tax_amount),
+          rounding_delta: int(uiTotals.rounding_delta),
+          grand_total: int(uiTotals.grand_total),
+
+          payment_method: method,
+          payment_provider:
+            method === PM.QRIS && !QRIS_USE_STATIC ? 'xendit' : null,
+
+          payment_status: initialPaymentStatus,
+          paid_at: initialPaidAt,
+          payment_proof_url: null,
+
+          status: 'created',
+          placed_at: new Date(),
+
+          delivery: {
+            ...deliveryObj,
             delivery_fee: int(uiTotals.delivery_fee),
             shipping_discount: int(uiTotals.shipping_discount),
-
-            discounts: discounts || [],
-            applied_voucher_ids: appliedVoucherIds || [],
-
-            service_fee: int(uiTotals.service_fee),
-            tax_rate_percent: Number(uiTotals.tax_rate_percent),
-            tax_amount: int(uiTotals.tax_amount),
-            rounding_delta: int(uiTotals.rounding_delta),
-            grand_total: int(uiTotals.grand_total),
-
-            payment_method: method,
-            payment_provider:
-              method === PM.QRIS && !QRIS_USE_STATIC ? 'xendit' : null,
-
-            payment_status: initialPaymentStatus,
-            paid_at: initialPaidAt,
-            payment_proof_url: null,
-
-            status: 'created',
-            placed_at: new Date(),
-
-            delivery: {
-              ...deliveryObj,
-              delivery_fee: int(uiTotals.delivery_fee),
-              shipping_discount: int(uiTotals.shipping_discount),
-              delivery_fee_raw: int(deliveryObj.delivery_fee_raw || 0)
-            }
-          });
-
-          console.log('[checkout] order created tentatively', {
-            orderId: created._id,
-            tx: created.transaction_code
-          });
-          return created;
-        } catch (e) {
-          if (e?.code === 11000 && /transaction_code/.test(String(e.message))) {
-            console.warn(
-              '[checkout] tx collision, retrying...',
-              e?.message || e
-            );
-            continue;
+            delivery_fee_raw: int(deliveryObj.delivery_fee_raw || 0)
           }
-          console.error('[checkout] failed creating order', e?.message || e);
-          throwError(
-            e?.message
-              ? `Gagal membuat order: ${String(e.message)}`
-              : 'Gagal membuat order',
-            e?.status || 500
-          );
-        }
+        });
+      } catch (e) {
+        if (e?.code === 11000 && /transaction_code/.test(String(e.message)))
+          continue;
+        throwError(
+          e?.message
+            ? `Gagal membuat order: ${String(e.message)}`
+            : 'Gagal membuat order',
+          e?.status || 500
+        );
       }
-      throwError('Gagal generate transaction_code unik', 500);
-    })();
-  } catch (e) {
-    console.error('[checkout] create order fatal', e?.message || e);
-    throw e;
-  }
+    }
+    throwError('Gagal generate transaction_code unik', 500);
+  })();
 
-  // --- handle upload bukti jika perlu ---
+  // handle upload proof jika perlu
   try {
     if (needProof(method)) {
       if (!req.file) {
         await Order.deleteOne({ _id: order._id }).catch(() => {});
-        console.error(
-          '[checkout] missing proof file for method that requires it'
-        );
         throwError('Bukti pembayaran wajib diunggah untuk metode ini', 400);
       }
-
       const proofUrl = await handleTransferProofIfAny(req, method, {
         transactionCode: order.transaction_code
       });
-
       if (proofUrl) {
         order.payment_proof_url = proofUrl;
         order.payment_status = 'paid';
         order.paid_at = new Date();
         await order.save();
-        console.log('[checkout] proof uploaded, order marked paid', {
-          orderId: order._id
-        });
       } else {
         await Order.deleteOne({ _id: order._id }).catch(() => {});
-        console.error('[checkout] proof upload returned empty url');
         throwError('Gagal mengunggah bukti pembayaran', 500);
       }
     }
   } catch (err) {
     try {
       await Order.deleteOne({ _id: order._id });
-    } catch (ee) {
-      console.error('[checkout][rollback][deleteOrder]', ee?.message || ee);
-    }
-    console.error('[checkout] handle proof error', err?.message || err);
+    } catch (_) {}
     throwError(
       err?.message
         ? `Gagal upload bukti pembayaran: ${String(err.message)}`
@@ -1971,41 +1866,54 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
-  // --- konsumsi voucher claims (non-fatal) berdasarkan priced.chosenClaimIds ---
+  // konsumsi voucher claims (atomic-ish per claim)
   if (MemberDoc) {
-    console.log('[checkout] start consuming voucher claims', {
-      chosenClaimIds: priced.chosenClaimIds || []
-    });
-    for (const claimId of priced.chosenClaimIds || []) {
+    for (const claimId of chosenClaimIds || []) {
       try {
-        const c = await VoucherClaim.findById(claimId);
-        if (
-          c &&
-          c.status === 'claimed' &&
-          String(c.member) === String(MemberDoc._id)
-        ) {
-          c.remainingUse = Math.max(0, (c.remainingUse || 1) - 1);
-          if (c.remainingUse <= 0) c.status = 'used';
-          c.history = c.history || [];
-          c.history.push({
-            at: new Date(),
-            action: 'USE',
-            ref: String(order._id),
-            note: 'dipakai pada order'
-          });
-          await c.save();
-          console.log('[checkout] voucher claim consumed', {
-            claimId: c._id,
-            remainingUse: c.remainingUse,
-            status: c.status
-          });
+        // decrement remainingUse atomically; only if status is 'claimed' and remainingUse >= 1
+        const updated = await VoucherClaim.findOneAndUpdate(
+          { _id: claimId, status: 'claimed', remainingUse: { $gte: 1 } },
+          { $inc: { remainingUse: -1 } },
+          { new: true }
+        );
+        if (updated) {
+          if ((updated.remainingUse || 0) <= 0) {
+            await VoucherClaim.updateOne(
+              { _id: updated._id },
+              {
+                $set: { status: 'used' },
+                $push: {
+                  history: {
+                    at: new Date(),
+                    action: 'USE',
+                    ref: String(order._id),
+                    note: 'dipakai pada order'
+                  }
+                }
+              }
+            );
+          } else {
+            await VoucherClaim.updateOne(
+              { _id: updated._id },
+              {
+                $push: {
+                  history: {
+                    at: new Date(),
+                    action: 'USE',
+                    ref: String(order._id),
+                    note: 'dipakai pada order'
+                  }
+                }
+              }
+            );
+          }
 
-          // jika voucher pakai global_stock dan stok = 0 -> revoke klaim lain
+          // jika voucher punya global_stock dan stok sudah 0, revoke klaim lain
           try {
-            const v = await Voucher.findById(c.voucher).lean();
+            const v = await Voucher.findById(updated.voucher).lean();
             if (v && v.visibility && v.visibility.mode === 'global_stock') {
-              const remaining = Number(v.visibility.globalStock || 0);
-              if (remaining <= 0) {
+              const remainingGlobal = Number(v.visibility.globalStock || 0);
+              if (remainingGlobal <= 0) {
                 await VoucherClaim.updateMany(
                   { voucher: v._id, status: 'claimed' },
                   {
@@ -2019,34 +1927,21 @@ exports.checkout = asyncHandler(async (req, res) => {
                     }
                   }
                 );
-                console.log(
-                  '[checkout] global stock empty -> revoked other claims',
-                  { voucher: v._id }
-                );
               }
             }
-          } catch (ee) {
-            console.error(
-              '[voucher][consume][revoke-if-stock-empty] failed',
-              ee?.message || ee
-            );
+          } catch (_) {
+            /* non-fatal */
           }
         } else {
-          console.warn('[checkout] voucher claim not consumable', {
-            claimId,
-            found: !!c,
-            status: c?.status
-          });
+          // tidak dapat mengkonsumsi klaim (sudah dipakai/dirubah) -> non-fatal
         }
       } catch (err) {
-        console.error('[voucher][consume] gagal update', err?.message || err);
+        // non-fatal, tapi jangan block order
       }
     }
-  } else {
-    console.log('[checkout] no MemberDoc -> skip consuming vouchers');
   }
 
-  // --- update cart status checked_out ---
+  // update cart checked_out (non-fatal)
   try {
     await Cart.findByIdAndUpdate(cart._id, {
       $set: {
@@ -2060,39 +1955,28 @@ exports.checkout = asyncHandler(async (req, res) => {
         total_price: 0
       }
     });
-    console.log('[checkout] cart updated to checked_out', { cartId: cart._id });
-  } catch (err) {
-    console.error(
-      '[checkout] gagal update cart setelah order dibuat',
-      err?.message || err
-    );
-    // tidak menggagalkan order — tapi beri warning
+  } catch (_) {
+    /* non-fatal */
   }
 
-  // --- update member stats (non-fatal) ---
+  // update member stats (non-fatal)
   if (MemberDoc) {
     try {
       await Member.findByIdAndUpdate(MemberDoc._id, {
         $inc: { total_spend: order.grand_total || 0 },
         $set: { last_visit_at: new Date() }
       });
-      console.log('[checkout] member stats updated', {
-        memberId: MemberDoc._id
-      });
-    } catch (err) {
-      console.error('[member][stats] gagal update', err?.message || err);
+    } catch (_) {
+      /* non-fatal */
     }
   }
 
-  // --- snapshot order (non-fatal) ---
+  // snapshot order (non-fatal)
   try {
     await snapshotOrder(order._id, { uiTotals }).catch(() => {});
-    console.log('[checkout] snapshot order done', { orderId: order._id });
-  } catch (e) {
-    console.error('[OrderHistory][checkout]', e?.message || e);
-  }
+  } catch (_) {}
 
-  // --- EMIT SOCKET (non-fatal) ---
+  // EMIT SOCKET (non-fatal)
   try {
     const summary = {
       id: String(order._id),
@@ -2136,27 +2020,16 @@ exports.checkout = asyncHandler(async (req, res) => {
     emitToCashier('staff:notify', {
       message: 'Ada pesanan yang masuk, silakan cek halaman pesanan Anda'
     });
-
     emitOrdersStream({ target: 'cashier', action: 'insert', item: summary });
-
     emitToStaff('staff:notify', { message: 'Pesanan baru dibuat.' });
-    console.log('[checkout] emitted order summary to streams', {
-      orderId: order._id
-    });
-  } catch (e) {
-    console.error('[emit][checkout]', e?.message || e);
+  } catch (_) {
+    /* non-fatal */
   }
 
-  // --- response ---
-  console.log('[checkout] finished success', {
-    orderId: order._id,
-    grand_total: order.grand_total
-  });
-  res.status(201).json({
-    order: order.toObject(),
-    uiTotals,
-    message: 'Checkout berhasil.'
-  });
+  // response
+  res
+    .status(201)
+    .json({ order: order.toObject(), uiTotals, message: 'Checkout berhasil.' });
 });
 
 exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
