@@ -1770,18 +1770,43 @@ exports.checkout = asyncHandler(async (req, res) => {
   try {
     const summary = {
       id: String(order._id),
-      transaction_code: order.transaction_code,
-      fulfillment_type: order.fulfillment_type,
-      table_number: order.table_number || null,
-      items_total: order.items_subtotal,
-      grand_total: order.grand_total,
-      total_quantity: order.total_quantity,
-      source: order.source,
-      status: order.status,
-      payment_status: order.payment_status,
-      placed_at: order.placed_at,
-      member: order.member ? String(order.member) : null,
-      guestToken: order.guestToken || null
+      transaction_code: order.transaction_code || '',
+
+      delivery_mode:
+        order.delivery?.mode ||
+        (order.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
+
+      grand_total: Number(order.grand_total || 0),
+      fulfillment_type: order.fulfillment_type || null,
+
+      customer_name:
+        (order.member && order.member.name) || order.customer_name || '',
+
+      customer_phone:
+        (order.member && order.member.phone) || order.customer_phone || '',
+
+      placed_at: order.placed_at || order.createdAt || null,
+
+      table_number:
+        order.fulfillment_type === 'dine_in'
+          ? order.table_number || null
+          : null,
+
+      payment_status: order.payment_status || null,
+      status: order.status || null,
+
+      total_quantity: Number(order.total_quantity || 0),
+
+      pickup_window: order.delivery?.pickup_window
+        ? {
+            from: order.delivery.pickup_window.from || null,
+            to: order.delivery.pickup_window.to || null
+          }
+        : null,
+
+      delivery_slot_label: order.delivery?.slot_label || null,
+
+      member_id: order.member ? String(order.member) : null
     };
 
     emitToCashier('staff:notify', {
@@ -3076,10 +3101,51 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   }
 
   try {
+    const summary = {
+      id: String(order._id),
+      transaction_code: order.transaction_code || '',
+
+      delivery_mode:
+        order.delivery?.mode ||
+        (order.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
+
+      grand_total: Number(order.grand_total || 0),
+      fulfillment_type: order.fulfillment_type || null,
+
+      customer_name:
+        (order.member && order.member.name) || order.customer_name || '',
+
+      customer_phone:
+        (order.member && order.member.phone) || order.customer_phone || '',
+
+      placed_at: order.placed_at || order.createdAt || null,
+
+      table_number:
+        order.fulfillment_type === 'dine_in'
+          ? order.table_number || null
+          : null,
+
+      payment_status: order.payment_status || null,
+      status: order.status || null,
+
+      total_quantity: Number(order.total_quantity || 0),
+
+      pickup_window: order.delivery?.pickup_window
+        ? {
+            from: order.delivery.pickup_window.from || null,
+            to: order.delivery.pickup_window.to || null
+          }
+        : null,
+
+      delivery_slot_label: order.delivery?.slot_label || null,
+
+      member_id: order.member ? String(order.member) : null
+    };
+
     emitToCashier('staff:notify', {
       message: 'Ada pesanan baru, cek halaman pesanan.'
     });
-    emitOrdersStream({ target: 'cashier', action: 'insert', item: summary });
+    emitOrdersStream({ target: 'kitchen', action: 'insert', item: summary });
     emitToKitchen('staff:notify', {
       message: 'Pesanan baru diterima, cek halaman kitchen.'
     });
@@ -3232,9 +3298,14 @@ exports.completeOrder = asyncHandler(async (req, res) => {
   };
 
   try {
+    emitOrdersStream({
+      target: 'kitchen',
+      action: 'remove',
+      item: { id: payload.id }
+    });
+
     emitToStaff('order:completed', payload);
     emitToCashier('order:completed', payload);
-    emitToKitchen('order:completed', payload);
 
     if (order.member)
       emitToMember(String(order.member), 'order:completed', payload);
@@ -3327,6 +3398,48 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
       status: payload.status,
       payment_status: payload.payment_status
     };
+
+    const summary = {
+      id: String(order._id),
+      transaction_code: order.transaction_code || '',
+
+      delivery_mode:
+        order.delivery?.mode ||
+        (order.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
+
+      grand_total: Number(order.grand_total || 0),
+      fulfillment_type: order.fulfillment_type || null,
+
+      customer_name:
+        (order.member && order.member.name) || order.customer_name || '',
+
+      customer_phone:
+        (order.member && order.member.phone) || order.customer_phone || '',
+
+      placed_at: order.placed_at || order.createdAt || null,
+
+      table_number:
+        order.fulfillment_type === 'dine_in'
+          ? order.table_number || null
+          : null,
+
+      payment_status: order.payment_status || null,
+      status: order.status || null,
+
+      total_quantity: Number(order.total_quantity || 0),
+
+      pickup_window: order.delivery?.pickup_window
+        ? {
+            from: order.delivery.pickup_window.from || null,
+            to: order.delivery.pickup_window.to || null
+          }
+        : null,
+
+      delivery_slot_label: order.delivery?.slot_label || null,
+
+      member_id: order.member ? String(order.member) : null
+    };
+
     emitOrdersStream({
       target: 'cashier',
       action: 'update',
@@ -3335,7 +3448,7 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     emitOrdersStream({
       target: 'kitchen',
       action: 'insert',
-      item: summaryUpdate
+      item: summary
     });
 
     // member/guest already emitted below
