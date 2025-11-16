@@ -1716,20 +1716,39 @@ exports.checkout = asyncHandler(async (req, res) => {
   // --- PANGGIL price engine (sumber kebenaran) ---
   let priced;
   try {
+    const normalizedForEngine = {
+      items: (cart.items || []).map((it) => {
+        const base = Number(it.base_price ?? it.unit_price ?? it.price ?? 0);
+        const addons = Array.isArray(it.addons) ? it.addons : [];
+        const addonsPerUnit = addons.reduce((s, a) => {
+          const ap = Number(a?.price || 0);
+          const aq = Number(a?.qty || 1);
+          return s + ap * Math.max(1, aq);
+        }, 0);
+        const unit_price = Math.round(base + addonsPerUnit);
+        return {
+          menuId: it.menu,
+          name: it.name || null,
+          qty: Number(it.quantity ?? it.qty ?? 0),
+          price: unit_price,
+          category: it.category || null,
+          addons: addons.map((a) => ({
+            name: a.name,
+            price: Number(a.price || 0),
+            qty: Number(a.qty || 1)
+          }))
+        };
+      })
+    };
+
     priced = await validateAndPrice({
       memberId: MemberDoc ? MemberDoc._id : null,
-      cart: {
-        items: cart.items.map((it) => ({
-          menuId: it.menu,
-          qty: it.quantity,
-          price: it.base_price,
-          category: it.category || null
-        }))
-      },
+      cart: normalizedForEngine,
       fulfillmentType: ft,
       deliveryFee: deliveryObj.delivery_fee || 0,
       voucherClaimIds: eligibleClaimIds
     });
+
     console.log('[checkout] price engine returned', {
       ok: priced?.ok,
       reasons: priced?.reasons,
@@ -1918,17 +1937,31 @@ exports.checkout = asyncHandler(async (req, res) => {
             source: iden.source || 'online',
             fulfillment_type: ft,
             transaction_code: code,
-            items: cart.items.map((it) => ({
-              menu: it.menu,
-              menu_code: it.menu_code,
-              name: it.name,
-              imageUrl: it.imageUrl,
-              base_price: it.base_price,
-              quantity: it.quantity,
-              addons: it.addons,
-              notes: String(it.notes || '').trim(),
-              category: it.category || null
-            })),
+            items: (cart.items || []).map((it) => {
+              const base = Number(
+                it.base_price ?? it.unit_price ?? it.price ?? 0
+              );
+              const addons = Array.isArray(it.addons) ? it.addons : [];
+              const addonsPerUnit = addons.reduce(
+                (s, a) =>
+                  s + Number(a?.price || 0) * Math.max(1, Number(a?.qty || 1)),
+                0
+              );
+              const unit_price = Math.round(base + addonsPerUnit);
+              const qty = Number(it.quantity ?? it.qty ?? 0) || 0;
+              return {
+                menu: it.menu,
+                menu_code: it.menu_code,
+                name: it.name,
+                imageUrl: it.imageUrl,
+                base_price: unit_price, // simpan unit price termasuk addons
+                quantity: qty,
+                addons: it.addons,
+                notes: String(it.notes || '').trim(),
+                category: it.category || null,
+                line_before_tax: int(unit_price * qty) // line total termasuk addons
+              };
+            }),
 
             items_subtotal: int(uiTotals.items_subtotal),
             items_discount: int(uiTotals.items_discount),
