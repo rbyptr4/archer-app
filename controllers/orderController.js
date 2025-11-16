@@ -4088,7 +4088,6 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
   }
 
   // cursor-based (infinite scroll)
-  // cursor = ISO datetime string yang merepresentasikan last seen delivery.scheduled_at (or placed_at fallback)
   const cursorRaw = req.query.cursor || null;
   const limit = Math.min(
     100,
@@ -4100,7 +4099,7 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     ? String(req.query.status).toLowerCase()
     : null;
 
-  // slot filters
+  // slot filters (tetap dukung, optional)
   const slotLabel = req.query.slot_label
     ? String(req.query.slot_label).trim()
     : null;
@@ -4113,7 +4112,6 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
   const q = {
     fulfillment_type: 'delivery',
     'delivery.mode': 'delivery',
-    // search courier.user or legacy courier.id or legacy assignee.user
     $or: [
       { 'delivery.courier.user': userId },
       { 'delivery.courier.user.id': userId },
@@ -4121,7 +4119,6 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
       { 'delivery.assignee.user': userId }, // legacy (if still present)
       { 'delivery.assignee.user.id': userId }
     ],
-    // exclude cancelled orders by default
     status: { $ne: 'cancelled' }
   };
 
@@ -4129,12 +4126,10 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     q['delivery.status'] = deliveryStatus;
   }
 
-  // slot_label exact match
   if (slotLabel) {
     q['delivery.slot_label'] = slotLabel;
   }
 
-  // scheduled_from / scheduled_to (ISO strings accepted)
   if (scheduledFromRaw || scheduledToRaw) {
     q['delivery.scheduled_at'] = {};
     if (scheduledFromRaw) {
@@ -4150,7 +4145,6 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     }
   }
 
-  // scheduled_date convenience: treat as full-day range in UTC (00:00 - 23:59:59.999)
   if (scheduledDate) {
     const dayStart = new Date(`${scheduledDate}T00:00:00.000Z`);
     const dayEnd = new Date(`${scheduledDate}T23:59:59.999Z`);
@@ -4162,13 +4156,9 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     }
   }
 
-  // cursor: ambil records setelah cursor (ascending by delivery.scheduled_at)
-  // cursor expected: ISO string; fallback to placed_at if scheduled_at missing on docs is handled by using $and
   if (cursorRaw) {
     const cursorDate = new Date(cursorRaw);
     if (!isNaN(cursorDate.getTime())) {
-      // select docs where delivery.scheduled_at > cursorDate
-      // also include docs without scheduled_at but placed_at > cursorDate (fallback)
       q.$and = q.$and || [];
       q.$and.push({
         $or: [
@@ -4192,41 +4182,115 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     .populate('items.menu', 'name')
     .lean();
 
+  // Jika yang buka adalah owner, kumpulkan semua courier.user Id untuk fetch user data
+  const isOwner = String(req.user?.role || '').toLowerCase() === 'owner';
+  let courierUserMap = {};
+
+  if (isOwner && Array.isArray(orders) && orders.length) {
+    const idsSet = new Set();
+    const extractCourierUserId = (c) => {
+      if (!c) return null;
+      // cases:
+      // - courier.user = ObjectId/string
+      // - courier.user = { _id: ..., ... } or { id: ... }
+      if (typeof c.user === 'string' || typeof c.user === 'number')
+        return String(c.user);
+      if (c.user && (c.user._id || c.user.id))
+        return String(c.user._id || c.user.id);
+      // fallback: courier.id (legacy)
+      if (c.id) return String(c.id);
+      return null;
+    };
+
+    for (const o of orders) {
+      const c = o.delivery?.courier || o.delivery?.assignee || null;
+      const uid = extractCourierUserId(c);
+      if (uid) idsSet.add(uid);
+    }
+
+    const ids = Array.from(idsSet).filter(Boolean);
+    if (ids.length) {
+      // ambil data user kurir (ringkas)
+      const users = await User.find({ _id: { $in: ids } })
+        .select('_id name email phone role')
+        .lean();
+      courierUserMap = users.reduce((m, u) => {
+        m[String(u._id)] = u;
+        return m;
+      }, {});
+    }
+  }
+
   // map response
-  const mapped = (orders || []).map((o) => ({
-    _id: o._id,
-    transaction_code: o.transaction_code,
-    placed_at: o.placed_at,
-    fulfillment_type: o.fulfillment_type,
-    payment_method: o.payment_method,
-    payment_status: o.payment_status,
-    status: o.status,
-    grand_total: o.grand_total,
-    delivery: {
-      status: o.delivery?.status,
-      slot_label: o.delivery?.slot_label,
-      scheduled_at: o.delivery?.scheduled_at,
-      address_text: o.delivery?.address_text,
-      location: o.delivery?.location,
-      distance_km: o.delivery?.distance_km,
-      delivery_fee: o.delivery?.delivery_fee,
-      // prefer new courier field, fallback to legacy assignee if present
-      courier: o.delivery?.courier || o.delivery?.assignee || {}
-    },
-    customer: {
-      member: o.member || null,
-      name: o.customer_name || null,
-      phone: o.customer_phone || null
-    },
-    items: (o.items || []).map((it) => ({
-      name: it.name,
-      qty: it.quantity,
-      base_price: it.base_price,
-      line_subtotal: it.line_subtotal,
-      menu: it.menu ? (typeof it.menu === 'object' ? it.menu : it.menu) : null,
-      addons: it.addons || []
-    }))
-  }));
+  const mapped = (orders || []).map((o) => {
+    // determine courier object (prefer new field)
+    const courier = o.delivery?.courier || o.delivery?.assignee || {};
+
+    // if owner, attach user info if available
+    let courier_with_info = { ...courier };
+    if (isOwner) {
+      // extract id same way as above
+      let courierUserId = null;
+      if (courier) {
+        if (
+          typeof courier.user === 'string' ||
+          typeof courier.user === 'number'
+        )
+          courierUserId = String(courier.user);
+        else if (courier.user && (courier.user._id || courier.user.id))
+          courierUserId = String(courier.user._id || courier.user.id);
+        else if (courier.id) courierUserId = String(courier.id);
+      }
+      if (courierUserId && courierUserMap[courierUserId]) {
+        courier_with_info = {
+          ...courier_with_info,
+          user_info: courierUserMap[courierUserId] // _id, name, email, phone, role
+        };
+      } else {
+        // still include user_info null for clarity/audit
+        courier_with_info = { ...courier_with_info, user_info: null };
+      }
+    }
+
+    return {
+      _id: o._id,
+      transaction_code: o.transaction_code,
+      placed_at: o.placed_at,
+      fulfillment_type: o.fulfillment_type,
+      payment_method: o.payment_method,
+      payment_status: o.payment_status,
+      status: o.status,
+      grand_total: o.grand_total,
+      delivery: {
+        status: o.delivery?.status,
+        slot_label: o.delivery?.slot_label,
+        scheduled_at: o.delivery?.scheduled_at,
+        address_text: o.delivery?.address_text,
+        location: o.delivery?.location,
+        distance_km: o.delivery?.distance_km,
+        delivery_fee: o.delivery?.delivery_fee,
+        // courier object (with user_info only visible to owner)
+        courier: courier_with_info
+      },
+      customer: {
+        member: o.member || null,
+        name: o.customer_name || null,
+        phone: o.customer_phone || null
+      },
+      items: (o.items || []).map((it) => ({
+        name: it.name,
+        qty: it.quantity,
+        base_price: it.base_price,
+        line_subtotal: it.line_subtotal,
+        menu: it.menu
+          ? typeof it.menu === 'object'
+            ? it.menu
+            : it.menu
+          : null,
+        addons: it.addons || []
+      }))
+    };
+  });
 
   // next_cursor: delivery.scheduled_at (or placed_at) of last item
   let next_cursor = null;

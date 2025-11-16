@@ -11,6 +11,7 @@ const {
 } = require('../utils/googleDrive');
 const { buildExpenseProofFileName } = require('../utils/makeFileName');
 const { parsePeriod } = require('../utils/periodRange');
+const { getDriveFolder } = require('../utils/driveFolders');
 
 exports.createType = asyncHandler(async (req, res) => {
   const { name, description } = req.body || {};
