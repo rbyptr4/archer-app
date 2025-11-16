@@ -4107,18 +4107,27 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
   const scheduledToRaw = req.query.scheduled_to || null;
   const scheduledDate = req.query.scheduled_date || null; // YYYY-MM-DD
 
-  // query dasar: hanya delivery orders yang assigned to this courier (or past assigned)
-  // support both new field delivery.courier.user and possible legacy shapes
+  // --- DEBUG: log info input untuk troubleshooting ---
+  console.log(
+    '[getAssignedDeliveries] userId:',
+    userId,
+    'typeof:',
+    typeof userId
+  );
+  console.log('[getAssignedDeliveries] query params:', {
+    cursorRaw,
+    limit,
+    deliveryStatus,
+    slotLabel,
+    scheduledFromRaw,
+    scheduledToRaw,
+    scheduledDate
+  });
+
+  // Build base query
   const q = {
     fulfillment_type: 'delivery',
-    'delivery.mode': 'delivery',
-    $or: [
-      { 'delivery.courier.user': userId },
-      { 'delivery.courier.user.id': userId },
-      { 'delivery.courier.id': userId },
-      { 'delivery.assignee.user': userId }, // legacy (if still present)
-      { 'delivery.assignee.user.id': userId }
-    ],
+    // jangan set delivery.mode langsung — cek dulu apakah ada dokumen yang pakai field ini
     status: { $ne: 'cancelled' }
   };
 
@@ -4130,6 +4139,7 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     q['delivery.slot_label'] = slotLabel;
   }
 
+  // scheduled_from / scheduled_to (ISO strings accepted)
   if (scheduledFromRaw || scheduledToRaw) {
     q['delivery.scheduled_at'] = {};
     if (scheduledFromRaw) {
@@ -4174,6 +4184,72 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     }
   }
 
+  // --- Perbaiki matching courier.user: dukung string dan ObjectId ---
+  // kumpulkan $or untuk match courier user / legacy fields
+  const courierOr = [];
+  // selalu include string match (kadang field di DB disimpan string)
+  courierOr.push({ 'delivery.courier.user': String(userId) });
+  courierOr.push({ 'delivery.courier.user.id': String(userId) });
+  courierOr.push({ 'delivery.courier.id': String(userId) });
+  courierOr.push({ 'delivery.assignee.user': String(userId) });
+  courierOr.push({ 'delivery.assignee.user.id': String(userId) });
+
+  // jika userId valid sebagai ObjectId, tambahkan juga match ObjectId
+  if (mongoose.isValidObjectId(userId)) {
+    const oid = mongoose.Types.ObjectId(userId);
+    courierOr.push({ 'delivery.courier.user': oid });
+    courierOr.push({ 'delivery.courier.user.id': oid });
+    courierOr.push({ 'delivery.courier.id': oid });
+    courierOr.push({ 'delivery.assignee.user': oid });
+    courierOr.push({ 'delivery.assignee.user.id': oid });
+  }
+
+  q.$or = courierOr;
+
+  // --- Toleransi delivery.mode: jika ada dokumen yang memang pakai field delivery.mode === 'delivery', baru tambahkan filter ---
+  try {
+    const hasMode = await Order.exists({ 'delivery.mode': 'delivery' });
+    if (hasMode) {
+      q['delivery.mode'] = 'delivery';
+      console.log(
+        '[getAssignedDeliveries] delivery.mode detected in DB, adding filter delivery.mode=delivery'
+      );
+    } else {
+      console.log(
+        '[getAssignedDeliveries] delivery.mode not found in sample documents, skipping filter'
+      );
+    }
+  } catch (e) {
+    console.error(
+      '[getAssignedDeliveries] error checking delivery.mode existance:',
+      e?.message || e
+    );
+  }
+
+  // --- DEBUG: tampilkan final query sebelum eksekusi (hati-hati jangan print data sensitif di prod) ---
+  console.log('[getAssignedDeliveries] final mongo query:', JSON.stringify(q));
+
+  // quick diagnostic: lihat berapa banyak yang cocok & ambil sample 5 untuk inspect
+  try {
+    const matchCount = await Order.countDocuments(q);
+    console.log('[getAssignedDeliveries] countDocuments matching:', matchCount);
+    const sampleMatches = await Order.find(q).limit(5).lean();
+    console.log(
+      '[getAssignedDeliveries] sampleMatches (limit 5):',
+      sampleMatches.map((s) => ({
+        _id: s._id,
+        delivery_status: s.delivery?.status,
+        courier: s.delivery?.courier,
+        scheduled_at: s.delivery?.scheduled_at
+      }))
+    );
+  } catch (diagErr) {
+    console.error(
+      '[getAssignedDeliveries] diag query error:',
+      diagErr?.message || diagErr
+    );
+  }
+
   // fetch: sort by scheduled_at asc, then createdAt asc
   const orders = await Order.find(q)
     .sort({ 'delivery.scheduled_at': 1, createdAt: 1 })
@@ -4190,14 +4266,10 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     const idsSet = new Set();
     const extractCourierUserId = (c) => {
       if (!c) return null;
-      // cases:
-      // - courier.user = ObjectId/string
-      // - courier.user = { _id: ..., ... } or { id: ... }
       if (typeof c.user === 'string' || typeof c.user === 'number')
         return String(c.user);
       if (c.user && (c.user._id || c.user.id))
         return String(c.user._id || c.user.id);
-      // fallback: courier.id (legacy)
       if (c.id) return String(c.id);
       return null;
     };
@@ -4210,7 +4282,6 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
 
     const ids = Array.from(idsSet).filter(Boolean);
     if (ids.length) {
-      // ambil data user kurir (ringkas)
       const users = await User.find({ _id: { $in: ids } })
         .select('_id name email phone role')
         .lean();
@@ -4223,13 +4294,10 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
 
   // map response
   const mapped = (orders || []).map((o) => {
-    // determine courier object (prefer new field)
     const courier = o.delivery?.courier || o.delivery?.assignee || {};
 
-    // if owner, attach user info if available
     let courier_with_info = { ...courier };
     if (isOwner) {
-      // extract id same way as above
       let courierUserId = null;
       if (courier) {
         if (
@@ -4244,10 +4312,9 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
       if (courierUserId && courierUserMap[courierUserId]) {
         courier_with_info = {
           ...courier_with_info,
-          user_info: courierUserMap[courierUserId] // _id, name, email, phone, role
+          user_info: courierUserMap[courierUserId]
         };
       } else {
-        // still include user_info null for clarity/audit
         courier_with_info = { ...courier_with_info, user_info: null };
       }
     }
@@ -4269,7 +4336,6 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
         location: o.delivery?.location,
         distance_km: o.delivery?.distance_km,
         delivery_fee: o.delivery?.delivery_fee,
-        // courier object (with user_info only visible to owner)
         courier: courier_with_info
       },
       customer: {
@@ -4292,7 +4358,7 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     };
   });
 
-  // next_cursor: delivery.scheduled_at (or placed_at) of last item
+  // next_cursor
   let next_cursor = null;
   if (mapped.length) {
     const last = mapped[mapped.length - 1];
