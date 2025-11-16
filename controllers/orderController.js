@@ -4185,18 +4185,18 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
   }
 
   // --- Perbaiki matching courier.user: dukung string dan ObjectId ---
-  // kumpulkan $or untuk match courier user / legacy fields
   const courierOr = [];
-  // selalu include string match (kadang field di DB disimpan string)
+
+  // selalu match string dulu (karena kadang disimpan string)
   courierOr.push({ 'delivery.courier.user': String(userId) });
   courierOr.push({ 'delivery.courier.user.id': String(userId) });
   courierOr.push({ 'delivery.courier.id': String(userId) });
   courierOr.push({ 'delivery.assignee.user': String(userId) });
   courierOr.push({ 'delivery.assignee.user.id': String(userId) });
 
-  // jika userId valid sebagai ObjectId, tambahkan juga match ObjectId
+  // jika id valid ObjectId, match juga tipe ObjectId
   if (mongoose.isValidObjectId(userId)) {
-    const oid = mongoose.Types.ObjectId(userId);
+    const oid = new mongoose.Types.ObjectId(userId); // <= FIX
     courierOr.push({ 'delivery.courier.user': oid });
     courierOr.push({ 'delivery.courier.user.id': oid });
     courierOr.push({ 'delivery.courier.id': oid });
