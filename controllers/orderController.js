@@ -3912,7 +3912,7 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
 
     // member/guest already emitted below
     emitToStaff('order:accepted', payload);
-    emitToKitchen('order:accepted', payload);
+    // emitToKitchen('order:accepted', payload);
     emitToCashier('order:accepted', payload);
 
     if (doc.member) emitToMember(String(doc.member), 'order:accepted', payload);
