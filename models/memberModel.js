@@ -19,6 +19,17 @@ const MemberSchema = new mongoose.Schema(
     visit_count: { type: Number, default: 0 },
     last_visit_at: { type: Date },
     phone_verified_at: { type: Date },
+    birthday: { type: Date, default: null },
+    birthday_editable: { type: Boolean, default: true },
+    loyalty_card: { type: Boolean, default: false },
+    loyalty_awarded_at: { type: Date, default: null },
+    promoUsageHistory: [
+      {
+        promoId: { type: mongoose.Schema.Types.ObjectId, ref: 'Promo' },
+        usedAt: Date,
+        orderId: { type: mongoose.Schema.Types.ObjectId, ref: 'Order' }
+      }
+    ],
 
     is_active: { type: Boolean, default: true }
   },

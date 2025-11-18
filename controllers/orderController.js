@@ -17,6 +17,7 @@ const Order = require('../models/orderModel');
 const MemberSession = require('../models/memberSessionModel');
 const VoucherClaim = require('../models/voucherClaimModel');
 const Voucher = require('../models/voucherModel');
+const Promo = require('../models/promoModel');
 
 const {
   recordOrderHistory,
@@ -37,6 +38,11 @@ const throwError = require('../utils/throwError');
 const { DELIVERY_SLOTS } = require('../config/onlineConfig'); // import
 const { sendText, buildOrderReceiptMessage } = require('../utils/wablas');
 const { buildUiTotalsFromCart } = require('../utils/cartUiCache');
+const {
+  findApplicablePromos,
+  applyPromo,
+  executePromoActions
+} = require('../utils/promoEngine');
 const {
   parsePpnRate,
   SERVICE_FEE_RATE,
@@ -1361,6 +1367,17 @@ exports.checkout = asyncHandler(async (req, res) => {
     register_decision = 'register'
   } = req.body || {};
 
+  const guestToken =
+    (req.body && String(req.body.guestToken || '').trim()) ||
+    (req.headers && String(req.headers['x-guest-token'] || '').trim()) ||
+    (req.cookies && String(req.cookies.guestToken || '').trim()) ||
+    null;
+
+  if (guestToken === '') guestToken = null;
+  console.log('[checkout] guestToken resolved', {
+    guestToken: guestToken ? 'present' : 'none'
+  });
+
   console.log('[checkout] incoming body snippet', {
     fulfillment_type,
     payment_method,
@@ -1940,6 +1957,7 @@ exports.checkout = asyncHandler(async (req, res) => {
             source: iden.source || 'online',
             fulfillment_type: ft,
             transaction_code: code,
+            guestToken: guestToken || null,
             items: (cart.items || []).map((it) => {
               const menuBase = Number(
                 it.base_price ?? it.unit_price ?? it.price ?? 0
