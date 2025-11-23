@@ -38,7 +38,7 @@ connectDb();
 
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true })); // biar form non-file juga kebaca
+app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
 // CORS
@@ -71,6 +71,48 @@ app.use(
     credentials: true
   })
 );
+
+app.use((req, res, next) => {
+  try {
+    const origin = req.get('Origin') || req.get('origin');
+    if (origin && allowedOrigins.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader(
+        'Access-Control-Allow-Methods',
+        'GET,POST,PUT,PATCH,DELETE,OPTIONS'
+      );
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Authorization,Content-Type,Accept,X-Requested-With,Origin'
+      );
+    }
+
+    if (
+      req.path.includes('/orders/') &&
+      (req.method === 'PATCH' || req.method === 'OPTIONS')
+    ) {
+      console.log('[REQ_DEBUG]', {
+        method: req.method,
+        path: req.path,
+        origin,
+        hasAuth: !!req.get('Authorization'),
+        headers: {
+          'content-type': req.get('content-type'),
+          'access-control-request-headers': req.get(
+            'access-control-request-headers'
+          )
+        }
+      });
+    }
+
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+  } catch (err) {
+    console.error('[CORS_DEBUG_MW]', err?.message || err);
+  }
+  next();
+});
+
 app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -93,6 +135,17 @@ app.use('/promo', promoRoutes);
 app.use('/history', orderHistoryRoutes);
 app.use('/orders', orderRoutes);
 app.use('/payments', paymentRoutes);
+
+app.use((err, req, res, next) => {
+  const origin = req.get('Origin');
+  if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+
+  next(err);
+});
+
 app.use(errorHandler);
 
 const server = http.createServer(app);

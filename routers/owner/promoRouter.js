@@ -1,7 +1,7 @@
 const express = require('express');
-const validateToken = require('../../utils/tokenHandler'); // pastikan ada
-const requireRole = require('../../utils/requireRole'); // pastikan ada
-const requirePageAccess = require('../../utils/requirePageAccess'); // pastikan ada
+const validateToken = require('../../utils/tokenHandler');
+const requireRole = require('../../utils/requireRole');
+const requirePageAccess = require('../../utils/requirePageAccess');
 const ctrl = require('../../controllers/owner/promoController');
 const router = express.Router();
 
