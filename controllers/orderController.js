@@ -3693,7 +3693,7 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
     q.placed_at = { $gt: cDate };
   }
 
-  // Ambil field ringkas + full items
+  // Ambil field ringkas + full items, populate image pada menu
   const raw = await Order.find(q)
     .select(
       'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label delivery.scheduled_at delivery.status status member createdAt items'
@@ -3701,15 +3701,20 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
     .sort({ placed_at: 1 }) // kitchen: oldest orders first (FIFO)
     .limit(lim)
     .populate({ path: 'member', select: 'name' })
+    .populate('items.menu', 'name image') // <-- tambahkan image di populate
     .lean();
 
   const items = (Array.isArray(raw) ? raw : []).map((o) => {
     const deliveryMode = o.delivery ? o.delivery.mode || null : null;
 
     const orderItems = (Array.isArray(o.items) ? o.items : []).map((it) => ({
-      menu: it.menu ? String(it.menu) : null,
-      name: it.name || '',
+      // menu id jika terpouplate atau hanya id
+      menu: it.menu ? String(it.menu._id || it.menu) : null,
+      // prefer nama dari menu yang dipopulate, fallback ke nama item
+      name: (it.menu && it.menu.name) || it.name || '',
       menu_code: it.menu_code || '',
+      // image dari menu jika ada (bisa string url atau path)
+      image: (it.menu && it.menu.image) || null,
       quantity: Number(it.quantity || 0),
       base_price: Number(it.base_price || 0),
       addons: Array.isArray(it.addons)
@@ -5616,9 +5621,6 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     100,
     Math.max(1, parseInt(String(req.query.limit || '50'), 10) || 50)
   );
-  const deliveryStatus = req.query.status
-    ? String(req.query.status).toLowerCase()
-    : null;
   const slotLabel = req.query.slot_label
     ? String(req.query.slot_label).trim()
     : null;
@@ -5627,15 +5629,20 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
   const scheduledDate = req.query.scheduled_date || null; // YYYY-MM-DD
   const cursorRaw = req.query.cursor || null; // ISO datetime for paging
 
+  // dasar query: hanya delivery, mode delivery, tidak cancelled
+  // tambahan: hanya payment_status verified dan delivery.status assigned
   const q = {
     fulfillment_type: 'delivery',
     'delivery.mode': 'delivery',
-    status: { $ne: 'cancelled' }
+    status: { $ne: 'cancelled' },
+    payment_status: 'verified',
+    'delivery.status': 'assigned'
   };
 
-  if (deliveryStatus) q['delivery.status'] = deliveryStatus;
+  // slot label filter (opsional)
   if (slotLabel) q['delivery.slot_label'] = slotLabel;
 
+  // scheduled range filter
   if (scheduledFromRaw || scheduledToRaw) {
     const range = {};
     if (scheduledFromRaw) {
@@ -5649,6 +5656,7 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     if (Object.keys(range).length) q['delivery.scheduled_at'] = range;
   }
 
+  // scheduledDate override
   if (scheduledDate) {
     const dayStart = new Date(`${scheduledDate}T00:00:00.000Z`);
     const dayEnd = new Date(`${scheduledDate}T23:59:59.999Z`);
@@ -5682,13 +5690,12 @@ exports.getAssignedDeliveries = asyncHandler(async (req, res) => {
     .limit(limit)
     .populate('member', 'name phone')
     .populate('items.menu', 'name')
-    .populate({ path: 'delivery.courier.user', select: 'name phone role' }) // hanya berguna kalau ada ref User
+    .populate({ path: 'delivery.courier.user', select: 'name phone role' })
     .lean();
 
   // map response ringkas
   const mapped = (orders || []).map((o) => {
     const courierRaw = o.delivery?.courier || o.delivery?.assignee || {};
-    // untuk owner: sertakan user info jika populate tersedia
     const courier = {
       ...courierRaw,
       user:
