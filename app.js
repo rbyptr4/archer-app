@@ -74,43 +74,60 @@ app.use(
 
 app.use((req, res, next) => {
   try {
-    const origin = req.get('Origin') || req.get('origin');
-    if (origin && allowedOrigins.includes(origin)) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Access-Control-Allow-Credentials', 'true');
-      res.setHeader(
-        'Access-Control-Allow-Methods',
-        'GET,POST,PUT,PATCH,DELETE,OPTIONS'
-      );
-      res.setHeader(
-        'Access-Control-Allow-Headers',
-        'Authorization,Content-Type,Accept,X-Requested-With,Origin'
-      );
+    const origin = req.get('Origin') || req.get('origin') || null;
+    const shortPath = req.path;
+    const isTarget =
+      shortPath.includes('/orders/') &&
+      (req.method === 'PATCH' || req.method === 'OPTIONS');
+
+    // minimal request info (jangan log token value)
+    const info = {
+      ts: new Date().toISOString(),
+      method: req.method,
+      path: req.path,
+      origin,
+      hasAuth: !!req.get('Authorization'),
+      contentType: req.get('Content-Type'),
+      contentLength: req.get('Content-Length') || null
+    };
+
+    if (isTarget) {
+      console.log('[REQ_DEBUG][ENTER]', info);
     }
 
-    if (
-      req.path.includes('/orders/') &&
-      (req.method === 'PATCH' || req.method === 'OPTIONS')
-    ) {
-      console.log('[REQ_DEBUG]', {
-        method: req.method,
-        path: req.path,
-        origin,
-        hasAuth: !!req.get('Authorization'),
-        headers: {
-          'content-type': req.get('content-type'),
-          'access-control-request-headers': req.get(
-            'access-control-request-headers'
-          )
+    // hook finish to log final status & outgoing headers (very important)
+    res.on('finish', () => {
+      try {
+        const out = {
+          ts: new Date().toISOString(),
+          method: req.method,
+          path: req.path,
+          statusCode: res.statusCode,
+          // logger only keys that matter
+          headers: {
+            'access-control-allow-origin': res.getHeader(
+              'Access-Control-Allow-Origin'
+            ),
+            'access-control-allow-credentials': res.getHeader(
+              'Access-Control-Allow-Credentials'
+            ),
+            'content-type': res.getHeader('Content-Type'),
+            'x-powered-by': res.getHeader('X-Powered-By')
+          }
+        };
+        if (isTarget) {
+          console.log('[REQ_DEBUG][FINISH]', out);
         }
-      });
-    }
+      } catch (e) {
+        console.error('[REQ_DEBUG][FINISH][ERR]', e?.message || e);
+      }
+    });
 
-    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
   } catch (err) {
-    console.error('[CORS_DEBUG_MW]', err?.message || err);
+    console.error('[REQ_DEBUG][MW][ERR]', err?.message || err);
+    next();
   }
-  next();
 });
 
 app.use((req, res, next) => {
@@ -137,12 +154,20 @@ app.use('/orders', orderRoutes);
 app.use('/payments', paymentRoutes);
 
 app.use((err, req, res, next) => {
-  const origin = req.get('Origin');
-  if (origin && allowedOrigins.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  try {
+    const origin = req.get('Origin') || req.get('origin');
+    if (
+      origin &&
+      Array.isArray(allowedOrigins) &&
+      allowedOrigins.includes(origin)
+    ) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    }
+  } catch (e) {
+    // ignore
   }
-
+  // pass to main error handler
   next(err);
 });
 
