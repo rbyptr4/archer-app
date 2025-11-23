@@ -110,6 +110,13 @@ router.post(
   requirePageAccess('orders'),
   order.previewPosOrder
 );
+router.post(
+  '/evaluate-pos',
+  validateToken,
+  requireRole('owner', 'cashier'),
+  requirePageAccess('orders'),
+  order.evaluatePos
+);
 
 router.get(
   '/list-order',

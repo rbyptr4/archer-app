@@ -1,70 +1,74 @@
 // utils/promoEngine.js
 const Promo = require('../models/promoModel');
-const Menu = require('../models/menuModel'); // asumsi ada model Menu
 const throwError = require('../utils/throwError');
 
 /**
- * helper utk menghitung total qty & subtotal
+ * snapshotTotals(cart)
  */
 function snapshotTotals(cart) {
   const items = Array.isArray(cart.items) ? cart.items : [];
   const items_subtotal = items.reduce(
     (s, it) =>
       s +
-      Number(it.base_price || it.unit_price || 0) *
-        Number(it.quantity || it.qty || 0),
+      Number(it.base_price || it.unit_price || it.price || 0) *
+        Number(it.quantity || it.qty || it.q || 0),
     0
   );
   const totalQty = items.reduce(
-    (s, it) => s + Number(it.quantity || it.qty || 0),
+    (s, it) => s + Number(it.quantity || it.qty || it.q || 0),
     0
   );
   return { items, items_subtotal, totalQty };
 }
 
 /**
- * findApplicablePromos(cart, member, now)
- * - mengembalikan array promo (lean) yang eligible untuk ditampilkan/pilih
+ * findApplicablePromos(cart, member, now, options)
+ * - options.fetchers = { getMemberUsageCount(promoId, memberId, sinceDate) => Promise<number>, getGlobalUsageCount(promoId, sinceDate) => Promise<number> }
+ *
+ * If fetchers not provided, usage-limit checks are skipped.
  */
 async function findApplicablePromos(
   cart = {},
   member = null,
-  now = new Date()
+  now = new Date(),
+  options = {}
 ) {
-  const { items_subtotal, totalQty } = snapshotTotals(cart);
+  const { items_subtotal, totalQty, items } = snapshotTotals(cart);
 
-  // ambil promo aktif
   const promos = await Promo.find({ isActive: true })
     .sort({ priority: -1 })
     .lean();
 
   const eligible = [];
+  const memberId = member ? String(member._id || member.id) : null;
+  const fetchers = options.fetchers || {};
+
   for (const p of promos) {
-    // tanggal absolute
+    // 1) absolute period
     if (p.conditions?.startAt && new Date(p.conditions.startAt) > now) continue;
     if (p.conditions?.endAt && new Date(p.conditions.endAt) < now) continue;
 
-    // audience
+    // 2) audience
     if (p.conditions?.audience === 'members' && !member) continue;
 
-    // minTotal
+    // 3) minTotal
     if (
       p.conditions?.minTotal &&
       Number(items_subtotal) < Number(p.conditions.minTotal)
     )
       continue;
 
-    // minQty
+    // 4) minQty
     if (p.conditions?.minQty && Number(totalQty) < Number(p.conditions.minQty))
       continue;
 
-    // item-specific checks
+    // 5) item-specific conditions
     if (Array.isArray(p.conditions?.items) && p.conditions.items.length) {
       let ok = true;
       for (const cond of p.conditions.items) {
         const need = Number(cond.qty || 1);
         if (cond.menuId) {
-          const found = (cart.items || []).reduce(
+          const found = (items || []).reduce(
             (s, it) =>
               s +
               (String(it.menu || it.menuId) === String(cond.menuId)
@@ -77,7 +81,7 @@ async function findApplicablePromos(
             break;
           }
         } else if (cond.category) {
-          const found = (cart.items || []).reduce(
+          const found = (items || []).reduce(
             (s, it) =>
               s +
               (String(it.category) === String(cond.category)
@@ -94,37 +98,69 @@ async function findApplicablePromos(
       if (!ok) continue;
     }
 
-    // perMemberLimit
+    // 6) perMemberLimit (lifetime) using member.promoUsageHistory if available
     if (p.perMemberLimit && member) {
-      const used = (member.promoUsageHistory || []).filter(
-        (h) => String(h.promoId) === String(p._id)
-      ).length;
+      const used = Array.isArray(member.promoUsageHistory)
+        ? member.promoUsageHistory.filter(
+            (h) => String(h.promoId) === String(p._id)
+          ).length
+        : 0;
       if (used >= Number(p.perMemberLimit)) continue;
     }
 
-    // birthday relative window
-    if (p.conditions?.birthdayWindowDays && member) {
-      const bd = member.birthday ? new Date(member.birthday) : null;
-      if (!bd) continue; // butuh birthday
-      const bdThisYear = new Date(
-        now.getFullYear(),
-        bd.getMonth(),
-        bd.getDate()
-      );
-      const start = bdThisYear;
-      const end = new Date(
-        bdThisYear.getTime() +
-          Number(p.conditions.birthdayWindowDays || 0) * 24 * 3600 * 1000
-      );
-      if (now < start || now > end) continue;
-      // cek perMemberLimit handled di atas
+    // 7) usageWindowDays / usageLimitGlobal / usageLimitPerMember
+    if (Number(p.conditions?.usageWindowDays) > 0) {
+      const windowDays = Number(p.conditions.usageWindowDays || 0);
+      const sinceDate = new Date(now.getTime() - windowDays * 24 * 3600 * 1000);
+      // per-member usage
+      if (
+        Number(p.conditions?.usageLimitPerMember) > 0 &&
+        fetchers.getMemberUsageCount &&
+        memberId
+      ) {
+        try {
+          const cnt = await fetchers.getMemberUsageCount(
+            String(p._id),
+            memberId,
+            sinceDate
+          );
+          if (cnt >= Number(p.conditions.usageLimitPerMember)) continue;
+        } catch (e) {
+          // if fetcher fails, conservative: skip promo
+          console.warn(
+            '[promoEngine] getMemberUsageCount failed',
+            e?.message || e
+          );
+          continue;
+        }
+      }
+      // global usage
+      if (
+        Number(p.conditions?.usageLimitGlobal) > 0 &&
+        fetchers.getGlobalUsageCount
+      ) {
+        try {
+          const gcnt = await fetchers.getGlobalUsageCount(
+            String(p._id),
+            sinceDate
+          );
+          if (gcnt >= Number(p.conditions.usageLimitGlobal)) continue;
+        } catch (e) {
+          console.warn(
+            '[promoEngine] getGlobalUsageCount failed',
+            e?.message || e
+          );
+          continue;
+        }
+      }
     }
 
-    // globalStock
+    // 8) globalStock check (lifetime)
     if (Number.isFinite(Number(p.globalStock))) {
       if ((p.globalStock || 0) <= 0) continue;
     }
 
+    // passed all checks -> eligible
     eligible.push(p);
   }
 
@@ -132,189 +168,179 @@ async function findApplicablePromos(
 }
 
 /**
- * applyPromo(promo, cartSnapshot, pricing)
- * - menghitung dampak (impact) dari promo pada cart, tanpa melakukan side-effect
- * - return { impact, actions }
- *   impact: { itemsDiscount, cartDiscount, addedFreeItems: [{menuId, qty}], note }
- *   actions: [{ type:'award_points'|'grant_membership', amount?, meta? }]
+ * applyPromo(promo, cartSnapshot = {}, pricing = {})
+ * - returns { impact, actions }
+ *
+ * impact: { itemsDiscount, cartDiscount, addedFreeItems: [{menuId, qty, category}], note }
+ * actions: array of side-effect instructions e.g. award_points/grant_membership
  */
 async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
+  if (!promo) throw new Error('promo required');
   const impact = {
     itemsDiscount: 0,
     cartDiscount: 0,
     addedFreeItems: [],
-    note: null
+    note: ''
   };
   const actions = [];
 
-  const { items_subtotal } = snapshotTotals(cartSnapshot);
+  const { items_subtotal, items } = snapshotTotals(cartSnapshot);
   const sub = Number(items_subtotal || 0);
 
-  switch (String(promo.type)) {
-    case 'free_item':
-    case 'buy_x_get_y':
-    case 'bundling': {
-      if (promo.reward?.freeMenuId) {
-        const qty = Number(promo.reward?.freeQty || 1);
-        impact.addedFreeItems.push({ menuId: promo.reward.freeMenuId, qty });
-        impact.note = `Menambah free item (${qty})`;
-      }
-      break;
+  // support model with single reward object: promo.reward (preferred)
+  // but keep fallback compatibility if some docs still use promo.rewards (array)
+  const rewards =
+    promo && promo.reward && typeof promo.reward === 'object'
+      ? [promo.reward]
+      : Array.isArray(promo.rewards) && promo.rewards.length
+      ? promo.rewards
+      : [];
+
+  for (const r of rewards) {
+    if (!r) continue;
+
+    // free item (covers free_item and buy_x_get_y)
+    if (r.freeMenuId) {
+      const qty = Math.max(0, Number(r.freeQty || 1));
+      impact.addedFreeItems.push({
+        menuId: r.freeMenuId,
+        qty,
+        category: r.appliesToCategory || null
+      });
+      impact.note += (impact.note ? '; ' : '') + `Gratis item x${qty}`;
     }
-    case 'cart_percent': {
-      if (Number.isFinite(Number(promo.reward?.percent))) {
-        const pct = Math.max(0, Math.min(100, Number(promo.reward.percent)));
-        const amt = Math.floor((sub * pct) / 100);
-        impact.cartDiscount = amt;
-        impact.itemsDiscount += amt;
-        impact.note = `Diskon ${pct}%`;
+
+    // cart percent / scoped percent
+    if (Number.isFinite(Number(r.percent))) {
+      const pct = Math.max(0, Math.min(100, Number(r.percent)));
+      // if reward appliesTo menu/category, compute subtotal of that scope
+      let scopeSub = sub;
+      if (r.appliesTo === 'menu' && r.appliesToMenuId) {
+        scopeSub = (items || []).reduce(
+          (s, it) =>
+            s +
+            (String(it.menu || it.menuId) === String(r.appliesToMenuId)
+              ? Number(it.price || it.unit_price || it.base_price || 0) *
+                Number(it.qty || it.quantity || 0)
+              : 0),
+          0
+        );
+      } else if (r.appliesTo === 'category' && r.appliesToCategory) {
+        scopeSub = (items || []).reduce(
+          (s, it) =>
+            s +
+            (String(it.category) === String(r.appliesToCategory)
+              ? Number(it.price || it.unit_price || it.base_price || 0) *
+                Number(it.qty || it.quantity || 0)
+              : 0),
+          0
+        );
       }
-      break;
+      let amt = Math.floor((scopeSub * pct) / 100);
+      if (Number.isFinite(Number(r.maxDiscountAmount)))
+        amt = Math.min(amt, Number(r.maxDiscountAmount));
+      impact.cartDiscount += amt;
+      impact.itemsDiscount += amt;
+      impact.note += (impact.note ? '; ' : '') + `Diskon ${pct}% (${amt})`;
     }
-    case 'cart_amount': {
-      if (Number.isFinite(Number(promo.reward?.amount))) {
-        const amt = Math.max(0, Number(promo.reward.amount));
-        impact.cartDiscount = amt;
-        impact.itemsDiscount += amt;
-        impact.note = `Diskon Rp ${amt}`;
+
+    // flat amount (cart_amount)
+    if (Number.isFinite(Number(r.amount))) {
+      let amt = Math.max(0, Number(r.amount));
+      // if scoped, restrict by scope subtotal
+      if (r.appliesTo === 'menu' && r.appliesToMenuId) {
+        const scopeSub = (items || []).reduce(
+          (s, it) =>
+            s +
+            (String(it.menu || it.menuId) === String(r.appliesToMenuId)
+              ? Number(it.price || it.unit_price || it.base_price || 0) *
+                Number(it.qty || it.quantity || 0)
+              : 0),
+          0
+        );
+        amt = Math.min(amt, scopeSub);
+      } else if (r.appliesTo === 'category' && r.appliesToCategory) {
+        const scopeSub = (items || []).reduce(
+          (s, it) =>
+            s +
+            (String(it.category) === String(r.appliesToCategory)
+              ? Number(it.price || it.unit_price || it.base_price || 0) *
+                Number(it.qty || it.quantity || 0)
+              : 0),
+          0
+        );
+        amt = Math.min(amt, scopeSub);
+      } else {
+        amt = Math.min(amt, sub);
       }
-      break;
+      impact.cartDiscount += amt;
+      impact.itemsDiscount += amt;
+      impact.note += (impact.note ? '; ' : '') + `Potongan Rp ${amt}`;
     }
-    case 'fixed_price_bundle': {
-      // simple handling: if conditions.items specify a group qty, compute naive delta
-      const group = Array.isArray(promo.conditions?.items)
-        ? promo.conditions.items[0]
-        : null;
-      if (group && Number(promo.reward?.fixedPriceBundle)) {
-        const need = Number(group.qty || 0);
-        if (need > 0) {
-          // gather candidate prices
-          const candidates = [];
-          for (const it of cartSnapshot.items || []) {
-            const matches =
-              (group.menuId &&
-                String(it.menu || it.menuId) === String(group.menuId)) ||
-              (group.category &&
-                String(it.category) === String(group.category));
-            if (matches) {
-              for (let i = 0; i < Number(it.quantity || it.qty || 0); i++)
-                candidates.push(Number(it.base_price || it.unit_price || 0));
-            }
-          }
-          const groupsCount = Math.floor(candidates.length / need);
-          if (groupsCount > 0) {
-            candidates.sort((a, b) => a - b);
-            // conservative calc: take cheapest per group
-            let sumGroup = 0;
-            for (let g = 0; g < groupsCount; g++) {
-              const slice = candidates.slice(g * need, g * need + need);
-              sumGroup += slice.reduce((s, x) => s + x, 0);
-            }
-            const fixedTotal =
-              Number(promo.reward.fixedPriceBundle) * groupsCount;
-            const delta = Math.max(0, sumGroup - fixedTotal);
-            impact.itemsDiscount += delta;
-            impact.note = `Bundle fixed price ${promo.reward.fixedPriceBundle} x ${groupsCount}`;
-          }
-        }
-      }
-      break;
-    }
-    case 'award_points': {
-      if (Number.isFinite(Number(promo.reward?.pointsFixed))) {
+
+    // pointsFixed / pointsPercent => action
+    if (Number.isFinite(Number(r.pointsFixed))) {
+      actions.push({
+        type: 'award_points',
+        amount: Number(r.pointsFixed),
+        meta: { promoId: promo._id }
+      });
+      impact.note += (impact.note ? '; ' : '') + `Poin ${r.pointsFixed}`;
+    } else if (Number.isFinite(Number(r.pointsPercent))) {
+      const pts = Math.floor((sub * Number(r.pointsPercent || 0)) / 100);
+      if (pts > 0)
         actions.push({
           type: 'award_points',
-          amount: Number(promo.reward.pointsFixed),
+          amount: pts,
           meta: { promoId: promo._id }
         });
-      } else if (Number.isFinite(Number(promo.reward?.pointsPercent))) {
-        const pts = Math.floor(
-          (sub * Number(promo.reward.pointsPercent || 0)) / 100
-        );
-        if (pts > 0)
-          actions.push({
-            type: 'award_points',
-            amount: pts,
-            meta: { promoId: promo._id }
-          });
-      }
-      impact.note = 'Member akan menerima poin';
-      break;
+      impact.note += (impact.note ? '; ' : '') + `Poin ${r.pointsPercent}%`;
     }
-    case 'grant_membership': {
+
+    // grant membership
+    if (r.grantMembership) {
       actions.push({ type: 'grant_membership', meta: { promoId: promo._id } });
-      impact.note = 'Member akan didaftarkan';
-      break;
+      impact.note += (impact.note ? '; ' : '') + `Grant membership`;
     }
-    case 'composite': {
-      // composite: gabungan free item + percent (contoh birthday)
-      if (promo.reward?.freeMenuId) {
-        const qty = Number(promo.reward?.freeQty || 1);
-        impact.addedFreeItems.push({ menuId: promo.reward.freeMenuId, qty });
-      }
-      if (Number.isFinite(Number(promo.reward?.percent))) {
-        const pct = Number(promo.reward.percent);
-        const amt = Math.floor((sub * pct) / 100);
-        impact.itemsDiscount += amt;
-        impact.cartDiscount += amt;
-      }
-      if (
-        Number.isFinite(Number(promo.reward?.pointsFixed)) ||
-        Number.isFinite(Number(promo.reward?.pointsPercent))
-      ) {
-        if (Number.isFinite(Number(promo.reward?.pointsFixed)))
-          actions.push({
-            type: 'award_points',
-            amount: Number(promo.reward.pointsFixed),
-            meta: { promoId: promo._id }
-          });
-        else if (Number.isFinite(Number(promo.reward?.pointsPercent))) {
-          const pts = Math.floor(
-            (sub * Number(promo.reward.pointsPercent || 0)) / 100
-          );
-          if (pts > 0)
-            actions.push({
-              type: 'award_points',
-              amount: pts,
-              meta: { promoId: promo._id }
-            });
-        }
-      }
-      if (promo.reward?.grantMembership)
-        actions.push({
-          type: 'grant_membership',
-          meta: { promoId: promo._id }
-        });
-      break;
-    }
-    default:
-      break;
   }
+
+  // safety: cap itemsDiscount to subtotal
+  impact.itemsDiscount = Math.max(
+    0,
+    Math.min(Number(impact.itemsDiscount || 0), sub)
+  );
 
   return { impact, actions };
 }
 
 /**
- * executePromoActions(order, memberModel)
- * - mengeksekusi side-effects setelah order ter-verified
- * - melakukan update pada member (points, loyalty) dan menambah entry di order.rewards
+ * executePromoActions(order, MemberModel, { session })
+ * - menjalankan actions (award points, grant membership)
  */
-async function executePromoActions(order, MemberModel) {
-  if (!order || !order.applied_promo) return;
-  const actions = order.applied_promo.actions || [];
+async function executePromoActions(
+  order,
+  MemberModel,
+  { session = null } = {}
+) {
+  if (!order || !order.appliedPromo) return;
+  const applied = order.appliedPromo || {};
+  const actions = applied.actions || [];
   if (!actions.length) return;
 
-  // ambil member doc
   const memberId = order.member;
   const now = new Date();
-  const rewards = order.rewards || [];
+  const rewards = order.promoRewards || [];
 
   for (const a of actions) {
     if (a.type === 'award_points') {
       if (!memberId) continue;
       const add = Number(a.amount || 0);
       if (add <= 0) continue;
-      await MemberModel.updateOne({ _id: memberId }, { $inc: { points: add } });
+      await MemberModel.updateOne(
+        { _id: memberId },
+        { $inc: { points: add } },
+        { session }
+      );
       rewards.push({
         type: 'points',
         amount: add,
@@ -325,23 +351,23 @@ async function executePromoActions(order, MemberModel) {
       if (!memberId) continue;
       await MemberModel.updateOne(
         { _id: memberId },
-        { $set: { loyalty_card: true, loyalty_awarded_at: now } }
+        { $set: { loyalty_card: true, loyalty_awarded_at: now } },
+        { session }
       );
       rewards.push({
         type: 'membership',
         grantedAt: now,
         promoId: a.meta?.promoId || null
       });
-      // set order flag
       order.granted_membership = true;
     }
   }
 
-  order.rewards = rewards;
-  await order.save();
+  order.promoRewards = rewards;
 }
 
 module.exports = {
+  snapshotTotals,
   findApplicablePromos,
   applyPromo,
   executePromoActions

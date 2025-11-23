@@ -92,6 +92,9 @@ const discountBreakdownSchema = new mongoose.Schema(
     name: { type: String, trim: true },
     itemsDiscount: { type: Number, default: 0, set: int, get: int },
     shippingDiscount: { type: Number, default: 0, set: int, get: int },
+    amountTotal: { type: Number, default: 0, set: int, get: int }, // items + shipping
+    appliedAt: { type: Date, default: Date.now },
+    meta: { type: Object, default: {} },
     note: { type: String, trim: true, default: '' }
   },
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
@@ -221,7 +224,29 @@ const orderSchema = new mongoose.Schema(
     cancelled_at: { type: Date },
     cancellation_reason: { type: String, trim: true, default: '' },
 
-    delivery: { type: DeliverySchema, default: undefined }
+    delivery: { type: DeliverySchema, default: undefined }, // snippets: orderModel.js (mongoose)
+    appliedPromo: {
+      promoId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Promo',
+        default: null
+      },
+      promoSnapshot: { type: Object, default: {} } // simpan nama, type, impact, note
+    },
+    appliedVouchers: [
+      {
+        claimId: { type: mongoose.Schema.Types.ObjectId, ref: 'VoucherClaim' },
+        voucherSnapshot: { type: Object, default: {} } // simpan voucherId, name, amount
+      }
+    ],
+    promoRewards: [
+      {
+        // jika promo menambahkan free items / reward metadata
+        type: { type: String },
+        data: { type: Object }
+      }
+    ],
+    orderPriceSnapshot: { type: Object, default: {} } // mirror ui_totals / breakdown for audit
   },
   {
     timestamps: true,

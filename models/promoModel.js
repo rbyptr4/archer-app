@@ -9,7 +9,7 @@ const PromoItemCondSchema = new mongoose.Schema(
       default: null
     },
     category: { type: String, default: null },
-    qty: { type: Number, default: 1 } // required quantity for this condition
+    qty: { type: Number, default: 1 }
   },
   { _id: false }
 );
@@ -20,8 +20,6 @@ const PromoConditionSchema = new mongoose.Schema(
     minQty: { type: Number, default: 0 },
     items: { type: [PromoItemCondSchema], default: [] },
     audience: { type: String, enum: ['all', 'members'], default: 'all' },
-    // relative birthday window (days after birthday inclusive)
-    birthdayWindowDays: { type: Number, default: 0 },
     // period-specific absolute window (optional)
     startAt: { type: Date, default: null },
     endAt: { type: Date, default: null }
@@ -37,12 +35,31 @@ const PromoRewardSchema = new mongoose.Schema(
       default: null
     },
     freeQty: { type: Number, default: 1 },
-    percent: { type: Number, default: null }, // cart percent discount
-    amount: { type: Number, default: null }, // flat amount
-    fixedPriceBundle: { type: Number, default: null },
+
+    // cart discounts
+    percent: { type: Number, default: null }, // cart percent discount (0-100)
+    amount: { type: Number, default: null }, // flat amount discount (Rp)
+    maxDiscountAmount: { type: Number, default: null }, // cap for percent discount (Rp)
+
+    // points (award / cashback as points)
     pointsFixed: { type: Number, default: null },
-    pointsPercent: { type: Number, default: null },
-    grantMembership: { type: Boolean, default: false }
+    pointsPercent: { type: Number, default: null }, // percent of cart converted to points
+
+    // membership grant
+    grantMembership: { type: Boolean, default: false },
+
+    // scope: reward bisa diterapkan hanya ke kategori/menu tertentu
+    appliesTo: {
+      type: String,
+      enum: ['all', 'category', 'menu'],
+      default: 'all'
+    },
+    appliesToCategory: { type: String, default: null },
+    appliesToMenuId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Menu',
+      default: null
+    }
   },
   { _id: false }
 );
@@ -50,7 +67,6 @@ const PromoRewardSchema = new mongoose.Schema(
 const promoSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
-    code: { type: String, trim: true, default: '' }, // optional, for admin reference
     type: {
       type: String,
       enum: [
@@ -59,14 +75,13 @@ const promoSchema = new mongoose.Schema(
         'bundling',
         'cart_percent',
         'cart_amount',
-        'fixed_price_bundle',
         'price_override',
         'award_points',
-        'grant_membership',
-        'composite' // for combo rewards like birthday free+percent
+        'grant_membership'
       ],
       required: true
     },
+
     conditions: { type: PromoConditionSchema, default: () => ({}) },
     reward: { type: PromoRewardSchema, default: () => ({}) },
 
@@ -75,20 +90,28 @@ const promoSchema = new mongoose.Schema(
     stackable: { type: Boolean, default: false }, // not used if policy one-promo-only
     blocksVoucher: { type: Boolean, default: false },
     priority: { type: Number, default: 0 }, // sorting/resolve
-    perMemberLimit: { type: Number, default: 0 }, // 0 = unlimited
-    globalStock: { type: Number, default: null }, // optional decrement
+
+    // per-member and global counters
+    perMemberLimit: { type: Number, default: 0 }, // 0 = unlimited (legacy; per member total lifetime)
+    globalStock: { type: Number, default: null }, // optional decrement global usage (lifetime)
+
+    // aktif / notes / author
     isActive: { type: Boolean, default: true },
-    notes: { type: String, default: '' },
-    createdBy: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-      default: null
-    }
+    notes: { type: String, default: '' }
   },
   {
     timestamps: true,
     versionKey: false
   }
 );
+
+// indexes
+promoSchema.index({ code: 1 }, { sparse: true });
+promoSchema.index({
+  isActive: 1,
+  'conditions.startAt': 1,
+  'conditions.endAt': 1,
+  priority: -1
+});
 
 module.exports = mongoose.model('Promo', promoSchema);

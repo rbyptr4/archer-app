@@ -13,7 +13,9 @@ const ALLOWED_PAGES = [
   'delivery',
   'expense',
   'closing',
-  'courier'
+  'courier',
+  'promo',
+  'voucher'
 ];
 
 const isPlainObject = (v) => v && typeof v === 'object' && !Array.isArray(v);
