@@ -73,64 +73,6 @@ app.use(
 );
 
 app.use((req, res, next) => {
-  try {
-    const origin = req.get('Origin') || req.get('origin') || null;
-    const shortPath = req.path;
-    const isTarget =
-      shortPath.includes('/orders/') &&
-      (req.method === 'PATCH' || req.method === 'OPTIONS');
-
-    // minimal request info (jangan log token value)
-    const info = {
-      ts: new Date().toISOString(),
-      method: req.method,
-      path: req.path,
-      origin,
-      hasAuth: !!req.get('Authorization'),
-      contentType: req.get('Content-Type'),
-      contentLength: req.get('Content-Length') || null
-    };
-
-    if (isTarget) {
-      console.log('[REQ_DEBUG][ENTER]', info);
-    }
-
-    // hook finish to log final status & outgoing headers (very important)
-    res.on('finish', () => {
-      try {
-        const out = {
-          ts: new Date().toISOString(),
-          method: req.method,
-          path: req.path,
-          statusCode: res.statusCode,
-          // logger only keys that matter
-          headers: {
-            'access-control-allow-origin': res.getHeader(
-              'Access-Control-Allow-Origin'
-            ),
-            'access-control-allow-credentials': res.getHeader(
-              'Access-Control-Allow-Credentials'
-            ),
-            'content-type': res.getHeader('Content-Type'),
-            'x-powered-by': res.getHeader('X-Powered-By')
-          }
-        };
-        if (isTarget) {
-          console.log('[REQ_DEBUG][FINISH]', out);
-        }
-      } catch (e) {
-        console.error('[REQ_DEBUG][FINISH][ERR]', e?.message || e);
-      }
-    });
-
-    next();
-  } catch (err) {
-    console.error('[REQ_DEBUG][MW][ERR]', err?.message || err);
-    next();
-  }
-});
-
-app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -152,24 +94,6 @@ app.use('/promo', promoRoutes);
 app.use('/history', orderHistoryRoutes);
 app.use('/orders', orderRoutes);
 app.use('/payments', paymentRoutes);
-
-app.use((err, req, res, next) => {
-  try {
-    const origin = req.get('Origin') || req.get('origin');
-    if (
-      origin &&
-      Array.isArray(allowedOrigins) &&
-      allowedOrigins.includes(origin)
-    ) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Access-Control-Allow-Credentials', 'true');
-    }
-  } catch (e) {
-    // ignore
-  }
-  // pass to main error handler
-  next(err);
-});
 
 app.use(errorHandler);
 

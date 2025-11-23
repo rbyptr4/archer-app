@@ -5431,6 +5431,8 @@ exports.deliveryBoard = asyncHandler(async (req, res) => {
     fulfillment_type: 'delivery'
   };
 
+  q.payment_status = 'verified';
+
   if (status && DELIVERY_ALLOWED.includes(status)) {
     q['delivery.status'] = status;
   } else {
