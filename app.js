@@ -49,7 +49,9 @@ const allowedOrigins = [
 app.use(
   cors({
     origin(origin, cb) {
+      console.log('[CORS] incoming origin ->', origin);
       if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+      console.warn('[CORS] rejected origin ->', origin);
       return cb(new Error('Not allowed by CORS: ' + origin));
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
