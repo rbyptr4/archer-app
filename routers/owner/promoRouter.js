@@ -8,6 +8,7 @@ const router = express.Router();
 router.use(validateToken, requireRole('owner'), requirePageAccess('promo'));
 
 router.post('/available-promo', ctrl.evaluate);
+router.post('/create-promo', ctrl.create);
 router.get('/list', ctrl.list);
 router.patch('/:id/activate', ctrl.activate);
 router.patch('/:id/deactivate', ctrl.deactivate);
