@@ -483,8 +483,7 @@ exports.devRegister = asyncHandler(async (req, res) => {
     throwError('Format nomor tidak valid (gunakan 08xxxxxxxx)', 400);
   }
 
-  // createMember akan return existing jika sudah ada (atau throw error tergantung implementasi)
-  const created = await createMember({
+  await createMember({
     name,
     phone: normalizedPhone,
     gender,
@@ -493,13 +492,9 @@ exports.devRegister = asyncHandler(async (req, res) => {
     join_channel
   });
 
-  // ambil mongoose doc utk token/session
-  let member = created;
-  if (!member._id) {
-    member = await Member.findOne({ phone: normalizedPhone });
-  }
-
+  const member = await Member.findOne({ phone: normalizedPhone });
   if (!member) throwError('Gagal membuat member', 500);
+
   if (!member.phone_verified_at) member.phone_verified_at = new Date();
   member.visit_count = (member.visit_count || 0) + 1;
   member.last_visit_at = new Date();
@@ -517,7 +512,7 @@ exports.devRegister = asyncHandler(async (req, res) => {
 
   try {
     await MemberSession.create({
-      member: member._1d || member._id,
+      member: member._id,
       device_id,
       refresh_hash: refreshHash,
       user_agent: req.get('user-agent') || '',
