@@ -35,6 +35,7 @@ const {
 } = require('./socket/socketBus'); // <-- sesuaikan path relatif kalau perlu
 
 const throwError = require('../utils/throwError');
+const { createMember } = require('../utils/memberService');
 const { DELIVERY_SLOTS } = require('../config/onlineConfig'); // import
 const { sendText, buildOrderReceiptMessage } = require('../utils/wablas');
 const { buildUiTotalsFromCart } = require('../utils/cartUiCache');
@@ -3770,7 +3771,6 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
   });
 });
 
-/* ===================== POS DINE-IN (staff) ===================== */
 exports.createPosDineIn = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
@@ -3781,7 +3781,8 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     member_id,
     name,
     phone,
-    payment_method
+    payment_method,
+    selectedPromoId
   } = req.body || {};
 
   // ===== Validasi meja & item =====
@@ -3803,29 +3804,22 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   let customer_phone = '';
 
   if (as_member) {
-    if (!member_id && !(name && phone)) {
-      throwError('Sertakan member_id atau name+phone', 400);
+    if (!member_id) {
+      throwError(
+        'Pilih member terlebih dahulu (via daftar atau pilih member)',
+        400
+      );
     }
-    if (member_id) {
-      member = await Member.findById(member_id).lean();
-      if (!member) throwError('Member tidak ditemukan', 404);
-    } else {
-      const normalizedPhone = normalizePhone(phone);
-      let existing = await Member.findOne({ phone: normalizedPhone }).lean();
-      if (!existing) {
-        const created = await Member.create({
-          name: String(name).trim(),
-          phone: normalizedPhone,
-          join_channel: 'pos',
-          visit_count: 1,
-          last_visit_at: new Date(),
-          is_active: true
-        });
-        existing = created.toObject();
-      }
-      member = existing;
-    }
+
+    const m = await Member.findById(member_id).lean();
+    if (!m) throwError('Member tidak ditemukan', 404);
+    member = m;
+
+    // jika member ada, auto-fill customer_name & customer_phone dari member
+    customer_name = String(member.name || '').trim();
+    customer_phone = String(member.phone || '').trim();
   } else {
+    // Guest: minimal isi nama atau phone
     customer_name = String(name || '').trim();
     customer_phone = String(phone || '').trim();
     if (!customer_name && !customer_phone) {
@@ -3892,13 +3886,10 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   console.log('[createPosDineIn] eligible promos:', promos.length);
 
   // decide which promo to apply:
-  // - if as_member and FE supplied selectedPromoId (req.body.selectedPromoId), try use that
-  // - else auto-pick best by monetary impact (applyPromo returns impact)
   let appliedPromoSnapshot = null;
   let promoRewards = [];
   let promoImpact = null;
-
-  const requestedPromoId = req.body?.selectedPromoId || null;
+  const requestedPromoId = selectedPromoId || null;
 
   if (requestedPromoId) {
     const chosen = promos.find(
@@ -4068,14 +4059,13 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     throw new Error('Gagal generate transaction_code unik');
   })();
 
-  // setelah Order.create success:
+  // setelah Order.create success: (side-effects sama seperti implementasi Anda)
   try {
     if (
       appliedPromoSnapshot &&
       appliedPromoSnapshot.actions &&
       appliedPromoSnapshot.actions.length
     ) {
-      // jalankan side-effects (award points / grant membership) via executePromoActions
       try {
         if (
           appliedPromoSnapshot &&
@@ -4085,7 +4075,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           await executePromoActions(order, Member, { session: null });
         }
 
-        // decrement promo.globalStock (lifetime) jika ada dan promo dipakai
         if (appliedPromoSnapshot && appliedPromoSnapshot.promoId) {
           try {
             await Promo.updateOne(
@@ -4103,7 +4092,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           }
         }
 
-        // catat penggunaan untuk member (member.promoUsageHistory)
         if (
           order.member &&
           appliedPromoSnapshot &&
@@ -4133,7 +4121,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
         );
       }
     }
-    // decrement promo.globalStock if needed: executePromoActions bisa handle itu if implemented
   } catch (e) {
     console.error(
       '[createPosDineIn] promo side-effects failed',
@@ -4650,6 +4637,57 @@ exports.evaluatePos = asyncHandler(async (req, res) => {
     eligiblePromos: eligibleSummary,
     appliedPromo,
     promoPreviews
+  });
+});
+
+exports.cashierRegisterMember = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const { name, phone, gender } = req.body || {};
+  if (!name || !phone || !gender)
+    throwError('Nama, nomor telepon, dan gender wajib diisi', 400);
+
+  const normalizedPhone = normalizePhone(phone);
+  if (!/^0\d{9,13}$/.test(normalizedPhone)) {
+    throwError('Format nomor tidak valid (gunakan 08xxxxxxxx)', 400);
+  }
+
+  const g = String(gender).toLowerCase();
+  if (!['male', 'female'].includes(g)) {
+    throwError('Gender harus salah satu dari: Laki-laki/Perempuan', 400);
+  }
+
+  let existing = await Member.findOne({ phone: normalizedPhone }).lean();
+  if (existing) {
+    return res.status(200).json({
+      message: 'Nomor sudah terdaftar',
+      member: {
+        id: existing._id,
+        name: existing.name,
+        phone: existing.phone
+      }
+    });
+  }
+
+  await createMember({
+    name: String(name).trim(),
+    phone: normalizedPhone,
+    gender: g,
+    birthday: null,
+    address: '',
+    join_channel: 'pos'
+  });
+
+  const member = await Member.findOne({ phone: normalizedPhone }).lean();
+  if (!member) throwError('Gagal membuat member', 500);
+
+  return res.status(201).json({
+    message: 'Member berhasil dibuat',
+    member: {
+      id: member._id,
+      name: member.name,
+      phone: member.phone
+    }
   });
 });
 
