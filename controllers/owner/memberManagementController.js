@@ -154,109 +154,28 @@ exports.newCustomers = asyncHandler(async (req, res) => {
   });
 });
 
-/* ===========================================================
- * 3) Detail pelanggan (+ metrik periode & lifetime)
- * GET /member-reports/:id
- * Query:
- *  - mode/period|from,to|range_mode  (untuk metrik periode paid_at)
- *  - recent_limit (default 10)
- * =========================================================== */
 exports.getMemberDetail = asyncHandler(async (req, res) => {
   const { id } = req.params;
+
   if (!mongoose.Types.ObjectId.isValid(id)) throwError('ID tidak valid', 400);
 
   const m = await Member.findById(id).lean();
   if (!m) throwError('Member tidak ditemukan', 404);
-
-  const { start, end } = getRangeFromQuery(req.query);
-  const recentLimit = Math.min(asInt(req.query.recent_limit, 10), 50);
-
-  // metrik periode (paid)
-  const [agg] = await OrderHistory.aggregate([
-    {
-      $match: {
-        'member.id': new mongoose.Types.ObjectId(id),
-        payment_status: 'paid',
-        paid_at: { $gte: start, $lte: end }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        orders: { $sum: 1 },
-        spend: { $sum: '$grand_total' },
-        avg_ticket: { $avg: '$grand_total' },
-        last_paid_at: { $max: '$paid_at' }
-      }
-    }
-  ]);
-
-  const refunds = await OrderHistory.countDocuments({
-    'member.id': id,
-    payment_status: 'refunded',
-    paid_at: { $gte: start, $lte: end }
-  });
-
-  const recent_orders = await OrderHistory.find({
-    'member.id': id,
-    payment_status: 'paid',
-    paid_at: { $gte: start, $lte: end }
-  })
-    .sort({ paid_at: -1 })
-    .limit(recentLimit)
-    .lean();
-
-  // Top items (opsional insight)
-  const topItems = await OrderHistory.aggregate([
-    {
-      $match: {
-        'member.id': new mongoose.Types.ObjectId(id),
-        payment_status: 'paid',
-        paid_at: { $gte: start, $lte: end }
-      }
-    },
-    { $unwind: { path: '$items', preserveNullAndEmptyArrays: false } },
-    {
-      $group: {
-        _id: { name: '$items.name' },
-        qty: { $sum: '$items.quantity' },
-        spend: { $sum: '$items.line_subtotal' }
-      }
-    },
-    { $sort: { spend: -1, qty: -1 } },
-    { $limit: 10 }
-  ]);
 
   res.json({
     member: {
       _id: m._id,
       name: m.name,
       phone: m.phone,
-      join_channel: m.join_channel,
-      is_active: m.is_active,
+      gender: m.gender,
       createdAt: m.createdAt,
       points: m.points || 0,
-      // lifetime dari koleksi member
-      lifetime: {
-        total_spend: m.total_spend || 0,
-        visit_count: m.visit_count || 0,
-        last_visit_at: m.last_visit_at || null
-      }
-    },
-    period: { start, end },
-    metrics: {
-      period_orders: agg?.orders || 0,
-      period_spend: agg?.spend || 0,
-      avg_ticket_size: agg?.avg_ticket ? Math.round(agg.avg_ticket) : 0,
-      last_paid_at: agg?.last_paid_at || null,
-      refunds
-    },
-    recent_orders,
-    top_items: topItems.map((x) => ({
-      name: x._id.name,
-      qty: x.qty,
-      spend: x.spend
-    }))
+      spend_point_total: m.spend_point_total,
+      birthday: m.birthday,
+      total_spend: m.total_spend || 0,
+      visit_count: m.visit_count || 0,
+      last_visit_at: m.last_visit_at || null
+    }
   });
 });
 
