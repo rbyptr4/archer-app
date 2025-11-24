@@ -4,7 +4,7 @@ const mongoose = require('mongoose');
 const Member = require('../../models/memberModel');
 const OrderHistory = require('../../models/orderHistoryModel');
 const throwError = require('../../utils/throwError');
-const { parsePeriod } = require('../../utils/periodRange');
+const { parseRange } = require('../../utils/periodRange');
 
 const asInt = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
 
@@ -20,13 +20,14 @@ function buildMemberMatch({ search = '' } = {}) {
 }
 
 /** {start,end} dari parsePeriod */
-function getRangeFromQuery(q = {}, fallbackMode = 'calendar') {
-  const { start, end } = parsePeriod({
-    period: q.mode || q.period || 'day',
-    start: q.from,
-    end: q.to,
-    mode: q.range_mode || fallbackMode,
-    weekStartsOn: Number.isFinite(+q.weekStartsOn) ? +q.weekStartsOn : 1
+function getRangeFromQuery(q = {}) {
+  const rangeKey = q.range || q.period || 'today';
+  const weekStartsOn = Number.isFinite(+q.weekStartsOn) ? +q.weekStartsOn : 1;
+  const { start, end } = parseRange({
+    range: rangeKey,
+    from: q.from,
+    to: q.to,
+    weekStartsOn
   });
   return { start, end };
 }
@@ -146,49 +147,61 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
   });
 });
 
-/* ===========================================================
- * 2) Pelanggan baru (pertumbuhan) — pakai Member.createdAt
- * GET /member-reports/new
- * Query:
- *  - mode/period|from,to|range_mode
- *  - groupBy: 'day'|'week'|'month'|'year'|'none' (default: none)
- * =========================================================== */
 exports.newCustomers = asyncHandler(async (req, res) => {
   const { start, end } = getRangeFromQuery(req.query);
-  const groupBy = ['day', 'week', 'month', 'year', 'none'].includes(
-    String(req.query.groupBy)
-  )
-    ? String(req.query.groupBy)
-    : 'none';
+
+  // Gender filter (optional)
+  const gender =
+    req.query.gender === 'male' || req.query.gender === 'female'
+      ? req.query.gender
+      : null;
 
   const match = {
     createdAt: { $gte: start, $lte: end }
   };
 
-  if (groupBy === 'none') {
-    const count = await Member.countDocuments(match);
-    return res.json({ period: { start, end }, count });
+  // Jika gender dikirim -> filter, kalau tidak -> ALL gender
+  if (gender) match.gender = gender;
+
+  // Ambil semua member baru (sesuai filter)
+  const rows = await Member.find(match).select('createdAt gender').lean();
+
+  // Ambil juga data male/female (tanpa filter gender)
+  const genderRows = await Member.find({
+    createdAt: { $gte: start, $lte: end }
+  })
+    .select('gender')
+    .lean();
+
+  const maleCount = genderRows.filter((x) => x.gender === 'male').length;
+  const femaleCount = genderRows.filter((x) => x.gender === 'female').length;
+
+  // BUCKET HARIAN
+  const days = [];
+  const cur = new Date(start);
+
+  while (cur <= end) {
+    const dayStr = cur.toISOString().substring(0, 10);
+    days.push({ key: dayStr, count: 0 });
+    cur.setDate(cur.getDate() + 1);
   }
 
-  const keySpec =
-    groupBy === 'day'
-      ? { $dateToString: { date: '$createdAt', format: '%Y-%m-%d' } }
-      : groupBy === 'week'
-      ? { $dateToString: { date: '$createdAt', format: '%G-W%V' } }
-      : groupBy === 'month'
-      ? { $dateToString: { date: '$createdAt', format: '%Y-%m' } }
-      : { $dateToString: { date: '$createdAt', format: '%Y' } };
-
-  const items = await Member.aggregate([
-    { $match: match },
-    { $group: { _id: keySpec, count: { $sum: 1 } } },
-    { $sort: { _id: 1 } }
-  ]);
+  // Hitung jumlah per hari
+  for (const m of rows) {
+    const d = m.createdAt.toISOString().substring(0, 10);
+    const bucket = days.find((x) => x.key === d);
+    if (bucket) bucket.count++;
+  }
 
   res.json({
     period: { start, end },
-    items: items.map((x) => ({ key: x._id, count: x.count })),
-    total: items.reduce((s, x) => s + (x.count || 0), 0)
+    gender_filter: gender || 'all',
+    items: days,
+    total: rows.length,
+    gender_stats: {
+      male: maleCount,
+      female: femaleCount
+    }
   });
 });
 
