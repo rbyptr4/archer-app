@@ -1,3 +1,9 @@
+// utils/periodRange.js
+// Sederhana: hanya gunakan tanggal. Semua return berupa Date object (UTC local JS Date).
+// Preset yang didukung untuk query.range:
+// 'today', 'yesterday', 'this_week', 'this_month', 'this_year', 'last_7', 'last_30', 'custom'
+// Untuk custom gunakan query.from, query.to (ISO/parsable string)
+
 function startOfDay(d) {
   const x = new Date(d);
   x.setHours(0, 0, 0, 0);
@@ -10,9 +16,9 @@ function endOfDay(d) {
 }
 
 function startOfWeek(d, weekStartsOn = 1) {
-  // 1 = Senin (ID)
+  // weekStartsOn: 1 = Senin (ID)
   const x = new Date(d);
-  const day = x.getDay(); // 0=Min,1=Sen,...6=Sab
+  const day = x.getDay(); // 0=Sun,1=Mon,...6=Sat
   const diff = (day - weekStartsOn + 7) % 7;
   x.setDate(x.getDate() - diff);
   return startOfDay(x);
@@ -31,7 +37,7 @@ function startOfMonth(d) {
 }
 function endOfMonth(d) {
   const x = new Date(d);
-  x.setMonth(x.getMonth() + 1, 0);
+  x.setMonth(x.getMonth() + 1, 0); // last day prev month
   return endOfDay(x);
 }
 
@@ -47,74 +53,70 @@ function endOfYear(d) {
 }
 
 /**
- * period: 'day' | 'week' | 'month' | 'year' | 'overall'
- * mode: 'calendar' (default) | 'rolling'
- * start/end (ISO date) override period jika diisi
- * weekStartsOn: 1=Senin (Indonesia)
+ * parseRange(options)
+ * options:
+ *   - range: 'today'|'yesterday'|'this_week'|'this_month'|'this_year'|'last_7'|'last_30'|'custom'
+ *   - from: ISO date string (untuk custom)
+ *   - to: ISO date string (untuk custom)
+ *   - weekStartsOn: 1 = Monday (default)
+ *
+ * Returns: { start: Date, end: Date }
  */
-function parsePeriod({
-  period,
-  start,
-  end,
-  mode = 'calendar',
-  weekStartsOn = 1
-} = {}) {
-  // 1) Custom range menang
-  if (start || end) {
-    const s = start ? new Date(start) : new Date('1970-01-01');
-    const e = end ? new Date(end) : new Date();
-    return { start: s, end: e };
+function parseRange({ range = 'today', from, to, weekStartsOn = 1 } = {}) {
+  // custom range wins when from/to diberikan
+  if (from || to) {
+    const s = from ? new Date(from) : new Date('1970-01-01');
+    const e = to ? new Date(to) : new Date();
+    // normalize to day boundaries
+    const start = isNaN(s.getTime()) ? new Date('1970-01-01') : startOfDay(s);
+    const end = isNaN(e.getTime()) ? endOfDay(new Date()) : endOfDay(e);
+    return { start, end };
   }
 
   const now = new Date();
 
-  // 2) Preset kalender (default)
-  if (mode === 'calendar') {
-    switch (String(period || '').toLowerCase()) {
-      case 'day': {
-        return { start: startOfDay(now), end: endOfDay(now) };
-      }
-      case 'week': {
-        return {
-          start: startOfWeek(now, weekStartsOn),
-          end: endOfWeek(now, weekStartsOn)
-        };
-      }
-      case 'month': {
-        return { start: startOfMonth(now), end: endOfMonth(now) };
-      }
-      case 'year': {
-        return { start: startOfYear(now), end: endOfYear(now) };
-      }
-      case 'overall':
-      default:
-        return { start: new Date('1970-01-01'), end: endOfDay(now) };
+  switch (String(range || '').toLowerCase()) {
+    case 'today':
+      return { start: startOfDay(now), end: endOfDay(now) };
+    case 'yesterday': {
+      const d = new Date(now);
+      d.setDate(d.getDate() - 1);
+      return { start: startOfDay(d), end: endOfDay(d) };
     }
-  }
-
-  // 3) Preset rolling (bergerak mundur dari "sekarang")
-  switch (String(period || '').toLowerCase()) {
-    case 'day': // 1 hari terakhir
-      return { start: new Date(now.getTime() - 24 * 60 * 60 * 1000), end: now };
-    case 'week': // 7 hari terakhir
+    case 'this_week':
       return {
-        start: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000),
-        end: now
+        start: startOfWeek(now, weekStartsOn),
+        end: endOfWeek(now, weekStartsOn)
       };
-    case 'month': // 30 hari terakhir
+    case 'this_month':
+      return { start: startOfMonth(now), end: endOfMonth(now) };
+    case 'this_year':
+      return { start: startOfYear(now), end: endOfYear(now) };
+    case 'last_7':
       return {
-        start: new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000),
-        end: now
+        start: startOfDay(new Date(Date.now() - 7 * 24 * 3600 * 1000)),
+        end: endOfDay(now)
       };
-    case 'year': // 365 hari terakhir
+    case 'last_30':
       return {
-        start: new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000),
-        end: now
+        start: startOfDay(new Date(Date.now() - 30 * 24 * 3600 * 1000)),
+        end: endOfDay(now)
       };
-    case 'overall':
+    case 'custom':
+    // fallback to today if no from/to supplied
     default:
-      return { start: new Date('1970-01-01'), end: now };
+      return { start: startOfDay(now), end: endOfDay(now) };
   }
 }
 
-module.exports = { parsePeriod };
+module.exports = {
+  parseRange,
+  startOfDay,
+  endOfDay,
+  startOfWeek,
+  endOfWeek,
+  startOfMonth,
+  endOfMonth,
+  startOfYear,
+  endOfYear
+};

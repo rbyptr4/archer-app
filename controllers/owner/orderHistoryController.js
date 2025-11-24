@@ -1,54 +1,277 @@
-// controllers/orderHistoryController.js
 const asyncHandler = require('express-async-handler');
 const mongoose = require('mongoose');
 
 const Order = require('../../models/orderModel');
 const OrderHistory = require('../../models/orderHistoryModel');
 const Expense = require('../../models/expenseModel'); // sesuaikan path model Expenses kamu
-const { parsePeriod } = require('../../utils/periodRange');
 const throwError = require('../../utils/throwError');
+const { parseRange } = require('../../utils/periodRange');
 
 /* ===================== Helpers umum ===================== */
 const asInt = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
 const toBool = (v) => String(v) === 'true';
 
-function buildCommonMatch(q = {}) {
-  const match = {};
-
-  if (q.source) match.source = q.source; // 'qr' | 'online' | 'pos'
-  if (q.fulfillment_type) match.fulfillment_type = q.fulfillment_type; // 'dine_in'|'delivery'
-  if (q.payment_status) match.payment_status = q.payment_status; // 'paid'|'refunded'|'void'|'unpaid'
-  if (q.status) match.status = q.status;
-  if (q.table) match.table_number = Number(q.table);
-
-  // filter kasir / member
-  if (q.cashier_id && mongoose.Types.ObjectId.isValid(q.cashier_id)) {
-    match['verified_by.id'] = new mongoose.Types.ObjectId(String(q.cashier_id));
-  }
-  if (q.member_id && mongoose.Types.ObjectId.isValid(q.member_id)) {
-    match['member.id'] = new mongoose.Types.ObjectId(String(q.member_id));
-  }
-  if (q.is_member === 'true') match['member.is_member'] = true;
-  if (q.is_member === 'false') match['member.is_member'] = false;
-
-  // refund/cancel flags cepat
-  if (q.refund_only === 'true') match.is_refund = true;
-  if (q.cancel_only === 'true') match.is_cancelled = true;
-
-  return match;
-}
-
-/** Ambil {start,end} dari parsePeriod helper kamu */
-function getRangeFromQuery(q = {}, fallbackMode = 'calendar') {
-  const { start, end } = parsePeriod({
-    period: q.mode || q.period || 'day',
-    start: q.from,
-    end: q.to,
-    mode: q.range_mode || fallbackMode, // 'calendar' | 'rolling'
-    weekStartsOn: Number.isFinite(+q.weekStartsOn) ? +q.weekStartsOn : 1
+function getRangeFromQuery(q = {}) {
+  const rangeKey = q.range || q.period || 'today';
+  const weekStartsOn = Number.isFinite(+q.weekStartsOn) ? +q.weekStartsOn : 1;
+  const { start, end } = parseRange({
+    range: rangeKey,
+    from: q.from,
+    to: q.to,
+    weekStartsOn
   });
   return { start, end };
 }
+
+exports.summaryByPeriod = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+
+  const orderMatch = { paid_at: { $gte: start, $lte: end } };
+
+  const orderPipeline = [
+    { $match: orderMatch },
+    {
+      $group: {
+        _id: null,
+        transaksiMasuk: { $sum: 1 },
+        omzet: { $sum: { $ifNull: ['$grand_total', 0] } }
+      }
+    }
+  ];
+
+  const [ordersAgg] = await Order.aggregate(orderPipeline);
+
+  const expenseMatch = {
+    date: { $gte: start, $lte: end },
+    isDeleted: { $ne: true }
+  };
+  const expensePipeline = [
+    { $match: expenseMatch },
+    {
+      $group: { _id: null, totalExpense: { $sum: { $ifNull: ['$amount', 0] } } }
+    }
+  ];
+  const [expenseAgg] = await Expense.aggregate(expensePipeline);
+
+  const omzet = Number(ordersAgg?.omzet || 0);
+  const pengeluaran = Number(expenseAgg?.totalExpense || 0);
+  const pendapatan = omzet - pengeluaran;
+
+  res.json({
+    period: { start, end },
+    transaksi_masuk: ordersAgg?.transaksiMasuk || 0,
+    omzet,
+    pendapatan,
+    pengeluaran
+  });
+});
+
+exports.totalPaidTransactions = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+
+  // params cursor & limit
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+  const cursor = req.query.cursor ? String(req.query.cursor) : null;
+
+  // match untuk aggregate & list (hanya completed & paid_at in range)
+  const match = {
+    status: 'completed',
+    paid_at: { $gte: start, $lte: end }
+  };
+
+  // 1) Aggregate: total count & total grand
+  const [agg] = await Order.aggregate([
+    { $match: match },
+    {
+      $group: {
+        _id: null,
+        count: { $sum: 1 },
+        total_grand: { $sum: { $ifNull: ['$grand_total', 0] } }
+      }
+    }
+  ]);
+
+  const count = agg?.count || 0;
+  const totalGrand = agg?.total_grand || 0;
+  const averagePerOrder = count ? Math.round(totalGrand / count) : 0;
+
+  // 2) Fetch list (paginated via cursor)
+  // Build query object for mongoose find
+  const findQuery = { ...match };
+
+  // cursor logic: because we sort by createdAt desc, use _id < cursor for "next page"
+  if (cursor) {
+    // validate cursor
+    if (!mongoose.Types.ObjectId.isValid(cursor)) {
+      // return bad request
+      return res.status(400).json({ error: 'Invalid cursor' });
+    }
+    // When sorting DESC, to get items after the cursor we want _id < cursor
+    findQuery._id = { $lt: mongoose.Types.ObjectId(cursor) };
+  }
+
+  // select only required fields + member ref
+  const rows = await Order.find(findQuery)
+    .select(
+      'member customer_name customer_phone grand_total transaction_code createdAt'
+    )
+    .populate('member', 'name phone') // kalau member ada, ambil name & phone
+    .sort({ createdAt: -1, _id: -1 })
+    .limit(limit + 1) // ambil satu ekstra untuk cek nextCursor
+    .lean();
+
+  // determine nextCursor
+  let nextCursor = null;
+  let resultRows = rows;
+  if (rows.length > limit) {
+    const extra = rows.pop(); // remove extra
+    nextCursor = extra._id.toString();
+    resultRows = rows;
+  } else if (rows.length > 0) {
+    // kalau tidak ada extra, nextCursor tetap null
+    nextCursor = null;
+  }
+
+  // map rows -> shape minimal (name, phone, grand_total, transaction_code, created_at)
+  const orders = resultRows.map((r) => {
+    const member = r.member;
+    const name = member?.name || r.customer_name || '';
+    const phone = member?.phone || r.customer_phone || '';
+    return {
+      name,
+      phone,
+      grand_total: r.grand_total || 0,
+      transaction_code: r.transaction_code || r.transaction_code || '',
+      created_at: r.createdAt || r.created_at || null,
+      _id: r._id // optional, FE bisa pakai ini sebagai cursor fallback
+    };
+  });
+
+  // respond (period, aggregates, pagination)
+  res.json({
+    period: { start, end },
+    total_transactions: count,
+    total_grand: totalGrand,
+    average_per_order: averagePerOrder,
+    limit,
+    nextCursor, // null jika tidak ada halaman selanjutnya
+    orders
+  });
+});
+
+exports.financeSales = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+
+  // HANYA filter waktu (paid_at)
+  const match = { paid_at: { $gte: start, $lte: end } };
+
+  const [agg] = await Order.aggregate([
+    { $match: match },
+    {
+      $group: {
+        _id: null,
+        total_omzet: { $sum: { $ifNull: ['$grand_total', 0] } }
+      }
+    }
+  ]);
+
+  res.json({
+    period: { start, end },
+    total: agg?.total_omzet || 0
+  });
+});
+
+exports.financeExpenses = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+
+  const match = { isDeleted: { $ne: true }, date: { $gte: start, $lte: end } };
+
+  const [agg] = await Expense.aggregate([
+    { $match: match },
+    { $group: { _id: null, total: { $sum: { $ifNull: ['$amount', 0] } } } }
+  ]);
+
+  res.json({
+    period: { start, end },
+    total: agg?.total || 0
+  });
+});
+
+/* ===================== profitLoss (sederhana) ===================== */
+exports.profitLoss = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+
+  const revenueMatch = { paid_at: { $gte: start, $lte: end } };
+  const [revAgg] = await Order.aggregate([
+    { $match: revenueMatch },
+    {
+      $group: { _id: null, revenue: { $sum: { $ifNull: ['$grand_total', 0] } } }
+    }
+  ]);
+  const revenue = revAgg?.revenue || 0;
+
+  const expenseMatch = {
+    isDeleted: { $ne: true },
+    date: { $gte: start, $lte: end }
+  };
+  const [expAgg] = await Expense.aggregate([
+    { $match: expenseMatch },
+    { $group: { _id: null, expenses: { $sum: { $ifNull: ['$amount', 0] } } } }
+  ]);
+  const expenses = expAgg?.expenses || 0;
+
+  res.json({
+    period: { start, end },
+    revenue,
+    expenses,
+    profit: revenue - expenses
+  });
+});
+
+/* ===================== bestSellers (sederhana, hanya periode) ===================== */
+exports.bestSellers = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+  const limit = Math.min(Number(req.query.limit) || 10, 100);
+
+  // filter hanya by paid_at range
+  const pipeline = [
+    { $match: { paid_at: { $gte: start, $lte: end } } },
+    { $unwind: '$items' },
+    {
+      $group: {
+        _id: {
+          menu: '$items.menu',
+          name: '$items.name',
+          code: '$items.menu_code'
+        },
+        qty: { $sum: '$items.quantity' },
+        revenue: { $sum: { $ifNull: ['$items.line_subtotal', 0] } },
+        sample_image: { $first: '$items.imageUrl' }
+      }
+    },
+    { $sort: { qty: -1, revenue: -1 } },
+    { $limit: limit }
+  ];
+
+  const rows = await Order.aggregate(pipeline);
+
+  const items = rows.map((r) => ({
+    menu_id: r._id.menu || null,
+    code: r._id.code || '',
+    name: r._id.name || '(no name)',
+    qty: r.qty || 0,
+    revenue: r.revenue || 0,
+    imageUrl: r.sample_image || ''
+  }));
+
+  res.json({
+    period: { start, end },
+    limit,
+    items,
+    total_qty: items.reduce((s, x) => s + (x.qty || 0), 0),
+    total_revenue: items.reduce((s, x) => s + (x.revenue || 0), 0)
+  });
+});
 
 exports.recordOrderHistory = asyncHandler(
   async (orderOrId, eventType, user = null, extra = {}) => {
@@ -275,462 +498,4 @@ exports.deleteHistory = asyncHandler(async (req, res) => {
 
   await OrderHistory.deleteOne({ _id: doc._id });
   res.json({ message: 'History dihapus' });
-});
-
-exports.summaryByPeriod = asyncHandler(async (req, res) => {
-  const { start, end } = getRangeFromQuery(req.query);
-
-  const match = buildCommonMatch(req.query);
-
-  match.paid_at = { $gte: start, $lte: end };
-
-  const orderPipeline = [
-    { $match: match },
-    {
-      $group: {
-        _id: null,
-        transaksiMasuk: {
-          $sum: { $cond: [{ $eq: ['$status', 'accepted'] }, 1, 0] }
-        },
-        transaksiSelesai: {
-          $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] }
-        },
-        omzet: { $sum: { $ifNull: ['$grand_total', 0] } }
-      }
-    }
-  ];
-
-  const [ordersAgg] = await Order.aggregate(orderPipeline);
-
-  const expenseMatch = { date: { $gte: start, $lte: end } };
-
-  const expensePipeline = [
-    { $match: expenseMatch },
-    {
-      $group: {
-        _id: null,
-        totalExpense: { $sum: { $ifNull: ['$amount', 0] } },
-        count: { $sum: 1 }
-      }
-    }
-  ];
-
-  const [expenseAgg] = await Expense.aggregate(expensePipeline);
-
-  // Ambil nilai fallback ke 0
-  const omzet = (ordersAgg && Number(ordersAgg.omzet || 0)) || 0;
-  const pengeluaran = (expenseAgg && Number(expenseAgg.totalExpense || 0)) || 0;
-  const pendapatan = omzet - pengeluaran;
-
-  const transaksi_masuk = (ordersAgg && ordersAgg.transaksiMasuk) || 0;
-  const transaksi_selesai = (ordersAgg && ordersAgg.transaksiSelesai) || 0;
-
-  res.json({
-    period: { start, end },
-    transaksi_masuk,
-    transaksi_selesai,
-    omzet,
-    pendapatan,
-    pengeluaran
-  });
-});
-
-// ===================== 2) totalPaidTransactions (dari Order) =====================
-exports.totalPaidTransactions = asyncHandler(async (req, res) => {
-  const { start, end } = getRangeFromQuery(req.query);
-
-  const match = buildCommonMatch({ ...req.query, payment_status: 'paid' });
-
-  // default window & if you want still filter status completed/verified by default? we respect query override;
-  // but since metric is "paid transactions", we won't force status=completed here.
-  match.paid_at = { $gte: start, $lte: end };
-
-  const [agg] = await Order.aggregate([
-    { $match: match },
-    {
-      $group: {
-        _id: null,
-        count: { $sum: 1 },
-        total_grand: { $sum: '$grand_total' },
-        total_items_subtotal: { $sum: '$items_subtotal' }
-      }
-    }
-  ]);
-
-  let list;
-  if (String(req.query.include) === 'list') {
-    const limit = Math.min(asInt(req.query.limit, 50), 200);
-    list = await Order.find(match).sort({ paid_at: -1 }).limit(limit).lean();
-  }
-
-  const count = agg?.count || 0;
-  const totalGrand = agg?.total_grand || 0;
-  res.json({
-    period: { start, end },
-    count,
-    total_grand: totalGrand,
-    total_items_subtotal: agg?.total_items_subtotal || 0,
-    average_per_orders: count ? Math.round(totalGrand / count) : 0,
-    list
-  });
-});
-
-// ===================== 3) financeSales (dari Order) =====================
-exports.financeSales = asyncHandler(async (req, res) => {
-  const { start, end } = getRangeFromQuery(req.query);
-  const metric = ['omzet', 'pendapatan'].includes(String(req.query.metric))
-    ? String(req.query.metric)
-    : 'pendapatan';
-  const groupBy = ['day', 'week', 'month', 'year', 'none'].includes(
-    String(req.query.groupBy)
-  )
-    ? String(req.query.groupBy)
-    : 'none';
-
-  // default filter: completed + verified, kecuali user override
-  const baseMatch = buildCommonMatch({ ...req.query });
-  if (!req.query.status) baseMatch.status = 'created';
-  if (!req.query.payment_status) baseMatch.payment_status = 'paid';
-  baseMatch.paid_at = { $gte: start, $lte: end };
-
-  const sumField = metric === 'omzet' ? '$items_subtotal' : '$grand_total';
-
-  if (groupBy === 'none') {
-    const [agg] = await Order.aggregate([
-      { $match: baseMatch },
-      { $group: { _id: null, total: { $sum: sumField } } }
-    ]);
-    return res.json({
-      period: { start, end },
-      metric,
-      total: agg?.total || 0
-    });
-  }
-
-  const keyField =
-    groupBy === 'day'
-      ? '$dayKey'
-      : groupBy === 'week'
-      ? '$weekKey'
-      : groupBy === 'month'
-      ? '$monthKey'
-      : '$year';
-
-  // ensure we have those keys on Order model? If not, compute via $dateToString on paid_at
-  // We'll use $dateToString to be safe (no need dayKey in Order)
-  const dateKeySpec =
-    groupBy === 'day'
-      ? { $dateToString: { date: '$paid_at', format: '%Y-%m-%d' } }
-      : groupBy === 'week'
-      ? { $dateToString: { date: '$paid_at', format: '%G-W%V' } }
-      : groupBy === 'month'
-      ? { $dateToString: { date: '$paid_at', format: '%Y-%m' } }
-      : { $dateToString: { date: '$paid_at', format: '%Y' } };
-
-  const items = await Order.aggregate([
-    { $match: baseMatch },
-    { $group: { _id: dateKeySpec, total: { $sum: sumField } } },
-    { $sort: { _id: 1 } }
-  ]);
-
-  res.json({
-    period: { start, end },
-    metric,
-    items: items.map((x) => ({ key: x._id, total: x.total })),
-    total: items.reduce((s, x) => s + (x.total || 0), 0)
-  });
-});
-
-// ===================== 4) financeExpenses (tidak berubah) =====================
-exports.financeExpenses = asyncHandler(async (req, res) => {
-  const { start, end } = getRangeFromQuery(req.query);
-  const groupBy = ['day', 'week', 'month', 'year', 'none'].includes(
-    String(req.query.groupBy)
-  )
-    ? String(req.query.groupBy)
-    : 'none';
-
-  const match = {
-    isDeleted: { $ne: true },
-    date: { $gte: start, $lte: end }
-  };
-  if (req.query.type) match.type = String(req.query.type);
-
-  if (groupBy === 'none') {
-    const [agg] = await Expense.aggregate([
-      { $match: match },
-      { $group: { _id: null, total: { $sum: '$amount' } } }
-    ]);
-    return res.json({
-      period: { start, end },
-      total: agg?.total || 0
-    });
-  }
-
-  const keySpec =
-    groupBy === 'day'
-      ? { $dateToString: { date: '$date', format: '%Y-%m-%d' } }
-      : groupBy === 'week'
-      ? { $dateToString: { date: '$date', format: '%G-W%V' } }
-      : groupBy === 'month'
-      ? { $dateToString: { date: '$date', format: '%Y-%m' } }
-      : { $dateToString: { date: '$date', format: '%Y' } };
-
-  const items = await Expense.aggregate([
-    { $match: match },
-    { $group: { _id: keySpec, total: { $sum: '$amount' } } },
-    { $sort: { _id: 1 } }
-  ]);
-
-  res.json({
-    period: { start, end },
-    items: items.map((x) => ({ key: x._id, total: x.total })),
-    total: items.reduce((s, x) => s + (x.total || 0), 0)
-  });
-});
-
-// ===================== 5) profitLoss (Order + Expense) =====================
-exports.profitLoss = asyncHandler(async (req, res) => {
-  const { start, end } = getRangeFromQuery(req.query);
-  const revenueMetric = ['pendapatan', 'omzet'].includes(
-    String(req.query.revenue_metric)
-  )
-    ? String(req.query.revenue_metric)
-    : 'pendapatan';
-
-  // Revenue from Order model (default completed + verified)
-  const revenueMatchBase = buildCommonMatch({ ...req.query });
-  if (!req.query.status) revenueMatchBase.status = 'created';
-  if (!req.query.payment_status) revenueMatchBase.payment_status = 'paid';
-  revenueMatchBase.paid_at = { $gte: start, $lte: end };
-  const revenueField =
-    revenueMetric === 'omzet' ? '$items_subtotal' : '$grand_total';
-
-  const [revAgg] = await Order.aggregate([
-    { $match: revenueMatchBase },
-    { $group: { _id: null, total: { $sum: revenueField } } }
-  ]);
-  const revenue = revAgg?.total || 0;
-
-  // Expenses
-  const expenseMatch = {
-    isDeleted: { $ne: true },
-    date: { $gte: start, $lte: end }
-  };
-  if (req.query.expense_type)
-    expenseMatch.type = String(req.query.expense_type);
-
-  const [expAgg] = await Expense.aggregate([
-    { $match: expenseMatch },
-    { $group: { _id: null, total: { $sum: '$amount' } } }
-  ]);
-  const expenses = expAgg?.total || 0;
-
-  const profit = revenue - expenses;
-
-  const result = {
-    period: { start, end },
-    revenue_metric: revenueMetric,
-    revenue,
-    expenses,
-    profit
-  };
-
-  if (toBool(req.query.detail)) {
-    const expenseByType = await Expense.aggregate([
-      { $match: expenseMatch },
-      {
-        $group: { _id: '$type', total: { $sum: '$amount' }, count: { $sum: 1 } }
-      },
-      { $sort: { total: -1 } }
-    ]);
-
-    const revenueBreak = await Order.aggregate([
-      { $match: revenueMatchBase },
-      {
-        $group: {
-          _id: { source: '$source', fulfillment: '$fulfillment_type' },
-          total: { $sum: revenueField },
-          count: { $sum: 1 }
-        }
-      },
-      { $sort: { total: -1 } }
-    ]);
-
-    result.detail = {
-      expense_by_type: expenseByType.map((x) => ({
-        type: x._id,
-        total: x.total,
-        count: x.count
-      })),
-      revenue_breakdown: revenueBreak.map((x) => ({
-        source: x._id.source,
-        fulfillment_type: x._id.fulfillment,
-        total: x.total,
-        count: x.count
-      }))
-    };
-  }
-
-  res.json(result);
-});
-
-// ===================== 6) bestSellers (dari Order.items) =====================
-exports.bestSellers = asyncHandler(async (req, res) => {
-  const metric = ['qty', 'revenue'].includes(String(req.query.metric))
-    ? String(req.query.metric)
-    : 'qty';
-  const groupBy = ['menu', 'big_category', 'subcategory'].includes(
-    String(req.query.groupBy)
-  )
-    ? String(req.query.groupBy)
-    : 'menu';
-
-  const limit = Math.min(Number(req.query.limit) || 10, 100);
-  const collapseVariants = String(req.query.collapse_variants) !== 'false'; // default true
-
-  const { start, end } = getRangeFromQuery(req.query);
-  const match = buildCommonMatch({ ...req.query });
-
-  // default to only take completed+verified sales for best-sellers (overrideable)
-  if (!req.query.status) match.status = 'created';
-  if (!req.query.payment_status) match.payment_status = 'paid';
-  match.paid_at = { $gte: start, $lte: end };
-
-  // build group id like before but using Order.items fields
-  let groupId;
-  if (groupBy === 'big_category') {
-    groupId = { big: '$items.category.big' };
-  } else if (groupBy === 'subcategory') {
-    groupId = {
-      subId: '$items.category.subId',
-      subName: '$items.category.subName',
-      big: '$items.category.big'
-    };
-  } else {
-    if (collapseVariants) {
-      groupId = {
-        menu: '$items.menu',
-        name: '$items.name',
-        code: '$items.menu_code',
-        category_big: '$items.category.big',
-        category_subId: '$items.category.subId',
-        category_subName: '$items.category.subName'
-      };
-    } else {
-      groupId = {
-        menu: '$items.menu',
-        name: '$items.name',
-        code: '$items.menu_code',
-        category_big: '$items.category.big',
-        category_subId: '$items.category.subId',
-        category_subName: '$items.category.subName',
-        line_key: '$items.line_key',
-        notes: '$items.notes',
-        addons_sig: {
-          $map: {
-            input: { $ifNull: ['$items.addons', []] },
-            as: 'a',
-            in: {
-              $concat: [
-                '$$a.name',
-                ':',
-                { $toString: '$$a.price' },
-                'x',
-                { $toString: '$$a.qty' }
-              ]
-            }
-          }
-        }
-      };
-    }
-  }
-
-  const pipeline = [
-    { $match: match },
-    { $unwind: '$items' },
-    {
-      $group: {
-        _id: groupId,
-        qty: { $sum: '$items.quantity' },
-        revenue: { $sum: '$items.line_subtotal' },
-        orders: { $addToSet: '$_id' },
-        first_image: { $first: '$items.imageUrl' }
-      }
-    },
-    { $addFields: { order_count: { $size: '$orders' } } },
-    { $project: { orders: 0 } },
-    {
-      $sort:
-        metric === 'revenue'
-          ? { revenue: -1, qty: -1 }
-          : { qty: -1, revenue: -1 }
-    },
-    { $limit: limit }
-  ];
-
-  const rows = await Order.aggregate(pipeline);
-
-  // normalize output like sebelumnya
-  const items = rows.map((r) => {
-    if (groupBy === 'big_category') {
-      return {
-        key: r._id.big || 'Uncategorized',
-        type: 'big_category',
-        qty: r.qty || 0,
-        revenue: r.revenue || 0,
-        order_count: r.order_count || 0
-      };
-    }
-    if (groupBy === 'subcategory') {
-      return {
-        key: String(r._id.subId || r._id.subName || 'unknown'),
-        type: 'subcategory',
-        subId: r._id.subId || null,
-        subName: r._id.subName || '',
-        big: r._id.big || null,
-        qty: r.qty || 0,
-        revenue: r.revenue || 0,
-        order_count: r.order_count || 0
-      };
-    }
-    const base = {
-      key: String(r._id.menu || r._id.code || r._id.name),
-      type: 'menu',
-      menu_id: r._id.menu || null,
-      code: r._id.code || '',
-      name: r._id.name || '(no name)',
-      category: {
-        big: r._id.category_big || null,
-        subId: r._id.category_subId || null,
-        subName: r._id.category_subName || ''
-      },
-      imageUrl: r.first_image || '',
-      qty: r.qty || 0,
-      revenue: r.revenue || 0,
-      order_count: r.order_count || 0
-    };
-    if (!collapseVariants) {
-      base.variant =
-        r._id.line_key ||
-        [
-          r._id.notes || '',
-          ...(Array.isArray(r._id.addons_sig) ? r._id.addons_sig : [])
-        ]
-          .filter(Boolean)
-          .join(' | ');
-    }
-    return base;
-  });
-
-  res.json({
-    period: { start, end },
-    metric,
-    groupBy,
-    collapse_variants: collapseVariants,
-    limit,
-    items,
-    total_qty: items.reduce((s, x) => s + (x.qty || 0), 0),
-    total_revenue: items.reduce((s, x) => s + (x.revenue || 0), 0)
-  });
 });
