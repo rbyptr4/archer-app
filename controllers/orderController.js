@@ -4666,7 +4666,7 @@ exports.cashierRegisterMember = asyncHandler(async (req, res) => {
     phone: normalizedPhone,
     gender: g,
     birthday: null,
-    address: '',
+    address: null,
     join_channel: 'pos'
   });
 

@@ -36,7 +36,7 @@ async function createMember(payload = {}) {
     last_visit_at: new Date(),
     is_active: true,
     birthday: payload.birthday || null,
-    address: payload.address || {}
+    address: payload.address || null
   };
 
   const created = await Member.create(doc);
