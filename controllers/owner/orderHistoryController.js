@@ -280,69 +280,58 @@ exports.deleteHistory = asyncHandler(async (req, res) => {
 exports.summaryByPeriod = asyncHandler(async (req, res) => {
   const { start, end } = getRangeFromQuery(req.query);
 
-  // base match dari query
   const match = buildCommonMatch(req.query);
 
-  // default filtering untuk reporting: completed + verified (kamu bisa override dengan query)
-  if (!req.query.status) match.status = 'created';
-  if (!req.query.payment_status) match.payment_status = 'paid';
-
-  // window pakai paid_at
   match.paid_at = { $gte: start, $lte: end };
 
-  const pipeline = [
+  const orderPipeline = [
     { $match: match },
     {
       $group: {
         _id: null,
-        allCount: { $sum: 1 },
-        paidCount: {
-          $sum: { $cond: [{ $eq: ['$payment_status', 'paid'] }, 1, 0] }
+        transaksiMasuk: {
+          $sum: { $cond: [{ $eq: ['$status', 'accepted'] }, 1, 0] }
         },
-        verifiedCount: {
-          $sum: { $cond: [{ $eq: ['$payment_status', 'verified'] }, 1, 0] }
+        transaksiSelesai: {
+          $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] }
         },
-        refundedCount: {
-          $sum: { $cond: [{ $eq: ['$payment_status', 'refunded'] }, 1, 0] }
-        },
-        voidCount: {
-          $sum: { $cond: [{ $eq: ['$payment_status', 'void'] }, 1, 0] }
-        },
-        // <<-- perbaikan di sini: pakai format [ condition, then, else ]
-        cancelledCount: {
-          $sum: { $cond: [{ $eq: ['$status', 'cancelled'] }, 1, 0] }
-        },
-
-        omzet: { $sum: '$items_subtotal' },
-        pendapatan: { $sum: '$grand_total' },
-        delivery_fee: { $sum: '$delivery_fee' },
-        items_discount: { $sum: '$items_discount' },
-        shipping_discount: { $sum: '$shipping_discount' },
-        grand_total: { $sum: '$grand_total' }
+        omzet: { $sum: { $ifNull: ['$grand_total', 0] } }
       }
     }
   ];
 
-  const [agg] = await Order.aggregate(pipeline);
+  const [ordersAgg] = await Order.aggregate(orderPipeline);
+
+  const expenseMatch = { date: { $gte: start, $lte: end } };
+
+  const expensePipeline = [
+    { $match: expenseMatch },
+    {
+      $group: {
+        _id: null,
+        totalExpense: { $sum: { $ifNull: ['$amount', 0] } },
+        count: { $sum: 1 }
+      }
+    }
+  ];
+
+  const [expenseAgg] = await Expense.aggregate(expensePipeline);
+
+  // Ambil nilai fallback ke 0
+  const omzet = (ordersAgg && Number(ordersAgg.omzet || 0)) || 0;
+  const pengeluaran = (expenseAgg && Number(expenseAgg.totalExpense || 0)) || 0;
+  const pendapatan = omzet - pengeluaran;
+
+  const transaksi_masuk = (ordersAgg && ordersAgg.transaksiMasuk) || 0;
+  const transaksi_selesai = (ordersAgg && ordersAgg.transaksiSelesai) || 0;
 
   res.json({
     period: { start, end },
-    count: {
-      all: agg?.allCount || 0,
-      paid: agg?.paidCount || 0,
-      verified: agg?.verifiedCount || 0,
-      refunded: agg?.refundedCount || 0,
-      void: agg?.voidCount || 0,
-      cancelled: agg?.cancelledCount || 0
-    },
-    sums: {
-      omzet: agg?.omzet || 0,
-      pendapatan: agg?.pendapatan || 0,
-      delivery_fee: agg?.delivery_fee || 0,
-      items_discount: agg?.items_discount || 0,
-      shipping_discount: agg?.shipping_discount || 0,
-      grand_total: agg?.grand_total || 0
-    }
+    transaksi_masuk,
+    transaksi_selesai,
+    omzet,
+    pendapatan,
+    pengeluaran
   });
 });
 
