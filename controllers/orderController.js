@@ -3685,36 +3685,32 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
     payment_status: 'verified'
   };
 
-  // gunakan placed_at konsisten untuk cursor (karena kita sort berdasarkan placed_at)
   if (cursor) {
     const cDate = new Date(cursor);
     if (isNaN(cDate.getTime()))
       throwError('cursor tidak valid (harus ISO date)', 400);
-    // sort ascending (oldest first) => untuk halaman berikutnya ambil yang lebih baru
-    q.placed_at = { $gt: cDate };
+    q.placed_at = { $lt: cDate };
   }
 
-  // Ambil field ringkas + full items, populate image pada menu
   const raw = await Order.find(q)
     .select(
-      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label delivery.scheduled_at delivery.status status member createdAt items'
+      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label delivery.scheduled_at delivery.status status member createdAt items delivery.mode'
     )
-    .sort({ placed_at: 1 }) // kitchen: oldest orders first (FIFO)
+    .sort({ placed_at: -1 })
     .limit(lim)
-    .populate({ path: 'member', select: 'name' })
-    .populate('items.menu', 'name image') // <-- tambahkan image di populate
+    .populate({ path: 'member', select: 'name phone' })
+    .populate('items.menu', 'name image')
     .lean();
 
   const items = (Array.isArray(raw) ? raw : []).map((o) => {
-    const deliveryMode = o.delivery ? o.delivery.mode || null : null;
+    const deliveryMode =
+      (o.delivery && o.delivery.mode) ||
+      (o.fulfillment_type === 'dine_in' ? 'none' : 'delivery');
 
     const orderItems = (Array.isArray(o.items) ? o.items : []).map((it) => ({
-      // menu id jika terpouplate atau hanya id
       menu: it.menu ? String(it.menu._id || it.menu) : null,
-      // prefer nama dari menu yang dipopulate, fallback ke nama item
       name: (it.menu && it.menu.name) || it.name || '',
       menu_code: it.menu_code || '',
-      // image dari menu jika ada (bisa string url atau path)
       image: (it.menu && it.menu.image) || null,
       quantity: Number(it.quantity || 0),
       base_price: Number(it.base_price || 0),
@@ -3732,13 +3728,10 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
     return {
       id: String(o._id),
       transaction_code: o.transaction_code || '',
+      delivery_mode: deliveryMode,
       grand_total: Number(o.grand_total || 0),
-      fulfillment_type: o.fulfillment_type || null,
-      delivery_mode:
-        deliveryMode ||
-        (o.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
       customer_name: (o.member && o.member.name) || o.customer_name || '',
-      customer_phone: o.customer_phone || '',
+      customer_phone: (o.member && o.member.phone) || o.customer_phone || '',
       placed_at: o.placed_at || o.createdAt || null,
       table_number:
         o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
@@ -3762,7 +3755,6 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
     };
   });
 
-  // next_cursor: last item placed_at (as ISO) — frontend harus pakai value ini di request selanjutnya
   return res.status(200).json({
     items,
     next_cursor: items.length
