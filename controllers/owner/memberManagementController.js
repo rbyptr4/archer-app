@@ -2,7 +2,7 @@
 const asyncHandler = require('express-async-handler');
 const mongoose = require('mongoose');
 const Member = require('../../models/memberModel');
-const OrderHistory = require('../../models/orderHistoryModel');
+const Order = require('../../models/orderModel');
 const throwError = require('../../utils/throwError');
 const { parseRange } = require('../../utils/periodRange');
 
@@ -179,29 +179,22 @@ exports.getMemberDetail = asyncHandler(async (req, res) => {
   });
 });
 
-/* ===========================================================
- * 4) Top customer by spend (paid only, periode)
- * GET /member-reports/top-spenders
- * Query:
- *  - mode/period|from,to|range_mode
- *  - limit (default 20)
- * =========================================================== */
 exports.topSpenders = asyncHandler(async (req, res) => {
   const { start, end } = getRangeFromQuery(req.query);
-  const limit = Math.min(asInt(req.query.limit, 20), 200);
+  const limit = Math.min(asInt(req.query.limit, 50), 200);
 
-  const rows = await OrderHistory.aggregate([
+  const rows = await Order.aggregate([
     {
       $match: {
-        payment_status: 'paid',
-        'member.id': { $ne: null },
+        payment_status: 'verified',
+        member: { $ne: null },
         paid_at: { $gte: start, $lte: end }
       }
     },
     {
       $group: {
-        _id: '$member.id',
-        spend: { $sum: '$grand_total' },
+        _id: '$member',
+        spend: { $sum: { $ifNull: ['$grand_total', 0] } },
         orders: { $sum: 1 },
         last_paid_at: { $max: '$paid_at' }
       }
