@@ -32,7 +32,6 @@ router.get('/get-cart', order.getCart);
 router.post('/new-items', order.addItem);
 router.delete('/clear', order.clearCart);
 router.post('/table', order.assignTable);
-router.post('/dine-in/cashier/register', order.cashierRegisterMember);
 router.patch('/change-table', order.changeTable);
 router.patch('/change-order-type', order.setFulfillmentType);
 router.get('/delivery/estimate', order.estimateDelivery);
@@ -42,6 +41,14 @@ router.post(
   requireRole('owner', 'cashier'),
   requirePageAccess('orders'),
   order.assignBatch
+);
+
+router.post(
+  '/dine-in/cashier/register',
+  validateToken,
+  requireRole('owner', 'cashier'),
+  requirePageAccess('orders'),
+  order.cashierRegisterMember
 );
 
 router.post(
