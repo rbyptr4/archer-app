@@ -1,9 +1,9 @@
+// controllers/member/authMemberController.js
 const asyncHandler = require('express-async-handler');
 const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
 const Member = require('../../models/memberModel');
 const MemberSession = require('../../models/memberSessionModel');
-const MemberOtp = require('../../models/memberOtpModel'); // <-- pastikan ada model ini
+const MemberOtp = require('../../models/memberOtpModel'); // pastikan ada model ini
 const throwError = require('../../utils/throwError');
 const { baseCookie } = require('../../utils/authCookies');
 
@@ -25,6 +25,8 @@ const {
   OTP_TTL_MIN
 } = require('../../utils/otp');
 const { sendOtpText } = require('../../utils/wablas');
+
+const { createMember } = require('../../utils/memberService');
 
 const oneYearMs = REFRESH_TTL_MS;
 const cookieAccess = { ...baseCookie, httpOnly: true, maxAge: 15 * 60 * 1000 };
@@ -55,6 +57,7 @@ const sameName = (a = '', b = '') =>
   String(a).trim().replace(/\s+/g, ' ').toLowerCase() ===
   String(b).trim().replace(/\s+/g, ' ').toLowerCase();
 
+/* ============ LOGIN (kirim OTP) ============ */
 exports.loginMember = asyncHandler(async (req, res) => {
   const { name, phone } = req.body || {};
   if (!name || !phone) throwError('Nama dan nomor WA wajib diisi', 400);
@@ -112,6 +115,7 @@ exports.loginMember = asyncHandler(async (req, res) => {
   });
 });
 
+/* ============ DEV LOGIN (no OTP) ============ */
 exports.devLoginMember = asyncHandler(async (req, res) => {
   const { name, phone } = req.body || {};
   if (!name || !phone) throwError('Nama dan nomor WA wajib diisi', 400);
@@ -175,6 +179,8 @@ exports.devLoginMember = asyncHandler(async (req, res) => {
         id: member._id,
         name: member.name,
         phone: member.phone,
+        gender: member.gender || null,
+        address: member.address || '',
         points: member.points,
         total_spend: member.total_spend,
         visit_count: member.visit_count,
@@ -186,6 +192,7 @@ exports.devLoginMember = asyncHandler(async (req, res) => {
     });
 });
 
+/* ============ VERIFY LOGIN OTP ============ */
 exports.verifyLoginOtp = asyncHandler(async (req, res) => {
   const { phone, otp } = req.body || {};
   if (!phone || !otp) throwError('Phone & OTP wajib diisi', 400);
@@ -252,6 +259,8 @@ exports.verifyLoginOtp = asyncHandler(async (req, res) => {
         id: member._id,
         name: member.name,
         phone: member.phone,
+        gender: member.gender || null,
+        address: member.address || '',
         points: member.points,
         total_spend: member.total_spend,
         visit_count: member.visit_count,
@@ -262,17 +271,21 @@ exports.verifyLoginOtp = asyncHandler(async (req, res) => {
     });
 });
 
-/* =========================================================
- * REGISTER (OTP) — START: kirim OTP ke nomor baru
- * body: { name, phone }
- * ========================================================= */
 exports.registerMember = asyncHandler(async (req, res) => {
-  const { name, phone } = req.body || {};
-  if (!name || !phone) throwError('Nama dan nomor telepon wajib diisi', 400);
+  const { name, phone, gender, birthday, address, join_channel } =
+    req.body || {};
+  if (!name || !phone || !gender)
+    throwError('Nama, nomor telepon, dan gender wajib diisi', 400);
 
   const normalizedPhone = normalizePhone(phone);
   if (!/^0\d{9,13}$/.test(normalizedPhone)) {
     throwError('Format nomor tidak valid (gunakan 08xxxxxxxx)', 400);
+  }
+
+  // validasi gender enum sederhana
+  const g = String(gender).toLowerCase();
+  if (!['male', 'female', 'other'].includes(g)) {
+    throwError('Gender harus salah satu dari: male|female|other', 400);
   }
 
   const existing = await Member.findOne({ phone: normalizedPhone });
@@ -304,7 +317,13 @@ exports.registerMember = asyncHandler(async (req, res) => {
     expires_at: expiresAtFromNow(),
     last_sent_at: new Date(),
     purpose: 'register',
-    meta: { name }
+    meta: {
+      name,
+      gender: g,
+      birthday: birthday || null,
+      address: address || '',
+      join_channel: join_channel || 'cashier'
+    }
   });
 
   await sendOtpText(toWa62(normalizedPhone), code);
@@ -316,7 +335,6 @@ exports.registerMember = asyncHandler(async (req, res) => {
   });
 });
 
-// ===== REGISTER (OTP) — VERIFY + AUTO-LOGIN =====
 exports.verifyRegisterOtp = asyncHandler(async (req, res) => {
   const { phone, otp } = req.body || {};
   if (!phone || !otp) throwError('Phone & OTP wajib diisi', 400);
@@ -342,24 +360,57 @@ exports.verifyRegisterOtp = asyncHandler(async (req, res) => {
   }
 
   // Ambil data meta dari request register
-  const { name, join_channel = 'cashier' } = rec.meta || {};
-  if (!name) throwError('Data registrasi tidak lengkap (name).', 400);
+  const {
+    name,
+    gender,
+    birthday = null,
+    address = '',
+    join_channel = 'cashier'
+  } = rec.meta || {};
+  if (!name || !gender)
+    throwError('Data registrasi tidak lengkap (name/gender).', 400);
 
-  // Buat member kalau belum ada (handle race condition)
+  // Buat member kalau belum ada (handle race condition) via createMember
   let member = await Member.findOne({ phone: normalizedPhone });
   if (!member) {
-    member = await Member.create({
+    // createMember akan melempar error jika tidak valid (mis. gender)
+    member = await createMember({
       name,
       phone: normalizedPhone,
-      join_channel,
-      total_spend: 0,
-      visit_count: 0,
-      is_active: true
+      gender,
+      birthday,
+      address,
+      join_channel
     });
+    // createMember bisa return plain object atau mongoose doc tergantung implementasi
+    // pastikan kita punya mongoose doc untuk session/token => fetch ulang jika perlu
+    if (!member._id) {
+      // jika returned plain object, ambil kembali dari DB
+      member = await Member.findOne({ phone: normalizedPhone });
+    } else {
+      // jika createMember mengembalikan object plain, convert to mongoose doc by requery
+      // but safe path above already handles.
+    }
   } else {
-    // Jika sudah ada (race), update name bila berbeda (opsional)
-    if (name && member.name !== name) member.name = name;
-    if (!member.is_active) member.is_active = true;
+    // Jika sudah ada (race), update name/gender/address bila perlu
+    let changed = false;
+    if (name && String(member.name || '') !== String(name)) {
+      member.name = name;
+      changed = true;
+    }
+    if (gender && String(member.gender || '') !== String(gender)) {
+      member.gender = gender;
+      changed = true;
+    }
+    if (typeof address !== 'undefined' && member.address !== address) {
+      member.address = address || '';
+      changed = true;
+    }
+    if (!member.is_active) {
+      member.is_active = true;
+      changed = true;
+    }
+    if (changed) await member.save();
   }
 
   // Mark verified + increment visit
@@ -403,6 +454,93 @@ exports.verifyRegisterOtp = asyncHandler(async (req, res) => {
         id: member._id,
         name: member.name,
         phone: member.phone,
+        gender: member.gender || null,
+        address: member.address || '',
+        points: member.points,
+        total_spend: member.total_spend,
+        visit_count: member.visit_count,
+        phone_verified_at: member.phone_verified_at || null
+      },
+      access_expires: ACCESS_TTL,
+      refresh_expires_ms: oneYearMs
+    });
+});
+
+exports.devRegister = asyncHandler(async (req, res) => {
+  const {
+    name,
+    phone,
+    gender,
+    birthday = null,
+    address = '',
+    join_channel = 'online'
+  } = req.body || {};
+  if (!name || !phone || !gender)
+    throwError('Nama, nomor telepon, dan gender wajib diisi', 400);
+
+  const normalizedPhone = normalizePhone(phone);
+  if (!/^0\d{9,13}$/.test(normalizedPhone)) {
+    throwError('Format nomor tidak valid (gunakan 08xxxxxxxx)', 400);
+  }
+
+  // createMember akan return existing jika sudah ada (atau throw error tergantung implementasi)
+  const created = await createMember({
+    name,
+    phone: normalizedPhone,
+    gender,
+    birthday,
+    address,
+    join_channel
+  });
+
+  // ambil mongoose doc utk token/session
+  let member = created;
+  if (!member._id) {
+    member = await Member.findOne({ phone: normalizedPhone });
+  }
+
+  if (!member) throwError('Gagal membuat member', 500);
+  if (!member.phone_verified_at) member.phone_verified_at = new Date();
+  member.visit_count = (member.visit_count || 0) + 1;
+  member.last_visit_at = new Date();
+  await member.save();
+
+  const incomingDev = req.cookies?.[DEVICE_COOKIE] || req.header('x-device-id');
+  const device_id =
+    incomingDev && String(incomingDev).trim()
+      ? String(incomingDev).trim()
+      : crypto.randomUUID();
+
+  const accessToken = signAccessToken(member);
+  const refreshToken = generateOpaqueToken();
+  const refreshHash = hashToken(refreshToken);
+
+  try {
+    await MemberSession.create({
+      member: member._1d || member._id,
+      device_id,
+      refresh_hash: refreshHash,
+      user_agent: req.get('user-agent') || '',
+      ip: req.ip,
+      expires_at: new Date(Date.now() + oneYearMs)
+    });
+  } catch (e) {
+    console.warn('[devRegister] MemberSession.create failed', e?.message || e);
+  }
+
+  res
+    .cookie(ACCESS_COOKIE, accessToken, cookieAccess)
+    .cookie(REFRESH_COOKIE, refreshToken, cookieRefresh)
+    .cookie(DEVICE_COOKIE, device_id, cookieDevice)
+    .status(201)
+    .json({
+      message: 'Registrasi dev berhasil & login (no OTP)',
+      member: {
+        id: member._id,
+        name: member.name,
+        phone: member.phone,
+        gender: member.gender || null,
+        address: member.address || '',
         points: member.points,
         total_spend: member.total_spend,
         visit_count: member.visit_count,
@@ -477,13 +615,15 @@ exports.logoutMember = asyncHandler(async (req, res) => {
 
 exports.member = asyncHandler(async (req, res) => {
   const m = await Member.findById(req.member.id).select(
-    'name phone points total_spend last_visit_at updatedAt'
+    'name phone gender address points total_spend last_visit_at updatedAt'
   );
   if (!m) throwError('Member tidak ditemukan!', 404);
   res.status(200).json({
     id: m._id,
     name: m.name,
     phone: m.phone,
+    gender: m.gender || null,
+    address: m.address || '',
     points: m.points,
     total_spend: m.total_spend,
     last_visit_at: m.last_visit_at,
