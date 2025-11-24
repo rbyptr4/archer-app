@@ -32,34 +32,12 @@ function getRangeFromQuery(q = {}) {
   return { start, end };
 }
 
-/* ===========================================================
- * 1) Ringkasan pelanggan (list + metrik periode)
- * GET /member-reports/summary
- * Query:
- *  - page, limit, search
- *  - mode/period|from,to|range_mode (parsePeriod) -> apply ke paid_at (paid only)
- *  - sort: 'spend' | 'orders' | 'last_visit' | 'created' | 'lifetime_spend'
- * =========================================================== */
 exports.listMemberSummary = asyncHandler(async (req, res) => {
-  let { limit = 10, search = '', sort = 'created', cursor } = req.query;
+  let { limit = 10, search = '', cursor } = req.query;
   limit = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 200);
 
-  const { start, end } = getRangeFromQuery(req.query);
   const baseMatch = buildMemberMatch({ search });
 
-  // sorting setelah enrich tetap seperti sebelumnya
-  const sortStage =
-    sort === 'spend'
-      ? { period_spend: -1 }
-      : sort === 'orders'
-      ? { period_orders: -1 }
-      : sort === 'last_visit'
-      ? { last_visit_at: -1 }
-      : sort === 'lifetime_spend'
-      ? { total_spend: -1 }
-      : { createdAt: -1 };
-
-  // cursor based on createdAt: expect cursor = ISO date string
   const matchCursor = {};
   if (cursor) {
     const d = new Date(cursor);
@@ -68,82 +46,53 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
     }
   }
 
-  const pipeline = [
-    { $match: { $and: [baseMatch, matchCursor] } },
-    { $sort: { createdAt: -1, _id: -1 } },
-    { $limit: limit + 1 }, // ambil 1 lebih untuk deteksi next_cursor
+  const combinedMatch = { $and: [baseMatch, matchCursor] };
 
-    // lookup orders paid in period
-    {
-      $lookup: {
-        from: 'orderhistories',
-        let: { mid: '$_id' },
-        pipeline: [
-          {
-            $match: {
-              $expr: {
-                $and: [
-                  { $eq: ['$member.id', '$$mid'] },
-                  { $eq: ['$payment_status', 'paid'] },
-                  { $gte: ['$paid_at', start] },
-                  { $lte: ['$paid_at', end] }
-                ]
-              }
-            }
-          },
-          { $project: { grand_total: 1, paid_at: 1 } }
-        ],
-        as: 'tx'
-      }
-    },
-    {
-      $addFields: {
-        period_orders: { $size: '$tx' },
-        period_spend: { $sum: '$tx.grand_total' },
-        last_paid_at: { $max: '$tx.paid_at' }
-      }
-    },
+  // pipeline: match -> sort desc -> limit+1 -> project only required fields
+  const pipeline = [
+    { $match: combinedMatch },
+    { $sort: { createdAt: -1, _id: -1 } },
+    { $limit: limit + 1 },
     {
       $project: {
         name: 1,
         phone: 1,
-        join_channel: 1,
-        is_active: 1,
-        createdAt: 1,
-        last_visit_at: 1,
-        visit_count: 1,
         total_spend: 1,
-        points: 1,
-        period_orders: 1,
-        period_spend: 1,
-        last_paid_at: 1
+        createdAt: 1
       }
-    },
-    { $sort: sortStage }
+    }
   ];
 
   const raw = await Member.aggregate(pipeline).allowDiskUse(true);
 
   // next_cursor logic
   let next_cursor = null;
+  let rows = raw;
   if (raw.length > limit) {
-    const last = raw[limit - 1];
-    next_cursor = last?.createdAt
-      ? new Date(last.createdAt).toISOString()
+    const extra = raw[limit]; // there is an extra
+    next_cursor = extra?.createdAt
+      ? new Date(extra.createdAt).toISOString()
       : null;
-    raw.splice(limit); // remove extra
+    rows = raw.slice(0, limit);
   }
 
-  // total count: optional (costly). Jika FE hanya butuh infinite scroll, skip total.
+  // optional total count for search (still useful for FE)
   const total = await Member.countDocuments(baseMatch);
 
+  // map to minimal shape (no extra fields)
+  const data = rows.map((r) => ({
+    name: r.name || '',
+    phone: r.phone || '',
+    total_spend: r.total_spend || 0,
+    createdAt: r.createdAt
+  }));
+
   res.json({
-    message: 'Ringkasan pelanggan',
-    period: { start, end },
-    total,
+    message: 'Ringkasan pelanggan (simple)',
     limit,
     next_cursor,
-    data: raw
+    total,
+    data
   });
 });
 
