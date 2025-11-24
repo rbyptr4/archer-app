@@ -233,7 +233,6 @@ exports.topSpenders = asyncHandler(async (req, res) => {
   });
 });
 
-// DELETE /member-reports/member/:id?anonymize=true
 exports.deleteMemberAccount = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const anonymize = String(req.query.anonymize) === 'true';
