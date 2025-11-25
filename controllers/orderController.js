@@ -2496,20 +2496,16 @@ exports.checkout = asyncHandler(async (req, res) => {
         full._id
       }&token=${encodeURIComponent(tokenRaw)}`;
 
-      // build message
-      const receipt = buildOrderReceiptMessage(full);
       const msg = [
         '🔔 *Order Perlu Verifikasi Pembayaran*',
         `Kode: *${full.transaction_code}*`,
         `Nama: ${full.customer_name || '-'} — ${full.customer_phone || '-'}`,
         `Total: ${rp(full.grand_total)}`,
         '',
-        receipt,
-        '',
         `Jika bukti pembayaran valid, klik verifikasi (link satu kali, berlaku ${EXPIRE_HOURS} jam):`,
-        verifyLink,
+        `>${verifyLink}`,
         '',
-        '— Archer System'
+        '— Archers Cafe System'
       ].join('\n');
 
       const owners = getOwnerPhone();
@@ -4271,7 +4267,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
         full._id
       }&token=${encodeURIComponent(tokenRaw)}`;
 
-      const receipt = buildOrderReceiptMessage(full);
       const msg = [
         '🔔 *Order Via Kasir Perlu Verifikasi Pembayaran*',
         `Kode: *${full.transaction_code}*`,
@@ -4279,12 +4274,10 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
         `Pemesan: ${full.customer_name || '-'} — ${full.customer_phone || '-'}`,
         `Total: ${rp(full.grand_total)}`,
         '',
-        receipt,
-        '',
         `Jika bukti pembayaran valid, klik verifikasi (link satu kali, berlaku ${EXPIRE_HOURS} jam):`,
-        verifyLink,
+        `>${verifyLink}`,
         '',
-        '— Archer System'
+        '— Archers Cafe System'
       ].join('\n');
 
       const owners = getOwnerPhone();
