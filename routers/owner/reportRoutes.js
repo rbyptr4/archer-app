@@ -15,9 +15,9 @@ router.get('/orders/dashboard', rpt.reportDashboard);
 router.get('/orders/transactions', rpt.totalTransactions);
 router.get('/orders/transactions-type', rpt.orderDeliveryCounts);
 
-// ====== Laporan Keuangan ======
-// router.get('/finance/summary', rpt.);
-// router.get('/finance/expense-list', rpt.);
+router.get('/finance/turnover', rpt.turnover);
+router.get('/finance/revenue', rpt.revenue);
+router.get('/finance/expense', rpt.expense);
 router.get('/finance/profit-loss', rpt.profitLoss);
 
 // ====== Laporan Member ======

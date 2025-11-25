@@ -1,6 +1,7 @@
 const asyncHandler = require('express-async-handler');
 const mongoose = require('mongoose');
 const Member = require('../../models/memberModel');
+const Order = require('../../models/orderModel');
 const throwError = require('../../utils/throwError');
 const { parseRange } = require('../../utils/periodRange');
 

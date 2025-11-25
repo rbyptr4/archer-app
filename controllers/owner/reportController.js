@@ -36,6 +36,214 @@ function buildMemberMatch({ search = '' } = {}) {
   return match;
 }
 
+function toDayKey(d) {
+  return new Date(d).toISOString().substring(0, 10);
+}
+
+function buildDaysArray(start, end) {
+  const days = [];
+  const cur = new Date(start);
+  cur.setHours(0, 0, 0, 0);
+  const last = new Date(end);
+  last.setHours(0, 0, 0, 0);
+
+  while (cur <= last) {
+    days.push({
+      key: cur.toISOString().substring(0, 10),
+      omset: 0,
+      orders: [],
+      expense: 0,
+      expenses: [],
+      pendapatan: 0
+    });
+    cur.setDate(cur.getDate() + 1);
+  }
+  return days;
+}
+
+// Omset
+exports.turnover = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+  if (!start || !end) throwError('Range tanggal tidak valid', 400);
+
+  // ambil orders yang counted sebagai omset
+  const orders = await Order.find({
+    payment_status: { $in: ['paid', 'verified'] },
+    status: { $ne: 'cancelled' },
+    paid_at: { $gte: start, $lte: end }
+  })
+    .select('paid_at grand_total transaction_code customer_name member')
+    .populate('member', 'name')
+    .lean();
+
+  const days = buildDaysArray(start, end);
+  let totalOmset = 0;
+
+  for (const o of orders || []) {
+    const dt = o.paid_at || o.placed_at || o.createdAt;
+    if (!dt) continue;
+    const key = toDayKey(dt);
+    const bucket = days.find((d) => d.key === key);
+    const amt = Number(o.grand_total || 0);
+
+    if (bucket) {
+      bucket.omset += amt;
+      bucket.orders.push({
+        code: o.transaction_code || '',
+        customer: (o.member && o.member.name) || o.customer_name || '',
+        grand_total: amt
+      });
+    }
+    totalOmset += amt;
+  }
+
+  // map output items with only required fields
+  const items = days.map((d) => ({
+    key: d.key,
+    omset: d.omset,
+    orders: d.orders
+  }));
+
+  res.json({
+    period: { start, end },
+    total_omset: totalOmset,
+    items
+  });
+});
+
+// Pendapatan
+exports.revenue = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+  if (!start || !end) throwError('Range tanggal tidak valid', 400);
+
+  // ambil orders & expenses in parallel
+  const [orders, expenses] = await Promise.all([
+    Order.find({
+      payment_status: { $in: ['paid', 'verified'] },
+      status: { $ne: 'cancelled' },
+      paid_at: { $gte: start, $lte: end }
+    })
+      .select(
+        'paid_at grand_total transaction_code customer_name member payment_method'
+      )
+      .populate('member', 'name')
+      .lean(),
+    Expense.find({
+      date: { $gte: start, $lte: end }
+    })
+      .select('date amount note createdBy')
+      .populate('createdBy', 'name') // optional, if createdBy is user ref
+      .lean()
+  ]);
+
+  const days = buildDaysArray(start, end);
+
+  let totalOmset = 0;
+  let totalExpense = 0;
+
+  // orders -> fill omset and order list
+  for (const o of orders || []) {
+    const dt = o.paid_at || o.placed_at || o.createdAt;
+    if (!dt) continue;
+    const key = toDayKey(dt);
+    const bucket = days.find((d) => d.key === key);
+    const amt = Number(o.grand_total || 0);
+    if (bucket) {
+      bucket.omset += amt;
+      bucket.orders.push({
+        code: o.transaction_code || '',
+        customer: (o.member && o.member.name) || o.customer_name || '',
+        grand_total: amt,
+        payment_method: o.payment_method || null
+      });
+    }
+    totalOmset += amt;
+  }
+
+  // expenses -> fill expense list
+  for (const e of expenses || []) {
+    const dt = e.date;
+    if (!dt) continue;
+    const key = toDayKey(dt);
+    const bucket = days.find((d) => d.key === key);
+    const amt = Number(e.amount || 0);
+    if (bucket) {
+      bucket.expense += amt;
+      bucket.expenses.push({
+        name: e.note || 'Expense',
+        amount: amt,
+        createdBy: e.createdBy ? e.createdBy.name || String(e.createdBy) : null
+      });
+    }
+    totalExpense += amt;
+  }
+
+  // compute pendapatan per day and totals
+  let totalPendapatan = 0;
+  const items = days.map((d) => {
+    const pendapatan = Number(d.omset || 0) - Number(d.expense || 0);
+    totalPendapatan += pendapatan;
+    return {
+      key: d.key,
+      pendapatan,
+      orders: d.orders,
+      expenses: d.expenses
+    };
+  });
+
+  res.json({
+    period: { start, end },
+    total_pendapatan: totalPendapatan,
+    items
+  });
+});
+
+// Pengeluaran
+exports.expense = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+  if (!start || !end) throwError('Range tanggal tidak valid', 400);
+
+  const expenses = await Expense.find({
+    date: { $gte: start, $lte: end }
+  })
+    .select('date amount note createdBy')
+    .populate('createdBy', 'name')
+    .lean();
+
+  const days = buildDaysArray(start, end);
+  let totalExpense = 0;
+
+  for (const e of expenses || []) {
+    const dt = e.date;
+    if (!dt) continue;
+    const key = toDayKey(dt);
+    const bucket = days.find((d) => d.key === key);
+    const amt = Number(e.amount || 0);
+    if (bucket) {
+      bucket.expense += amt;
+      bucket.expenses.push({
+        name: e.note || 'Expense',
+        amount: amt,
+        createdBy: e.createdBy ? e.createdBy.name || String(e.createdBy) : null,
+        date: key
+      });
+    }
+    totalExpense += amt;
+  }
+
+  const items = days.map((d) => ({
+    key: d.key,
+    expense: d.expense,
+    expenses: d.expenses
+  }));
+
+  res.json({
+    period: { start, end },
+    total_expense: totalExpense,
+    items
+  });
+});
+
 // Data dashboard laporan
 exports.reportDashboard = asyncHandler(async (req, res) => {
   const { start, end } = getRangeFromQuery(req.query);
@@ -747,7 +955,188 @@ exports.bestSeller = asyncHandler(async (req, res) => {
   });
 });
 
-// List pengeluaran grafik (belum)
+// Omset
+exports.turnover = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+  if (!start || !end) throwError('Range tanggal tidak valid', 400);
+
+  // ambil orders yang counted sebagai omset
+  const orders = await Order.find({
+    payment_status: { $in: ['paid', 'verified'] },
+    status: { $ne: 'cancelled' },
+    paid_at: { $gte: start, $lte: end }
+  })
+    .select('paid_at grand_total transaction_code customer_name member')
+    .populate('member', 'name')
+    .lean();
+
+  const days = buildDaysArray(start, end);
+  let totalOmset = 0;
+
+  for (const o of orders || []) {
+    const dt = o.paid_at || o.placed_at || o.createdAt;
+    if (!dt) continue;
+    const key = toDayKey(dt);
+    const bucket = days.find((d) => d.key === key);
+    const amt = Number(o.grand_total || 0);
+
+    if (bucket) {
+      bucket.omset += amt;
+      bucket.orders.push({
+        code: o.transaction_code || '',
+        customer: (o.member && o.member.name) || o.customer_name || '',
+        grand_total: amt
+      });
+    }
+    totalOmset += amt;
+  }
+
+  // map output items with only required fields
+  const items = days.map((d) => ({
+    key: d.key,
+    omset: d.omset,
+    orders: d.orders
+  }));
+
+  res.json({
+    period: { start, end },
+    total_omset: totalOmset,
+    items
+  });
+});
+
+// Pendapatan
+exports.revenue = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+  if (!start || !end) throwError('Range tanggal tidak valid', 400);
+
+  // ambil orders & expenses in parallel
+  const [orders, expenses] = await Promise.all([
+    Order.find({
+      payment_status: { $in: ['paid', 'verified'] },
+      status: { $ne: 'cancelled' },
+      paid_at: { $gte: start, $lte: end }
+    })
+      .select(
+        'paid_at grand_total transaction_code customer_name member payment_method'
+      )
+      .populate('member', 'name')
+      .lean(),
+    Expense.find({
+      date: { $gte: start, $lte: end }
+    })
+      .select('date amount note createdBy')
+      .populate('createdBy', 'name') // optional, if createdBy is user ref
+      .lean()
+  ]);
+
+  const days = buildDaysArray(start, end);
+
+  let totalOmset = 0;
+  let totalExpense = 0;
+
+  // orders -> fill omset and order list
+  for (const o of orders || []) {
+    const dt = o.paid_at || o.placed_at || o.createdAt;
+    if (!dt) continue;
+    const key = toDayKey(dt);
+    const bucket = days.find((d) => d.key === key);
+    const amt = Number(o.grand_total || 0);
+    if (bucket) {
+      bucket.omset += amt;
+      bucket.orders.push({
+        code: o.transaction_code || '',
+        customer: (o.member && o.member.name) || o.customer_name || '',
+        grand_total: amt,
+        payment_method: o.payment_method || null
+      });
+    }
+    totalOmset += amt;
+  }
+
+  // expenses -> fill expense list
+  for (const e of expenses || []) {
+    const dt = e.date;
+    if (!dt) continue;
+    const key = toDayKey(dt);
+    const bucket = days.find((d) => d.key === key);
+    const amt = Number(e.amount || 0);
+    if (bucket) {
+      bucket.expense += amt;
+      bucket.expenses.push({
+        name: e.note || 'Expense',
+        amount: amt,
+        createdBy: e.createdBy ? e.createdBy.name || String(e.createdBy) : null
+      });
+    }
+    totalExpense += amt;
+  }
+
+  // compute pendapatan per day and totals
+  let totalPendapatan = 0;
+  const items = days.map((d) => {
+    const pendapatan = Number(d.omset || 0) - Number(d.expense || 0);
+    totalPendapatan += pendapatan;
+    return {
+      key: d.key,
+      pendapatan,
+      orders: d.orders,
+      expenses: d.expenses
+    };
+  });
+
+  res.json({
+    period: { start, end },
+    total_pendapatan: totalPendapatan,
+    items
+  });
+});
+
+// Pengeluaran
+exports.expense = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+  if (!start || !end) throwError('Range tanggal tidak valid', 400);
+
+  const expenses = await Expense.find({
+    date: { $gte: start, $lte: end }
+  })
+    .select('date amount note createdBy')
+    .populate('createdBy', 'name')
+    .lean();
+
+  const days = buildDaysArray(start, end);
+  let totalExpense = 0;
+
+  for (const e of expenses || []) {
+    const dt = e.date;
+    if (!dt) continue;
+    const key = toDayKey(dt);
+    const bucket = days.find((d) => d.key === key);
+    const amt = Number(e.amount || 0);
+    if (bucket) {
+      bucket.expense += amt;
+      bucket.expenses.push({
+        name: e.note || 'Expense',
+        amount: amt,
+        createdBy: e.createdBy ? e.createdBy.name || String(e.createdBy) : null,
+        date: key
+      });
+    }
+    totalExpense += amt;
+  }
+
+  const items = days.map((d) => ({
+    key: d.key,
+    expense: d.expense,
+    expenses: d.expenses
+  }));
+
+  res.json({
+    period: { start, end },
+    total_expense: totalExpense,
+    items
+  });
+});
 
 // Laba rugi
 exports.profitLoss = asyncHandler(async (req, res) => {
