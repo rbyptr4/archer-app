@@ -208,14 +208,6 @@ function buildOwnerVerifyMessage(order, verifyLink, expireHours = 6) {
   /* ===== Tambahkan payment method ===== */
   const pm = order.payment_method ? order.payment_method.toUpperCase() : '-';
   lines.push(`Metode Pembayaran: *${pm}*`);
-
-  lines.push('');
-  lines.push('*Rincian Pesanan:*');
-
-  for (const it of order.items || []) {
-    lines.push(`• ${it.name} x${it.quantity} — ${rp(it.line_subtotal)}`);
-  }
-
   lines.push('');
   lines.push(`Klik link berikut untuk verifikasi pembayaran:\n${verifyLink}`);
   lines.push(
