@@ -262,8 +262,6 @@ exports.updateExpense = asyncHandler(async (req, res) => {
     try {
       const folderId = getDriveFolder('expense'); // pastikan ada folder ini
       const desiredName = buildExpenseProofFileName(
-        // ambil nama tipe kalau mau: bisa ambil dari ExpenseType document,
-        // di sini kita pakai tipeId jika ada, fallback 'expense'
         req.body.typeName || doc.type || 'expense',
         doc.date || new Date(),
         req.file.originalname,

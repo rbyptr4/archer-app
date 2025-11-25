@@ -3,6 +3,7 @@ require('dotenv').config();
 const DRIVE_FOLDERS = {
   menu: process.env.MENU,
   invoice: process.env.INVOICE,
+  banner: process.env.BANNER,
   expense: process.env.EXPENSE
 };
 

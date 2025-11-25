@@ -610,7 +610,7 @@ exports.logoutMember = asyncHandler(async (req, res) => {
 
 exports.member = asyncHandler(async (req, res) => {
   const m = await Member.findById(req.member.id).select(
-    'name phone gender address points total_spend last_visit_at updatedAt'
+    'name phone gender address points total_spend last_visit_at updatedAt birthday birthday_editable'
   );
   if (!m) throwError('Member tidak ditemukan!', 404);
   res.status(200).json({
@@ -620,6 +620,8 @@ exports.member = asyncHandler(async (req, res) => {
     gender: m.gender || null,
     address: m.address || '',
     points: m.points,
+    birthday: m.birthday,
+    birthday_editable: m.birthday_editable,
     total_spend: m.total_spend,
     last_visit_at: m.last_visit_at,
     updatedAt: m.updatedAt
