@@ -1,19 +1,18 @@
 const asyncHandler = require('express-async-handler');
 const mongoose = require('mongoose');
+const dayjs = require('dayjs');
 
 const Expense = require('../../models/expenseModel');
 const Order = require('../../models/orderModel');
 const Member = require('../../models/memberModel');
 
-const dayjs = require('dayjs');
 const throwError = require('../../utils/throwError');
+const { parseRange } = require('../../utils/periodRange');
 
 const asInt = (v, d = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? Math.trunc(n) : d;
 };
-
-const { parseRange } = require('../../utils/periodRange');
 
 function getRangeFromQuery(q = {}) {
   const rangeKey = q.range || q.period || 'today';
@@ -469,6 +468,7 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
 
   // map to minimal shape (no extra fields)
   const data = rows.map((r) => ({
+    id: r._id,
     name: r.name || '',
     phone: r.phone || '',
     total_spend: r.total_spend || 0,
@@ -815,37 +815,46 @@ exports.customerGrowth = asyncHandler(async (req, res) => {
 
   if (gender) match.gender = gender;
 
+  // ambil data sesuai filter gender (untuk chart utama)
   const rows = await Member.find(match).select('createdAt gender').lean();
 
-  const genderRows = await Member.find({
+  // ambil semua gender di periode (untuk breakdown per hari)
+  const allGenderRows = await Member.find({
     createdAt: { $gte: start, $lte: end }
   })
-    .select('gender')
+    .select('createdAt gender')
     .lean();
 
-  const maleCount = genderRows.filter((x) => x.gender === 'male').length;
-  const femaleCount = genderRows.filter((x) => x.gender === 'female').length;
+  // hitung total gender global periode
+  const maleCount = allGenderRows.filter((x) => x.gender === 'male').length;
+  const femaleCount = allGenderRows.filter((x) => x.gender === 'female').length;
 
+  // bikin range hari
   const days = [];
   const cur = new Date(start);
 
   while (cur <= end) {
-    const dayStr = cur.toISOString().substring(0, 10);
-    days.push({ key: dayStr, count: 0 });
+    const key = cur.toISOString().substring(0, 10);
+    days.push({ key, count: 0, male: 0, female: 0 });
     cur.setDate(cur.getDate() + 1);
   }
 
-  for (const m of rows) {
+  // hitung breakdown per hari (tanpa filter gender)
+  for (const m of allGenderRows) {
     const d = m.createdAt.toISOString().substring(0, 10);
     const bucket = days.find((x) => x.key === d);
-    if (bucket) bucket.count++;
+    if (bucket) {
+      bucket.count++;
+      if (m.gender === 'male') bucket.male++;
+      if (m.gender === 'female') bucket.female++;
+    }
   }
 
   res.json({
     period: { start, end },
     gender_filter: gender || 'all',
-    items: days,
-    total: rows.length,
+    items: days, // tiap hari: key, count, male, female
+    total: rows.length, // total row sesuai filter gender
     gender_stats: {
       male: maleCount,
       female: femaleCount
