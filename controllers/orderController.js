@@ -2492,7 +2492,7 @@ exports.checkout = asyncHandler(async (req, res) => {
       // build verify link with raw token
       const DASHBOARD_URL =
         process.env.DASHBOARD_URL || 'https://dashboard.example.com';
-      const verifyLink = `${DASHBOARD_URL}/orders/owner-verify?orderId=${
+      const verifyLink = `${DASHBOARD_URL}/public/owner-verify?orderId=${
         full._id
       }&token=${encodeURIComponent(tokenRaw)}`;
 
@@ -4261,9 +4261,8 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
         )
       );
 
-      const DASHBOARD_URL =
-        process.env.DASHBOARD_URL || 'https://dashboard.example.com';
-      const verifyLink = `${DASHBOARD_URL}/orders/owner-verify?orderId=${
+      const DASHBOARD_URL = process.env.DASHBOARD_URL;
+      const verifyLink = `${DASHBOARD_URL}/public/owner-verify?orderId=${
         full._id
       }&token=${encodeURIComponent(tokenRaw)}`;
 

@@ -24,6 +24,7 @@ const orderRoutes = require('./routers/orderRoutes'); // order list/detail/kitch
 const paymentRoutes = require('./routers/paymentRoutes');
 const guestSession = require('./routers/guestSessionRouter');
 const promoRoutes = require('./routers/owner/promoRouter');
+const verificationRoutes = require('./routers/public/verificationRouter');
 
 // Models (load sekali di awal)
 require('./models/orderModel');
@@ -75,6 +76,7 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use('/public', verificationRoutes);
 app.use('/guest', guestSession);
 app.use('/auth', authRoutes);
 app.use('/employees', employeeRoutes);
