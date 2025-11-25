@@ -3498,6 +3498,7 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
       name: order.member?.name || order.customer_name || null,
       phone: order.member?.phone || order.customer_phone || null
     },
+    ownerVerified: order.ownerVerified,
     fulfillment_type: order.fulfillment_type || null,
     table_number: order.table_number ?? null,
     payment_status: order.payment_status ?? null,
