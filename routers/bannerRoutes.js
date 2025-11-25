@@ -9,7 +9,6 @@ const imageUploader = require('../utils/fileUploader');
 
 const ctl = require('../controllers/bannerController');
 
-// === Proteksi semua route banner ===
 router.use(
   validateToken,
   requireRole('owner', 'courier', 'kitchen', 'cashier'),

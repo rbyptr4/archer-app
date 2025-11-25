@@ -171,6 +171,17 @@ exports.listBanners = asyncHandler(async (req, res) => {
   });
 });
 
+exports.publicHomeBanners = asyncHandler(async (req, res) => {
+  const rows = await Banner.find({ isActive: true })
+    .sort({ createdAt: -1 })
+    .select('imageUrl -_id')
+    .lean();
+
+  const urls = (rows || []).map((r) => r.imageUrl).filter(Boolean);
+
+  res.json({ data: urls });
+});
+
 exports.getBannerById = asyncHandler(async (req, res) => {
   const id = req.params.id;
   if (!mongoose.Types.ObjectId.isValid(id)) throwError('ID tidak valid', 400);
