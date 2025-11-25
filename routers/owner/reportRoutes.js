@@ -30,7 +30,6 @@ router.get('/members/customer-growth', rpt.customerGrowth);
 router.get('/menu/top-menu', rpt.bestSeller);
 
 router.get('/orders/:id', rpt.getDetailOrder);
-router.get('/members/:id', rpt.getMemberDetail);
-router.get('/members/transaction/:id', rpt.transactionMemberDetail);
+router.get('/members/:id', rpt.getMemberFullDetail);
 
 module.exports = router;

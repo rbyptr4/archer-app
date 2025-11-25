@@ -505,7 +505,7 @@ exports.memberDashboard = asyncHandler(async (req, res) => {
   });
 });
 
-exports.transactionMemberDetail = asyncHandler(async (req, res) => {
+exports.getMemberFullDetail = asyncHandler(async (req, res) => {
   const { id } = req.params;
 
   if (!mongoose.Types.ObjectId.isValid(id)) {
@@ -542,7 +542,6 @@ exports.transactionMemberDetail = asyncHandler(async (req, res) => {
 
   const totalTransaksi = orders.length;
 
-  // tanggal transaksi pertama & terakhir
   const firstTransaction = orders.length
     ? orders.reduce((a, b) => (a.paid_at < b.paid_at ? a : b)).paid_at
     : null;
@@ -551,13 +550,13 @@ exports.transactionMemberDetail = asyncHandler(async (req, res) => {
     ? orders.reduce((a, b) => (a.paid_at > b.paid_at ? a : b)).paid_at
     : null;
 
-  // total diskon yang didapat
+  // total diskon yang didapat (top-level)
   const totalDiskon = orders.reduce(
     (sum, o) => sum + (o.items_discount || 0) + (o.shipping_discount || 0),
     0
   );
 
-  // rincian fulfillment count
+  // rincian fulfillment
   const summaryFulfillment = {
     dine_in: 0,
     delivery: 0,
@@ -581,10 +580,10 @@ exports.transactionMemberDetail = asyncHandler(async (req, res) => {
     }
   });
 
-  // Ambil detail order limit 50
-  const recentOrders = await Order.find({
-    member: id
-  })
+  // ===========================
+  //   RECENT 50 ORDERS
+  // ===========================
+  const recentOrders = await Order.find({ member: id })
     .sort({ placed_at: -1 })
     .limit(50)
     .select({
@@ -596,49 +595,36 @@ exports.transactionMemberDetail = asyncHandler(async (req, res) => {
     })
     .lean();
 
+  // ===========================
+  //   FINAL RESPONSE (CLEAN)
+  // ===========================
   res.json({
-    member: {
+    member_profile: {
       id: member._id,
       name: member.name,
       phone: member.phone,
-      points: member.points,
-      spend_total: member.total_spend,
-      spend_point_total: member.spend_point_total
+      gender: member.gender,
+      createdAt: member.createdAt,
+      birthday: member.birthday,
+      address: member.address,
+
+      // loyalty
+      points: member.points || 0,
+      spend_total: member.total_spend || 0,
+      spend_point_total: member.spend_point_total || 0,
+      visit_count: member.visit_count || 0,
+      last_visit_at: member.last_visit_at || null
     },
-    transaction_summary: {
-      total_transaksi: totalTransaksi,
-      pertama_transaksi: firstTransaction,
-      terakhir_transaksi: lastTransaction,
-      total_diskon: totalDiskon,
-      fulfillment: summaryFulfillment
+
+    transaction_stats: {
+      total_transaction: totalTransaksi,
+      first_transaction: firstTransaction,
+      last_transaction: lastTransaction,
+      total_discount: totalDiskon,
+      fulfillment_breakdown: summaryFulfillment
     },
+
     recent_orders: recentOrders
-  });
-});
-
-// Detail
-exports.getMemberDetail = asyncHandler(async (req, res) => {
-  const { id } = req.params;
-
-  if (!mongoose.Types.ObjectId.isValid(id)) throwError('ID tidak valid', 400);
-
-  const m = await Member.findById(id).lean();
-  if (!m) throwError('Member tidak ditemukan', 404);
-
-  res.json({
-    member: {
-      _id: m._id,
-      name: m.name,
-      phone: m.phone,
-      gender: m.gender,
-      createdAt: m.createdAt,
-      points: m.points || 0,
-      spend_point_total: m.spend_point_total,
-      birthday: m.birthday,
-      total_spend: m.total_spend || 0,
-      visit_count: m.visit_count || 0,
-      last_visit_at: m.last_visit_at || null
-    }
   });
 });
 
