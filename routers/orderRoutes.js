@@ -154,7 +154,7 @@ router.get(
   '/owner-verify',
   validateToken,
   requireRole('owner'),
-  order.verifyOwnerWA
+  order.verifyOwnerByToken
 );
 
 router.get(

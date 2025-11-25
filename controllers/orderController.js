@@ -2492,7 +2492,7 @@ exports.checkout = asyncHandler(async (req, res) => {
       // build verify link with raw token
       const DASHBOARD_URL =
         process.env.DASHBOARD_URL || 'https://dashboard.example.com';
-      const verifyLink = `${DASHBOARD_URL}/api/owner/orders/verify?orderId=${
+      const verifyLink = `${DASHBOARD_URL}/orders/owner-verify?orderId=${
         full._id
       }&token=${encodeURIComponent(tokenRaw)}`;
 
@@ -4267,13 +4267,13 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
 
       const DASHBOARD_URL =
         process.env.DASHBOARD_URL || 'https://dashboard.example.com';
-      const verifyLink = `${DASHBOARD_URL}/api/owner/orders/verify?orderId=${
+      const verifyLink = `${DASHBOARD_URL}/orders/owner-verify?orderId=${
         full._id
       }&token=${encodeURIComponent(tokenRaw)}`;
 
       const receipt = buildOrderReceiptMessage(full);
       const msg = [
-        '🔔 *Order POS Perlu Verifikasi Pembayaran*',
+        '🔔 *Order Via Kasir Perlu Verifikasi Pembayaran*',
         `Kode: *${full.transaction_code}*`,
         `Meja: ${full.table_number || '-'}`,
         `Pemesan: ${full.customer_name || '-'} — ${full.customer_phone || '-'}`,
