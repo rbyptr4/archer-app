@@ -6256,28 +6256,20 @@ exports.verifyOwnerByToken = asyncHandler(async (req, res) => {
 
   const verification = order.verification || {};
   if (!verification.tokenHash || !verification.expiresAt) {
-    return res.status(400).json({
-      ok: false,
-      code: 'no_token',
-      message: 'Token verifikasi tidak ditemukan'
-    });
+    const EXPIRED_URL = process.env.OWNER_VERIFY_EXPIRED_URL;
+    return res.redirect(EXPIRED_URL);
   }
 
-  // already used?
   if (verification.usedAt) {
-    return res
-      .status(409)
-      .json({ ok: false, code: 'used', message: 'Token sudah digunakan' });
+    const USED_URL = process.env.OWNER_VERIFY_USED_URL;
+    return res.redirect(USED_URL);
   }
 
-  // expired?
   if (new Date() > new Date(verification.expiresAt)) {
-    return res
-      .status(410)
-      .json({ ok: false, code: 'expired', message: 'Token sudah kadaluarsa' });
+    const EXPIRED_URL = process.env.OWNER_VERIFY_EXPIRED_URL;
+    return res.redirect(EXPIRED_URL);
   }
 
-  // verify token hash
   const candidateHash = hashTokenVerification(token);
   if (candidateHash !== verification.tokenHash) {
     return res
@@ -6285,7 +6277,6 @@ exports.verifyOwnerByToken = asyncHandler(async (req, res) => {
       .json({ ok: false, code: 'invalid', message: 'Token tidak valid' });
   }
 
-  // valid -> mark ownerVerified & mark used meta
   order.ownerVerified = true;
   order.ownerVerifiedAt = new Date();
 
@@ -6312,12 +6303,7 @@ exports.verifyOwnerByToken = asyncHandler(async (req, res) => {
     console.error('[emit][verifyOwnerByToken]', e?.message || e);
   }
 
-  // Redirect on success (WA opens this in browser)
-  const SUCCESS_URL =
-    process.env.OWNER_VERIFY_SUCCESS_URL ||
-    (process.env.DASHBOARD_URL
-      ? `${process.env.DASHBOARD_URL}/owner/verify-success`
-      : '/owner/verify-success');
+  const SUCCESS_URL = process.env.OWNER_VERIFY_SUCCESS_URL;
 
   return res.redirect(SUCCESS_URL);
 });
