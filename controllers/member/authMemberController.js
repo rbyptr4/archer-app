@@ -631,10 +631,10 @@ exports.updateBirthday = asyncHandler(async (req, res) => {
   if (!memberId) throwError('Unauthorized', 401);
 
   const { birthday } = req.body || {};
-  if (!birthday) throwError('Field birthday wajib diisi', 400);
+  if (!birthday) throwError('Tanggal ulang tahun wajib diisi', 400);
 
   const d = new Date(birthday);
-  if (isNaN(d.getTime())) throwError('Tanggal birthday tidak valid', 400);
+  if (isNaN(d.getTime())) throwError('Tanggal tidak valid', 400);
 
   const member = await Member.findById(memberId);
   if (!member) throwError('Member tidak ditemukan', 404);

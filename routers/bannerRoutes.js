@@ -18,7 +18,7 @@ router.use(
 
 router.post(
   '/create-banner',
-  imageUploader.single('banner_image'),
+  imageUploader.single('banner-image'),
   parseFormData,
   ctl.createBanner
 );
