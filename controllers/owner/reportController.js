@@ -261,6 +261,173 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
   return res.status(200).json({ success: true, order: slim });
 });
 
+const asyncHandler = require('express-async-handler');
+const mongoose = require('mongoose');
+const Order = require('../../models/orderModel');
+const { parseRange } = require('../../utils/periodRange');
+const throwError = require('../../utils/throwError');
+
+// helper konsisten
+function getRangeFromQuery(q = {}) {
+  const rangeKey = q.range || q.period || 'today';
+  const weekStartsOn = Number.isFinite(+q.weekStartsOn) ? +q.weekStartsOn : 1;
+  const { start, end } = parseRange({
+    range: rangeKey,
+    from: q.from || q.start,
+    to: q.to || q.end,
+    weekStartsOn
+  });
+  return { start, end };
+}
+
+// Ringkasan per layanan
+exports.orderDeliveryCounts = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const { start, end } = getRangeFromQuery(req.query);
+
+  const pipeline = [
+    {
+      $match: {
+        placed_at: { $gte: start, $lte: end }
+      }
+    },
+    // normalisasi mode delivery
+    {
+      $addFields: {
+        delivery_mode: {
+          $let: {
+            vars: {
+              dm: { $ifNull: ['$delivery.mode', null] },
+              ft: { $ifNull: ['$fulfillment_type', null] }
+            },
+            in: {
+              $cond: [
+                { $and: [{ $ne: ['$$dm', null] }, { $ne: ['$$dm', ''] }] },
+                '$$dm',
+                {
+                  $cond: [
+                    { $eq: ['$$ft', 'dine_in'] },
+                    'none',
+                    {
+                      $cond: [{ $eq: ['$$ft', 'delivery'] }, 'delivery', 'none']
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    // hitung per-order: base grand_total, top-level discounts, dan total discounts dari discounts[] (mis. voucher/promo)
+    {
+      $addFields: {
+        _perOrderTopLevelDiscounts: {
+          $add: [
+            { $ifNull: ['$items_discount', 0] },
+            { $ifNull: ['$shipping_discount', 0] }
+          ]
+        },
+        _perOrderDiscountsArrayTotal: {
+          $reduce: {
+            input: { $ifNull: ['$discounts', []] },
+            initialValue: 0,
+            in: {
+              $add: ['$$value', { $ifNull: ['$$this.amountTotal', 0] }]
+            }
+          }
+        }
+      }
+    },
+    // group by mode: count, sum grand_total, sum all discounts (top-level + array)
+    {
+      $group: {
+        _id: '$delivery_mode',
+        count: { $sum: 1 },
+        grand_total_sum: { $sum: { $ifNull: ['$grand_total', 0] } },
+        discounts_sum: {
+          $sum: {
+            $add: [
+              '$_perOrderTopLevelDiscounts',
+              '$_perOrderDiscountsArrayTotal'
+            ]
+          }
+        }
+      }
+    }
+  ];
+
+  const agg = await Order.aggregate(pipeline).allowDiskUse(true);
+
+  const map = {
+    none: {
+      count: 0,
+      grand_total: 0,
+      discounts: 0,
+      grand_total_including_discounts: 0
+    },
+    delivery: {
+      count: 0,
+      grand_total: 0,
+      discounts: 0,
+      grand_total_including_discounts: 0
+    },
+    pickup: {
+      count: 0,
+      grand_total: 0,
+      discounts: 0,
+      grand_total_including_discounts: 0
+    }
+  };
+
+  let totalCount = 0;
+  let totalGrand = 0;
+  let totalDiscounts = 0;
+
+  for (const r of agg) {
+    const key = String(r._id || 'none');
+    const cnt = Number(r.count || 0);
+    const gsum = Number(r.grand_total_sum || 0);
+    const dsum = Number(r.discounts_sum || 0);
+
+    if (!map[key]) {
+      map[key] = {
+        count: 0,
+        grand_total: 0,
+        discounts: 0,
+        grand_total_including_discounts: 0
+      };
+    }
+
+    map[key].count = cnt;
+    map[key].grand_total = gsum;
+    map[key].discounts = dsum;
+    map[key].grand_total_including_discounts = gsum + dsum;
+
+    totalCount += cnt;
+    totalGrand += gsum;
+    totalDiscounts += dsum;
+  }
+
+  const total = {
+    count: totalCount,
+    grand_total: totalGrand,
+    discounts: totalDiscounts,
+    grand_total_including_discounts: totalGrand + totalDiscounts
+  };
+
+  res.json({
+    period: { start, end },
+    counts: {
+      none: map.none,
+      delivery: map.delivery,
+      pickup: map.pickup,
+      total
+    }
+  });
+});
+
 //  list member
 exports.listMemberSummary = asyncHandler(async (req, res) => {
   let { limit = 10, search = '', cursor } = req.query;
@@ -354,6 +521,117 @@ exports.memberDashboard = asyncHandler(async (req, res) => {
       new_last_7_days: new7days,
       new_this_month: newThisMonth
     }
+  });
+});
+
+exports.transactionMemberDetail = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    throwError('Member ID tidak valid', 400);
+  }
+
+  const member = await Member.findById(id).lean();
+  if (!member) throwError('Member tidak ditemukan', 404);
+
+  // ===========================
+  //   AGGREGATE ORDER MEMBER
+  // ===========================
+  const orders = await Order.aggregate([
+    {
+      $match: {
+        member: new mongoose.Types.ObjectId(id),
+        payment_status: 'verified'
+      }
+    },
+    {
+      $project: {
+        transaction_code: 1,
+        fulfillment_type: 1,
+        'delivery.mode': 1,
+        payment_status: 1,
+        status: 1,
+        placed_at: 1,
+        paid_at: 1,
+        items_discount: 1,
+        shipping_discount: 1
+      }
+    }
+  ]);
+
+  const totalTransaksi = orders.length;
+
+  // tanggal transaksi pertama & terakhir
+  const firstTransaction = orders.length
+    ? orders.reduce((a, b) => (a.paid_at < b.paid_at ? a : b)).paid_at
+    : null;
+
+  const lastTransaction = orders.length
+    ? orders.reduce((a, b) => (a.paid_at > b.paid_at ? a : b)).paid_at
+    : null;
+
+  // total diskon yang didapat
+  const totalDiskon = orders.reduce(
+    (sum, o) => sum + (o.items_discount || 0) + (o.shipping_discount || 0),
+    0
+  );
+
+  // rincian fulfillment count
+  const summaryFulfillment = {
+    dine_in: 0,
+    delivery: 0,
+    pickup: 0,
+    none: 0
+  };
+
+  orders.forEach((o) => {
+    const mode =
+      o.delivery?.mode ||
+      (o.fulfillment_type === 'dine_in'
+        ? 'dine_in'
+        : o.fulfillment_type === 'delivery'
+        ? 'delivery'
+        : 'none');
+
+    if (summaryFulfillment[mode] !== undefined) {
+      summaryFulfillment[mode]++;
+    } else {
+      summaryFulfillment.none++;
+    }
+  });
+
+  // Ambil detail order limit 50
+  const recentOrders = await Order.find({
+    member: id
+  })
+    .sort({ placed_at: -1 })
+    .limit(50)
+    .select({
+      transaction_code: 1,
+      placed_at: 1,
+      status: 1,
+      payment_status: 1,
+      'delivery.mode': 1
+    })
+    .lean();
+
+  res.json({
+    member: {
+      id: member._id,
+      name: member.name,
+      phone: member.phone,
+      points: member.points,
+      spend_total: member.total_spend,
+      spend_point_total: member.spend_point_total
+    },
+    transaction_summary: {
+      total_transaksi: totalTransaksi,
+      pertama_transaksi: firstTransaction,
+      terakhir_transaksi: lastTransaction,
+      total_diskon: totalDiskon,
+      fulfillment: summaryFulfillment
+    },
+    recent_orders: recentOrders
   });
 });
 

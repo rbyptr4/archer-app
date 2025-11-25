@@ -10,8 +10,20 @@ const {
   extractDriveIdFromUrl
 } = require('../utils/googleDrive');
 const { buildExpenseProofFileName } = require('../utils/makeFileName');
-const { parsePeriod } = require('../utils/periodRange');
+const { parseRange } = require('../utils/periodRange');
 const { getDriveFolder } = require('../utils/driveFolders');
+
+function getRangeFromQuery(q = {}) {
+  const rangeKey = q.range || q.period || 'today';
+  const weekStartsOn = Number.isFinite(+q.weekStartsOn) ? +q.weekStartsOn : 1;
+  const { start, end } = parseRange({
+    range: rangeKey,
+    from: q.from,
+    to: q.to,
+    weekStartsOn
+  });
+  return { start, end };
+}
 
 exports.createType = asyncHandler(async (req, res) => {
   const { name, description } = req.body || {};

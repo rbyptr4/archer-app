@@ -13,6 +13,7 @@ router.use(
 
 router.get('/orders/dashboard', rpt.reportDashboard);
 router.get('/orders/transactions', rpt.totalTransactions);
+router.get('/orders/transactions-type', rpt.orderDeliveryCounts);
 
 // ====== Laporan Keuangan ======
 // router.get('/finance/summary', rpt.);
@@ -30,5 +31,6 @@ router.get('/menu/top-menu', rpt.bestSeller);
 
 router.get('/orders/:id', rpt.getDetailOrder);
 router.get('/members/:id', rpt.getMemberDetail);
+router.get('/members/transaction/:id', rpt.transactionMemberDetail);
 
 module.exports = router;
