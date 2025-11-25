@@ -5485,11 +5485,13 @@ exports.markAssignedToDelivered = asyncHandler(async (req, res) => {
     );
   }
 
-  if (
-    order.delivery.courier?.user &&
-    String(order.delivery.courier.user) !== String(req.user._id)
-  ) {
-    throwError('Tidak berhak: order ini bukan ditugaskan ke Anda', 403);
+  if (req.user.role !== 'owner') {
+    if (
+      order.delivery.courier?.user &&
+      String(order.delivery.courier.user) !== String(req.user._id)
+    ) {
+      throwError('Tidak berhak: order ini bukan ditugaskan ke Anda', 403);
+    }
   }
 
   const now = new Date();
@@ -5498,14 +5500,12 @@ exports.markAssignedToDelivered = asyncHandler(async (req, res) => {
   order.delivery.status = 'delivered';
   order.delivery.timestamps = order.delivery.timestamps || {};
   order.delivery.timestamps.delivered_at = now;
-  // some schemas had top-level delivery.delivered_at legacy field — set kalau ada
   if ('delivered_at' in (order.delivery || {})) {
     order.delivery.delivered_at = now;
   }
 
   const updatedOrder = await order.save();
 
-  // === EMIT SOCKETS sesuai contoh kamu ===
   try {
     const payload = {
       id: String(updatedOrder._id),
@@ -5521,15 +5521,13 @@ exports.markAssignedToDelivered = asyncHandler(async (req, res) => {
       }
     };
 
-    // beri tahu kasir (toast singkat)
     if (typeof emitToCashier === 'function') {
       emitToCashier('staff:notify', {
         message:
-          'Kurir menandai pesanan sebagai sudah diantar. Silakan cek untuk konfirmasi.'
+          'Kurir menandai pesanan sudah diantar. Silakan cek untuk konfirmasi.'
       });
     }
 
-    // update stream supaya kasir bisa tampilkan pending-complete
     if (typeof emitOrdersStream === 'function') {
       emitOrdersStream({ target: 'cashier', action: 'update', item: payload });
     }
