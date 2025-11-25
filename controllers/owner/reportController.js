@@ -27,6 +27,16 @@ function getRangeFromQuery(q = {}) {
   return { start, end };
 }
 
+function buildMemberMatch({ search = '' } = {}) {
+  const match = {};
+  const s = String(search || '').trim();
+  if (s) {
+    const rx = new RegExp(s, 'i');
+    match.$or = [{ name: rx }, { phone: rx }];
+  }
+  return match;
+}
+
 // Data dashboard laporan
 exports.reportDashboard = asyncHandler(async (req, res) => {
   const { start, end } = getRangeFromQuery(req.query);

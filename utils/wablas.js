@@ -19,13 +19,12 @@ async function sendText(phone, message) {
   }
 }
 
-/** Sudah ada di kamu, biarkan tetap tersedia */
 async function sendOtpText(phone, code) {
   const message = `
   🔐 Kode OTP Archers : *${code}*
 
 _Jangan bagikan kode ini ke siapa pun._
-_Berlaku 5 menit.
+_Berlaku 5 menit._
 
 _
 `;
