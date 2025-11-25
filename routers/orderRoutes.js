@@ -150,12 +150,7 @@ router.get(
   order.getPickupOrders
 );
 
-router.get(
-  '/owner-verify',
-  validateToken,
-  requireRole('owner'),
-  order.verifyOwnerByToken
-);
+router.get('/verify-owner', order.verifyOwnerByToken);
 
 router.get(
   '/dashboard',
