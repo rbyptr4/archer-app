@@ -261,25 +261,6 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
   return res.status(200).json({ success: true, order: slim });
 });
 
-const asyncHandler = require('express-async-handler');
-const mongoose = require('mongoose');
-const Order = require('../../models/orderModel');
-const { parseRange } = require('../../utils/periodRange');
-const throwError = require('../../utils/throwError');
-
-// helper konsisten
-function getRangeFromQuery(q = {}) {
-  const rangeKey = q.range || q.period || 'today';
-  const weekStartsOn = Number.isFinite(+q.weekStartsOn) ? +q.weekStartsOn : 1;
-  const { start, end } = parseRange({
-    range: rangeKey,
-    from: q.from || q.start,
-    to: q.to || q.end,
-    weekStartsOn
-  });
-  return { start, end };
-}
-
 // Ringkasan per layanan
 exports.orderDeliveryCounts = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
