@@ -1,4 +1,3 @@
-// controllers/member/authMemberController.js
 const asyncHandler = require('express-async-handler');
 const crypto = require('crypto');
 const Member = require('../../models/memberModel');
@@ -133,41 +132,34 @@ exports.devLoginMember = asyncHandler(async (req, res) => {
     );
   if (!member.is_active) throwError('Akun member tidak aktif.', 403);
 
-  // optional: cek nama kalau mau
   if (!sameName(member.name, name)) {
     throwError('Nama tidak cocok dengan nomor ini.', 400);
   }
 
-  // update minimal metadata sama seperti verifyLoginOtp
   if (!member.phone_verified_at) member.phone_verified_at = new Date();
   member.visit_count = (member.visit_count || 0) + 1;
   member.last_visit_at = new Date();
   await member.save();
 
-  // device id: prioritas cookie, lalu header, bila tidak ada generate baru
   const incomingDev = req.cookies?.[DEVICE_COOKIE] || req.header('x-device-id');
   const device_id =
     incomingDev && String(incomingDev).trim()
       ? String(incomingDev).trim()
       : crypto.randomUUID();
 
-  // Token handling: access JWT + opaque refresh
   const accessToken = signAccessToken(member);
   const refreshToken = generateOpaqueToken();
   const refreshHash = hashToken(refreshToken);
 
-  // Simpan session member (mirip alur verifyLoginOtp)
   await MemberSession.create({
     member: member._id,
     device_id,
     refresh_hash: refreshHash,
     user_agent: req.get('user-agent') || '',
     ip: req.ip,
-    // gunakan TTL yang sama dengan mekanisme lain (REFRESH_TTL_MS)
     expires_at: new Date(Date.now() + REFRESH_TTL_MS)
   });
 
-  // set cookie (akses HTTP-only untuk access & refresh, device non-httpOnly)
   res
     .cookie(ACCESS_COOKIE, accessToken, cookieAccess)
     .cookie(REFRESH_COOKIE, refreshToken, cookieRefresh)
@@ -271,6 +263,7 @@ exports.verifyLoginOtp = asyncHandler(async (req, res) => {
     });
 });
 
+/* ============ registerMember (kirim OTP) ============ */
 exports.registerMember = asyncHandler(async (req, res) => {
   const { name, phone, gender, birthday, address, join_channel } =
     req.body || {};
@@ -282,7 +275,6 @@ exports.registerMember = asyncHandler(async (req, res) => {
     throwError('Format nomor tidak valid (gunakan 08xxxxxxxx)', 400);
   }
 
-  // validasi gender enum sederhana
   const g = String(gender).toLowerCase();
   if (!['male', 'female', 'other'].includes(g)) {
     throwError('Gender harus salah satu dari: male|female|other', 400);
@@ -370,10 +362,13 @@ exports.verifyRegisterOtp = asyncHandler(async (req, res) => {
   if (!name || !gender)
     throwError('Data registrasi tidak lengkap (name/gender).', 400);
 
+  // Tandai OTP terpakai segera (agar race lebih aman)
+  rec.used_at = new Date();
+  await rec.save();
+
   // Buat member kalau belum ada (handle race condition) via createMember
   let member = await Member.findOne({ phone: normalizedPhone });
   if (!member) {
-    // createMember akan melempar error jika tidak valid (mis. gender)
     member = await createMember({
       name,
       phone: normalizedPhone,
@@ -382,17 +377,12 @@ exports.verifyRegisterOtp = asyncHandler(async (req, res) => {
       address,
       join_channel
     });
-    // createMember bisa return plain object atau mongoose doc tergantung implementasi
-    // pastikan kita punya mongoose doc untuk session/token => fetch ulang jika perlu
     if (!member._id) {
-      // jika returned plain object, ambil kembali dari DB
       member = await Member.findOne({ phone: normalizedPhone });
     } else {
-      // jika createMember mengembalikan object plain, convert to mongoose doc by requery
-      // but safe path above already handles.
+      // if createMember returned doc-like, okay
     }
   } else {
-    // Jika sudah ada (race), update name/gender/address bila perlu
     let changed = false;
     if (name && String(member.name || '') !== String(name)) {
       member.name = name;
@@ -410,6 +400,15 @@ exports.verifyRegisterOtp = asyncHandler(async (req, res) => {
       member.is_active = true;
       changed = true;
     }
+
+    if (birthday) {
+      const d = new Date(birthday);
+      if (isNaN(d.getTime())) throwError('Tanggal birthday tidak valid', 400);
+      member.birthday = d;
+      member.birthday_editable = false;
+      changed = true;
+    }
+
     if (changed) await member.save();
   }
 
@@ -418,10 +417,6 @@ exports.verifyRegisterOtp = asyncHandler(async (req, res) => {
   member.visit_count = (member.visit_count || 0) + 1;
   member.last_visit_at = new Date();
   await member.save();
-
-  // Tandai OTP terpakai
-  rec.used_at = new Date();
-  await rec.save();
 
   // === AUTO-LOGIN (issue tokens + cookies) ===
   const incomingDev = req.cookies?.[DEVICE_COOKIE] || req.header('x-device-id');
@@ -466,6 +461,7 @@ exports.verifyRegisterOtp = asyncHandler(async (req, res) => {
     });
 });
 
+/* ============ devRegister (no OTP) ============ */
 exports.devRegister = asyncHandler(async (req, res) => {
   const {
     name,
@@ -546,6 +542,7 @@ exports.devRegister = asyncHandler(async (req, res) => {
     });
 });
 
+/* ============ refreshMember, logoutMember, member (me) ============ */
 exports.refreshMember = asyncHandler(async (req, res) => {
   const rawRt = req.cookies?.[REFRESH_COOKIE];
   const dev = req.cookies?.[DEVICE_COOKIE] || req.header('x-device-id');
@@ -625,5 +622,55 @@ exports.member = asyncHandler(async (req, res) => {
     total_spend: m.total_spend,
     last_visit_at: m.last_visit_at,
     updatedAt: m.updatedAt
+  });
+});
+
+/* ============ PATCH: update birthday (one-time editable when allowed) ============ */
+exports.updateBirthday = asyncHandler(async (req, res) => {
+  const memberId = req.member && req.member.id;
+  if (!memberId) throwError('Unauthorized', 401);
+
+  const { birthday } = req.body || {};
+  if (!birthday) throwError('Field birthday wajib diisi', 400);
+
+  const d = new Date(birthday);
+  if (isNaN(d.getTime())) throwError('Tanggal birthday tidak valid', 400);
+
+  const member = await Member.findById(memberId);
+  if (!member) throwError('Member tidak ditemukan', 404);
+
+  if (member.birthday_editable === false) {
+    throwError('Tanggal ulang tahun tidak dapat diubah', 403);
+  }
+
+  member.birthday = d;
+  member.birthday_editable = false;
+  await member.save();
+
+  res.status(200).json({
+    message: 'Birthday berhasil diperbarui',
+    birthday: member.birthday,
+    birthday_editable: member.birthday_editable
+  });
+});
+
+/* ============ PATCH: update address ============ */
+exports.updateAddress = asyncHandler(async (req, res) => {
+  const memberId = req.member && req.member.id;
+  if (!memberId) throwError('Unauthorized', 401);
+
+  const { address } = req.body || {};
+  if (typeof address !== 'string')
+    throwError('Field address wajib berupa string', 400);
+
+  const member = await Member.findById(memberId);
+  if (!member) throwError('Member tidak ditemukan', 404);
+
+  member.address = address || '';
+  await member.save();
+
+  res.status(200).json({
+    message: 'Alamat berhasil diperbarui',
+    address: member.address
   });
 });

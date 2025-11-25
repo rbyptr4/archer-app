@@ -8,7 +8,9 @@ const {
   verifyLoginOtp,
   verifyRegisterOtp,
   devLoginMember,
-  devRegister
+  devRegister,
+  updateBirthday,
+  updateAddress
 } = require('../../controllers/member/authMemberController');
 const authMember = require('../../middlewares/authMember');
 const {
@@ -32,6 +34,10 @@ router.post('/register', registerMember);
 router.post('/register/verify', verifyRegisterOtp);
 router.post('/refresh-token', refreshMember);
 router.get('/me', authMember, member);
+
+router.patch('/me/birthday', authMember, updateBirthday);
+router.patch('/me/address', authMember, updateAddress);
+
 router.post('/logout', logoutMember);
 router.post('/resend-otp', resendOtp);
 
