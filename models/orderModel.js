@@ -218,6 +218,13 @@ const orderSchema = new mongoose.Schema(
       default: null
     },
     verified_at: { type: Date },
+    ownerVerified: { type: Boolean, default: false, index: true },
+    ownerVerifiedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
+    },
+    ownerVerifiedAt: { type: Date },
 
     placed_at: { type: Date, default: Date.now, required: true },
     paid_at: { type: Date },

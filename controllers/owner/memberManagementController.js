@@ -4,6 +4,11 @@ const Member = require('../../models/memberModel');
 const throwError = require('../../utils/throwError');
 const { parseRange } = require('../../utils/periodRange');
 
+const asInt = (v, d = 0) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.trunc(n) : d;
+};
+
 function buildMemberMatch({ search = '' } = {}) {
   const match = {};
   const s = String(search || '').trim();

@@ -80,6 +80,17 @@ const QRIS_USE_STATIC =
 const QRIS_REQUIRE_PROOF =
   String(process.env.QRIS_REQUIRE_PROOF || 'true').toLowerCase() === 'true';
 
+const OWNER_VERIFY_REQUIRED = (
+  process.env.OWNER_VERIFY_REQUIRED || 'qris,transfer'
+)
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+function paymentRequiresOwnerVerify(method) {
+  return OWNER_VERIFY_REQUIRED.includes(String(method || '').toLowerCase());
+}
+
 const {
   DELIVERY_MAX_RADIUS_KM,
   CAFE_COORD,
@@ -2125,7 +2136,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     engineTotals: priced.totals || {},
     breakdown: priced.breakdown || []
   };
-
+  const ownerVerified = !paymentRequiresOwnerVerify(method);
   let order;
   try {
     order = await (async () => {
@@ -2151,7 +2162,9 @@ exports.checkout = asyncHandler(async (req, res) => {
             applied_voucher_ids: appliedVoucherIds || [],
             appliedPromo: appliedPromoSnapshot,
             promoRewards: promoRewards || [],
-
+            ownerVerified, // new field
+            ownerVerifiedBy: ownerVerified ? req.user?.id || null : null,
+            ownerVerifiedAt: ownerVerified ? new Date() : null,
             // snapshot price untuk audit & receipt
             orderPriceSnapshot: orderPriceSnapshot,
 
@@ -2426,6 +2439,35 @@ exports.checkout = asyncHandler(async (req, res) => {
     orderId: order._id,
     grand_total: order.grand_total
   });
+
+  // setelah order dibuat (non-blocking notify owner)
+  (async () => {
+    try {
+      const full = await Order.findById(order._id).lean();
+      if (!full) return;
+
+      // build link verifikasi (WA link — GET)
+      const DASHBOARD_URL =
+        process.env.DASHBOARD_URL ||
+        'https://archer-app-production.up.railway.app';
+      const verifyLink = `${DASHBOARD_URL}/orders/owner-verify?id=${order._id}`;
+
+      // message built by wablas util + CTA
+      const receipt = buildOrderReceiptMessage(full);
+      const msg =
+        receipt +
+        '\n\n' +
+        `Jika bukti pembayaran valid, klik Verifikasi di bawah:\n${verifyLink}\n\n— Archer System`;
+
+      const ownerPhone = process.env.OWNER_WA || null;
+      if (ownerPhone) {
+        await sendText(toWa62(ownerPhone), msg);
+      }
+    } catch (e) {
+      console.error('[notify][owner] gagal kirim WA:', e?.message || e);
+    }
+  })();
+
   res.status(201).json({
     order: order.toObject(),
     uiTotals,
@@ -3776,7 +3818,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   if (!ALLOWED_PM_POS.includes(method)) {
     throwError('payment_method POS tidak valid (cash|qris|card)', 400);
   }
-
+  const ownerVerified = !paymentRequiresOwnerVerify(method);
   // ===== Member / Guest =====
   let member = null;
   let customer_name = '';
@@ -3972,7 +4014,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   const roundingDelta = int(grandTotal - rawBeforeRound);
 
   const now = new Date();
-
   // ===== Create order (langsung verified) =====
   const order = await (async () => {
     for (let i = 0; i < 5; i++) {
@@ -3987,6 +4028,9 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           source: 'pos',
           fulfillment_type: 'dine_in',
           transaction_code: code,
+          ownerVerified,
+          ownerVerifiedBy: ownerVerified ? req.user?.id || null : null,
+          ownerVerifiedAt: ownerVerified ? new Date() : null,
           // di payload Order.create tambahkan:
           appliedPromo: appliedPromoSnapshot,
           promoRewards: promoRewards,
@@ -4106,6 +4150,31 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
       e?.message || e
     );
   }
+
+  (async () => {
+    try {
+      const full = await Order.findById(order._id).lean();
+      if (!full) return;
+
+      const DASHBOARD_URL =
+        process.env.DASHBOARD_URL ||
+        'https://archer-app-production.up.railway.app';
+      const verifyLink = `${DASHBOARD_URL}/orders/owner-verify?id=${order._id}`;
+
+      const receipt = buildOrderReceiptMessage(full);
+      const msg =
+        receipt +
+        '\n\n' +
+        `Jika bukti pembayaran valid, klik Verifikasi di bawah:\n${verifyLink}\n\n— Archer System`;
+
+      const ownerPhone = process.env.OWNER_WA || null;
+      if (ownerPhone) {
+        await sendText(toWa62(ownerPhone), msg);
+      }
+    } catch (e) {
+      console.error('[notify][owner] gagal kirim WA:', e?.message || e);
+    }
+  })();
 
   try {
     const summary = {
@@ -4722,6 +4791,16 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
   if (order.status !== 'created') {
     throwError('Hanya pesanan berstatus created yang bisa diterima', 409);
   }
+  // prevent accept if owner verification required but not yet done
+  const requiresOwner = paymentRequiresOwnerVerify(order.payment_method);
+  if (requiresOwner && !order.ownerVerified) {
+    throwError(
+      'Pembayaran belum diverifikasi oleh Owner. Tidak bisa menerima pesanan.',
+      409
+    );
+  }
+
+  // existing payment status guard (optional, sesuaikan policy)
   if (order.payment_status !== 'paid') {
     throwError('Pembayaran belum paid. Tidak bisa verifikasi.', 409);
   }
@@ -5978,5 +6057,87 @@ exports.cancelOrder = asyncHandler(async (req, res) => {
     message: 'Order dibatalkan & dihapus',
     id: String(id),
     transaction_code: order.transaction_code || null
+  });
+});
+
+exports.verifyOwnerWA = asyncHandler(async (req, res) => {
+  const FRONTEND_LOGIN = process.env.FRONTEND_LOGIN_URL;
+  const SUCCESS_URL = process.env.OWNER_VERIFY_SUCCESS_URL;
+  const { id } = req.query;
+  if (!id) return res.redirect(FRONTEND_LOGIN);
+
+  if (!req.user) {
+    // redirect ke login — setelah login owner bisa kembali ke same URL
+    const returnTo = `${req.originalUrl}`;
+    return res.redirect(
+      `${FRONTEND_LOGIN}?returnTo=${encodeURIComponent(returnTo)}`
+    );
+  }
+
+  const order = await Order.findById(id);
+  if (!order) throwError('Order tidak ditemukan', 404);
+
+  if (!order.ownerVerified) {
+    order.ownerVerified = true;
+    order.ownerVerifiedBy = req.user._id;
+    order.ownerVerifiedAt = new Date();
+    await order.save();
+
+    try {
+      emitToCashier('staff:notify', {
+        message: `Order ${order.transaction_code} telah diverifikasi owner.`
+      });
+      emitOrdersStream({
+        target: 'cashier',
+        action: 'update',
+        item: { id: String(order._id), ownerVerified: true }
+      });
+    } catch (e) {
+      console.error('[emit][ownerVerifyGET]', e?.message || e);
+    }
+  }
+
+  return res.redirect(SUCCESS_URL);
+});
+
+exports.verifyOwnerDashboard = asyncHandler(async (req, res) => {
+  if (!req.user && req.user.role != 'owner')
+    throwError('Hanya owner yang bisa akses ini', 401);
+
+  const id = req.params.id;
+  const order = await Order.findById(id);
+  if (!order) throwError('Order tidak ditemukan', 404);
+
+  if (order.ownerVerified) {
+    return res.status(200).json({
+      ok: true,
+      message: 'Order sudah diverifikasi owner',
+      orderId: String(order._id)
+    });
+  }
+
+  order.ownerVerified = true;
+  order.ownerVerifiedBy = req.user._id;
+  order.ownerVerifiedAt = new Date();
+  await order.save();
+
+  // Emit ke kasir
+  try {
+    emitToCashier('staff:notify', {
+      message: `Order ${order.transaction_code} telah diverifikasi owner.`
+    });
+    emitOrdersStream({
+      target: 'cashier',
+      action: 'update',
+      item: { id: String(order._id), ownerVerified: true }
+    });
+  } catch (e) {
+    console.error('[emit][verifyOwnerPATCH]', e?.message || e);
+  }
+
+  res.status(200).json({
+    ok: true,
+    message: 'Order diverifikasi oleh owner',
+    orderId: String(order._id)
   });
 });

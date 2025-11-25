@@ -151,6 +151,13 @@ router.get(
 );
 
 router.get(
+  '/owner-verify',
+  validateToken,
+  requireRole('owner'),
+  order.verifyOwnerWA
+);
+
+router.get(
   '/dashboard',
   validateToken,
   requireRole('owner', 'courier', 'kitchen', 'cashier'),
@@ -174,6 +181,13 @@ router.post(
   requireRole('owner', 'cashier'),
   requirePageAccess('orders'),
   order.acceptAndVerify
+);
+
+router.get(
+  '/owner-verify/:id',
+  validateToken,
+  requireRole('owner'),
+  order.verifyOwnerDashboard
 );
 
 router.patch(
