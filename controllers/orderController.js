@@ -35,11 +35,14 @@ const { DELIVERY_SLOTS } = require('../config/onlineConfig'); // import
 const { sendText, buildOrderReceiptMessage } = require('../utils/wablas');
 const { buildUiTotalsFromCart } = require('../utils/cartUiCache');
 const { applyPromoThenVoucher } = require('../utils/priceEngine');
+const { getOwnerPhone } = require('../utils/ownerPhone');
+
 const {
   findApplicablePromos,
   applyPromo,
   executePromoActions
 } = require('../utils/promoEngine');
+s;
 const {
   parsePpnRate,
   SERVICE_FEE_RATE,
@@ -2440,31 +2443,73 @@ exports.checkout = asyncHandler(async (req, res) => {
     grand_total: order.grand_total
   });
 
-  // setelah order dibuat (non-blocking notify owner)
   (async () => {
     try {
       const full = await Order.findById(order._id).lean();
       if (!full) return;
 
-      // build link verifikasi (WA link — GET)
-      const DASHBOARD_URL =
-        process.env.DASHBOARD_URL ||
-        'https://archer-app-production.up.railway.app';
-      const verifyLink = `${DASHBOARD_URL}/orders/owner-verify?id=${order._id}`;
+      // Hanya kirim WA jika payment method membutuhkan owner verify
+      if (!paymentRequiresOwnerVerify(full.payment_method)) return;
 
-      // message built by wablas util + CTA
-      const receipt = buildOrderReceiptMessage(full);
-      const msg =
-        receipt +
-        '\n\n' +
-        `Jika bukti pembayaran valid, klik Verifikasi di bawah:\n${verifyLink}\n\n— Archer System`;
-
-      const ownerPhone = process.env.OWNER_WA || null;
-      if (ownerPhone) {
-        await sendText(toWa62(ownerPhone), msg);
+      // ambil list owner phones
+      const owners = getOwnerPhones();
+      if (!owners.length) {
+        console.warn('[notify][owner] OWNER_WA not set, skip WA');
+        return;
       }
+
+      // buat pesan: reuse buildOrderReceiptMessage
+      const DASHBOARD_URL =
+        process.env.DASHBOARD_URL || 'https://dashboard.example.com';
+      const verifyLink = `${DASHBOARD_URL}/owner/orders/verify?id=${order._id}`;
+      const receipt = buildOrderReceiptMessage(full);
+      const msg = [
+        '🔔 *Order Perlu Verifikasi Pembayaran*',
+        `Kode: *${full.transaction_code}*`,
+        `Nama: ${full.customer_name || '-'} — ${full.customer_phone || '-'}`,
+        `Total: ${rp(full.grand_total)}`,
+        '',
+        receipt,
+        '',
+        `Jika bukti pembayaran valid, klik verifikasi:`,
+        verifyLink,
+        '',
+        '— Archer System'
+      ].join('\n');
+
+      // kirim ke semua owner secara paralel (non-blocking)
+      const sendPromises = owners.map((rawPhone) => {
+        const phone =
+          typeof toWa62 === 'function' ? toWa62(rawPhone) : rawPhone;
+        // selalu tangkap error di level promise
+        return sendText(phone, msg).then(
+          (r) => ({ ok: true, phone: rawPhone, res: r }),
+          (e) => ({ ok: false, phone: rawPhone, err: e?.message || e })
+        );
+      });
+
+      const results = await Promise.allSettled(sendPromises);
+      // log ringkasan hasil
+      results.forEach((r) => {
+        if (r.status === 'fulfilled') {
+          const v = r.value;
+          if (v.ok) {
+            console.log('[notify][owner] WA sent', {
+              phone: v.phone,
+              orderId: String(order._id)
+            });
+          } else {
+            console.error('[notify][owner] WA failed', {
+              phone: v.phone,
+              err: v.err
+            });
+          }
+        } else {
+          console.error('[notify][owner] WA promise rejected', r.reason);
+        }
+      });
     } catch (e) {
-      console.error('[notify][owner] gagal kirim WA:', e?.message || e);
+      console.error('[notify][owner] unexpected error', e?.message || e);
     }
   })();
 
@@ -3355,7 +3400,7 @@ exports.listOrders = asyncHandler(async (req, res) => {
   // note: include member.name via populate (light)
   const raw = await Order.find(q)
     .select(
-      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt delivery.mode'
+      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt delivery.mode ownerVerified'
     )
     .sort({ createdAt: -1 })
     .limit(lim)
@@ -3379,6 +3424,7 @@ exports.listOrders = asyncHandler(async (req, res) => {
     table_number:
       o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
     payment_status: o.payment_status || null,
+    ownerVerified: o.ownerVerified,
     status: o.status || null, // created|accepted|completed|cancelled
     total_quantity: Number(o.total_quantity || 0),
     pickup_window:
@@ -4156,23 +4202,68 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
       const full = await Order.findById(order._id).lean();
       if (!full) return;
 
-      const DASHBOARD_URL =
-        process.env.DASHBOARD_URL ||
-        'https://archer-app-production.up.railway.app';
-      const verifyLink = `${DASHBOARD_URL}/orders/owner-verify?id=${order._id}`;
+      // Hanya kirim WA jika payment method membutuhkan owner verify
+      if (!paymentRequiresOwnerVerify(full.payment_method)) return;
 
-      const receipt = buildOrderReceiptMessage(full);
-      const msg =
-        receipt +
-        '\n\n' +
-        `Jika bukti pembayaran valid, klik Verifikasi di bawah:\n${verifyLink}\n\n— Archer System`;
-
-      const ownerPhone = process.env.OWNER_WA || null;
-      if (ownerPhone) {
-        await sendText(toWa62(ownerPhone), msg);
+      // ambil list owner phones
+      const owners = getOwnerPhones();
+      if (!owners.length) {
+        console.warn('[notify][owner] OWNER_WA not set, skip WA');
+        return;
       }
+
+      // buat pesan: reuse buildOrderReceiptMessage
+      const DASHBOARD_URL =
+        process.env.DASHBOARD_URL || 'https://dashboard.example.com';
+      const verifyLink = `${DASHBOARD_URL}/owner/orders/verify?id=${order._id}`;
+      const receipt = buildOrderReceiptMessage(full);
+      const msg = [
+        '🔔 *Order Perlu Verifikasi Pembayaran*',
+        `Kode: *${full.transaction_code}*`,
+        `Nama: ${full.customer_name || '-'} — ${full.customer_phone || '-'}`,
+        `Total: ${rp(full.grand_total)}`,
+        '',
+        receipt,
+        '',
+        `Jika bukti pembayaran valid, klik verifikasi:`,
+        verifyLink,
+        '',
+        '— Archer System'
+      ].join('\n');
+
+      // kirim ke semua owner secara paralel (non-blocking)
+      const sendPromises = owners.map((rawPhone) => {
+        const phone =
+          typeof toWa62 === 'function' ? toWa62(rawPhone) : rawPhone;
+        // selalu tangkap error di level promise
+        return sendText(phone, msg).then(
+          (r) => ({ ok: true, phone: rawPhone, res: r }),
+          (e) => ({ ok: false, phone: rawPhone, err: e?.message || e })
+        );
+      });
+
+      const results = await Promise.allSettled(sendPromises);
+      // log ringkasan hasil
+      results.forEach((r) => {
+        if (r.status === 'fulfilled') {
+          const v = r.value;
+          if (v.ok) {
+            console.log('[notify][owner] WA sent', {
+              phone: v.phone,
+              orderId: String(order._id)
+            });
+          } else {
+            console.error('[notify][owner] WA failed', {
+              phone: v.phone,
+              err: v.err
+            });
+          }
+        } else {
+          console.error('[notify][owner] WA promise rejected', r.reason);
+        }
+      });
     } catch (e) {
-      console.error('[notify][owner] gagal kirim WA:', e?.message || e);
+      console.error('[notify][owner] unexpected error', e?.message || e);
     }
   })();
 
