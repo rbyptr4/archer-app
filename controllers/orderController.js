@@ -3886,13 +3886,26 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   if (!Array.isArray(items) || !items.length) throwError('items wajib', 400);
 
   // ===== Metode bayar POS =====
-  const PM_POS = { CASH: 'cash', QRIS: 'qris', CARD: 'card' };
-  const ALLOWED_PM_POS = [PM_POS.CASH, PM_POS.QRIS, PM_POS.CARD];
+  const PM_POS = {
+    CASH: 'cash',
+    QRIS: 'qris',
+    CARD: 'card',
+    TRANSFER: 'transfer'
+  };
+  const ALLOWED_PM_POS = [
+    PM_POS.CASH,
+    PM_POS.QRIS,
+    PM_POS.CARD,
+    PM_POS.TRANSFER
+  ];
   const method = String(payment_method || '').toLowerCase();
   if (!ALLOWED_PM_POS.includes(method)) {
-    throwError('payment_method POS tidak valid (cash|qris|card)', 400);
+    throwError('payment_method POS tidak valid (cash|qris|card|transfer)', 400);
   }
+
+  // ownerVerified initial decision: jika paymentRequiresOwnerVerify(method) => ownerVerified = false
   const ownerVerified = !paymentRequiresOwnerVerify(method);
+
   // ===== Member / Guest =====
   let member = null;
   let customer_name = '';
@@ -3905,16 +3918,12 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
         400
       );
     }
-
     const m = await Member.findById(member_id).lean();
     if (!m) throwError('Member tidak ditemukan', 404);
     member = m;
-
-    // jika member ada, auto-fill customer_name & customer_phone dari member
     customer_name = String(member.name || '').trim();
     customer_phone = String(member.phone || '').trim();
   } else {
-    // Guest: minimal isi nama atau phone
     customer_name = String(name || '').trim();
     customer_phone = String(phone || '').trim();
     if (!customer_name && !customer_phone) {
@@ -3970,15 +3979,13 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     }))
   };
 
-  // find applicable promos (kasir mode: voucher NOT allowed)
-  // allow member promos only if member present
+  // promos (kasir mode: voucher NOT allowed)
   const memberForPromo = member ? member : null;
   const promos = await findApplicablePromos(
     cartForEngine,
     memberForPromo,
     new Date()
   );
-  console.log('[createPosDineIn] eligible promos:', promos.length);
 
   // decide which promo to apply:
   let appliedPromoSnapshot = null;
@@ -3990,12 +3997,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     const chosen = promos.find(
       (p) => String(p._id) === String(requestedPromoId)
     );
-    if (!chosen) {
-      console.warn(
-        '[createPosDineIn] requested promo not eligible',
-        requestedPromoId
-      );
-    } else {
+    if (chosen) {
       const { impact, actions } = await applyPromo(chosen, cartForEngine);
       appliedPromoSnapshot = {
         promoId: String(chosen._id),
@@ -4004,6 +4006,11 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
         actions: actions || []
       };
       promoImpact = impact;
+    } else {
+      console.warn(
+        '[createPosDineIn] requested promo not eligible',
+        requestedPromoId
+      );
     }
   } else if (!requestedPromoId && promos.length > 0) {
     const autoPromo = chooseAutoPromo(promos);
@@ -4019,9 +4026,8 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     }
   }
 
-  // If we have promoImpact, mutate orderItems & itemsSubtotal accordingly
+  // apply promoImpact
   if (promoImpact) {
-    // add free items
     if (Array.isArray(promoImpact.addedFreeItems)) {
       for (const f of promoImpact.addedFreeItems) {
         const freeQty = Number(f.qty || 1);
@@ -4046,14 +4052,13 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
       }
     }
 
-    // apply discount to subtotal (ensure not negative)
     const discountAmount = Number(
       promoImpact.itemsDiscount || promoImpact.cartDiscount || 0
     );
     itemsSubtotal = Math.max(0, itemsSubtotal - discountAmount);
-    // store promoRewards for points/membership actions too
+
     if (
-      Array.isArray(appliedPromoSnapshot.actions) &&
+      Array.isArray(appliedPromoSnapshot?.actions) &&
       appliedPromoSnapshot.actions.length
     ) {
       for (const a of appliedPromoSnapshot.actions) {
@@ -4064,7 +4069,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
         });
       }
     }
-    // attach impact to snapshot (ensure actions array present)
     appliedPromoSnapshot.impact = promoImpact;
   }
 
@@ -4080,7 +4084,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
         : Number(process.env.PPN_RATE)
       : parsePpnRate();
   const taxRatePercent = Math.round(rate * 100 * 100) / 100;
-  const taxBase = itemsSubtotal; // POS: no voucher, no delivery
+  const taxBase = itemsSubtotal;
   const taxAmount = int(Math.max(0, Math.round(taxBase * rate)));
 
   const rawBeforeRound = itemsSubtotal + serviceFee + taxAmount;
@@ -4088,7 +4092,16 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   const roundingDelta = int(grandTotal - rawBeforeRound);
 
   const now = new Date();
-  // ===== Create order (langsung verified) =====
+
+  // determine statuses based on ownerVerified
+  // NOTE: per request, jika owner verification required => tetap jadi 'paid' (tapi not verified/ownerVerified=false)
+  const initialPaymentStatus = ownerVerified ? 'verified' : 'paid';
+  const initialOrderStatus = ownerVerified ? 'accepted' : 'created';
+  const paidAtValue = now; // set paid_at sekarang meskipun owner belum verify
+  const verifiedByValue = ownerVerified ? req.user?.id || null : null;
+  const verifiedAtValue = ownerVerified ? now : null;
+
+  // ===== Create order (retry loop for tx code collisions) =====
   const order = await (async () => {
     for (let i = 0; i < 5; i++) {
       try {
@@ -4102,12 +4115,14 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           source: 'pos',
           fulfillment_type: 'dine_in',
           transaction_code: code,
+
+          // ownerVerified set based on method & env
           ownerVerified,
           ownerVerifiedBy: ownerVerified ? req.user?.id || null : null,
           ownerVerifiedAt: ownerVerified ? new Date() : null,
-          // di payload Order.create tambahkan:
+
           appliedPromo: appliedPromoSnapshot,
-          promoRewards: promoRewards,
+          promoRewards,
           orderPriceSnapshot: {
             ui_totals: {
               items_subtotal: itemsSubtotal,
@@ -4137,14 +4152,14 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           rounding_delta: roundingDelta,
           grand_total: grandTotal,
 
-          // pembayaran: langsung verified
+          // pembayaran
           payment_method: method,
-          payment_status: 'verified',
-          paid_at: now,
-          verified_by: req.user?.id || null,
-          verified_at: now,
+          payment_status: initialPaymentStatus,
+          paid_at: paidAtValue,
+          verified_by: verifiedByValue,
+          verified_at: verifiedAtValue,
 
-          status: 'accepted',
+          status: initialOrderStatus,
           placed_at: now
         });
       } catch (e) {
@@ -4156,7 +4171,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     throw new Error('Gagal generate transaction_code unik');
   })();
 
-  // setelah Order.create success: (side-effects sama seperti implementasi Anda)
+  // --- promo side-effects (unchanged) ---
   try {
     if (
       appliedPromoSnapshot &&
@@ -4164,14 +4179,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
       appliedPromoSnapshot.actions.length
     ) {
       try {
-        if (
-          appliedPromoSnapshot &&
-          Array.isArray(appliedPromoSnapshot.actions) &&
-          appliedPromoSnapshot.actions.length
-        ) {
-          await executePromoActions(order, Member, { session: null });
-        }
-
+        await executePromoActions(order, Member, { session: null });
         if (appliedPromoSnapshot && appliedPromoSnapshot.promoId) {
           try {
             await Promo.updateOne(
@@ -4225,12 +4233,13 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     );
   }
 
+  // --- async notify owner if paymentRequiresOwnerVerify (generate token & WA) ---
   (async () => {
     try {
       const full = await Order.findById(order._id).lean();
       if (!full) return;
 
-      // hanya kirim WA jika payment method membutuhkan owner verify
+      // only send owner verify WA if method requires owner verify
       if (!paymentRequiresOwnerVerify(full.payment_method)) return;
 
       const EXPIRE_HOURS = Number(process.env.OWNER_VERIFY_EXPIRE_HOURS || 6);
@@ -4300,62 +4309,62 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     }
   })();
 
+  // --- EMIT / socket: only notify kitchen if order already ownerVerified (cash/card) ---
   try {
     const summary = {
       id: String(order._id),
       transaction_code: order.transaction_code || '',
-
       delivery_mode:
         order.delivery?.mode ||
         (order.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
-
       grand_total: Number(order.grand_total || 0),
       fulfillment_type: order.fulfillment_type || null,
-
       customer_name:
         (order.member && order.member.name) || order.customer_name || '',
-
       customer_phone:
         (order.member && order.member.phone) || order.customer_phone || '',
-
       placed_at: order.placed_at || order.createdAt || null,
-
       table_number:
         order.fulfillment_type === 'dine_in'
           ? order.table_number || null
           : null,
-
       payment_status: order.payment_status || null,
       status: order.status || null,
-
       total_quantity: Number(order.total_quantity || 0),
-
       pickup_window: order.delivery?.pickup_window
         ? {
             from: order.delivery.pickup_window.from || null,
             to: order.delivery.pickup_window.to || null
           }
         : null,
-
       delivery_slot_label: order.delivery?.slot_label || null,
-
       member_id: order.member ? String(order.member) : null
     };
 
+    // always inform cashier UI that order was created
     emitToCashier('staff:notify', {
       message: 'Ada pesanan baru, cek halaman pesanan.'
     });
-    emitOrdersStream({ target: 'kitchen', action: 'insert', item: summary });
-    emitToKitchen('staff:notify', {
-      message: 'Pesanan baru diterima, cek halaman kitchen.'
-    });
+
+    // only push to kitchen/stream if ownerVerified true (i.e. already accepted)
+    if (ownerVerified) {
+      emitOrdersStream({ target: 'kitchen', action: 'insert', item: summary });
+      emitToKitchen('staff:notify', {
+        message: 'Pesanan baru diterima, cek halaman kitchen.'
+      });
+    }
   } catch (e) {
     console.error('[emit][createPosDineIn]', e?.message || e);
   }
 
+  // --- response ---
+  const responseMessage = ownerVerified
+    ? 'Order POS dine-in dibuat & langsung verified'
+    : 'Order POS dine-in dibuat. Menunggu verifikasi owner sebelum diteruskan ke kitchen';
+
   res.status(201).json({
     order: { ...order.toObject(), transaction_code: order.transaction_code },
-    message: 'Order POS dine-in dibuat & langsung verified'
+    message: responseMessage
   });
 });
 
