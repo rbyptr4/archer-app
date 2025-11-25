@@ -225,6 +225,13 @@ const orderSchema = new mongoose.Schema(
       default: null
     },
     ownerVerifiedAt: { type: Date },
+    verification: {
+      tokenHash: { type: String, trim: true, default: null }, // sha256(token)
+      expiresAt: { type: Date, default: null, index: true },
+      usedAt: { type: Date, default: null },
+      usedFromIp: { type: String, trim: true, default: '' },
+      usedUserAgent: { type: String, trim: true, default: '' }
+    },
 
     placed_at: { type: Date, default: Date.now, required: true },
     paid_at: { type: Date },

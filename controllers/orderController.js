@@ -42,7 +42,7 @@ const {
   applyPromo,
   executePromoActions
 } = require('../utils/promoEngine');
-s;
+
 const {
   parsePpnRate,
   SERVICE_FEE_RATE,
@@ -93,6 +93,8 @@ const OWNER_VERIFY_REQUIRED = (
 function paymentRequiresOwnerVerify(method) {
   return OWNER_VERIFY_REQUIRED.includes(String(method || '').toLowerCase());
 }
+
+const EXPIRE_HOURS = Number(process.env.OWNER_VERIFY_EXPIRE_HOURS || 6);
 
 const {
   DELIVERY_MAX_RADIUS_KM,
@@ -167,6 +169,14 @@ function getSlotsForDate(dateDay = null) {
 function isSlotAvailable(label, dateDay = null) {
   const slot = getSlotsForDate(dateDay).find((s) => s.label === label);
   return !!(slot && slot.available);
+}
+
+function genTokenRaw(lenBytes = 32) {
+  return crypto.randomBytes(lenBytes).toString('hex'); // 64 chars hex for 32 bytes
+}
+
+function hashTokenVerification(token) {
+  return crypto.createHash('sha256').update(String(token)).digest('hex');
 }
 
 function computeUnitPriceWithAddons(item) {
@@ -2445,23 +2455,48 @@ exports.checkout = asyncHandler(async (req, res) => {
 
   (async () => {
     try {
-      const full = await Order.findById(order._id).lean();
+      const full =
+        (await Order.findById(order._1 ? order._1 : order._id).lean?.()) ||
+        (await Order.findById(order._id).lean());
       if (!full) return;
 
-      // Hanya kirim WA jika payment method membutuhkan owner verify
+      // hanya kirim WA jika payment method membutuhkan owner verify
       if (!paymentRequiresOwnerVerify(full.payment_method)) return;
 
-      // ambil list owner phones
-      const owners = getOwnerPhones();
-      if (!owners.length) {
-        console.warn('[notify][owner] OWNER_WA not set, skip WA');
-        return;
-      }
+      // generate token & hash, expiry (hours from env)
+      const EXPIRE_HOURS = Number(process.env.OWNER_VERIFY_EXPIRE_HOURS || 6);
+      const tokenRaw = genTokenRaw(); // raw token -> dikirim via WA
+      const tokenHash = hashTokenVerification(tokenRaw);
+      const expiresAt = new Date(Date.now() + EXPIRE_HOURS * 60 * 60 * 1000);
 
-      // buat pesan: reuse buildOrderReceiptMessage
+      // simpan tokenHash & expiresAt di order (non-blocking update)
+      await Order.updateOne(
+        { _id: full._id },
+        {
+          $set: {
+            'verification.tokenHash': tokenHash,
+            'verification.expiresAt': expiresAt,
+            // clear previous used meta if any
+            'verification.usedAt': null,
+            'verification.usedFromIp': '',
+            'verification.usedUserAgent': ''
+          }
+        }
+      ).catch((e) =>
+        console.error(
+          '[checkout][notify] failed update verification',
+          e?.message || e
+        )
+      );
+
+      // build verify link with raw token
       const DASHBOARD_URL =
         process.env.DASHBOARD_URL || 'https://dashboard.example.com';
-      const verifyLink = `${DASHBOARD_URL}/owner/orders/verify?id=${order._id}`;
+      const verifyLink = `${DASHBOARD_URL}/api/owner/orders/verify?orderId=${
+        full._id
+      }&token=${encodeURIComponent(tokenRaw)}`;
+
+      // build message
       const receipt = buildOrderReceiptMessage(full);
       const msg = [
         '🔔 *Order Perlu Verifikasi Pembayaran*',
@@ -2471,17 +2506,21 @@ exports.checkout = asyncHandler(async (req, res) => {
         '',
         receipt,
         '',
-        `Jika bukti pembayaran valid, klik verifikasi:`,
+        `Jika bukti pembayaran valid, klik verifikasi (link satu kali, berlaku ${EXPIRE_HOURS} jam):`,
         verifyLink,
         '',
         '— Archer System'
       ].join('\n');
 
-      // kirim ke semua owner secara paralel (non-blocking)
+      const owners = getOwnerPhones();
+      if (!owners.length) {
+        console.warn('[notify][owner] OWNER_WA not set, skip WA');
+        return;
+      }
+
       const sendPromises = owners.map((rawPhone) => {
         const phone =
           typeof toWa62 === 'function' ? toWa62(rawPhone) : rawPhone;
-        // selalu tangkap error di level promise
         return sendText(phone, msg).then(
           (r) => ({ ok: true, phone: rawPhone, res: r }),
           (e) => ({ ok: false, phone: rawPhone, err: e?.message || e })
@@ -2489,21 +2528,19 @@ exports.checkout = asyncHandler(async (req, res) => {
       });
 
       const results = await Promise.allSettled(sendPromises);
-      // log ringkasan hasil
       results.forEach((r) => {
         if (r.status === 'fulfilled') {
           const v = r.value;
-          if (v.ok) {
+          if (v.ok)
             console.log('[notify][owner] WA sent', {
               phone: v.phone,
-              orderId: String(order._id)
+              orderId: String(full._id)
             });
-          } else {
+          else
             console.error('[notify][owner] WA failed', {
               phone: v.phone,
               err: v.err
             });
-          }
         } else {
           console.error('[notify][owner] WA promise rejected', r.reason);
         }
@@ -4202,40 +4239,63 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
       const full = await Order.findById(order._id).lean();
       if (!full) return;
 
-      // Hanya kirim WA jika payment method membutuhkan owner verify
+      // hanya kirim WA jika payment method membutuhkan owner verify
       if (!paymentRequiresOwnerVerify(full.payment_method)) return;
 
-      // ambil list owner phones
-      const owners = getOwnerPhones();
-      if (!owners.length) {
-        console.warn('[notify][owner] OWNER_WA not set, skip WA');
-        return;
-      }
+      const EXPIRE_HOURS = Number(process.env.OWNER_VERIFY_EXPIRE_HOURS || 6);
+      const tokenRaw = genTokenRaw();
+      const tokenHash = hashTokenVerification(tokenRaw);
+      const expiresAt = new Date(Date.now() + EXPIRE_HOURS * 60 * 60 * 1000);
 
-      // buat pesan: reuse buildOrderReceiptMessage
+      await Order.updateOne(
+        { _id: full._id },
+        {
+          $set: {
+            'verification.tokenHash': tokenHash,
+            'verification.expiresAt': expiresAt,
+            'verification.usedAt': null,
+            'verification.usedFromIp': '',
+            'verification.usedUserAgent': ''
+          }
+        }
+      ).catch((e) =>
+        console.error(
+          '[createPosDineIn][notify] failed update verification',
+          e?.message || e
+        )
+      );
+
       const DASHBOARD_URL =
         process.env.DASHBOARD_URL || 'https://dashboard.example.com';
-      const verifyLink = `${DASHBOARD_URL}/owner/orders/verify?id=${order._id}`;
+      const verifyLink = `${DASHBOARD_URL}/api/owner/orders/verify?orderId=${
+        full._id
+      }&token=${encodeURIComponent(tokenRaw)}`;
+
       const receipt = buildOrderReceiptMessage(full);
       const msg = [
-        '🔔 *Order Perlu Verifikasi Pembayaran*',
+        '🔔 *Order POS Perlu Verifikasi Pembayaran*',
         `Kode: *${full.transaction_code}*`,
-        `Nama: ${full.customer_name || '-'} — ${full.customer_phone || '-'}`,
+        `Meja: ${full.table_number || '-'}`,
+        `Pemesan: ${full.customer_name || '-'} — ${full.customer_phone || '-'}`,
         `Total: ${rp(full.grand_total)}`,
         '',
         receipt,
         '',
-        `Jika bukti pembayaran valid, klik verifikasi:`,
+        `Jika bukti pembayaran valid, klik verifikasi (link satu kali, berlaku ${EXPIRE_HOURS} jam):`,
         verifyLink,
         '',
         '— Archer System'
       ].join('\n');
 
-      // kirim ke semua owner secara paralel (non-blocking)
+      const owners = getOwnerPhones();
+      if (!owners.length) {
+        console.warn('[notify][owner][pos] OWNER_WA not set, skip WA');
+        return;
+      }
+
       const sendPromises = owners.map((rawPhone) => {
         const phone =
           typeof toWa62 === 'function' ? toWa62(rawPhone) : rawPhone;
-        // selalu tangkap error di level promise
         return sendText(phone, msg).then(
           (r) => ({ ok: true, phone: rawPhone, res: r }),
           (e) => ({ ok: false, phone: rawPhone, err: e?.message || e })
@@ -4243,27 +4303,25 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
       });
 
       const results = await Promise.allSettled(sendPromises);
-      // log ringkasan hasil
       results.forEach((r) => {
         if (r.status === 'fulfilled') {
           const v = r.value;
-          if (v.ok) {
-            console.log('[notify][owner] WA sent', {
+          if (v.ok)
+            console.log('[notify][owner][pos] WA sent', {
               phone: v.phone,
-              orderId: String(order._id)
+              orderId: String(full._id)
             });
-          } else {
-            console.error('[notify][owner] WA failed', {
+          else
+            console.error('[notify][owner][pos] WA failed', {
               phone: v.phone,
               err: v.err
             });
-          }
         } else {
-          console.error('[notify][owner] WA promise rejected', r.reason);
+          console.error('[notify][owner][pos] WA promise rejected', r.reason);
         }
       });
     } catch (e) {
-      console.error('[notify][owner] unexpected error', e?.message || e);
+      console.error('[notify][owner][pos] unexpected error', e?.message || e);
     }
   })();
 
@@ -6231,4 +6289,90 @@ exports.verifyOwnerDashboard = asyncHandler(async (req, res) => {
     message: 'Order diverifikasi oleh owner',
     orderId: String(order._id)
   });
+});
+
+exports.verifyOwnerByToken = asyncHandler(async (req, res) => {
+  const { orderId, token } = req.query || {};
+
+  if (!orderId || !token) {
+    return res.status(400).json({
+      ok: false,
+      code: 'missing',
+      message: 'orderId & token diperlukan'
+    });
+  }
+
+  const order = await Order.findById(orderId);
+  if (!order) {
+    return res
+      .status(404)
+      .json({ ok: false, code: 'not_found', message: 'Order tidak ditemukan' });
+  }
+
+  const verification = order.verification || {};
+  if (!verification.tokenHash || !verification.expiresAt) {
+    return res.status(400).json({
+      ok: false,
+      code: 'no_token',
+      message: 'Token verifikasi tidak ditemukan'
+    });
+  }
+
+  // already used?
+  if (verification.usedAt) {
+    return res
+      .status(409)
+      .json({ ok: false, code: 'used', message: 'Token sudah digunakan' });
+  }
+
+  // expired?
+  if (new Date() > new Date(verification.expiresAt)) {
+    return res
+      .status(410)
+      .json({ ok: false, code: 'expired', message: 'Token sudah kadaluarsa' });
+  }
+
+  // verify token hash
+  const candidateHash = hashTokenVerification(token);
+  if (candidateHash !== verification.tokenHash) {
+    return res
+      .status(400)
+      .json({ ok: false, code: 'invalid', message: 'Token tidak valid' });
+  }
+
+  // valid -> mark ownerVerified & mark used meta
+  order.ownerVerified = true;
+  order.ownerVerifiedAt = new Date();
+
+  order.verification.usedAt = new Date();
+  order.verification.usedFromIp = req.ip || '';
+  order.verification.usedUserAgent = req.get('user-agent') || '';
+
+  // clear tokenHash to avoid reuse
+  order.verification.tokenHash = null;
+
+  await order.save();
+
+  // Emit only to cashier so UI kasir bisa enable tombol
+  try {
+    emitToCashier('staff:notify', {
+      message: `Order ${order.transaction_code} diverifikasi owner.`
+    });
+    emitOrdersStream({
+      target: 'cashier',
+      action: 'update',
+      item: { id: String(order._id), ownerVerified: true }
+    });
+  } catch (e) {
+    console.error('[emit][verifyOwnerByToken]', e?.message || e);
+  }
+
+  // Redirect on success (WA opens this in browser)
+  const SUCCESS_URL =
+    process.env.OWNER_VERIFY_SUCCESS_URL ||
+    (process.env.DASHBOARD_URL
+      ? `${process.env.DASHBOARD_URL}/owner/verify-success`
+      : '/owner/verify-success');
+
+  return res.redirect(SUCCESS_URL);
 });
