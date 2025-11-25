@@ -8,20 +8,27 @@ const rpt = require('../../controllers/owner/reportController');
 router.use(
   validateToken,
   requireRole('owner', 'courier', 'kitchen', 'cashier'),
-  requirePageAccess('report')
+  requirePageAccess('reports')
 );
 
-router.get('/orders/summary', rpt.orderSummary);
-router.get('/orders/list', rpt.orderList);
-router.get('/orders/top-menu', rpt.orderTopMenu);
+router.get('/orders/dashboard', rpt.reportDashboard);
+router.get('/orders/transactions', rpt.totalTransactions);
 
 // ====== Laporan Keuangan ======
-router.get('/finance/summary', rpt.financeSummary);
-router.get('/finance/expense-list', rpt.expenseList);
+// router.get('/finance/summary', rpt.);
+// router.get('/finance/expense-list', rpt.);
+router.get('/finance/profit-loss', rpt.profitLoss);
 
 // ====== Laporan Member ======
-router.get('/members/summary', rpt.memberSummary);
-router.get('/members/list', rpt.memberList);
-router.get('/members/top-customer', rpt.topCustomer);
+router.get('/members/list', rpt.listMemberSummary);
+router.get('/members/dashboard', rpt.memberDashboard);
+router.get('/members/dashboard/top-spender', rpt.topSpendersThisMonth);
+router.get('/members/customer-growth', rpt.customerGrowth);
+
+// ====== Laporan Menu ======
+router.get('/menu/top-menu', rpt.bestSeller);
+
+router.get('/orders/:id', rpt.getDetailOrder);
+router.get('/members/:id', rpt.getMemberDetail);
 
 module.exports = router;

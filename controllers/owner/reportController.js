@@ -1,596 +1,412 @@
-// controllers/owner/reportController.js
 const asyncHandler = require('express-async-handler');
 const mongoose = require('mongoose');
 
+const Expense = require('../../models/expenseModel');
 const Order = require('../../models/orderModel');
 const Member = require('../../models/memberModel');
-// OPTIONAL: kalau belum ada, kamu bisa comment baris Expense ini + fungsi yang memakainya
-let Expense = null;
-try {
-  Expense = require('../../models/expenseModel');
-} catch {
-  /* optional */
-}
 
-const { parsePeriod } = require('../../utils/periodRange');
+const dayjs = require('dayjs');
+const throwError = require('../../utils/throwError');
 
-/* ========================= Helpers ========================= */
-function rangeFromQuery(q) {
-  const { period, start, end, mode, weekStartsOn } = q || {};
-  const { start: s, end: e } = parsePeriod({
-    period,
-    start,
-    end,
-    mode,
+const asInt = (v, d = 0) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.trunc(n) : d;
+};
+
+const { parseRange } = require('../../utils/periodRange');
+
+function getRangeFromQuery(q = {}) {
+  const rangeKey = q.range || q.period || 'today';
+  const weekStartsOn = Number.isFinite(+q.weekStartsOn) ? +q.weekStartsOn : 1;
+  const { start, end } = parseRange({
+    range: rangeKey,
+    from: q.from,
+    to: q.to,
     weekStartsOn
   });
-  return { start: s, end: e };
+  return { start, end };
 }
 
-// granularity untuk timeseries chart berdasarkan period yang diminta
-function inferBucket(period = 'day') {
-  const p = String(period || '').toLowerCase();
-  if (p === 'year' || p === 'overall') return 'month';
-  if (p === 'month') return 'day';
-  if (p === 'week') return 'day';
-  return 'hour'; // default detail
-}
+// Data dashboard laporan
+exports.reportDashboard = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
 
-// builder $match untuk PAID dan CANCELLED
-function matchPaid(rs) {
-  return {
-    payment_status: 'paid',
-    paid_at: { $gte: rs.start, $lte: rs.end },
-    isDeleted: { $ne: true }
-  };
-}
-function matchCancelled(rs) {
-  return {
-    status: 'cancelled',
-    cancelled_at: { $gte: rs.start, $lte: rs.end },
-    isDeleted: { $ne: true }
-  };
-}
+  const orderMatch = { paid_at: { $gte: start, $lte: end } };
 
-// util aman aggregate Expense (kalau model belum ada)
-async function safeExpenseAggregate(pipeline) {
-  if (!Expense) return [];
-  try {
-    return await Expense.aggregate(pipeline);
-  } catch {
-    return [];
-  }
-}
-
-/* ==================== 1) Laporan Order/Transaksi ==================== */
-
-/**
- * GET /reports/orders/summary
- * Query: period|start|end|mode|weekStartsOn
- * Return:
- *  - total_paid (jumlah order yang paid pada range)
- *  - total_cancelled (jumlah order batal pada range)
- *  - omzet_paid (sum grand_total pada order paid)
- */
-exports.transactionSummary = asyncHandler(async (req, res) => {
-  if (!req.user) throwError('Unauthorized', 401);
-
-  const period = String(req.query?.period || 'day'); // day|month|year|range
-  const dateQ = String(req.query?.date || '').trim(); // YYYY-MM-DD
-  const monthQ = String(req.query?.month || '').trim(); // YYYY-MM
-  const yearQ = String(req.query?.year || '').trim(); // YYYY
-  const fromQ = req.query?.from || null; // ISO
-  const toQ = req.query?.to || null; // ISO
-
-  // shift override (optional)
-  const defaultShift1 = '00:00-14:59';
-  const defaultShift2 = '15:00-23:59';
-  const shift1Str = String(req.query?.shift1 || defaultShift1).trim();
-  const shift2Str = String(req.query?.shift2 || defaultShift2).trim();
-
-  // helper to parse base range based on period
-  let rangeFrom, rangeTo;
-  const now = dayjs().tz(LOCAL_TZ);
-
-  if (period === 'day') {
-    const base = dateQ ? dayjs(dateQ).tz(LOCAL_TZ) : now;
-    if (!base.isValid()) throwError('date tidak valid (YYYY-MM-DD)', 400);
-    rangeFrom = base.startOf('day');
-    rangeTo = base.endOf('day');
-  } else if (period === 'month') {
-    const base = monthQ ? dayjs(monthQ + '-01').tz(LOCAL_TZ) : now;
-    if (!base.isValid()) throwError('month tidak valid (YYYY-MM)', 400);
-    rangeFrom = base.startOf('month');
-    rangeTo = base.endOf('month');
-  } else if (period === 'year') {
-    const base = yearQ ? dayjs(String(yearQ) + '-01-01').tz(LOCAL_TZ) : now;
-    if (!base.isValid()) throwError('year tidak valid (YYYY)', 400);
-    rangeFrom = base.startOf('year');
-    rangeTo = base.endOf('year');
-  } else if (period === 'range') {
-    if (!fromQ || !toQ)
-      throwError('Untuk period=range, kirimkan from & to (ISO).', 400);
-    const f = dayjs(fromQ).tz(LOCAL_TZ);
-    const t = dayjs(toQ).tz(LOCAL_TZ);
-    if (!f.isValid() || !t.isValid())
-      throwError('from/to tidak valid (ISO).', 400);
-    rangeFrom = f.startOf('minute');
-    rangeTo = t.endOf('minute');
-  } else {
-    throwError('period tidak valid. Gunakan day|month|year|range', 400);
-  }
-
-  // If shift override is provided (user may want to see only shift1 or shift2)
-  // support query param `only_shift=1|2` to restrict to only that shift.
-  const onlyShift = String(req.query?.only_shift || '').trim(); // '1' or '2' or ''
-
-  const toRangeDayjs = (rangeStr, baseDay) => {
-    const parsed = parseTimeRangeToDayjs(
-      rangeStr,
-      baseDay.format('YYYY-MM-DD')
-    );
-    if (!parsed) return null;
-    return { from: parsed.from, to: parsed.to };
-  };
-
-  // Build ranges to compute: full period + shift1 + shift2 (shift ranges inside the same day)
-  // For monthly/yearly/range, shift1/shift2 will be interpreted per-day if period === 'day'
-  // If period !== day and onlyShift set, we will apply shift time-of-day across all days in range (aggregate by paid_at)
-  // Simpler approach: when period === 'day' calculate shifts with same baseDay; else if onlyShift provided, restrict paid_at time-of-day across whole range.
-
-  const ranges = [];
-
-  // full range
-  ranges.push({ id: 'full', from: rangeFrom, to: rangeTo });
-
-  // For day: compute shift1 & shift2 as provided
-  if (period === 'day') {
-    const shift1 = toRangeDayjs(shift1Str, rangeFrom);
-    const shift2 = toRangeDayjs(shift2Str, rangeFrom);
-    if (!shift1 || !shift2)
-      throwError('Format shift tidak valid. Gunakan "HH:mm-HH:mm".', 400);
-    ranges.push({ id: 'shift1', from: shift1.from, to: shift1.to });
-    ranges.push({ id: 'shift2', from: shift2.from, to: shift2.to });
-  } else if (onlyShift === '1' || onlyShift === '2') {
-    // interpret shift times-of-day across entire date range
-    const baseForShift = rangeFrom; // we'll use only HH:mm parts
-    const shift1 = toRangeDayjs(shift1Str, baseForShift);
-    const shift2 = toRangeDayjs(shift2Str, baseForShift);
-    if (!shift1 || !shift2)
-      throwError('Format shift tidak valid. Gunakan "HH:mm-HH:mm".', 400);
-
-    // create a function to test time-of-day instead of building many ranges
-    ranges.push({
-      id: onlyShift === '1' ? 'shift1' : 'shift2',
-      from: shift1.from,
-      to: shift1.to,
-      applyDaily: true,
-      which: onlyShift === '1' ? shift1 : shift2
-    });
-  } else {
-    // not day and no onlyShift -> still include shift summaries but not apply them (optional)
-    // We'll still try to compute aggregated by_payment_method for full range only.
-  }
-
-  // helper builder: match for paid orders in a given from/to (dayjs objects)
-  const buildOrderMatchFor = (fromD, toD) => ({
-    payment_status: { $in: ['paid', 'verified'] },
-    paid_at: { $gte: fromD.toDate(), $lte: toD.toDate() },
-    status: { $ne: 'cancelled' }
-  });
-
-  // helper aggregation to get omzet + count + by payment method
-  const aggregateOrdersForRange = async (fromD, toD, applyDailyTimeWindow) => {
-    // If applyDailyTimeWindow === {fromDayjs,toDayjs, daily:true} we need to match based on time-of-day across days.
-    if (!applyDailyTimeWindow) {
-      const match = buildOrderMatchFor(fromD, toD);
-      const pipeline = [
-        { $match: match },
-        {
-          $group: {
-            _id: { $ifNull: ['$payment_method', 'unknown'] },
-            omzet: { $sum: { $ifNull: ['$grand_total', 0] } },
-            count: { $sum: 1 }
-          }
-        }
-      ];
-      const rows = await Order.aggregate(pipeline).allowDiskUse(true);
-      // normalize
-      const methods = { transfer: 0, qris: 0, cash: 0, card: 0, unknown: 0 };
-      let total = 0;
-      let totalCount = 0;
-      for (const r of rows || []) {
-        const m = String(r._id || 'unknown');
-        const amt = Number(r.omzet || 0);
-        const cnt = Number(r.count || 0);
-        if (Object.prototype.hasOwnProperty.call(methods, m)) methods[m] = amt;
-        else methods.unknown += amt;
-        total += amt;
-        totalCount += cnt;
-      }
-      return {
-        total_amount: total,
-        total_count: totalCount,
-        by_payment_method: methods
-      };
-    }
-
-    // applyDailyTimeWindow: select orders in [fromD_global, toD_global] AND where paid_at time-of-day within window
-    // We'll query by paid_at between global from/to, then filter in JS by time-of-day (safe for moderate data sizes).
-    const globalMatch = {
-      payment_status: { $in: ['paid', 'verified'] },
-      paid_at: { $gte: fromD.toDate(), $lte: toD.toDate() },
-      status: { $ne: 'cancelled' }
-    };
-    const docs = await Order.find(globalMatch)
-      .select('payment_method grand_total paid_at')
-      .lean();
-    const methods = { transfer: 0, qris: 0, cash: 0, card: 0, unknown: 0 };
-    let total = 0;
-    let totalCount = 0;
-
-    const dayWindowFrom = applyDailyTimeWindow.from; // dayjs with a sample date, we use HH:mm
-    const dayWindowTo = applyDailyTimeWindow.to;
-
-    for (const d of docs || []) {
-      if (!d.paid_at) continue;
-      const p = dayjs(d.paid_at).tz(LOCAL_TZ);
-      // build day-local window for this date
-      const dayStr = p.format('YYYY-MM-DD');
-      const winFrom = dayWindowFrom
-        .clone()
-        .set('year', p.year())
-        .set('month', p.month())
-        .set('date', p.date());
-      const winTo = dayWindowTo
-        .clone()
-        .set('year', p.year())
-        .set('month', p.month())
-        .set('date', p.date());
-      // if windowTo < windowFrom, assume window crosses midnight -> add 1 day to winTo
-      if (winTo.isBefore(winFrom)) winTo.add(1, 'day');
-      if (p.isBetween(winFrom, winTo, null, '[]')) {
-        const m = String(d.payment_method || 'unknown');
-        const amt = Number(d.grand_total || 0);
-        if (Object.prototype.hasOwnProperty.call(methods, m)) methods[m] += amt;
-        else methods.unknown += amt;
-        total += amt;
-        totalCount += 1;
+  const orderPipeline = [
+    { $match: orderMatch },
+    {
+      $group: {
+        _id: null,
+        transaksiMasuk: { $sum: 1 },
+        omzet: { $sum: { $ifNull: ['$grand_total', 0] } }
       }
     }
+  ];
 
-    return {
-      total_amount: total,
-      total_count: totalCount,
-      by_payment_method: methods
-    };
+  const [ordersAgg] = await Order.aggregate(orderPipeline);
+
+  const expenseMatch = {
+    date: { $gte: start, $lte: end },
+    isDeleted: { $ne: true }
   };
-
-  // compute pengeluaran: attempt to use Expense model if available
-  let pengeluaran = 0;
-  try {
-    let ExpenseModel = null;
-    try {
-      ExpenseModel = require('../models/expenseModel');
-    } catch (e) {
-      ExpenseModel = null;
+  const expensePipeline = [
+    { $match: expenseMatch },
+    {
+      $group: { _id: null, totalExpense: { $sum: { $ifNull: ['$amount', 0] } } }
     }
-    if (ExpenseModel) {
-      const expAgg = await ExpenseModel.aggregate([
-        {
-          $match: {
-            createdAt: { $gte: rangeFrom.toDate(), $lte: rangeTo.toDate() }
-          }
-        },
-        { $group: { _id: null, total: { $sum: { $ifNull: ['$amount', 0] } } } }
-      ]);
-      pengeluaran = expAgg?.[0]?.total || 0;
-    } else {
-      // no expense model found in project, default 0
-      pengeluaran = 0;
-    }
-  } catch (err) {
-    console.error('[transactionSummary][expense]', err?.message || err);
-    pengeluaran = 0;
-  }
+  ];
+  const [expenseAgg] = await Expense.aggregate(expensePipeline);
 
-  // run aggregations for ranges
-  const results = {};
-  for (const r of ranges) {
-    if (r.applyDaily) {
-      const agg = await aggregateOrdersForRange(rangeFrom, rangeTo, {
-        from: r.which.from,
-        to: r.which.to
-      });
-      results[r.id] = agg;
-    } else {
-      const agg = await aggregateOrdersForRange(r.from, r.to, null);
-      results[r.id] = agg;
-    }
-  }
-
-  // prepare response: full, shift1, shift2 (if present)
-  const omzet = results.full?.total_amount || 0;
-  const total_transactions = results.full?.total_count || 0;
-  const by_payment_method = results.full?.by_payment_method || {
-    transfer: 0,
-    qris: 0,
-    cash: 0,
-    card: 0,
-    unknown: 0
-  };
-
-  const shift1_summary = results.shift1 || null;
-  const shift2_summary = results.shift2 || null;
-
+  const omzet = Number(ordersAgg?.omzet || 0);
+  const pengeluaran = Number(expenseAgg?.totalExpense || 0);
   const pendapatan = omzet - pengeluaran;
 
-  return res.json({
-    success: true,
-    period: period,
-    range: { from: rangeFrom.toISOString(), to: rangeTo.toISOString() },
-    totals: {
-      pengeluaran,
-      omzet,
-      pendapatan,
-      total_transactions
+  res.json({
+    period: { start, end },
+    transaksi_masuk: ordersAgg?.transaksiMasuk || 0,
+    omzet,
+    pendapatan,
+    pengeluaran
+  });
+});
+
+// data transaksi
+exports.totalTransactions = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+  const cursor = req.query.cursor ? String(req.query.cursor) : null;
+
+  const match = {
+    status: 'completed',
+    paid_at: { $gte: start, $lte: end }
+  };
+
+  const [agg] = await Order.aggregate([
+    { $match: match },
+    {
+      $group: {
+        _id: null,
+        count: { $sum: 1 },
+        total_grand: { $sum: { $ifNull: ['$grand_total', 0] } }
+      }
+    }
+  ]);
+
+  const count = agg?.count || 0;
+  const totalGrand = agg?.total_grand || 0;
+  const averagePerOrder = count ? Math.round(totalGrand / count) : 0;
+
+  const findQuery = { ...match };
+
+  if (cursor) {
+    if (!mongoose.Types.ObjectId.isValid(cursor)) {
+      return res.status(400).json({ error: 'Invalid cursor' });
+    }
+    findQuery._id = { $lt: mongoose.Types.ObjectId(cursor) };
+  }
+
+  const rows = await Order.find(findQuery)
+    .select(
+      'member customer_name customer_phone grand_total transaction_code createdAt'
+    )
+    .populate('member', 'name phone')
+    .sort({ createdAt: -1, _id: -1 })
+    .limit(limit + 1)
+    .lean();
+
+  let nextCursor = null;
+  let resultRows = rows;
+  if (rows.length > limit) {
+    const extra = rows.pop(); // remove extra
+    nextCursor = extra._id.toString();
+    resultRows = rows;
+  } else if (rows.length > 0) {
+    nextCursor = null;
+  }
+
+  const orders = resultRows.map((r) => {
+    const member = r.member;
+    const name = member?.name || r.customer_name || '';
+    const phone = member?.phone || r.customer_phone || '';
+    return {
+      name,
+      phone,
+      grand_total: r.grand_total || 0,
+      transaction_code: r.transaction_code || r.transaction_code || '',
+      created_at: r.createdAt || r.created_at || null,
+      _id: r._id
+    };
+  });
+
+  res.json({
+    period: { start, end },
+    total_transactions: count,
+    total_grand: totalGrand,
+    average_per_order: averagePerOrder,
+    limit,
+    nextCursor,
+    orders
+  });
+});
+
+// Detail order
+exports.getDetailOrder = asyncHandler(async (req, res) => {
+  const id = req.params.id;
+  if (!req.user) throwError('Unauthorized', 401);
+  if (!mongoose.Types.ObjectId.isValid(id)) throwError('ID tidak valid', 400);
+
+  // populate member (ambil hanya name & phone)
+  const order = await Order.findById(id)
+    .populate({ path: 'member', select: 'name phone' })
+    .lean();
+  if (!order) throwError('Order tidak ditemukan', 404);
+
+  const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
+
+  // Susun response yang bersih / minimal (aggregate approach)
+  const slim = {
+    id: String(order._id),
+    transaction_code: order.transaction_code,
+    customer: {
+      // prioritas: member (populate) -> explicit customer_name/phone di order
+      name: order.member?.name || order.customer_name || null,
+      phone: order.member?.phone || order.customer_phone || null
     },
-    by_payment_method,
-    shifts: {
-      shift1: shift1_summary
-        ? {
-            total_amount: shift1_summary.total_amount,
-            total_count: shift1_summary.total_count,
-            by_payment_method: shift1_summary.by_payment_method
-          }
-        : null,
-      shift2: shift2_summary
-        ? {
-            total_amount: shift2_summary.total_amount,
-            total_count: shift2_summary.total_count,
-            by_payment_method: shift2_summary.by_payment_method
-          }
-        : null
+    fulfillment_type: order.fulfillment_type || null,
+    table_number: order.table_number ?? null,
+    payment_status: order.payment_status ?? null,
+    // items: show base price, addons and line_subtotal (no per-item tax/service)
+    items: (order.items || []).map((it) => {
+      const qty = safeNumber(it.quantity || 0);
+      const basePrice = safeNumber(it.base_price || 0);
+
+      const addons_unit = (it.addons || []).reduce(
+        (s, a) => s + (Number.isFinite(+a.price) ? +a.price : 0) * (a.qty || 1),
+        0
+      );
+
+      const unit_before_tax = basePrice + addons_unit;
+      const line_subtotal = Number(it.line_subtotal ?? unit_before_tax * qty);
+
+      return {
+        name: it.name,
+        menu: String(it.menu || ''),
+        menu_code: it.menu_code || '',
+        imageUrl: it.imageUrl || '',
+        qty,
+        base_price: basePrice,
+        addons: (it.addons || []).map((a) => ({
+          name: a.name,
+          price: safeNumber(a.price),
+          qty: a.qty || 1
+        })),
+        notes: it.notes || '',
+        line_subtotal
+      };
+    }),
+    totals: {
+      items_subtotal: safeNumber(order.items_subtotal || 0), // BEFORE tax
+      service_fee: safeNumber(order.service_fee || 0),
+      delivery_fee: safeNumber(order.delivery_fee || 0),
+      items_discount: safeNumber(order.items_discount || 0),
+      shipping_discount: safeNumber(order.shipping_discount || 0),
+      tax_rate_percent: safeNumber(
+        order.tax_rate_percent || Math.round((parsePpnRate() || 0.11) * 100)
+      ),
+      tax_amount: safeNumber(order.tax_amount || 0),
+      rounding_delta: safeNumber(order.rounding_delta || 0),
+      grand_total: safeNumber(order.grand_total || 0)
+    },
+    payment: {
+      method: order.payment_method || null,
+      provider: order.payment_provider || null,
+      status: order.payment_status || null,
+      proof_url: order.payment_proof_url || null,
+      paid_at: order.paid_at || null
+    },
+    status: order.status || null,
+    placed_at: order.placed_at || null,
+    created_at: order.createdAt || null,
+    updated_at: order.updatedAt || null,
+    delivery: order.delivery
+      ? {
+          mode: order.delivery.mode || null,
+          address_text: order.delivery.address_text || null,
+          location:
+            order.delivery.location &&
+            typeof order.delivery.location.lat === 'number'
+              ? {
+                  lat: order.delivery.location.lat,
+                  lng: order.delivery.location.lng
+                }
+              : null,
+          distance_km: order.delivery.distance_km ?? null,
+          delivery_fee: order.delivery.delivery_fee ?? null,
+          slot_label: order.delivery.slot_label || null,
+          scheduled_at: order.delivery.scheduled_at || null,
+          status: order.delivery.status || null,
+          // <-- pickup_window ditambahkan di sini (safe check)
+          pickup_window: order.delivery.pickup_window
+            ? {
+                from: order.delivery.pickup_window.from || null,
+                to: order.delivery.pickup_window.to || null
+              }
+            : null
+        }
+      : null
+  };
+
+  return res.status(200).json({ success: true, order: slim });
+});
+
+//  list member
+exports.listMemberSummary = asyncHandler(async (req, res) => {
+  let { limit = 10, search = '', cursor } = req.query;
+  limit = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 200);
+
+  const baseMatch = buildMemberMatch({ search });
+
+  const matchCursor = {};
+  if (cursor) {
+    const d = new Date(cursor);
+    if (!isNaN(d.getTime())) {
+      matchCursor.createdAt = { $lt: d };
+    }
+  }
+
+  const combinedMatch = { $and: [baseMatch, matchCursor] };
+
+  // pipeline: match -> sort desc -> limit+1 -> project only required fields
+  const pipeline = [
+    { $match: combinedMatch },
+    { $sort: { createdAt: -1, _id: -1 } },
+    { $limit: limit + 1 },
+    {
+      $project: {
+        name: 1,
+        phone: 1,
+        total_spend: 1,
+        createdAt: 1
+      }
+    }
+  ];
+
+  const raw = await Member.aggregate(pipeline).allowDiskUse(true);
+
+  // next_cursor logic
+  let next_cursor = null;
+  let rows = raw;
+  if (raw.length > limit) {
+    const extra = raw[limit]; // there is an extra
+    next_cursor = extra?.createdAt
+      ? new Date(extra.createdAt).toISOString()
+      : null;
+    rows = raw.slice(0, limit);
+  }
+
+  // optional total count for search (still useful for FE)
+  const total = await Member.countDocuments(baseMatch);
+
+  // map to minimal shape (no extra fields)
+  const data = rows.map((r) => ({
+    name: r.name || '',
+    phone: r.phone || '',
+    total_spend: r.total_spend || 0,
+    createdAt: r.createdAt
+  }));
+
+  res.json({
+    limit,
+    next_cursor,
+    total,
+    data
+  });
+});
+
+// Dashboard
+exports.memberDashboard = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const now = dayjs();
+  const startToday = now.startOf('day').toDate();
+  const start7Days = now.subtract(7, 'day').startOf('day').toDate();
+  const startMonth = now.startOf('month').toDate();
+
+  const [total, male, female, newToday, new7days, newThisMonth] =
+    await Promise.all([
+      Member.countDocuments({}),
+      Member.countDocuments({ gender: 'male' }),
+      Member.countDocuments({ gender: 'female' }),
+      Member.countDocuments({ createdAt: { $gte: startToday } }),
+      Member.countDocuments({ createdAt: { $gte: start7Days } }),
+      Member.countDocuments({ createdAt: { $gte: startMonth } })
+    ]);
+
+  res.json({
+    success: true,
+    summary: {
+      total,
+      male,
+      female,
+      new_today: newToday,
+      new_last_7_days: new7days,
+      new_this_month: newThisMonth
     }
   });
 });
 
-/**
- * GET /reports/orders/list
- * Daftar order pada range:
- *  - type=paid (default) → filter pakai paid_at
- *  - type=all → pakai createdAt
- *  - type=cancelled → pakai cancelled_at
- * Query: type, period|start|end|mode|weekStartsOn, limit (default 100)
- */
-exports.orderList = asyncHandler(async (req, res) => {
-  const { type = 'paid', limit = 100 } = req.query;
-  const rs = rangeFromQuery(req.query);
+// Detail
+exports.getMemberDetail = asyncHandler(async (req, res) => {
+  const { id } = req.params;
 
-  let q = { isDeleted: { $ne: true } };
-  if (type === 'paid') {
-    Object.assign(q, {
-      payment_status: 'paid',
-      paid_at: { $gte: rs.start, $lte: rs.end }
-    });
-  } else if (type === 'cancelled') {
-    Object.assign(q, {
-      status: 'cancelled',
-      cancelled_at: { $gte: rs.start, $lte: rs.end }
-    });
-  } else {
-    // all by createdAt
-    Object.assign(q, { createdAt: { $gte: rs.start, $lte: rs.end } });
-  }
+  if (!mongoose.Types.ObjectId.isValid(id)) throwError('ID tidak valid', 400);
 
-  const orders = await Order.find(q)
-    .populate('member', 'name phone')
-    .populate('verified_by', 'name') // kasir/verifikator pembayaran
-    .sort({ createdAt: -1 })
-    .limit(Math.min(parseInt(limit, 10) || 100, 500));
+  const m = await Member.findById(id).lean();
+  if (!m) throwError('Member tidak ditemukan', 404);
 
-  res.json({ orders });
+  res.json({
+    member: {
+      _id: m._id,
+      name: m.name,
+      phone: m.phone,
+      gender: m.gender,
+      createdAt: m.createdAt,
+      points: m.points || 0,
+      spend_point_total: m.spend_point_total,
+      birthday: m.birthday,
+      total_spend: m.total_spend || 0,
+      visit_count: m.visit_count || 0,
+      last_visit_at: m.last_visit_at || null
+    }
+  });
 });
 
-/**
- * GET /reports/orders/timeseries
- * Timeseries omzet (grand_total) untuk order paid pada range, di-bucket
- * otomatis berdasar period: hour/day/month
- * Return: { buckets: [ { t, count, omzet } ] }
- */
-exports.orderTimeseries = asyncHandler(async (req, res) => {
-  const rs = rangeFromQuery(req.query);
-  const bucket = inferBucket(req.query.period);
+// Top spender bulan ini
+exports.topSpendersThisMonth = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+  const limit = Math.min(asInt(req.query.limit, 50), 200);
 
-  // Pakai $dateTrunc (MongoDB 5.0+) agar rapi
-  const buckets = await Order.aggregate([
-    { $match: matchPaid(rs) },
-    {
-      $group: {
-        _id: {
-          t: {
-            $dateTrunc: {
-              date: '$paid_at',
-              unit: bucket,
-              timezone: 'Asia/Jakarta'
-            }
-          }
-        },
-        count: { $sum: 1 },
-        omzet: { $sum: '$grand_total' }
-      }
-    },
-    { $project: { _id: 0, t: '$_id.t', count: 1, omzet: 1 } },
-    { $sort: { t: 1 } }
-  ]);
+  const start = dayjs().startOf('month').toDate();
+  const end = dayjs().endOf('month').toDate();
 
-  res.json({ buckets, bucket });
-});
-
-/**
- * GET /reports/orders/top-menu
- * Top menu berdasarkan qty & sales (order paid dalam range)
- * Query: limit (default 10)
- */
-exports.orderTopMenu = asyncHandler(async (req, res) => {
-  const rs = rangeFromQuery(req.query);
-  const limit = Math.min(parseInt(req.query.limit, 10) || 10, 50);
-
-  const top = await Order.aggregate([
-    { $match: matchPaid(rs) },
-    { $unwind: '$items' },
-    {
-      $group: {
-        _id: '$items.menu',
-        name: { $last: '$items.name' },
-        total_qty: { $sum: '$items.quantity' },
-        total_sales: { $sum: '$items.line_subtotal' }
-      }
-    },
-    { $sort: { total_qty: -1 } },
-    { $limit: limit }
-  ]);
-
-  res.json({ top });
-});
-
-/* ==================== 2) Laporan Keuangan ==================== */
-
-/**
- * GET /reports/finance/summary
- * - omzet_paid: sum grand_total dari order paid (paid_at in range)
- * - total_expense: sum amount dari Expense (createdAt in range) — optional
- * - profit: omzet_paid - total_expense
- */
-exports.financeSummary = asyncHandler(async (req, res) => {
-  const rs = rangeFromQuery(req.query);
-
-  const [omzetAgg, expenseAgg] = await Promise.all([
-    Order.aggregate([
-      { $match: matchPaid(rs) },
-      { $group: { _id: null, omzet: { $sum: '$grand_total' } } }
-    ]),
-    safeExpenseAggregate([
-      {
-        $match: {
-          isDeleted: { $ne: true },
-          createdAt: { $gte: rs.start, $lte: rs.end }
-        }
-      },
-      { $group: { _id: null, total_expense: { $sum: '$amount' } } }
-    ])
-  ]);
-
-  const omzet_paid = omzetAgg?.[0]?.omzet || 0;
-  const total_expense = expenseAgg?.[0]?.total_expense || 0;
-  const profit = omzet_paid - total_expense;
-
-  res.json({ omzet_paid, total_expense, profit });
-});
-
-/**
- * GET /reports/finance/expense-list
- * Daftar pengeluaran (optional model). Query: period|start|end|...
- */
-exports.expenseList = asyncHandler(async (req, res) => {
-  if (!Expense)
-    return res.json({ expenses: [], note: 'Expense model belum tersedia' });
-  const rs = rangeFromQuery(req.query);
-  const data = await Expense.find({
-    isDeleted: { $ne: true },
-    createdAt: { $gte: rs.start, $lte: rs.end }
-  })
-    .populate('created_by', 'name')
-    .sort({ createdAt: -1 });
-
-  res.json({ expenses: data });
-});
-
-/**
- * GET /reports/finance/profit-loss
- * Laba/Rugi ringkas:
- *  - omzet_paid (paid_at range)
- *  - (opsional) COGS kalau kamu punya modelnya sendiri (sementara 0)
- *  - expense_operational (Expense)
- *  - profit = omzet - expense_operational - COGS
- */
-exports.profitLoss = asyncHandler(async (req, res) => {
-  const rs = rangeFromQuery(req.query);
-
-  const omzetAgg = await Order.aggregate([
-    { $match: matchPaid(rs) },
-    { $group: { _id: null, omzet: { $sum: '$grand_total' } } }
-  ]);
-  const omzet_paid = omzetAgg?.[0]?.omzet || 0;
-
-  const expenseAgg = await safeExpenseAggregate([
+  const rows = await Order.aggregate([
     {
       $match: {
-        isDeleted: { $ne: true },
-        createdAt: { $gte: rs.start, $lte: rs.end }
+        payment_status: 'verified',
+        member: { $ne: null },
+        paid_at: { $gte: start, $lte: end }
       }
     },
-    { $group: { _id: null, total_expense: { $sum: '$amount' } } }
-  ]);
-  const expense_operational = expenseAgg?.[0]?.total_expense || 0;
-
-  const cogs = 0; // TODO: jika ada tabel HPP/COGS, tarik di sini
-  const profit = omzet_paid - expense_operational - cogs;
-
-  res.json({ omzet_paid, expense_operational, cogs, profit });
-});
-
-/* ==================== 3) Laporan Member ==================== */
-
-/**
- * GET /reports/members/summary
- * - total_members (aktif & tidak — sesuaikan kebijakan)
- * - new_members (createdAt di range)
- */
-exports.memberSummary = asyncHandler(async (req, res) => {
-  const rs = rangeFromQuery(req.query);
-
-  const [total, newcomers] = await Promise.all([
-    Member.countDocuments({ isDeleted: { $ne: true } }),
-    Member.countDocuments({
-      isDeleted: { $ne: true },
-      createdAt: { $gte: rs.start, $lte: rs.end }
-    })
-  ]);
-
-  res.json({ total_members: total, new_members: newcomers });
-});
-
-/**
- * GET /reports/members/list
- * List seluruh member ringkas
- */
-exports.memberList = asyncHandler(async (_req, res) => {
-  const members = await Member.find({ isDeleted: { $ne: true } })
-    .select('name phone points total_spend last_visit_at createdAt is_active')
-    .sort({ createdAt: -1 });
-
-  res.json({ members });
-});
-
-/**
- * GET /reports/members/top-customer
- * Top pelanggan berdasarkan total belanja (grand_total) PAID di range
- */
-exports.topCustomer = asyncHandler(async (req, res) => {
-  const rs = rangeFromQuery(req.query);
-  const limit = Math.min(parseInt(req.query.limit, 10) || 10, 50);
-
-  const top = await Order.aggregate([
-    { $match: Object.assign(matchPaid(rs), { member: { $ne: null } }) },
     {
       $group: {
         _id: '$member',
-        total_spent: { $sum: '$grand_total' },
+        total_spend_period: { $sum: { $ifNull: ['$grand_total', 0] } },
         total_orders: { $sum: 1 }
       }
     },
-    { $sort: { total_spent: -1 } },
+    { $sort: { total_spend_period: -1 } },
     { $limit: limit },
     {
       $lookup: {
@@ -600,49 +416,184 @@ exports.topCustomer = asyncHandler(async (req, res) => {
         as: 'member'
       }
     },
-    { $unwind: '$member' },
+    { $unwind: { path: '$member', preserveNullAndEmptyArrays: false } },
     {
       $project: {
-        _id: 0,
         member_id: '$_id',
         name: '$member.name',
         phone: '$member.phone',
-        total_spent: 1,
-        total_orders: 1
+        address: '$member.address',
+        total_orders: 1,
+        total_spend_period: 1
+      }
+    }
+  ]).allowDiskUse(true);
+
+  res.json({
+    period: {
+      start,
+      end
+    },
+    total: rows.length,
+    items: rows
+  });
+});
+
+// Top menu
+exports.bestSeller = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+
+  // Ambil seluruh menu
+  const allMenus = await Menu.find({}).select({ _id: 1, name: 1 }).lean();
+
+  // Agregasi penjualan menu
+  const agg = await Order.aggregate([
+    {
+      $match: {
+        payment_status: 'verified',
+        paid_at: { $gte: start, $lte: end }
+      }
+    },
+    { $unwind: '$items' },
+    {
+      $group: {
+        _id: '$items.menu',
+        name: { $last: '$items.name' },
+        total_qty: { $sum: '$items.quantity' },
+        total_sales: { $sum: '$items.line_subtotal' }
       }
     }
   ]);
 
-  res.json({ top });
+  // Map hasil agar mudah di-join
+  const soldMap = new Map();
+  agg.forEach((r) => {
+    soldMap.set(String(r._id), r);
+  });
+
+  // Gabungkan dengan semua menu, tampilkan juga yang tidak laku
+  const final = allMenus.map((m) => {
+    const sold = soldMap.get(String(m._id));
+    return {
+      menu_id: m._id,
+      name: m.name,
+      total_qty: sold ? sold.total_qty : 0,
+      total_sales: sold ? sold.total_sales : 0
+    };
+  });
+
+  // Urutkan berdasarkan qty dari yang paling laku ke tidak
+  final.sort((a, b) => b.total_qty - a.total_qty);
+
+  res.json({
+    period: { start, end },
+    total: final.length,
+    items: final
+  });
 });
 
-/**
- * GET /reports/members/:id/detail
- * Detail pelanggan + histori order paid pada range
- */
-exports.memberDetail = asyncHandler(async (req, res) => {
-  const { id } = req.params;
-  if (!mongoose.isValidObjectId(id))
-    return res.status(400).json({ message: 'member id tidak valid' });
+// List pengeluaran grafik (belum)
 
-  const rs = rangeFromQuery(req.query);
+// Laba rugi
+exports.profitLoss = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
 
-  const [member, orders] = await Promise.all([
-    Member.findOne({ _id: id, isDeleted: { $ne: true } }).select(
-      'name phone points total_spend last_visit_at createdAt is_active'
-    ),
-    Order.find({
-      member: id,
-      payment_status: 'paid',
-      paid_at: { $gte: rs.start, $lte: rs.end },
-      isDeleted: { $ne: true }
-    })
-      .populate('verified_by', 'name')
-      .sort({ paid_at: -1 })
+  // ----------------- ORDER / OMZET -----------------
+  const [orderAgg] = await Order.aggregate([
+    {
+      $match: {
+        payment_status: 'verified',
+        paid_at: { $gte: start, $lte: end }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        omzet: { $sum: { $ifNull: ['$grand_total', 0] } }
+      }
+    }
   ]);
 
-  if (!member)
-    return res.status(404).json({ message: 'Member tidak ditemukan' });
+  const grand_total = Number(orderAgg?.omzet || 0);
 
-  res.json({ member, orders });
+  // ----------------- EXPENSE -----------------
+  const [expenseAgg] = await Expense.aggregate([
+    {
+      $match: {
+        date: { $gte: start, $lte: end }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        expense_total: { $sum: { $ifNull: ['$amount', 0] } }
+      }
+    }
+  ]);
+
+  const expense_total = Number(expenseAgg?.expense_total || 0);
+
+  const profit_loss = grand_total - expense_total;
+
+  res.json({
+    period: { start, end },
+    grand_total,
+    expense_total,
+    profit_loss
+  });
+});
+
+// ---------------------- Grafik --------------------------------
+
+// pertumbuhan member
+exports.customerGrowth = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+
+  const gender =
+    req.query.gender === 'male' || req.query.gender === 'female'
+      ? req.query.gender
+      : null;
+
+  const match = {
+    createdAt: { $gte: start, $lte: end }
+  };
+
+  if (gender) match.gender = gender;
+
+  const rows = await Member.find(match).select('createdAt gender').lean();
+
+  const genderRows = await Member.find({
+    createdAt: { $gte: start, $lte: end }
+  })
+    .select('gender')
+    .lean();
+
+  const maleCount = genderRows.filter((x) => x.gender === 'male').length;
+  const femaleCount = genderRows.filter((x) => x.gender === 'female').length;
+
+  const days = [];
+  const cur = new Date(start);
+
+  while (cur <= end) {
+    const dayStr = cur.toISOString().substring(0, 10);
+    days.push({ key: dayStr, count: 0 });
+    cur.setDate(cur.getDate() + 1);
+  }
+
+  for (const m of rows) {
+    const d = m.createdAt.toISOString().substring(0, 10);
+    const bucket = days.find((x) => x.key === d);
+    if (bucket) bucket.count++;
+  }
+
+  res.json({
+    period: { start, end },
+    gender_filter: gender || 'all',
+    items: days,
+    total: rows.length,
+    gender_stats: {
+      male: maleCount,
+      female: femaleCount
+    }
+  });
 });

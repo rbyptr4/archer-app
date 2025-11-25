@@ -1,14 +1,9 @@
-// controllers/memberReportController.js
 const asyncHandler = require('express-async-handler');
 const mongoose = require('mongoose');
 const Member = require('../../models/memberModel');
-const Order = require('../../models/orderModel');
 const throwError = require('../../utils/throwError');
 const { parseRange } = require('../../utils/periodRange');
 
-const asInt = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
-
-/** Helper: cari member by name/phone */
 function buildMemberMatch({ search = '' } = {}) {
   const match = {};
   const s = String(search || '').trim();
@@ -19,7 +14,6 @@ function buildMemberMatch({ search = '' } = {}) {
   return match;
 }
 
-/** {start,end} dari parsePeriod */
 function getRangeFromQuery(q = {}) {
   const rangeKey = q.range || q.period || 'today';
   const weekStartsOn = Number.isFinite(+q.weekStartsOn) ? +q.weekStartsOn : 1;
@@ -31,6 +25,56 @@ function getRangeFromQuery(q = {}) {
   });
   return { start, end };
 }
+
+// Top spender dengan filter
+exports.topSpenders = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+  const limit = Math.min(asInt(req.query.limit, 50), 200);
+
+  const rows = await Order.aggregate([
+    {
+      $match: {
+        payment_status: 'verified',
+        member: { $ne: null },
+        paid_at: { $gte: start, $lte: end }
+      }
+    },
+    {
+      $group: {
+        _id: '$member',
+        total_spend_period: { $sum: { $ifNull: ['$grand_total', 0] } },
+        total_orders: { $sum: 1 }
+      }
+    },
+    { $sort: { total_spend_period: -1 } },
+    { $limit: limit },
+    {
+      $lookup: {
+        from: 'members',
+        localField: '_id',
+        foreignField: '_id',
+        as: 'member'
+      }
+    },
+    { $unwind: '$member' },
+    {
+      $project: {
+        member_id: '$_id',
+        name: '$member.name',
+        phone: '$member.phone',
+        address: '$member.address',
+        total_orders: 1,
+        total_spend_period: 1
+      }
+    }
+  ]);
+
+  res.json({
+    period: { start, end },
+    total: rows.length,
+    items: rows
+  });
+});
 
 exports.listMemberSummary = asyncHandler(async (req, res) => {
   let { limit = 10, search = '', cursor } = req.query;
@@ -88,69 +132,10 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
   }));
 
   res.json({
-    message: 'Ringkasan pelanggan (simple)',
     limit,
     next_cursor,
     total,
     data
-  });
-});
-
-exports.newCustomers = asyncHandler(async (req, res) => {
-  const { start, end } = getRangeFromQuery(req.query);
-
-  // Gender filter (optional)
-  const gender =
-    req.query.gender === 'male' || req.query.gender === 'female'
-      ? req.query.gender
-      : null;
-
-  const match = {
-    createdAt: { $gte: start, $lte: end }
-  };
-
-  // Jika gender dikirim -> filter, kalau tidak -> ALL gender
-  if (gender) match.gender = gender;
-
-  // Ambil semua member baru (sesuai filter)
-  const rows = await Member.find(match).select('createdAt gender').lean();
-
-  // Ambil juga data male/female (tanpa filter gender)
-  const genderRows = await Member.find({
-    createdAt: { $gte: start, $lte: end }
-  })
-    .select('gender')
-    .lean();
-
-  const maleCount = genderRows.filter((x) => x.gender === 'male').length;
-  const femaleCount = genderRows.filter((x) => x.gender === 'female').length;
-
-  // BUCKET HARIAN
-  const days = [];
-  const cur = new Date(start);
-
-  while (cur <= end) {
-    const dayStr = cur.toISOString().substring(0, 10);
-    days.push({ key: dayStr, count: 0 });
-    cur.setDate(cur.getDate() + 1);
-  }
-
-  // Hitung jumlah per hari
-  for (const m of rows) {
-    const d = m.createdAt.toISOString().substring(0, 10);
-    const bucket = days.find((x) => x.key === d);
-    if (bucket) bucket.count++;
-  }
-
-  res.json({
-    period: { start, end },
-    gender_filter: gender || 'all',
-    items: days,
-    total: rows.length,
-    gender_stats: {
-      male: maleCount,
-      female: femaleCount
-    }
   });
 });
 
@@ -176,60 +161,6 @@ exports.getMemberDetail = asyncHandler(async (req, res) => {
       visit_count: m.visit_count || 0,
       last_visit_at: m.last_visit_at || null
     }
-  });
-});
-
-exports.topSpenders = asyncHandler(async (req, res) => {
-  const { start, end } = getRangeFromQuery(req.query);
-  const limit = Math.min(asInt(req.query.limit, 50), 200);
-
-  const rows = await Order.aggregate([
-    {
-      $match: {
-        payment_status: 'verified',
-        member: { $ne: null },
-        paid_at: { $gte: start, $lte: end }
-      }
-    },
-    {
-      $group: {
-        _id: '$member',
-        spend: { $sum: { $ifNull: ['$grand_total', 0] } },
-        orders: { $sum: 1 },
-        last_paid_at: { $max: '$paid_at' }
-      }
-    },
-    { $sort: { spend: -1 } },
-    { $limit: limit },
-    {
-      $lookup: {
-        from: 'members',
-        localField: '_id',
-        foreignField: '_id',
-        as: 'member'
-      }
-    },
-    { $unwind: { path: '$member', preserveNullAndEmptyArrays: true } },
-    {
-      $project: {
-        member_id: '$_id',
-        name: '$member.name',
-        phone: '$member.phone',
-        spend: 1,
-        orders: 1,
-        points: { $ifNull: ['$member.points', 0] },
-        last_paid_at: 1,
-        lifetime_total_spend: '$member.total_spend',
-        lifetime_visit_count: '$member.visit_count',
-        join_channel: '$member.join_channel'
-      }
-    }
-  ]);
-
-  res.json({
-    period: { start, end },
-    total: rows.length,
-    items: rows
   });
 });
 

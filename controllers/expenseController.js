@@ -129,82 +129,87 @@ exports.createExpense = asyncHandler(async (req, res) => {
 });
 
 exports.getExpenses = asyncHandler(async (req, res) => {
-  const {
-    period,
-    start,
-    end,
-    mode,
-    typeId,
-    q,
-    min,
-    max,
-    limit = 20,
-    cursor,
-    summary
-  } = req.query;
-
-  const { start: s, end: e } = parsePeriod({
-    period,
-    start,
-    end,
-    mode,
-    weekStartsOn: 1
-  });
-
-  const filter = { date: { $gte: s, $lte: e } };
-
-  if (typeId && mongoose.Types.ObjectId.isValid(typeId))
-    filter.type = new mongoose.Types.ObjectId(typeId);
-
-  if (q?.trim()) filter.$text = { $search: q.trim() };
-  if (min !== undefined)
-    filter.amount = Object.assign(filter.amount || {}, { $gte: +min });
-  if (max !== undefined)
-    filter.amount = Object.assign(filter.amount || {}, { $lte: +max });
+  const { q, limit = 20, cursor } = req.query;
+  const { start: s, end: e } = getRangeFromQuery(req.query);
 
   const lim = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 200);
 
-  // cursor by createdAt descending
+  // build pipeline
+  const pipeline = [];
+
+  // 1) match by date range
+  pipeline.push({
+    $match: {
+      date: { $gte: s, $lte: e }
+    }
+  });
+
+  // 2) optional cursor paging (based on createdAt descending)
   if (cursor) {
     const d = new Date(cursor);
     if (!isNaN(d.getTime())) {
-      filter.createdAt = { $lt: d };
+      pipeline.push({
+        $match: { createdAt: { $lt: d } }
+      });
     }
   }
 
-  const items = await Expense.find(filter)
-    .populate('type', 'name')
-    .sort({ createdAt: -1 })
-    .limit(lim + 1)
-    .lean();
+  // 3) lookup type to enable searching by type.name
+  pipeline.push({
+    $lookup: {
+      from: 'expensetypes', // koleksi ExpenseType (mongoose pluralize)
+      localField: 'type',
+      foreignField: '_id',
+      as: 'type'
+    }
+  });
+  pipeline.push({
+    $unwind: { path: '$type', preserveNullAndEmptyArrays: true }
+  });
 
-  const next_cursor =
-    items.length > lim
-      ? new Date(items[lim - 1].createdAt).toISOString()
-      : null;
-
-  const payload = {
-    data: items.slice(0, lim),
-    next_cursor,
-    page: 0,
-    limit: lim
-  };
-
-  if (String(summary).toLowerCase() === 'true' || summary === '1') {
-    const aggr = await Expense.aggregate([
-      { $match: filter },
-      {
-        $group: {
-          _id: null,
-          totalAmount: { $sum: '$amount' },
-          count: { $sum: 1 }
-        }
+  // 4) search q on note OR type.name (case-insensitive)
+  if (q && String(q).trim()) {
+    const regex = new RegExp(String(q).trim(), 'i');
+    pipeline.push({
+      $match: {
+        $or: [{ note: { $regex: regex } }, { 'type.name': { $regex: regex } }]
       }
-    ]);
-    payload.summary = aggr[0] || { totalAmount: 0, count: 0 };
+    });
   }
 
-  res.json(payload);
+  // 5) sort & limit (lim+1 to detect next_cursor)
+  pipeline.push({ $sort: { createdAt: -1 } });
+  pipeline.push({ $limit: lim + 1 });
+
+  // 6) project shape (include type.name)
+  pipeline.push({
+    $project: {
+      _id: 1,
+      date: 1,
+      amount: 1,
+      note: 1,
+      imageUrl: 1,
+      createdBy: 1,
+      createdAt: 1,
+      type: { _id: '$type._id', name: '$type.name' }
+    }
+  });
+
+  const rows = await Expense.aggregate(pipeline).allowDiskUse(true);
+
+  const hasMore = rows.length > lim;
+  const data = rows.slice(0, lim);
+
+  const next_cursor = hasMore
+    ? new Date(rows[lim - 1].createdAt).toISOString()
+    : null;
+
+  res.json({
+    period: { start: s, end: e },
+    data,
+    next_cursor,
+    limit: lim
+  });
 });
 
 exports.getExpenseById = asyncHandler(async (req, res) => {

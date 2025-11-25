@@ -20,11 +20,6 @@ const Voucher = require('../models/voucherModel');
 const Promo = require('../models/promoModel');
 
 const {
-  recordOrderHistory,
-  snapshotOrder
-} = require('../controllers/owner/orderHistoryController');
-
-const {
   emitToCashier,
   emitToKitchen,
   emitToStaff,
@@ -2371,14 +2366,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // --- snapshot order (non-fatal) ---
-  try {
-    await snapshotOrder(order._id, { uiTotals }).catch(() => {});
-    console.log('[checkout] snapshot order done', { orderId: order._id });
-  } catch (e) {
-    console.error('[OrderHistory][checkout]', e?.message || e);
-  }
-
   // --- EMIT SOCKET (non-fatal) ---
   try {
     const summary = {
@@ -4121,28 +4108,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   }
 
   try {
-    const uiTotals = {
-      items_subtotal: order.items_subtotal,
-      delivery_fee: order.delivery_fee || 0,
-      service_fee: order.service_fee || 0,
-      items_discount: order.items_discount || 0,
-      shipping_discount: order.shipping_discount || 0,
-      discounts: order.discounts || [],
-      tax_rate_percent: order.tax_rate_percent,
-      tax_amount: order.tax_amount,
-      grand_total: order.grand_total,
-      rounding_delta: order.rounding_delta
-    };
-
-    await snapshotOrder(order._id, {
-      uiTotals,
-      verified_by_name: req.user?.name
-    }).catch(() => {});
-  } catch (e) {
-    console.error('[OrderHistory][createPosDineIn]', e?.message || e);
-  }
-
-  try {
     const summary = {
       id: String(order._id),
       transaction_code: order.transaction_code || '',
@@ -4718,22 +4683,6 @@ exports.completeOrder = asyncHandler(async (req, res) => {
   order.status = 'completed';
   await order.save();
 
-  // history: order completed
-  try {
-    await recordOrderHistory(order._id, 'order_status', req.user, {
-      from: 'accepted',
-      to: 'completed',
-      note: 'Pesanan selesai',
-      at: new Date()
-    });
-    // snapshot final
-    await snapshotOrder(order._id, { verified_by_name: req.user?.name }).catch(
-      () => {}
-    );
-  } catch (e) {
-    console.error('[OrderHistory][completeOrder]', e?.message || e);
-  }
-
   const payload = {
     id: String(order._id),
     transaction_code: order.transaction_code,
@@ -4787,35 +4736,6 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
 
   if (!doc.loyalty_awarded_at) {
     await awardPointsIfEligible(doc, Member);
-  }
-
-  // history: payment verified & order accepted
-  try {
-    await recordOrderHistory(doc._id, 'payment_status', req.user, {
-      from: 'unpaid',
-      to: doc.payment_status,
-      note: 'Pembayaran diverifikasi & order diterima',
-      at: doc.verified_at
-    });
-
-    // optional: snapshot saat verified (recommended for accurate price snapshot)
-    await snapshotOrder(doc._id, {
-      uiTotals: {
-        items_subtotal: doc.items_subtotal,
-        delivery_fee: doc.delivery_fee,
-        service_fee: doc.service_fee,
-        items_discount: doc.items_discount,
-        shipping_discount: doc.shipping_discount,
-        discounts: doc.discounts,
-        tax_rate_percent: doc.tax_rate_percent,
-        tax_amount: doc.tax_amount,
-        grand_total: doc.grand_total,
-        rounding_delta: doc.rounding_delta
-      },
-      verified_by_name: req.user?.name
-    }).catch(() => {});
-  } catch (e) {
-    console.error('[OrderHistory][acceptAndVerify]', e?.message || e);
   }
 
   const payload = {
@@ -5370,37 +5290,7 @@ exports.markAssignedToDelivered = asyncHandler(async (req, res) => {
     order.delivery.delivered_at = now;
   }
 
-  // order.status = 'completed';
-
-  // simpan
   const updatedOrder = await order.save();
-
-  // record history & snapshot (non-fatal)
-  try {
-    if (typeof recordOrderHistory === 'function') {
-      await recordOrderHistory(order._id, 'delivery_status', req.user, {
-        from: currentDeliveryStatus,
-        to: 'delivered',
-        note: 'Kurir menandai pengantaran selesai',
-        at: now
-      });
-    }
-  } catch (e) {
-    console.error(
-      '[recordOrderHistory][markAssignedToDelivered]',
-      e?.message || e
-    );
-  }
-
-  try {
-    if (typeof snapshotOrder === 'function') {
-      await snapshotOrder(order._id, { updatedBy: req.user._id }).catch(
-        () => {}
-      );
-    }
-  } catch (e) {
-    console.error('[snapshotOrder][markAssignedToDelivered]', e?.message || e);
-  }
 
   // === EMIT SOCKETS sesuai contoh kamu ===
   try {

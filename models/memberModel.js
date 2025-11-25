@@ -27,14 +27,6 @@ const MemberSchema = new mongoose.Schema(
 
     // baru: spend point audit / total spend points untuk audit
     spend_point_total: { type: Number, default: 0 },
-    spend_point_audit: [
-      {
-        at: { type: Date, default: Date.now },
-        delta: { type: Number, default: 0 },
-        reason: { type: String, default: '' },
-        ref: { type: String, default: '' } // orderId / voucherId dsb
-      }
-    ],
 
     visit_count: { type: Number, default: 0 },
     last_visit_at: { type: Date },

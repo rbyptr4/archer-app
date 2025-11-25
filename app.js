@@ -13,10 +13,10 @@ const menuMemberRoutes = require('./routers/member/menuMemberRoutes');
 const voucherMemberRoutes = require('./routers/member/voucherMemberRoutes');
 const voucherRoutes = require('./routers/owner/voucherRoutes');
 const employeeRoutes = require('./routers/owner/employeeRoutes');
-const orderHistoryRoutes = require('./routers/owner/orderHistoryRoutes');
 const menuRoutes = require('./routers/owner/menuRoutes');
 const menuPackagesRoutes = require('./routers/owner/packageMenuRoutes');
 const categoryRoutes = require('./routers/owner/menuCategoryRoutes');
+const reportRoutes = require('./routers/owner/reportRoutes');
 const memberManagementRoutes = require('./routers/owner/memberManagementRoutes');
 const expenseRoutes = require('./routers/expenseRoutes');
 const closingShiftRoutes = require('./routers/closingShiftRoutes');
@@ -49,9 +49,7 @@ const allowedOrigins = [
 app.use(
   cors({
     origin(origin, cb) {
-      console.log('[CORS] incoming origin ->', origin);
       if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-      console.warn('[CORS] rejected origin ->', origin);
       return cb(new Error('Not allowed by CORS: ' + origin));
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -85,13 +83,13 @@ app.use('/menu', menuRoutes);
 app.use('/menu/packages', menuPackagesRoutes);
 app.use('/menu/category', categoryRoutes);
 app.use('/expense', expenseRoutes);
+app.use('/report', reportRoutes);
 app.use('/member-management', memberManagementRoutes);
 app.use('/member', authMemberRoutes);
 app.use('/member/menu', menuMemberRoutes);
 app.use('/member/voucher', voucherMemberRoutes);
 app.use('/voucher', voucherRoutes);
 app.use('/promo', promoRoutes);
-app.use('/history', orderHistoryRoutes);
 app.use('/orders', orderRoutes);
 app.use('/payments', paymentRoutes);
 

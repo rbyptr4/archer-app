@@ -5,12 +5,6 @@ const PaymentSession = require('../../models/paymentSessionModel');
 const Order = require('../../models/orderModel');
 const Member = require('../../models/memberModel');
 const Cart = require('../../models/cartModel');
-
-const { afterCreateOrderEmit } = require('../socket/emitHelpers'); // sesuaikan path
-const {
-  recordOrderHistory,
-  snapshotOrder
-} = require('../../controllers/owner/orderHistoryController');
 const { awardPointsIfEligible } = require('../../utils/loyalty');
 const { nextDailyTxCode } = require('../../utils/txCode');
 const throwError = require('../../utils/throwError');
@@ -229,20 +223,6 @@ exports.xenditQrisWebhook = asyncHandler(async (req, res) => {
   if (!order) {
     throwError('applyPaymentSuccess tidak mengembalikan order', 500);
   }
-
-  await recordOrderHistory(order._id, 'payment_status', null, {
-    from: order.payment_status === 'unpaid' ? 'unpaid' : 'pending',
-    to: 'paid',
-    note: 'Pembayaran QRIS berhasil',
-    at: new Date(),
-    transaction_code: order.transaction_code,
-    source: order.source,
-    fulfillment_type: order.fulfillment_type,
-    status: order.status,
-    payment_status: 'paid'
-  });
-
-  await snapshotOrder(order._id, { verified_by_name: 'XenditWebhook' });
 
   const summary = makeOrderSummary(order);
 
