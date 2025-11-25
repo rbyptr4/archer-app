@@ -32,7 +32,12 @@ const {
 const throwError = require('../utils/throwError');
 const { createMember } = require('../utils/memberService');
 const { DELIVERY_SLOTS } = require('../config/onlineConfig'); // import
-const { sendText, buildOrderReceiptMessage, rp } = require('../utils/wablas');
+const {
+  sendText,
+  buildOrderReceiptMessage,
+  buildOwnerVerifyMessage,
+  rp
+} = require('../utils/wablas');
 const { buildUiTotalsFromCart } = require('../utils/cartUiCache');
 const { applyPromoThenVoucher } = require('../utils/priceEngine');
 const { getOwnerPhone } = require('../utils/ownerPhone');
@@ -2496,17 +2501,7 @@ exports.checkout = asyncHandler(async (req, res) => {
         full._id
       }&token=${encodeURIComponent(tokenRaw)}`;
 
-      const msg = [
-        '🔔 *Order Perlu Verifikasi Pembayaran*',
-        `Kode: *${full.transaction_code}*`,
-        `Nama: ${full.customer_name || '-'} — ${full.customer_phone || '-'}`,
-        `Total: ${rp(full.grand_total)}`,
-        '',
-        `Jika bukti pembayaran valid, klik verifikasi (link satu kali, berlaku ${EXPIRE_HOURS} jam):`,
-        `>${verifyLink}`,
-        '',
-        '— Archers Cafe System'
-      ].join('\n');
+      const msg = buildOwnerVerifyMessage(full, verifyLink, EXPIRE_HOURS);
 
       const owners = getOwnerPhone();
       if (!owners.length) {
@@ -4266,19 +4261,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
         full._id
       }&token=${encodeURIComponent(tokenRaw)}`;
 
-      const msg = [
-        '🔔 *Order Via Kasir Perlu Verifikasi Pembayaran*',
-        `Kode: *${full.transaction_code}*`,
-        `Meja: ${full.table_number || '-'}`,
-        `Pemesan: ${full.customer_name || '-'} — ${full.customer_phone || '-'}`,
-        `Total: ${rp(full.grand_total)}`,
-        '',
-        `Jika bukti pembayaran valid, klik verifikasi (link satu kali, berlaku ${EXPIRE_HOURS} jam):`,
-        `>${verifyLink}`,
-        '',
-        '— Archers Cafe System'
-      ].join('\n');
-
+      const msg = buildOwnerVerifyMessage(full, verifyLink, EXPIRE_HOURS);
       const owners = getOwnerPhone();
       if (!owners.length) {
         console.warn('[notify][owner][pos] OWNER_WA not set, skip WA');
@@ -6201,46 +6184,6 @@ exports.cancelOrder = asyncHandler(async (req, res) => {
   });
 });
 
-exports.verifyOwnerWA = asyncHandler(async (req, res) => {
-  const FRONTEND_LOGIN = process.env.FRONTEND_LOGIN_URL;
-  const SUCCESS_URL = process.env.OWNER_VERIFY_SUCCESS_URL;
-  const { id } = req.query;
-  if (!id) return res.redirect(FRONTEND_LOGIN);
-
-  if (!req.user) {
-    // redirect ke login — setelah login owner bisa kembali ke same URL
-    const returnTo = `${req.originalUrl}`;
-    return res.redirect(
-      `${FRONTEND_LOGIN}?returnTo=${encodeURIComponent(returnTo)}`
-    );
-  }
-
-  const order = await Order.findById(id);
-  if (!order) throwError('Order tidak ditemukan', 404);
-
-  if (!order.ownerVerified) {
-    order.ownerVerified = true;
-    order.ownerVerifiedBy = req.user._id;
-    order.ownerVerifiedAt = new Date();
-    await order.save();
-
-    try {
-      emitToCashier('staff:notify', {
-        message: `Order ${order.transaction_code} telah diverifikasi owner.`
-      });
-      emitOrdersStream({
-        target: 'cashier',
-        action: 'update',
-        item: { id: String(order._id), ownerVerified: true }
-      });
-    } catch (e) {
-      console.error('[emit][ownerVerifyGET]', e?.message || e);
-    }
-  }
-
-  return res.redirect(SUCCESS_URL);
-});
-
 exports.verifyOwnerDashboard = asyncHandler(async (req, res) => {
   if (!req.user && req.user.role != 'owner')
     throwError('Hanya owner yang bisa akses ini', 401);
@@ -6367,4 +6310,75 @@ exports.verifyOwnerByToken = asyncHandler(async (req, res) => {
       : '/owner/verify-success');
 
   return res.redirect(SUCCESS_URL);
+});
+
+exports.ownerVerifyPendingList = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const limitRaw = parseInt(req.query.limit || '50', 10);
+  const limit = Math.min(
+    Math.max(Number.isFinite(limitRaw) ? limitRaw : 50, 1),
+    200
+  );
+
+  const q = {
+    ownerVerified: false
+  };
+
+  // cursor = createdAt < cursorIso
+  if (req.query.cursor) {
+    const cDate = new Date(req.query.cursor);
+    if (isNaN(cDate.getTime()))
+      throwError('cursor tidak valid (harus ISO date)', 400);
+    q.createdAt = { $lt: cDate };
+  }
+
+  // optionally: hanya pesanan aktif (tidak cancelled) — uncomment kalau mau
+  // q.status = { $ne: 'cancelled' };
+
+  const raw = await Order.find(q)
+    .select(
+      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery payment_method ownerVerified createdAt items'
+    )
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .populate({ path: 'member', select: 'name' })
+    .lean();
+
+  const items = (Array.isArray(raw) ? raw : []).map((o) => {
+    const deliveryMode = o.delivery ? o.delivery.mode || null : null;
+    const delivery_mode =
+      deliveryMode || (o.fulfillment_type === 'dine_in' ? 'none' : 'delivery');
+
+    const orderItems = (Array.isArray(o.items) ? o.items : []).map((it) => ({
+      name: it.name || '',
+      quantity: Number(it.quantity || 0),
+      line_subtotal: Number(it.line_subtotal || 0)
+    }));
+
+    return {
+      id: String(o._id),
+      transaction_code: o.transaction_code || '',
+      grand_total: Number(o.grand_total || 0),
+      fulfillment_type: o.fulfillment_type || null,
+      delivery_mode,
+      customer_name: (o.member && o.member.name) || o.customer_name || '',
+      customer_phone: o.customer_phone || '',
+      placed_at: o.placed_at || o.createdAt || null,
+      table_number:
+        o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
+      payment_status: o.payment_status || null,
+      payment_method: o.payment_method || null,
+      total_quantity: Number(o.total_quantity || 0),
+      items: orderItems,
+      ownerVerified: !!o.ownerVerified,
+      createdAt: o.createdAt || null
+    };
+  });
+
+  const next_cursor = items.length
+    ? new Date(items[items.length - 1].createdAt).toISOString()
+    : null;
+
+  res.status(200).json({ items, next_cursor });
 });

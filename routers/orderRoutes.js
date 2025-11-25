@@ -150,14 +150,18 @@ router.get(
   order.getPickupOrders
 );
 
-router.get('/verify-owner', order.verifyOwnerByToken);
-
 router.get(
   '/dashboard',
   validateToken,
   requireRole('owner', 'courier', 'kitchen', 'cashier'),
-  requirePageAccess('kitchen'),
   order.homeDashboard
+);
+
+router.get(
+  '/owner/verify-pending',
+  validateToken,
+  requireRole('owner'),
+  order.ownerVerifyPendingList
 );
 
 router.get(
@@ -178,8 +182,8 @@ router.post(
   order.acceptAndVerify
 );
 
-router.get(
-  '/owner-verify/:id',
+router.patch(
+  '/owner/verify/:id',
   validateToken,
   requireRole('owner'),
   order.verifyOwnerDashboard

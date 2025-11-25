@@ -162,11 +162,77 @@ function buildClosingShiftMessage(doc, phase = 'step2') {
   return lines.join('\n');
 }
 
+/* ===== Pesan khusus verifikasi Owner ===== */
+function buildOwnerVerifyMessage(order, verifyLink, expireHours = 6) {
+  const lines = [];
+
+  lines.push('🔔 *Order Perlu Verifikasi Pembayaran*');
+  lines.push(`Kode: *${order.transaction_code || '-'}*`);
+  lines.push(
+    `Waktu Pesan: ${fmtDT(order.placed_at || order.createdAt || new Date())}`
+  );
+
+  /* ===== Tipe order (pakai delivery.mode) ===== */
+  const mode = order?.delivery?.mode || 'none';
+  let typeLabel = '';
+
+  if (mode === 'none') {
+    // dine in
+    typeLabel = `Dine-in${
+      order.table_number ? ` (Meja ${order.table_number})` : ''
+    }`;
+  } else if (mode === 'pickup') {
+    typeLabel = 'Pickup';
+  } else {
+    // delivery
+    typeLabel = 'Delivery';
+  }
+
+  lines.push(`Tipe: ${typeLabel}`);
+
+  if (mode === 'delivery') {
+    if (order.delivery?.address_text)
+      lines.push(`Alamat: ${order.delivery.address_text}`);
+    if (order.delivery?.distance_km)
+      lines.push(`Jarak: ${order.delivery.distance_km} km`);
+  }
+
+  lines.push('');
+  lines.push(
+    `Nama Pemesan: ${order.customer_name || '-'} (${
+      order.customer_phone || '-'
+    })`
+  );
+  lines.push(`Total Pembayaran: *${rp(order.grand_total)}*`);
+
+  /* ===== Tambahkan payment method ===== */
+  const pm = order.payment_method ? order.payment_method.toUpperCase() : '-';
+  lines.push(`Metode Pembayaran: *${pm}*`);
+
+  lines.push('');
+  lines.push('*Rincian Pesanan:*');
+
+  for (const it of order.items || []) {
+    lines.push(`• ${it.name} x${it.quantity} — ${rp(it.line_subtotal)}`);
+  }
+
+  lines.push('');
+  lines.push(`Klik link berikut untuk verifikasi pembayaran:\n${verifyLink}`);
+  lines.push(
+    `(Link berlaku *${expireHours} jam* dan hanya bisa dipakai sekali)`
+  );
+  lines.push('');
+  lines.push('— Archer System');
+
+  return lines.join('\n');
+}
+
 module.exports = {
   sendText,
   sendOtpText,
   buildOrderReceiptMessage,
   buildClosingShiftMessage,
+  buildOwnerVerifyMessage,
   rp,
   fmtDT
 };
