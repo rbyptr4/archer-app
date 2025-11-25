@@ -32,7 +32,7 @@ const {
 const throwError = require('../utils/throwError');
 const { createMember } = require('../utils/memberService');
 const { DELIVERY_SLOTS } = require('../config/onlineConfig'); // import
-const { sendText, buildOrderReceiptMessage } = require('../utils/wablas');
+const { sendText, buildOrderReceiptMessage, rp } = require('../utils/wablas');
 const { buildUiTotalsFromCart } = require('../utils/cartUiCache');
 const { applyPromoThenVoucher } = require('../utils/priceEngine');
 const { getOwnerPhone } = require('../utils/ownerPhone');
@@ -2512,7 +2512,7 @@ exports.checkout = asyncHandler(async (req, res) => {
         '— Archer System'
       ].join('\n');
 
-      const owners = getOwnerPhones();
+      const owners = getOwnerPhone();
       if (!owners.length) {
         console.warn('[notify][owner] OWNER_WA not set, skip WA');
         return;
@@ -4287,7 +4287,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
         '— Archer System'
       ].join('\n');
 
-      const owners = getOwnerPhones();
+      const owners = getOwnerPhone();
       if (!owners.length) {
         console.warn('[notify][owner][pos] OWNER_WA not set, skip WA');
         return;
