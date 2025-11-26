@@ -3263,17 +3263,23 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     fulfillmentType = 'dine_in',
     voucherClaimIds = [],
     delivery_mode: deliveryModeFromBody = null,
-    selectedPromoId = null
+    selectedPromoId = null,
+    debug: debugFromBody = false
   } = req.body || {};
+
+  const debug =
+    debugFromBody ||
+    String(req.query?.debug || '').toLowerCase() === 'true' ||
+    false;
 
   if (!cart?.items?.length) throwError('Cart kosong', 400);
 
-  // ===== resolve member identity (support guest) =====
+  // resolve identity (support guest)
   const memberId = req.member?.id || null;
-
-  // ===== filter voucher milik member & masih valid (fallback) =====
-  let eligible = [];
   const now = new Date();
+
+  // filter vouchers (guest cannot use vouchers)
+  let eligible = [];
   if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
     if (!memberId) {
       console.warn('[previewPrice] guest attempted voucherClaimIds - ignored');
@@ -3290,20 +3296,18 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     }
   }
 
-  // ===== tentukan delivery_mode efektif =====
+  // delivery mode & fee
   const deliveryMode =
     (typeof deliveryModeFromBody === 'string' &&
       deliveryModeFromBody.trim().toLowerCase()) ||
     (fulfillmentType === 'delivery' ? 'delivery' : 'none');
-
-  // ===== delivery fee policy =====
   const envDeliveryFee = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
   const effectiveDeliveryFee =
     fulfillmentType === 'delivery' && deliveryMode === 'delivery'
       ? envDeliveryFee
       : 0;
 
-  // ===== NORMALISASI CART ITEMS untuk engine =====
+  // normalize cart for engine
   const normalizedCart = {
     items: (Array.isArray(cart.items) ? cart.items : []).map((it) => {
       const addons = Array.isArray(it.addons) ? it.addons : [];
@@ -3324,18 +3328,15 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     })
   };
 
-  // ambil MemberDoc lengkap (untuk usage history dsb) — hanya jika ada member
+  // optional MemberDoc for fetchers
   let MemberDoc = null;
   if (memberId) {
     MemberDoc = await Member.findById(memberId)
       .lean()
-      .catch((e) => {
-        console.warn('[previewPrice] gagal ambil MemberDoc', e?.message || e);
-        return null;
-      });
+      .catch(() => null);
   }
 
-  // ===== promo usage fetchers (dipassing ke priceEngine) =====
+  // promo usage fetchers
   const promoUsageFetchers = {
     getMemberUsageCount: async (promoId, mId, sinceDate) => {
       try {
@@ -3378,21 +3379,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     }
   };
 
-  // ===== hitung eligible promos list dulu (agar FE bisa tahu berapa banyak tersedia) =====
-  console.log(
-    '[previewPrice] normalizedCart for promo engine:',
-    JSON.stringify(normalizedCart)
-  );
-  console.log(
-    '[previewPrice] MemberDoc:',
-    JSON.stringify({
-      id: MemberDoc?._id || null,
-      level: MemberDoc?.level || null,
-      total_spend: MemberDoc?.total_spend || 0,
-      promoUsageHistoryCount: (MemberDoc?.promoUsageHistory || []).length
-    })
-  );
-
+  // eligiblePromos list (for FE summary)
   let eligiblePromosList = [];
   try {
     eligiblePromosList = await findApplicablePromos(
@@ -3400,14 +3387,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       MemberDoc,
       now,
       { fetchers: promoUsageFetchers }
-    );
-    console.log(
-      '[previewPrice] findApplicablePromos returned:',
-      (eligiblePromosList || []).map((p) => ({
-        id: String(p._id),
-        name: p.name,
-        conditions: p.conditions
-      }))
     );
   } catch (e) {
     console.warn('[previewPrice] findApplicablePromos failed', e?.message || e);
@@ -3418,7 +3397,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     ? eligiblePromosList.length
     : 0;
 
-  // tentukan autoAppliedPromo untuk preview (pilih autoApply true dengan priority tertinggi)
+  // autoApplied suggestion (pick highest priority autoApply)
   let autoAppliedPromo = null;
   try {
     if (Array.isArray(eligiblePromosList) && eligiblePromosList.length) {
@@ -3440,17 +3419,9 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     autoAppliedPromo = null;
   }
 
-  // ===== panggil price engine (promo -> voucher -> totals) =====
+  // call engine
   let result;
   try {
-    console.log('[previewPrice] calling priceEngine.applyPromoThenVoucher', {
-      memberId: memberId,
-      itemCount: normalizedCart.items.length,
-      deliveryFee: effectiveDeliveryFee,
-      voucherClaimIds: Array.isArray(eligible) ? eligible.length : 0,
-      selectedPromoId: selectedPromoId || null
-    });
-
     result = await applyPromoThenVoucher({
       memberId: memberId,
       memberDoc: MemberDoc || null,
@@ -3463,8 +3434,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       autoApplyPromo: selectedPromoId ? false : true,
       promoUsageFetchers
     });
-
-    console.log('[previewPrice][engine] result.ok:', result?.ok);
   } catch (err) {
     console.error('[previewPrice] price engine error', err?.message || err);
     throwError(
@@ -3484,7 +3453,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     );
   }
 
-  // ===== build ui_totals dari engine result (fallbacks) =====
+  // build ui_totals (fallback)
   const t =
     (result && result.totals) ||
     (result.voucherResult && result.voucherResult.totals) ||
@@ -3505,62 +3474,10 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     delivery_fee: finalDeliveryFee,
     shipping_discount: Number(t.shippingDiscount || 0),
     rounding_delta: Number(t.rounding_delta || 0),
-    grand_total: Number(t.grandTotal || t.grand_total || 0),
-    grand_total_with_delivery: Number(t.grandTotal || t.grand_total || 0)
+    grand_total: Number(t.grandTotal || t.grand_total || 0)
   };
 
-  // ===== build promo info for UI (backward-compatible) =====
-  const appliedPromo = result.promoApplied || null;
-  const autoAppliedPromoFinal = autoAppliedPromo || null;
-
-  // legacy items for backward-compat (keperluan FE lama)
-  const promo_breakdown = [];
-  const promo_rewards = [];
-
-  if (appliedPromo && appliedPromo.impact) {
-    const imp = appliedPromo.impact;
-    if (Number(imp.itemsDiscount || imp.cartDiscount || 0) > 0) {
-      promo_breakdown.push({
-        type: 'promo_discount',
-        promoId: appliedPromo.promoId,
-        label: appliedPromo.name || 'Promo',
-        amount: Number(imp.itemsDiscount || imp.cartDiscount || 0)
-      });
-    }
-    if (Array.isArray(imp.addedFreeItems) && imp.addedFreeItems.length) {
-      for (const f of imp.addedFreeItems) {
-        promo_breakdown.push({
-          type: 'promo_free_item',
-          promoId: appliedPromo.promoId,
-          menuId: f.menuId,
-          qty: Number(f.qty || 1),
-          note: f.note || null
-        });
-        promo_rewards.push({
-          type: 'free_item',
-          menuId: f.menuId,
-          qty: Number(f.qty || 1)
-        });
-      }
-    }
-    if (Array.isArray(appliedPromo.actions) && appliedPromo.actions.length) {
-      for (const a of appliedPromo.actions) {
-        promo_rewards.push({
-          type: a.type,
-          amount: a.amount || null,
-          meta: a.meta || {}
-        });
-        promo_breakdown.push({
-          type: 'promo_action',
-          promoId: appliedPromo.promoId,
-          action: a.type,
-          amount: a.amount || null
-        });
-      }
-    }
-  }
-
-  // voucher info from engine (normalize)
+  // normalize voucher info
   const voucherInfo = (result.voucherResult && {
     chosenClaimIds:
       result.chosenClaimIds || result.voucherResult.chosenClaimIds || [],
@@ -3570,54 +3487,39 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     breakdown: result.breakdown || []
   };
 
-  // --- NEW: unified promo summary (single source of truth for FE) ---
-  const engineDiscounts = Array.isArray(result.discounts)
-    ? result.discounts
-    : Array.isArray(result.breakdown)
-    ? result.breakdown
-    : [];
-
-  const itemAdjustments = result.itemAdjustments || {}; // map menuId -> adjustments[]
+  // build minimal promo single source of truth
+  const appliedPromo = result.promoApplied || null;
   const engineRewards = Array.isArray(result.promoRewards)
     ? result.promoRewards
     : [];
+  const pointsTotalFromEngine =
+    (result.points_awarded_details && result.points_awarded_details.total) ||
+    (Array.isArray(result.promoApplied?.actions)
+      ? result.promoApplied.actions
+          .filter((a) => String(a.type || '').toLowerCase() === 'award_points')
+          .reduce((s, a) => s + Number(a.points ?? a.amount ?? 0), 0)
+      : 0);
 
-  // Normalisasi rewards: buat bentuk konsisten untuk FE
+  // normalized reward (single item if points-only or free-items)
   const normalizedRewards = [];
-  for (const r of engineRewards) {
-    normalizedRewards.push({
-      type: r.type || 'unknown',
-      amount: r.amount ?? null,
-      label: r.label || null,
-      meta: r.meta || {}
-    });
-  }
-  if (!normalizedRewards.length && appliedPromo && appliedPromo.impact) {
-    const imp = appliedPromo.impact;
-    if (Array.isArray(imp.addedFreeItems)) {
-      for (const f of imp.addedFreeItems) {
-        normalizedRewards.push({
-          type: 'free_item',
-          amount: 0,
-          label: `Gratis ${f.menuId}`,
-          meta: { menuId: f.menuId, qty: Number(f.qty || 1) }
-        });
-      }
+  if (engineRewards.length) {
+    for (const r of engineRewards) {
+      normalizedRewards.push({
+        type: r.type || 'unknown',
+        amount: r.amount ?? null,
+        label: r.label || null,
+        meta: r.meta || {}
+      });
     }
-    if (Array.isArray(appliedPromo.actions)) {
+  } else if (appliedPromo) {
+    // fallback: summarize
+    if (appliedPromo.actions && Array.isArray(appliedPromo.actions)) {
       for (const a of appliedPromo.actions) {
-        if (a.type === 'award_points') {
+        if (String(a.type || '').toLowerCase() === 'award_points') {
           normalizedRewards.push({
             type: 'points',
             amount: Number(a.points ?? a.amount ?? 0),
-            label: 'Poin promo',
-            meta: a.meta || {}
-          });
-        } else if (a.type === 'grant_membership') {
-          normalizedRewards.push({
-            type: 'membership',
-            amount: null,
-            label: 'Grant membership',
+            label: 'Poin',
             meta: a.meta || {}
           });
         } else {
@@ -3630,72 +3532,124 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         }
       }
     }
-    if (Number(imp.itemsDiscount || imp.cartDiscount || 0) > 0) {
-      normalizedRewards.push({
-        type: 'discount',
-        amount: Number(imp.itemsDiscount || imp.cartDiscount || 0),
-        label: 'Potongan promo',
-        meta: {}
-      });
+    // addedFreeItems fallback
+    if (
+      appliedPromo.impact &&
+      Array.isArray(appliedPromo.impact.addedFreeItems)
+    ) {
+      for (const f of appliedPromo.impact.addedFreeItems) {
+        normalizedRewards.push({
+          type: 'free_item',
+          amount: 0,
+          label: f.name || `Free item ${f.menuId || ''}`,
+          meta: { menuId: f.menuId, qty: Number(f.qty || 1) }
+        });
+      }
     }
   }
 
-  // Points details (engine may include a points_awarded_details object)
-  const points_awarded_details = result.points_awarded_details || {
-    total: 0,
-    actions: []
-  };
-
-  // === NEW: reconstruct eligiblePromosSummary that was missing ===
+  // eligiblePromos summary (compact)
   const eligiblePromosSummary = (eligiblePromosList || []).map((p) => ({
     id: String(p._id),
     name: p.name,
     type: p.type,
-    blocksVoucher: !!p.blocksVoucher,
     autoApply: !!p.autoApply,
-    priority: Number(p.priority || 0),
-    rewardSummary:
-      Array.isArray(p.rewards) && p.rewards.length
-        ? p.rewards
-        : p.reward
-        ? [p.reward]
-        : []
+    priority: Number(p.priority || 0)
   }));
 
-  // build single promo summary object
-  const promoSummary = {
-    appliedPromo: appliedPromo || null,
-    autoAppliedPromo: autoAppliedPromoFinal,
+  // build compact promo object for default response
+  const promoCompact = {
+    // minimal applied promo info (id + name)
+    appliedPromoId: appliedPromo ? appliedPromo.promoId : null,
+    appliedPromoName: appliedPromo ? appliedPromo.name || null : null,
+    // normalized rewards (compact)
     rewards: normalizedRewards,
-    discounts: engineDiscounts,
-    itemAdjustments,
-    chosenClaimIds: voucherInfo.chosenClaimIds || [],
-    points_awarded_details,
-    engineSnapshot: result.engineSnapshot || {}
+    // summary points (if any)
+    points_total: Number(pointsTotalFromEngine || 0),
+    // chosen vouchers (ids)
+    chosenClaimIds: voucherInfo.chosenClaimIds || []
   };
 
-  // ===== response =====
+  // if debug -> include everything verbose
+  if (debug) {
+    const heavy = {
+      appliedPromo: appliedPromo || null,
+      autoAppliedPromo: autoAppliedPromo || null,
+      promo_breakdown: (() => {
+        const arr = [];
+        if (appliedPromo && appliedPromo.impact) {
+          const imp = appliedPromo.impact;
+          if (Number(imp.itemsDiscount || imp.cartDiscount || 0) > 0) {
+            arr.push({
+              type: 'promo_discount',
+              promoId: appliedPromo.promoId,
+              amount: Number(imp.itemsDiscount || imp.cartDiscount || 0)
+            });
+          }
+          if (Array.isArray(imp.addedFreeItems)) {
+            for (const f of imp.addedFreeItems) {
+              arr.push({
+                type: 'promo_free_item',
+                promoId: appliedPromo.promoId,
+                menuId: f.menuId,
+                qty: Number(f.qty || 1)
+              });
+            }
+          }
+        }
+        if (Array.isArray(appliedPromo?.actions)) {
+          for (const a of appliedPromo.actions) {
+            arr.push({
+              type: 'promo_action',
+              promoId: appliedPromo?.promoId || null,
+              action: a.type,
+              amount: a.amount ?? null
+            });
+          }
+        }
+        return arr;
+      })(),
+      promo_rewards: normalizedRewards,
+      engineSnapshot: result.engineSnapshot || {},
+      breakdown: result.breakdown || [],
+      voucher_breakdown: voucherInfo.breakdown || []
+    };
+
+    return res.status(200).json({
+      ok: true,
+      reasons: result.reasons || result.voucherResult?.reasons || [],
+      eligiblePromosCount,
+      eligiblePromos: eligiblePromosSummary,
+      autoAppliedPromo: autoAppliedPromo || null,
+      appliedPromo: appliedPromo || null,
+      promo_breakdown: heavy.promo_breakdown,
+      promo_rewards: heavy.promo_rewards,
+      promo: {
+        compact: promoCompact,
+        engineSnapshot: heavy.engineSnapshot
+      },
+      voucher: {
+        chosenClaimIds: voucherInfo.chosenClaimIds || [],
+        breakdown: heavy.voucher_breakdown
+      },
+      breakdown: heavy.breakdown,
+      ui_totals,
+      guest: !memberId
+    });
+  }
+
+  // default (compact) response
   return res.status(200).json({
     ok: true,
     reasons: result.reasons || result.voucherResult?.reasons || [],
     eligiblePromosCount,
     eligiblePromos: eligiblePromosSummary,
-    autoAppliedPromo: autoAppliedPromo,
-    appliedPromo: appliedPromo,
-    promo_breakdown,
-    promo_rewards,
-    promo: promoSummary,
-    voucher: voucherInfo,
-    breakdown:
-      result.breakdown ||
-      (result.voucherResult && result.voucherResult.breakdown) ||
-      [],
+    // compact promo single source of truth
+    promo: promoCompact,
+    // voucher chosen ids (if any)
+    voucher: { chosenClaimIds: voucherInfo.chosenClaimIds || [] },
     ui_totals,
-    guest: !memberId,
-    note:
-      !memberId && Array.isArray(voucherClaimIds) && voucherClaimIds.length
-        ? 'Voucher IDs diabaikan untuk guest'
-        : undefined
+    guest: !memberId
   });
 });
 
