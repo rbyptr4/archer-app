@@ -222,6 +222,14 @@ async function applyPromoThenVoucher({
 
   if (promoApplied) {
     const { impact, actions } = await applyPromoRaw(promoApplied, cart);
+    console.log(
+      '[priceEngine.debug] applyPromoRaw returned for promo',
+      String(promoApplied._id),
+      {
+        impact,
+        actions
+      }
+    );
     promoImpact = impact || {};
     promoActions = actions || [];
     promoAppliedSnapshot = {
