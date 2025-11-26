@@ -3276,7 +3276,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   const now = new Date();
   if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
     if (!memberId) {
-      // guest trying to pass voucher ids -> ignore them (guest tidak boleh pakai voucher)
       console.warn('[previewPrice] guest attempted voucherClaimIds - ignored');
       eligible = [];
     } else {
@@ -3320,7 +3319,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         qty: Number(it.quantity ?? it.qty ?? 0),
         price: unitPrice,
         category: it.category ?? it.cat ?? null,
-        // keep some metadata for FE trace/debug
         name: it.name || null
       };
     })
@@ -3342,7 +3340,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     getMemberUsageCount: async (promoId, mId, sinceDate) => {
       try {
         if (!mId) return 0;
-        // gunakan member.promoUsageHistory jika tersedia (cheap)
         if (MemberDoc && Array.isArray(MemberDoc.promoUsageHistory)) {
           return MemberDoc.promoUsageHistory.filter(
             (h) =>
@@ -3350,7 +3347,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
               new Date(h.usedAt || h.date) >= sinceDate
           ).length;
         }
-        // fallback: hitung order dengan appliedPromo.promoId
         const q = {
           'appliedPromo.promoId': promoId,
           member: mId,
@@ -3399,7 +3395,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
 
   let eligiblePromosList = [];
   try {
-    // pass member object jika ada, else null -> promoEngine akan treat guest correctly
     eligiblePromosList = await findApplicablePromos(
       normalizedCart,
       MemberDoc,
@@ -3463,7 +3458,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       fulfillmentType,
       deliveryFee:
         fulfillmentType === 'delivery' ? Number(effectiveDeliveryFee || 0) : 0,
-      voucherClaimIds: eligible, // array of eligible claim ids (from earlier) - empty for guest
+      voucherClaimIds: eligible,
       selectedPromoId: selectedPromoId || null,
       autoApplyPromo: selectedPromoId ? false : true,
       promoUsageFetchers
@@ -3576,7 +3571,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   };
 
   // --- NEW: unified promo summary (single source of truth for FE) ---
-  // prefer structured fields from engine if available
   const engineDiscounts = Array.isArray(result.discounts)
     ? result.discounts
     : Array.isArray(result.breakdown)
@@ -3590,7 +3584,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
 
   // Normalisasi rewards: buat bentuk konsisten untuk FE
   const normalizedRewards = [];
-  // 1) dari engine.promoRewards (already normalized by engine)
   for (const r of engineRewards) {
     normalizedRewards.push({
       type: r.type || 'unknown',
@@ -3599,7 +3592,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       meta: r.meta || {}
     });
   }
-  // 2) jika engineRewards kosong, fallback build dari appliedPromo
   if (!normalizedRewards.length && appliedPromo && appliedPromo.impact) {
     const imp = appliedPromo.impact;
     if (Array.isArray(imp.addedFreeItems)) {
@@ -3654,23 +3646,31 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     actions: []
   };
 
+  // === NEW: reconstruct eligiblePromosSummary that was missing ===
+  const eligiblePromosSummary = (eligiblePromosList || []).map((p) => ({
+    id: String(p._id),
+    name: p.name,
+    type: p.type,
+    blocksVoucher: !!p.blocksVoucher,
+    autoApply: !!p.autoApply,
+    priority: Number(p.priority || 0),
+    rewardSummary:
+      Array.isArray(p.rewards) && p.rewards.length
+        ? p.rewards
+        : p.reward
+        ? [p.reward]
+        : []
+  }));
+
   // build single promo summary object
   const promoSummary = {
-    // what engine applied (if any)
     appliedPromo: appliedPromo || null,
-    // server's preview suggestion (auto apply)
     autoAppliedPromo: autoAppliedPromoFinal,
-    // normalized list of rewards (free items, points, membership, discounts)
     rewards: normalizedRewards,
-    // discounts / voucher breakdown (prefer engine structured discounts)
     discounts: engineDiscounts,
-    // per-item adjustments (map)
     itemAdjustments,
-    // voucher chosen claims
     chosenClaimIds: voucherInfo.chosenClaimIds || [],
-    // points detail
     points_awarded_details,
-    // raw snapshot for debugging/audit
     engineSnapshot: result.engineSnapshot || {}
   };
 
@@ -3678,27 +3678,20 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   return res.status(200).json({
     ok: true,
     reasons: result.reasons || result.voucherResult?.reasons || [],
-    // ringkasan eligible promo untuk FE (count + list)
     eligiblePromosCount,
     eligiblePromos: eligiblePromosSummary,
-    // auto-applied preview (server suggestion berdasarkan autoApply+priority)
-    autoAppliedPromo: autoAppliedPromo, // backward compat
-    // what engine applied as promo (if any)
-    appliedPromo: appliedPromo, // backward compat
-    promo_breakdown, // legacy
-    promo_rewards, // legacy
-    // new unified promo summary (single source of truth)
+    autoAppliedPromo: autoAppliedPromo,
+    appliedPromo: appliedPromo,
+    promo_breakdown,
+    promo_rewards,
     promo: promoSummary,
-    // voucher: preserve existing shape for backward compat
     voucher: voucherInfo,
     breakdown:
       result.breakdown ||
       (result.voucherResult && result.voucherResult.breakdown) ||
       [],
     ui_totals,
-    // helper: apakah caller guest (FE bisa gunakan ini untuk adjust UI)
     guest: !memberId,
-    // jika guest lalu kirim voucherIds, FE akan mendapat info ini — optional
     note:
       !memberId && Array.isArray(voucherClaimIds) && voucherClaimIds.length
         ? 'Voucher IDs diabaikan untuk guest'
