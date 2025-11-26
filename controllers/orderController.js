@@ -1850,6 +1850,18 @@ exports.checkout = asyncHandler(async (req, res) => {
         }
       }
     };
+    let eligiblePromosList = [];
+    try {
+      eligiblePromosList = await findApplicablePromos(
+        normalizedForEngine,
+        MemberDoc,
+        new Date(),
+        { fetchers: promoUsageFetchers }
+      );
+    } catch (e) {
+      console.warn('[checkout] findApplicablePromos failed', e?.message || e);
+      eligiblePromosList = [];
+    }
 
     // --- VALIDASI: jika user mengirim voucherClaimIds tapi dia juga memilih selectedPromoId yang memblokir voucher -> reject
     const attemptedVoucherUse =
@@ -1884,8 +1896,6 @@ exports.checkout = asyncHandler(async (req, res) => {
       }
     }
 
-    // tambahan: jika tidak ada selectedPromo tetapi ada voucherClaimIds,
-    // dan ada eligible autoApply promo yang blocksVoucher -> reject (sama seperti preview)
     if (
       attemptedVoucherUse &&
       !selectedPromoIdFromReq &&
