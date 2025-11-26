@@ -1,4 +1,6 @@
 // utils/priceEngine.js
+const PromoModel = require('../models/promoModel'); // jika beda path, sesuaikan
+
 const {
   applyPromo: applyPromoRaw,
   findApplicablePromos
@@ -128,7 +130,6 @@ async function applyPromoThenVoucher({
       // coba ambil promo langsung dari DB (sesuaikan path model jika perlu)
       let promoFromDb = null;
       try {
-        const PromoModel = require('./promoModel'); // jika beda path, sesuaikan
         promoFromDb = await PromoModel.findById(selectedPromoId).lean();
       } catch (e) {
         promoFromDb = null;

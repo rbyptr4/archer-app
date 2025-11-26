@@ -1859,6 +1859,7 @@ exports.checkout = asyncHandler(async (req, res) => {
 
     priced = await applyPromoThenVoucher({
       memberId: MemberDoc ? MemberDoc._id : null,
+      memberDoc: MemberDoc || null,
       cart: normalizedForEngine,
       fulfillmentType: ft,
       deliveryFee: deliveryObj.delivery_fee || 0,
