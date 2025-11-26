@@ -1851,6 +1851,67 @@ exports.checkout = asyncHandler(async (req, res) => {
       }
     };
 
+    // --- VALIDASI: jika user mengirim voucherClaimIds tapi dia juga memilih selectedPromoId yang memblokir voucher -> reject
+    const attemptedVoucherUse =
+      Array.isArray(voucherClaimIds) && voucherClaimIds.length > 0;
+    const selectedPromoIdFromReq = req.body?.selectedPromoId || null;
+
+    if (attemptedVoucherUse && selectedPromoIdFromReq) {
+      // ambil promo doc untuk selectedPromoId (jangan andalkan eligible list)
+      try {
+        const promoDoc = await Promo.findById(
+          String(selectedPromoIdFromReq)
+        ).lean();
+        if (promoDoc && promoDoc.blocksVoucher) {
+          console.error(
+            '[checkout] selected promo blocks voucher but vouchers provided',
+            {
+              selectedPromoId: selectedPromoIdFromReq,
+              voucherClaimIds
+            }
+          );
+          throwError(
+            'Promo yang dipilih memblokir penggunaan voucher. Hapus voucher atau pilih promo lain.',
+            400
+          );
+        }
+      } catch (e) {
+        // jika promo tidak ditemukan, biarkan engine yang nanti akan validasi; tapi kita log saja
+        console.warn(
+          '[checkout] selectedPromoId not found (will let engine decide):',
+          selectedPromoIdFromReq
+        );
+      }
+    }
+
+    // tambahan: jika tidak ada selectedPromo tetapi ada voucherClaimIds,
+    // dan ada eligible autoApply promo yang blocksVoucher -> reject (sama seperti preview)
+    if (
+      attemptedVoucherUse &&
+      !selectedPromoIdFromReq &&
+      Array.isArray(eligiblePromosList) &&
+      eligiblePromosList.length
+    ) {
+      const highestAuto = eligiblePromosList
+        .filter((p) => !!p.autoApply)
+        .sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0))[0];
+      if (highestAuto && highestAuto.blocksVoucher) {
+        console.error(
+          '[checkout] attempted voucher but auto-applied promo blocks voucher',
+          {
+            promoId: highestAuto._id,
+            voucherClaimIds
+          }
+        );
+        throwError(
+          `Promo otomatis "${
+            highestAuto.name || highestAuto._id
+          }" akan dipakai dan memblokir voucher. Hapus voucher atau pilih promo lain.`,
+          400
+        );
+      }
+    }
+
     priced = await applyPromoThenVoucher({
       memberId: MemberDoc ? MemberDoc._id : null,
       memberDoc: MemberDoc || null,
@@ -3418,6 +3479,41 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     console.warn('[previewPrice] autoApply preview failed', e?.message || e);
     autoAppliedPromo = null;
   }
+
+  // ===== validasi: jika FE kirim voucherClaimIds tapi ada promo autoApply/selected yang memblokir voucher -> reject early =====
+  (function () {
+    // jika caller mengirim voucherClaimIds (nyoba pakai voucher)
+    const attemptedVoucherUse =
+      Array.isArray(voucherClaimIds) && voucherClaimIds.length > 0;
+
+    // cek selected promo dari request dulu (prioritas)
+    if (selectedPromoId) {
+      const sel = (eligiblePromosList || []).find(
+        (p) => String(p._id) === String(selectedPromoId)
+      );
+      if (sel && sel.blocksVoucher && attemptedVoucherUse) {
+        // user memilih promo yang memblok voucher namun juga mengirim voucher -> reject
+        throwError(
+          'Promo yang dipilih memblokir penggunaan voucher. Hapus voucher atau pilih promo lain.',
+          400
+        );
+      }
+    } else if (attemptedVoucherUse) {
+      // jika ada voucher yang dikirim dan tidak ada selectedPromoId, pastikan tidak ada auto-applied promo (highest priority) yang memblokir
+      // cari autoApply promos dari eligible list yang akan dijadikan saran
+      const highestAuto = (eligiblePromosList || [])
+        .filter((p) => !!p.autoApply)
+        .sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0))[0];
+      if (highestAuto && highestAuto.blocksVoucher) {
+        throwError(
+          `Promo "${
+            highestAuto.name || highestAuto._id
+          }" otomatis akan dipakai dan memblokir voucher. Hapus voucher atau non-aktifkan auto-apply pada promo.`,
+          400
+        );
+      }
+    }
+  })();
 
   // call engine
   let result;

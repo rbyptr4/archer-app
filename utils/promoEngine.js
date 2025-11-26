@@ -259,8 +259,10 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
         );
       }
       let amt = Math.floor((scopeSub * pct) / 100);
-      if (Number.isFinite(Number(parseNumber(r.maxDiscountAmount))))
-        amt = Math.min(amt, Number(parseNumber(r.maxDiscountAmount)));
+      const maxDisc = Number(r.maxDiscountAmount ?? NaN);
+      if (Number.isFinite(maxDisc) && maxDisc > 0) {
+        amt = Math.min(amt, maxDisc);
+      }
       impact.cartDiscount += amt;
       impact.itemsDiscount += amt;
       impact.note += (impact.note ? '; ' : '') + `Diskon ${pct}% (${amt})`;
