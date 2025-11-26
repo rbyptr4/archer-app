@@ -2635,25 +2635,8 @@ exports.checkout = asyncHandler(async (req, res) => {
       '[checkout] gagal update cart setelah order dibuat',
       err?.message || err
     );
-    // tidak menggagalkan order — tapi beri warning
   }
 
-  // --- update member stats (non-fatal) ---
-  if (MemberDoc) {
-    try {
-      await Member.findByIdAndUpdate(MemberDoc._id, {
-        $inc: { total_spend: order.grand_total || 0 },
-        $set: { last_visit_at: new Date() }
-      });
-      console.log('[checkout] member stats updated', {
-        memberId: MemberDoc._id
-      });
-    } catch (err) {
-      console.error('[member][stats] gagal update', err?.message || err);
-    }
-  }
-
-  // --- EMIT SOCKET (non-fatal) ---
   try {
     const summary = {
       id: String(order._id),
