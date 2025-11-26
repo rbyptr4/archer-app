@@ -58,6 +58,7 @@ function distributeDiscountToItems(items, discount) {
  */
 async function applyPromoThenVoucher({
   memberId = null,
+  memberDoc = null,
   cart = { items: [] },
   fulfillmentType = 'dine_in',
   deliveryFee = 0,
@@ -68,20 +69,18 @@ async function applyPromoThenVoucher({
   // opsional: fetchers untuk usage counts
   promoUsageFetchers = {}
 } = {}) {
-  // 1) cari promo yang eligible
+  const effectiveMember = memberDoc || (memberId ? { _id: memberId } : null);
+
   let applicable = [];
   try {
-    const effectiveMember =
-      args.memberDoc || (memberId ? { _id: memberId } : null);
-
     applicable = await findApplicablePromos(cart, effectiveMember, now, {
       fetchers: promoUsageFetchers
     });
   } catch (e) {
     console.warn('[priceEngine] findApplicablePromos failed', e?.message || e);
+    applicable = [];
   }
 
-  // 2) pilih promo yang dipakai (selected atau auto-best)
   let promoApplied = null;
   if (selectedPromoId) {
     promoApplied =
@@ -159,7 +158,10 @@ async function applyPromoThenVoucher({
       0
     );
     const itemsDiscount = Number(promoImpact?.itemsDiscount || 0);
-    const items_subtotal_after_discount = Math.max(0, baseSubtotal);
+    const items_subtotal_after_discount = Math.max(
+      0,
+      baseSubtotal - itemsDiscount
+    );
     const deliveryAfter = Math.max(0, Number(deliveryFee || 0));
     const money = require('./money');
     const service_fee = Math.round(
