@@ -680,6 +680,7 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
     name: r.name || '',
     phone: r.phone || '',
     total_spend: r.total_spend || 0,
+    gender: r.gender,
     createdAt: r.createdAt
   }));
 
@@ -886,6 +887,7 @@ exports.topSpendersThisMonth = asyncHandler(async (req, res) => {
         name: '$member.name',
         phone: '$member.phone',
         address: '$member.address',
+        gender: '$member.gender',
         total_orders: 1,
         total_spend_period: 1
       }

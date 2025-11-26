@@ -5563,8 +5563,9 @@ exports.deliveryBoard = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
   const { status, paid_only = 'false', limit = 50, cursor } = req.query || {};
+
   const q = {
-    fulfillment_type: 'delivery'
+    'delivery.mode': 'delivery'
   };
 
   q.payment_status = 'verified';
@@ -5575,15 +5576,17 @@ exports.deliveryBoard = asyncHandler(async (req, res) => {
     q['delivery.status'] = { $nin: ['delivered', 'failed'] };
   }
 
+  // jika paid_only param diset true, pakai 'paid' sebagai filter payment_status
   if (String(paid_only) === 'true') q.payment_status = 'paid';
+
+  // cursor paging berdasarkan createdAt
   if (cursor) q.createdAt = { $lt: new Date(cursor) };
 
-  // populate member name & phone supaya bisa gunakan data member jika ada
   const lim = Math.min(parseInt(limit, 10) || 50, 200);
   const items = await Order.find(q)
     .populate({
       path: 'member',
-      select: 'name phone' // ambil hanya yang perlu
+      select: 'name phone'
     })
     .sort({ createdAt: -1 })
     .limit(lim)
@@ -5591,17 +5594,14 @@ exports.deliveryBoard = asyncHandler(async (req, res) => {
 
   res.status(200).json({
     items: items.map((o) => {
-      // tentukan sumber nama & telepon
       let name = '';
       let phone = '';
 
       if (o.member && typeof o.member === 'object') {
-        // jika member ter-populate
         name = (o.member.name && String(o.member.name).trim()) || '';
         phone = (o.member.phone && String(o.member.phone).trim()) || '';
       }
 
-      // fallback ke guest fields kalau member tidak lengkap / tidak ada
       if (!name) {
         name = (o.customer_name && String(o.customer_name).trim()) || '';
       }
@@ -5609,7 +5609,6 @@ exports.deliveryBoard = asyncHandler(async (req, res) => {
         phone = (o.customer_phone && String(o.customer_phone).trim()) || '';
       }
 
-      // optional: jika kedua-duanya kosong, isi '-' supaya FE tidak dapat null/undefined
       if (!name && !phone) {
         name = '-';
         phone = '-';
@@ -5624,7 +5623,6 @@ exports.deliveryBoard = asyncHandler(async (req, res) => {
         order_status: o.status,
         delivery: o.delivery || null,
         createdAt: o.createdAt,
-        // field baru: name & phone (gabungan sumber member/guest)
         name,
         phone
       };
