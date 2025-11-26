@@ -251,8 +251,8 @@ async function applyPromoThenVoucher({
 
   // 4) if promo blocks voucher -> compute totals and return early
   if (promoApplied && promoApplied.blocksVoucher) {
-    const items = cartAfterPromo.items || [];
-    const baseSubtotal = items.reduce(
+    const originalItems = cart.items || []; // cart = input original (pre-promo)
+    const baseSubtotal = originalItems.reduce(
       (s, it) => s + Number(it.price || 0) * Number(it.qty || it.quantity || 0),
       0
     );
@@ -261,6 +261,7 @@ async function applyPromoThenVoucher({
       0,
       baseSubtotal - itemsDiscount
     );
+
     const deliveryAfter = Math.max(0, Number(deliveryFee || 0));
     const money = require('./money');
     const service_fee = Math.round(
@@ -316,10 +317,12 @@ async function applyPromoThenVoucher({
         ? {
             promoId: String(promoApplied._id),
             name: promoApplied.name || null,
+            description: promoApplied.notes || promoApplied.description || null,
             impact: promoImpact,
             actions: promoActions || []
           }
         : null,
+
       voucherResult: null,
       breakdown: [],
       totals: {
@@ -558,6 +561,7 @@ async function applyPromoThenVoucher({
       ? {
           promoId: String(promoApplied._id),
           name: promoApplied.name || null,
+          description: promoApplied.notes || promoApplied.description || null,
           impact: promoImpact,
           actions: promoActions || []
         }

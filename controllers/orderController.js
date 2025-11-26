@@ -3683,18 +3683,14 @@ exports.previewPrice = asyncHandler(async (req, res) => {
 
   // build compact promo object for default response
   const promoCompact = {
-    // minimal applied promo info (id + name)
     appliedPromoId: appliedPromo ? appliedPromo.promoId : null,
     appliedPromoName: appliedPromo ? appliedPromo.name || null : null,
-    // normalized rewards (compact)
+    description: appliedPromo ? appliedPromo.description || null : null,
     rewards: normalizedRewards,
-    // summary points (if any)
     points_total: Number(pointsTotalFromEngine || 0),
-    // chosen vouchers (ids)
     chosenClaimIds: voucherInfo.chosenClaimIds || []
   };
 
-  // if debug -> include everything verbose
   if (debug) {
     const heavy = {
       appliedPromo: appliedPromo || null,
