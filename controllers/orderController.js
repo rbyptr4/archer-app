@@ -3453,66 +3453,57 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     );
   }
 
-  // build ui_totals (fallback)  -- REPLACEMENT START
+  // ===== build ui_totals (deterministic fallback & normalize) =====
   const t =
     (result && result.totals) ||
     (result.voucherResult && result.voucherResult.totals) ||
     {};
-  const deliveryFeeFromEngine = t.deliveryFee;
-  const finalDeliveryFee = Number.isFinite(Number(deliveryFeeFromEngine))
-    ? Number(deliveryFeeFromEngine)
+
+  // engine fields (safely normalize)
+  const baseSubtotal = Number(t.baseSubtotal ?? t.base_subtotal ?? 0);
+  const itemsDiscount = Number(t.itemsDiscount ?? t.items_discount ?? 0);
+  const items_subtotal_after_discount = Number(
+    t.items_subtotal_after_discount ??
+      t.baseSubtotalAfterDiscount ??
+      Math.max(0, baseSubtotal - itemsDiscount)
+  );
+  const shippingDiscount = Number(
+    t.shippingDiscount ?? t.shipping_discount ?? 0
+  );
+
+  // delivery fee (engine may omit; use effectiveDeliveryFee as fallback)
+  const deliveryFeeFromEngine = Number(
+    t.deliveryFee ?? t.delivery_fee ?? finalDeliveryFee ?? 0
+  );
+  const deliveryFee = Number.isFinite(deliveryFeeFromEngine)
+    ? deliveryFeeFromEngine
     : Number(effectiveDeliveryFee || 0);
 
-  // compute voucherDiscount (sum dari voucher breakdown amounts) - robust parsing
-  const voucherBreakdown =
-    (result.voucherResult && result.voucherResult.breakdown) ||
-    result.breakdown ||
-    [];
-  const voucherDiscount = Array.isArray(voucherBreakdown)
-    ? voucherBreakdown.reduce((acc, it) => {
-        const maybeAmount = Number(it.amount ?? it.discount ?? it.value ?? 0);
-        return acc + (Number.isFinite(maybeAmount) ? maybeAmount : 0);
-      }, 0)
-    : 0;
+  // taxable base follows same logic as order compute: items_subtotal - items_discount
+  const taxableItems = Math.max(0, baseSubtotal - itemsDiscount);
 
-  // compute promoDiscount using promoApplied.impact if available (preferred),
-  // otherwise fallback to totals.itemsDiscount - voucherDiscount
-  let promoDiscount = 0;
-  if (result.promoApplied && result.promoApplied.impact) {
-    try {
-      const imp = result.promoApplied.impact || {};
-      promoDiscount =
-        Number(imp.itemsDiscount || 0) + Number(imp.cartDiscount || 0);
-    } catch (e) {
-      promoDiscount = 0;
-    }
-  } else {
-    // fallback: engine totals may combine promo + voucher into itemsDiscount
-    promoDiscount = Number(t.itemsDiscount || 0) - Number(voucherDiscount || 0);
-    if (!Number.isFinite(promoDiscount) || promoDiscount < 0) promoDiscount = 0;
-  }
+  // compute service fee & tax deterministically (same as order model)
+  const service_fee = Math.round(taxableItems * SERVICE_FEE_RATE);
+  const tax_amount = Math.round(taxableItems * parsePpnRate());
 
-  const itemsSubtotal = Number(t.baseSubtotal || 0);
-  const itemsSubtotalAfterPromo = Math.max(0, itemsSubtotal - promoDiscount);
+  // compute before rounding + grand total using rounding util
+  const beforeRound = Math.round(
+    taxableItems + service_fee + deliveryFee - shippingDiscount + tax_amount
+  );
+  const grand = roundRupiahCustom(beforeRound);
+  const rounding_delta = grand - beforeRound;
 
   const ui_totals = {
-    // original subtotal (before promo)
-    items_subtotal: itemsSubtotal,
-    // subtotal after applying promo (voucher discounts are reflected separately)
-    items_subtotal_after_discount: itemsSubtotalAfterPromo,
-    // promo discount (sum of cartDiscount + itemsDiscount from promo)
-    promo_discount: Number(promoDiscount || 0),
-    // item-level discounts coming from vouchers only (so FE can show voucher discounts separately)
-    items_discount: Number(voucherDiscount || 0),
-    service_fee: Number(t.service_fee || 0),
-    tax_amount: Number(t.tax_amount || 0),
-    delivery_fee: finalDeliveryFee,
-    shipping_discount: Number(t.shippingDiscount || 0),
-    rounding_delta: Number(t.rounding_delta || 0),
-    // grand total must remain authoritative from engine (after promo + voucher + fees + tax + rounding)
-    grand_total: Number(t.grandTotal || t.grand_total || 0)
+    items_subtotal: int(baseSubtotal),
+    items_subtotal_after_discount: int(items_subtotal_after_discount),
+    items_discount: int(itemsDiscount),
+    service_fee: int(service_fee),
+    tax_amount: int(tax_amount),
+    delivery_fee: int(deliveryFee),
+    shipping_discount: int(shippingDiscount),
+    rounding_delta: int(rounding_delta),
+    grand_total: int(grand)
   };
-  // REPLACEMENT END
 
   // normalize voucher info
   const voucherInfo = (result.voucherResult && {
