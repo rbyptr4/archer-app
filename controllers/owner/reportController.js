@@ -652,6 +652,7 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
       $project: {
         name: 1,
         phone: 1,
+        gender: 1,
         total_spend: 1,
         createdAt: 1
       }

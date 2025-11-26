@@ -4947,10 +4947,6 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
   if (!doc.placed_at) doc.placed_at = new Date();
   await doc.save();
 
-  if (!doc.loyalty_awarded_at) {
-    await awardPointsIfEligible(doc, Member);
-  }
-
   const payload = {
     id: String(doc._id),
     transaction_code: doc.transaction_code,
