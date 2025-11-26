@@ -3207,13 +3207,13 @@ exports.previewPrice = asyncHandler(async (req, res) => {
 
   // ===== filter voucher milik member & masih valid (fallback) =====
   let eligible = [];
+  const now = new Date();
   if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
     const raw = await VoucherClaim.find({
       _id: { $in: voucherClaimIds },
       member: req.member.id,
       status: 'claimed'
     }).lean();
-    const now = new Date();
     eligible = raw
       .filter((c) => !c.validUntil || new Date(c.validUntil) > now)
       .map((c) => String(c._id));
