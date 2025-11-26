@@ -42,149 +42,255 @@ const fmtDT = (iso) => {
   return d.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
 };
 
-function buildOrderReceiptMessage(order) {
-  const lines = [];
-  lines.push(`✅ *Pembayaran Terverifikasi*`);
-  lines.push(`Kode Transaksi: *${order.transaction_code || '-'}*`);
-  lines.push(
-    `Waktu: ${fmtDT(order.verified_at || order.paid_at || order.placed_at)}`
-  );
-  lines.push('');
-  if (order.fulfillment_type === 'delivery') {
-    lines.push(`Tipe: Delivery`);
-    if (order.delivery?.address_text)
-      lines.push(`Alamat: ${order.delivery.address_text}`);
-    if (typeof order.delivery?.delivery_fee === 'number')
-      lines.push(`Ongkir: ${rp(order.delivery.delivery_fee)}`);
-  } else {
-    lines.push(
-      `Tipe: Dine-in${
-        order.table_number ? ` (Meja ${order.table_number})` : ''
-      }`
-    );
+function fmtRp(n) {
+  try {
+    return `Rp ${Number(n || 0).toLocaleString('id-ID')}`;
+  } catch {
+    return `Rp ${n || 0}`;
   }
+}
+
+function buildOrderReceiptMessage({ order, uiTotals }) {
+  const lines = [];
+
+  lines.push('🏹 *Archers Cafe*');
   lines.push('');
-  lines.push(`*Rincian Pesanan:*`);
-  for (const it of order.items || []) {
-    const base = `• ${it.name} x${it.quantity} — ${rp(it.line_subtotal)}`;
-    lines.push(base);
-    if (Array.isArray(it.addons) && it.addons.length) {
-      for (const ad of it.addons) {
-        lines.push(
-          `   ◦ + ${ad.name} x${ad.qty} (${rp(ad.price * (ad.qty || 1))})`
-        );
+
+  // Kode + Customer
+  lines.push(`*Order:* ${order.transaction_code}`);
+  lines.push(`*Customer:* ${order.customer_name || 'Tamu'}`);
+  lines.push(`*Waktu:* ${new Date(order.placed_at).toLocaleString('id-ID')}`);
+  lines.push('');
+
+  lines.push('=== Rincian Pesanan ===');
+
+  // Item list
+  for (const it of order.items) {
+    const name = it.name || it.menu_code || 'Item';
+    const qty = Number(it.quantity ?? it.qty ?? 1);
+    const price = Number(it.base_price || it.price || 0);
+    const lineTotal = qty * price;
+
+    lines.push(`${name} x${qty}  Rp ${lineTotal.toLocaleString('id-ID')}`);
+  }
+
+  lines.push('');
+
+  // Totals breakdown
+  lines.push('=== Ringkasan Harga ===');
+  lines.push(
+    `Sub-total: Rp ${uiTotals.items_subtotal.toLocaleString('id-ID')}`
+  );
+
+  if (uiTotals.items_discount > 0)
+    lines.push(
+      `Diskon: -Rp ${uiTotals.items_discount.toLocaleString('id-ID')}`
+    );
+
+  if (uiTotals.shipping_discount > 0)
+    lines.push(
+      `Potongan Ongkir: -Rp ${uiTotals.shipping_discount.toLocaleString(
+        'id-ID'
+      )}`
+    );
+
+  lines.push(`Service fee: Rp ${uiTotals.service_fee.toLocaleString('id-ID')}`);
+  lines.push(`Pajak: Rp ${uiTotals.tax_amount.toLocaleString('id-ID')}`);
+
+  if (uiTotals.rounding_delta !== 0)
+    lines.push(
+      `Pembulatan: Rp ${uiTotals.rounding_delta.toLocaleString('id-ID')}`
+    );
+
+  lines.push('');
+  lines.push(
+    `*Total Bayar:* Rp ${uiTotals.grand_total.toLocaleString('id-ID')}`
+  );
+  lines.push(`*Metode:* ${order.payment_method.toUpperCase()}`);
+
+  // Voucher, promo, free item, dll
+  if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
+    lines.push('');
+    lines.push('Voucher digunakan:');
+    for (const v of order.appliedVouchers) {
+      lines.push(`• ${v.voucherId}`);
+    }
+  }
+
+  if (order.appliedPromo?.promoSnapshot) {
+    const p = order.appliedPromo.promoSnapshot;
+    lines.push('');
+    lines.push(`Promo: *${p.name || 'Promo'}*`);
+    if (p.description) lines.push(p.description);
+
+    // free items snapshot
+    if (Array.isArray(p.freeItemsSnapshot) && p.freeItemsSnapshot.length) {
+      lines.push('Bonus:');
+      for (const f of p.freeItemsSnapshot) {
+        lines.push(`• ${f.name || 'Free Item'} x${f.qty}`);
       }
     }
-    if (it.notes) lines.push(`   ◦ Catatan: _${it.notes}_`);
   }
+
   lines.push('');
-  if (order.items_discount)
-    lines.push(`Diskon Item: -${rp(order.items_discount)}`);
-  if (order.shipping_discount)
-    lines.push(`Diskon Ongkir: -${rp(order.shipping_discount)}`);
-  lines.push(`Total: *${rp(order.grand_total)}*`);
+  lines.push('Terima kasih telah memesan!');
   lines.push('');
-  lines.push(`Metode: ${order.payment_method?.toUpperCase() || '-'}`);
-  lines.push(`Status Bayar: ${order.payment_status || '-'}`);
   lines.push('');
-  lines.push(`Terima kasih telah memesan di *Archer*. 🙏`);
+  lines.push('Pesanan sedang diproses, mohon ditunggu sebentar ✨');
+  lines.push('Archers Cafe 🏹');
+
   return lines.join('\n');
 }
 
-function buildClosingShiftMessage(doc, phase = 'step2') {
-  // phase: 'step2' | 'locked'
-  const badge =
-    phase === 'locked'
-      ? '🔒 Laporan Closing (FINAL)'
-      : '📝 Laporan Closing (Shift-2)';
+function buildClosingShiftMessage({ closingShift = {}, totals = {} } = {}) {
   const lines = [];
-  lines.push(`${badge}`);
-  lines.push(`Tanggal: ${fmtDT(doc.date || doc.createdAt).split(',')[0]}`);
-  lines.push(`Tipe: *${String(doc.type || '').toUpperCase()}*`);
-  lines.push(`Status: *${doc.status}*`);
+  const type = (closingShift.type || 'unknown').toUpperCase();
+  const dateStr = closingShift.date
+    ? new Date(closingShift.date).toLocaleDateString('id-ID')
+    : '-';
+
+  // Header
+  lines.push(`🏹 *Archers Cafe — Laporan Closing (${type})*`);
+  lines.push(`Tanggal: ${dateStr}`);
+  lines.push(`Status: *${closingShift.status || '-'}*`);
   lines.push('');
 
-  if (doc.shift1?.staff?.name)
+  // --- SHIFT 1 ---
+  if (closingShift.shift1) {
+    const s1 = closingShift.shift1;
     lines.push(
-      `Shift-1: ${doc.shift1.staff.name}${
-        doc.shift1.staff.position ? ` (${doc.shift1.staff.position})` : ''
+      `*Shift 1* — ${s1.staff.name} ${
+        s1.staff.position ? `(${s1.staff.position})` : ''
       }`
     );
-  if (doc.shift2?.staff?.name)
-    lines.push(
-      `Shift-2: ${doc.shift2.staff.name}${
-        doc.shift2.staff.position ? ` (${doc.shift2.staff.position})` : ''
-      }`
-    );
+
+    if (type === 'CASHIER' && s1.cashier) {
+      lines.push(`Opening Turnover: ${fmtRp(s1.cashier.previousTurnover)}`);
+      lines.push('Opening Breakdown:');
+      lines.push(` • Cash: ${fmtRp(s1.cashier.openingBreakdown?.cash)}`);
+      lines.push(` • QRIS: ${fmtRp(s1.cashier.openingBreakdown?.qris)}`);
+      lines.push(
+        ` • Transfer: ${fmtRp(s1.cashier.openingBreakdown?.transfer)}`
+      );
+      lines.push(` • Card: ${fmtRp(s1.cashier.openingBreakdown?.card)}`);
+    }
+
+    if (
+      (type === 'BAR' || type === 'KITCHEN') &&
+      Array.isArray(s1.stockItemsStart)
+    ) {
+      lines.push('');
+      lines.push('Opname Awal:');
+      for (const r of s1.stockItemsStart) {
+        lines.push(` • ${r.name}: ${r.qty}`);
+      }
+    }
+  }
+
   lines.push('');
 
-  if (doc.type === 'cashier') {
-    const s1 = doc.shift1?.cashier || {};
-    const s2 = doc.shift2?.cashier || {};
-    lines.push(`*Kasir*`);
-    if (typeof s1.previousTurnover === 'number')
-      lines.push(`Omzet Awal: ${rp(s1.previousTurnover)}`);
-    if (typeof s2.diffFromShift1 === 'number')
-      lines.push(`Selisih Shift-2: ${rp(s2.diffFromShift1)}`);
-    if (s2.closingBreakdown) {
-      lines.push(`Rincian Closing:`);
-      lines.push(`• Cash: ${rp(s2.closingBreakdown.cash)}`);
-      lines.push(`• QRIS: ${rp(s2.closingBreakdown.qris)}`);
-      lines.push(`• Transfer: ${rp(s2.closingBreakdown.transfer)}`);
+  // --- SHIFT 2 ---
+  if (closingShift.shift2) {
+    const s2 = closingShift.shift2;
+    lines.push(
+      `*Shift 2* — ${s2.staff.name} ${
+        s2.staff.position ? `(${s2.staff.position})` : ''
+      }`
+    );
+
+    if (type === 'CASHIER' && s2.cashier) {
+      lines.push('Closing Breakdown:');
+      lines.push(` • Cash: ${fmtRp(s2.cashier.closingBreakdown?.cash)}`);
+      lines.push(` • QRIS: ${fmtRp(s2.cashier.closingBreakdown?.qris)}`);
+      lines.push(
+        ` • Transfer: ${fmtRp(s2.cashier.closingBreakdown?.transfer)}`
+      );
+      lines.push(` • Card: ${fmtRp(s2.cashier.closingBreakdown?.card)}`);
+      lines.push(`Selisih Shift 1 → 2: ${fmtRp(s2.diffFromShift1)}`);
+    }
+
+    if (
+      (type === 'BAR' || type === 'KITCHEN') &&
+      Array.isArray(s2.stockItemsEnd)
+    ) {
+      lines.push('');
+      lines.push('Opname Akhir:');
+      for (const r of s2.stockItemsEnd) {
+        lines.push(` • ${r.name}: ${r.qty}`);
+      }
+    }
+
+    if (s2.note) {
+      lines.push('');
+      lines.push('*Catatan Shift:*');
+      lines.push(s2.note);
+    }
+
+    if (s2.requestPurchase) {
+      lines.push('');
+      lines.push('🔔 *Permintaan Pembelian:* Ya ');
     }
   } else {
-    const s1 = doc.shift1?.stockItemsStart || [];
-    const s2 = doc.shift2?.stockItemsEnd || [];
-    lines.push(`*Stok*`);
-    if (s1.length) {
-      lines.push(`Awal:`);
-      for (const r of s1) lines.push(`• ${r.name}: ${r.qty}`);
-    }
-    if (s2.length) {
-      lines.push(`Akhir:`);
-      for (const r of s2) lines.push(`• ${r.name}: ${r.qty}`);
-    }
-    if (doc.shift2?.requestPurchase) lines.push(`Permintaan Pembelian: *YA*`);
-  }
-
-  if (doc.shift2?.note) {
-    lines.push('');
-    lines.push(`Catatan: _${doc.shift2.note}_`);
-  }
-
-  if (phase === 'locked' && doc.lockAt) {
-    lines.push('');
-    lines.push(`Dikunci pada: ${fmtDT(doc.lockAt)}`);
+    lines.push('*Shift 2 belum disubmit*');
   }
 
   lines.push('');
-  lines.push(`— Archer System`);
+
+  // --- SUMMARY FOR OWNER ---
+  lines.push('=== *Ringkasan Hari Ini* ===');
+
+  if (type === 'CASHIER') {
+    if (totals && Object.keys(totals).length) {
+      lines.push(`Omset (Sistem): ${fmtRp(totals.turnover)}`);
+      lines.push(`Pembayaran:`);
+      lines.push(` • Cash: ${fmtRp(totals.cash)}`);
+      lines.push(` • QRIS: ${fmtRp(totals.qris)}`);
+      lines.push(` • Transfer: ${fmtRp(totals.transfer)}`);
+      lines.push(` • Card: ${fmtRp(totals.card)}`);
+    } else {
+      lines.push('(Data omset sistem tidak tersedia)');
+    }
+  }
+
+  if (type === 'BAR') {
+    lines.push(
+      'Ringkasan stok bar sudah dicatat. Mohon cek item yang turun signifikan.'
+    );
+  }
+
+  if (type === 'KITCHEN') {
+    lines.push(
+      'Ringkasan stok kitchen sudah dicatat. Mohon cek bahan yang perlu restock.'
+    );
+  }
+
+  lines.push('');
+  lines.push('Laporan ini otomatis dikirim ke Owner untuk monitoring harian.');
+  lines.push('🏹 Archers Cafe');
+
   return lines.join('\n');
 }
 
-/* ===== Pesan khusus verifikasi Owner ===== */
 function buildOwnerVerifyMessage(order, verifyLink, expireHours = 6) {
   const lines = [];
 
-  lines.push('🔔 *Order Perlu Verifikasi Pembayaran*');
-  lines.push(`Kode: *${order.transaction_code || '-'}*`);
+  lines.push('🔔 *Verifikasi Pembayaran Diperlukan*');
+  lines.push(`Kode Order: *${order.transaction_code || '-'}*`);
   lines.push(
     `Waktu Pesan: ${fmtDT(order.placed_at || order.createdAt || new Date())}`
   );
 
-  /* ===== Tipe order (pakai delivery.mode) ===== */
+  /* ===== Tipe order ===== */
   const mode = order?.delivery?.mode || 'none';
   let typeLabel = '';
 
   if (mode === 'none') {
-    // dine in
     typeLabel = `Dine-in${
       order.table_number ? ` (Meja ${order.table_number})` : ''
     }`;
   } else if (mode === 'pickup') {
     typeLabel = 'Pickup';
   } else {
-    // delivery
     typeLabel = 'Delivery';
   }
 
@@ -198,23 +304,43 @@ function buildOwnerVerifyMessage(order, verifyLink, expireHours = 6) {
   }
 
   lines.push('');
-  lines.push(
-    `Nama Pemesan: ${order.customer_name || '-'} (${
-      order.customer_phone || '-'
-    })`
-  );
-  lines.push(`Total Pembayaran: *${rp(order.grand_total)}*`);
 
-  /* ===== Tambahkan payment method ===== */
+  /* ===== Informasi pemesan ===== */
+  const name = order.customer_name || '-';
+  const phone = order.customer_phone || '-';
+  lines.push(`Pemesan: ${name} (${phone})`);
+
+  /* ===== Ringkasan harga ===== */
+  lines.push(`Total: *${rp(order.grand_total)}*`);
   const pm = order.payment_method ? order.payment_method.toUpperCase() : '-';
-  lines.push(`Metode Pembayaran: *${pm}*`);
+  lines.push(`Metode: *${pm}*`);
+
+  /* ===== Mini ringkasan items ===== */
+  if (Array.isArray(order.items) && order.items.length) {
+    lines.push('');
+    lines.push('*Rincian Item:*');
+
+    const maxItemsPreview = 3;
+    const preview = order.items.slice(0, maxItemsPreview);
+
+    for (const it of preview) {
+      const nm = it.name || it.menu_code || 'Item';
+      const qty = Number(it.quantity || it.qty || 1);
+      lines.push(`• ${nm} x${qty}`);
+    }
+
+    if (order.items.length > maxItemsPreview) {
+      lines.push(`• +${order.items.length - maxItemsPreview} item lainnya`);
+    }
+  }
+
   lines.push('');
-  lines.push(`Klik link berikut untuk verifikasi pembayaran:\n${verifyLink}`);
-  lines.push(
-    `(Link berlaku *${expireHours} jam* dan hanya bisa dipakai sekali)`
-  );
+  lines.push('Silakan verifikasi pembayaran melalui link berikut:');
+  lines.push(verifyLink);
+  lines.push(`(Berlaku *${expireHours} jam*, satu kali pakai)`);
+
   lines.push('');
-  lines.push('— Archer System');
+  lines.push('— Archer System 🏹');
 
   return lines.join('\n');
 }
