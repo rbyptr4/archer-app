@@ -5,7 +5,7 @@ const requirePageAccess = require('../../utils/requirePageAccess');
 const ctrl = require('../../controllers/owner/promoController');
 const router = express.Router();
 
-router.use(validateToken, requireRole('owner'), requirePageAccess('promo'));
+// router.use(validateToken, requireRole('owner'), requirePageAccess('promo'));
 
 router.post('/available-promo', ctrl.evaluate);
 router.post('/create-promo', ctrl.create);

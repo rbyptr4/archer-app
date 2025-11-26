@@ -27,11 +27,12 @@ const {
   emitToGuest,
   emitToCourier,
   emitOrdersStream
-} = require('./socket/socketBus'); // <-- sesuaikan path relatif kalau perlu
+} = require('./socket/socketBus');
 
+const { evaluateMemberLevel } = require('../utils/loyalty');
 const throwError = require('../utils/throwError');
 const { createMember } = require('../utils/memberService');
-const { DELIVERY_SLOTS } = require('../config/onlineConfig'); // import
+const { DELIVERY_SLOTS } = require('../config/onlineConfig');
 const {
   sendText,
   buildOrderReceiptMessage,
@@ -117,7 +118,7 @@ const cookieRefresh = { ...baseCookie, httpOnly: true, maxAge: REFRESH_TTL_MS };
 const cookieDevice = { ...baseCookie, httpOnly: false, maxAge: REFRESH_TTL_MS };
 
 /* ================= Konstanta & helper status ================= */
-const ALLOWED_STATUSES = ['created', 'accepted', 'completed', 'cancelled'];
+const ALLOWED_STATUSES = ['created', 'accepted', 'completed'];
 const ALLOWED_PAY_STATUS = ['verified', 'paid', 'refunded', 'void'];
 
 const DELIVERY_ALLOWED = ['pending', 'assigned', 'delivered', 'failed'];
@@ -2156,89 +2157,207 @@ exports.checkout = asyncHandler(async (req, res) => {
   };
   const ownerVerified = !paymentRequiresOwnerVerify(method);
   let order;
+  function sumPointsAwardedFromPromoActions(actions = []) {
+    // standar: actions array mungkin berisi { type: 'award_points', points: 123 } atau reward details
+    if (!Array.isArray(actions)) return 0;
+    let sum = 0;
+    for (const a of actions) {
+      if (!a) continue;
+      if (String(a.type || '').toLowerCase() === 'award_points') {
+        // support both a.points or a.amount
+        sum += Number(a.points ?? a.amount ?? 0);
+      } else if (a?.reward && typeof a.reward === 'object') {
+        // legacy shaped action
+        sum += Number(a.reward.points ?? 0);
+      }
+    }
+    return Math.max(0, Math.round(sum));
+  }
+
+  // uiTotals dan priced sudah tersedia lebih atas di fungsi checkout (per kode asli)
+  const session = await mongoose.startSession();
+  let createdOrder = null;
   try {
-    order = await (async () => {
-      for (let i = 0; i < 5; i++) {
-        try {
-          const code = await nextDailyTxCode('ARCH');
+    await session.withTransaction(async () => {
+      // prepare payload for order creation (mirror existing payload)
+      const payload = {
+        member: MemberDoc ? MemberDoc._id : null,
+        customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
+        customer_phone: MemberDoc ? MemberDoc.phone || '' : customer_phone,
+        table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
+        source: iden.source || 'online',
+        fulfillment_type: ft,
+        transaction_code: await nextDailyTxCode('ARCH'), // keep original helper
+        guestToken: guestToken || null,
+        items: orderItems,
+        items_subtotal: int(uiTotals.items_subtotal || 0),
+        items_discount: int(uiTotals.items_discount || 0),
+        delivery_fee: int(uiTotals.delivery_fee || 0),
+        shipping_discount: int(uiTotals.shipping_discount || 0),
+        discounts: discounts || [],
+        applied_voucher_ids: appliedVoucherIds || [],
+        appliedPromo: appliedPromoSnapshot,
+        promoRewards: promoRewards || [],
+        ownerVerified, // existing logic
+        ownerVerifiedBy: ownerVerified ? req.user?.id || null : null,
+        ownerVerifiedAt: ownerVerified ? new Date() : null,
+        orderPriceSnapshot,
+        service_fee: int(uiTotals.service_fee || 0),
+        tax_rate_percent: Number(uiTotals.tax_rate_percent || 0),
+        tax_amount: int(uiTotals.tax_amount || 0),
+        rounding_delta: int(uiTotals.rounding_delta || 0),
+        grand_total: int(uiTotals.grand_total || 0),
+        payment_method: method,
+        payment_provider:
+          method === PM.QRIS && !QRIS_USE_STATIC ? 'xendit' : null,
+        payment_status: initialPaymentStatus,
+        paid_at: initialPaidAt,
+        payment_proof_url: null,
+        status: 'created',
+        placed_at: new Date(),
+        delivery: {
+          ...deliveryObj,
+          delivery_fee: int(uiTotals.delivery_fee || 0),
+          shipping_discount: int(uiTotals.shipping_discount || 0),
+          delivery_fee_raw: int(deliveryObj.delivery_fee_raw || 0)
+        }
+      };
 
-          const created = await Order.create({
-            member: MemberDoc ? MemberDoc._id : null,
-            customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
-            customer_phone: MemberDoc ? MemberDoc.phone || '' : customer_phone,
-            table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
-            source: iden.source || 'online',
-            fulfillment_type: ft,
-            transaction_code: code,
-            guestToken: guestToken || null,
-            items: orderItems,
-            items_subtotal: int(uiTotals.items_subtotal || 0),
-            items_discount: int(uiTotals.items_discount || 0),
-            delivery_fee: int(uiTotals.delivery_fee || 0),
-            shipping_discount: int(uiTotals.shipping_discount || 0),
-            discounts: discounts || [],
-            applied_voucher_ids: appliedVoucherIds || [],
-            appliedPromo: appliedPromoSnapshot,
-            promoRewards: promoRewards || [],
-            ownerVerified, // new field
-            ownerVerifiedBy: ownerVerified ? req.user?.id || null : null,
-            ownerVerifiedAt: ownerVerified ? new Date() : null,
-            // snapshot price untuk audit & receipt
-            orderPriceSnapshot: orderPriceSnapshot,
+      // --- Prepare loyalty/points snapshot values BEFORE any DB change ---
+      const member_level_before = MemberDoc
+        ? String(MemberDoc.level || 'bronze')
+        : null;
+      const total_spend_before = MemberDoc
+        ? Number(MemberDoc.total_spend || 0)
+        : 0;
 
-            service_fee: int(uiTotals.service_fee || 0),
-            tax_rate_percent: Number(uiTotals.tax_rate_percent || 0),
-            tax_amount: int(uiTotals.tax_amount || 0),
-            rounding_delta: int(uiTotals.rounding_delta || 0),
-            grand_total: int(uiTotals.grand_total || 0),
+      // Determine points_used request (FE may send points_used OR priceEngine may include pointsUsed)
+      const pointsUsedReq =
+        Number(req.body?.points_used ?? priced?.totals?.points_used ?? 0) || 0;
 
-            payment_method: method,
-            payment_provider:
-              method === PM.QRIS && !QRIS_USE_STATIC ? 'xendit' : null,
-
-            payment_status: initialPaymentStatus,
-            paid_at: initialPaidAt,
-            payment_proof_url: null,
-
-            status: 'created',
-            placed_at: new Date(),
-
-            delivery: {
-              ...deliveryObj,
-              delivery_fee: int(uiTotals.delivery_fee || 0),
-              shipping_discount: int(uiTotals.shipping_discount || 0),
-              delivery_fee_raw: int(deliveryObj.delivery_fee_raw || 0)
-            }
-          });
-
-          console.log('[checkout] order created tentatively', {
-            orderId: created._id,
-            tx: created.transaction_code
-          });
-          return created;
-        } catch (e) {
-          if (e?.code === 11000 && /transaction_code/.test(String(e.message))) {
-            console.warn(
-              '[checkout] tx collision, retrying...',
-              e?.message || e
-            );
-            continue;
-          }
-          console.error('[checkout] failed creating order', e?.message || e);
+      // If payment_method = 'points', enforce rules:
+      if (String(method) === 'points') {
+        if (!MemberDoc)
+          throwError('Pembayaran dengan point hanya untuk member', 400);
+        // grand total must be 0 (engine already applied discounts)
+        if (Number(uiTotals.grand_total || 0) !== 0) {
           throwError(
-            e?.message
-              ? `Gagal membuat order: ${String(e.message)}`
-              : 'Gagal membuat order',
-            e?.status || 500
+            'Pembayaran dengan point hanya bisa jika grand total = 0',
+            400
           );
         }
+        if (pointsUsedReq <= 0) {
+          throwError('points_used wajib untuk payment_method=points', 400);
+        }
+        // check fresh member points inside transaction
+        const freshMember = await Member.findById(MemberDoc._id).session(
+          session
+        );
+        if (!freshMember) throwError('Member tidak ditemukan', 404);
+        if (Number(freshMember.points || 0) < pointsUsedReq) {
+          throwError('Saldo point tidak mencukupi', 400);
+        }
       }
-      throwError('Gagal generate transaction_code unik', 500);
-    })();
-  } catch (e) {
-    console.error('[checkout] create order fatal', e?.message || e);
-    throw e;
+
+      // Compute points_awarded from applied promo actions (if any)
+      const promoActions =
+        appliedPromoSnapshot?.actions || priced?.promoApplied?.actions || [];
+      const points_awarded = sumPointsAwardedFromPromoActions(promoActions);
+      const points_awarded_details = promoActions?.length
+        ? { actions: promoActions }
+        : {};
+
+      // compute total_spend_delta:
+      // business decision: total_spend only increases by amount actually paid by customer (after points)
+      // uiTotals.grand_total is final amount customer pays (0 if fully covered by points)
+      const total_spend_delta = Number(uiTotals.grand_total || 0);
+
+      // attach snapshot to payload (so order doc already has these)
+      payload.member_level_before = member_level_before;
+      payload.total_spend_before = total_spend_before;
+      payload.total_spend_delta = int(total_spend_delta);
+      payload.member_level_after = null; // set after computing new total
+      payload.points_used = int(pointsUsedReq);
+      payload.points_awarded = int(points_awarded);
+      payload.points_awarded_details = points_awarded_details;
+
+      // Create order document inside session
+      const [doc] = await Order.create([payload], { session });
+
+      // Update member (if exists): apply point deduction, award points, update total_spend, evaluate level after
+      if (MemberDoc) {
+        const memberId = MemberDoc._id;
+        // Re-fetch inside session to be safe
+        const memberLive = await Member.findById(memberId).session(session);
+        if (!memberLive) throwError('Member tidak ditemukan saat commit', 404);
+
+        // compute new points balance
+        const currentPoints = Number(memberLive.points || 0);
+        const newPointsAfterUsage = Math.max(
+          0,
+          currentPoints - int(pointsUsedReq)
+        );
+        const newPointsAfterAward = newPointsAfterUsage + int(points_awarded);
+
+        // compute new total spend
+        const newTotalSpend =
+          Number(memberLive.total_spend || 0) + Number(total_spend_delta || 0);
+
+        // evaluate new level
+        const newLevel = evaluateMemberLevel(newTotalSpend);
+
+        // update member fields atomically inside session
+        await Member.updateOne(
+          { _id: memberId },
+          {
+            $set: {
+              points: int(newPointsAfterAward),
+              last_visit_at: new Date()
+            },
+            $inc: {
+              total_spend: int(total_spend_delta),
+              spend_point_total: int(pointsUsedReq)
+            }
+          },
+          { session }
+        );
+
+        // set member_level_after into order doc (update)
+        await Order.updateOne(
+          { _id: doc._id },
+          {
+            $set: {
+              member_level_after: newLevel
+            }
+          },
+          { session }
+        );
+
+        // also persist level on member (if changed)
+        if (String(memberLive.level || '') !== String(newLevel)) {
+          await Member.updateOne(
+            { _id: memberId },
+            { $set: { level: newLevel } },
+            { session }
+          );
+        }
+
+        // Optionally push history entry (if you have pointsHistory array)
+        // await Member.updateOne({ _id: memberId }, { $push: { pointsHistory: { ... } } }, { session });
+      }
+
+      createdOrder = doc;
+    }); // end withTransaction
+  } finally {
+    session.endSession();
   }
+
+  if (!createdOrder) {
+    throwError('Gagal create order (unknown)', 500);
+  }
+
+  // assign to order variable used further down
+  order = createdOrder;
 
   // --- handle upload bukti jika perlu (sama seperti sebelumnya) ---
   try {
@@ -3453,7 +3572,7 @@ exports.listOrders = asyncHandler(async (req, res) => {
       o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
     payment_status: o.payment_status || null,
     ownerVerified: o.ownerVerified,
-    status: o.status || null, // created|accepted|completed|cancelled
+    status: o.status || null,
     total_quantity: Number(o.total_quantity || 0),
     pickup_window:
       o.delivery && o.delivery.pickup_window
@@ -5911,19 +6030,12 @@ exports.getPickupOrders = asyncHandler(async (req, res) => {
     Math.max(1, parseInt(String(req.query.limit || '50'), 10) || 50)
   );
 
-  // dasar query: fulfillment delivery + mode pickup + order.status sesuai filter
   const q = {
     fulfillment_type: 'delivery',
     'delivery.mode': 'pickup',
     status: statusQ
-    // exclude cancelled just in case
-    // note: status already restricts to accepted/completed, but keep safety
-    // explicitly exclude cancelled if statusQ not cancelled
-    // (not strictly necessary but explicit)
-    // status: statusQ
   };
 
-  // cursor logic: cursor titik referensi = delivery.pickup_window.from OR placed_at fallback
   if (cursorRaw) {
     const cursorDate = new Date(cursorRaw);
     if (!isNaN(cursorDate.getTime())) {
@@ -6066,12 +6178,10 @@ exports.closingShiftSummary = asyncHandler(async (req, res) => {
   const startOfDay = baseDay.startOf('day');
   const endOfDay = baseDay.endOf('day');
 
-  // helper: agregasi sum per payment_method untuk suatu range (paid money)
   const buildSummaryForRange = async (fromD, toD) => {
     const match = {
       payment_status: { $in: ['paid', 'verified'] },
-      paid_at: { $gte: fromD.toDate(), $lte: toD.toDate() },
-      status: { $ne: 'cancelled' }
+      paid_at: { $gte: fromD.toDate(), $lte: toD.toDate() }
     };
 
     const pipeline = [
@@ -6148,42 +6258,91 @@ exports.closingShiftSummary = asyncHandler(async (req, res) => {
 });
 
 exports.cancelOrder = asyncHandler(async (req, res) => {
-  if (!req.user) throwError('Unauthorized', 401);
+  const orderId = req.params.id;
 
-  const id = req.params.id;
-  if (!id || !mongoose.Types.ObjectId.isValid(id))
-    throwError('ID tidak valid', 400);
+  if (!mongoose.Types.ObjectId.isValid(orderId))
+    throwError('ID order tidak valid', 400);
 
-  // ambil field imageUrl/paymentProofUrl (atau nama field yang kalian pakai)
-  const order = await Order.findById(id).select(
-    'status transaction_code member guestToken imageUrl paymentProofUrl'
-  );
-  if (!order) throwError('Order tidak ditemukan', 404);
+  const session = await mongoose.startSession();
+  try {
+    let deleted = null;
 
-  if (order.status !== 'created')
-    throwError('Hanya order dengan status "created" yang bisa dibatalkan', 409);
+    await session.withTransaction(async () => {
+      // ambil order (snapshot)
+      const order = await Order.findById(orderId).session(session).lean();
+      if (!order) throwError('Order tidak ditemukan', 404);
 
-  // hapus file bukti jika ada (coba hapus tapi jangan block kalau gagal)
-  const candidates = [order.imageUrl, order.paymentProofUrl].filter(Boolean);
-  for (const url of candidates) {
-    const fileId = extractDriveIdFromUrl(url);
-    if (fileId) {
-      try {
-        await deleteFile(fileId);
-      } catch (err) {
-        console.error('[cancelOrder][deleteFile]', err);
-        // jangan throw supaya proses cancel tetap jalan; ubah sesuai kebijakanmu
+      // optional: boleh masukkan kebijakan reject jika order sudah completed/paid and cannot be cancelled
+      // contoh: if (order.status === 'completed') throwError('Order sudah selesai', 400);
+
+      // Hitung jumlah yang harus direstore/revoke berdasarkan snapshot di order
+      const pointsUsed = Number(order.points_used || 0);
+      const pointsAwarded = Number(order.points_awarded || 0);
+      const totalSpendDelta = Number(order.total_spend_delta || 0);
+
+      // Jika member ada, update member
+      if (order.member) {
+        const member = await Member.findById(order.member).session(session);
+        if (!member) throwError('Member terkait order tidak ditemukan', 404);
+
+        // refund points used
+        const refundPoints = pointsUsed;
+
+        // revoke awarded points (jika ada)
+        const revokePoints = pointsAwarded;
+
+        // compute new points (refund then revoke), clamp >= 0
+        let newPoints =
+          Number(member.points || 0) + refundPoints - revokePoints;
+        if (newPoints < 0) newPoints = 0;
+
+        // compute new total_spend (revert delta)
+        const newTotalSpend = Math.max(
+          0,
+          Number(member.total_spend || 0) - totalSpendDelta
+        );
+
+        // update member atomically
+        await Member.updateOne(
+          { _id: member._id },
+          {
+            $set: {
+              points: Math.trunc(newPoints),
+              total_spend: Math.trunc(newTotalSpend),
+              last_visit_at: member.last_visit_at || null
+            }
+          },
+          { session }
+        );
+
+        // recalc level dan update bila berubah
+        const newLevel = evaluateMemberLevel(newTotalSpend);
+        if (String(member.level || '') !== String(newLevel)) {
+          await Member.updateOne(
+            { _id: member._id },
+            { $set: { level: newLevel } },
+            { session }
+          );
+        }
       }
-    }
+
+      // Delete order (sesuai permintaan: tidak disimpan di DB)
+      const delRes = await Order.deleteOne({ _id: order._id }).session(session);
+      if (delRes.deletedCount === 0) throwError('Gagal menghapus order', 500);
+
+      deleted = { id: String(order._id), message: 'Order dihapus' };
+    }); // end transaction
+
+    session.endSession();
+    return res.json({
+      success: true,
+      message: 'Order dibatalkan dan dihapus.',
+      deleted
+    });
+  } catch (err) {
+    session.endSession();
+    throw err;
   }
-
-  await Order.deleteOne({ _id: id });
-
-  return res.status(200).json({
-    message: 'Order dibatalkan & dihapus',
-    id: String(id),
-    transaction_code: order.transaction_code || null
-  });
 });
 
 exports.verifyOwnerDashboard = asyncHandler(async (req, res) => {

@@ -5,7 +5,7 @@ const MemberSchema = new mongoose.Schema(
   {
     name: { type: String, trim: true, required: true },
     phone: { type: String, trim: true, required: true },
-
+    level: { enum: ['bronze', 'silver', 'gold'] },
     gender: {
       type: String,
       enum: ['male', 'female'],

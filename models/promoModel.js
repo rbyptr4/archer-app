@@ -20,7 +20,11 @@ const PromoConditionSchema = new mongoose.Schema(
     minQty: { type: Number, default: 0 },
     items: { type: [PromoItemCondSchema], default: [] },
     audience: { type: String, enum: ['all', 'members'], default: 'all' },
-    // period-specific absolute window (optional)
+    memberLevels: {
+      type: [String],
+      enum: ['bronze', 'silver', 'gold'],
+      default: undefined
+    },
     startAt: { type: Date, default: null },
     endAt: { type: Date, default: null }
   },

@@ -21,12 +21,6 @@ function snapshotTotals(cart) {
   return { items, items_subtotal, totalQty };
 }
 
-/**
- * findApplicablePromos(cart, member, now, options)
- * - options.fetchers = { getMemberUsageCount(promoId, memberId, sinceDate) => Promise<number>, getGlobalUsageCount(promoId, sinceDate) => Promise<number> }
- *
- * If fetchers not provided, usage-limit checks are skipped.
- */
 async function findApplicablePromos(
   cart = {},
   member = null,
@@ -50,6 +44,20 @@ async function findApplicablePromos(
 
     // 2) audience
     if (p.conditions?.audience === 'members' && !member) continue;
+    // 2.b) memberLevels filter (optional)
+    // jika promo punya kondisi memberLevels: ['bronze','silver','gold'], hanya berlaku utk member tsb
+    if (
+      Array.isArray(p.conditions?.memberLevels) &&
+      p.conditions.memberLevels.length > 0
+    ) {
+      // jika tidak ada member, promo tidak berlaku
+      if (!member || !member.level) continue;
+
+      const allowed = new Set(
+        p.conditions.memberLevels.map((l) => String(l || '').toLowerCase())
+      );
+      if (!allowed.has(String(member.level || '').toLowerCase())) continue;
+    }
 
     // 3) minTotal
     if (
@@ -278,22 +286,26 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
       impact.note += (impact.note ? '; ' : '') + `Potongan Rp ${amt}`;
     }
 
-    // pointsFixed / pointsPercent => action
+    // pointsFixed / pointsPercent => action (standar: use 'points' field)
     if (Number.isFinite(Number(r.pointsFixed))) {
-      actions.push({
-        type: 'award_points',
-        amount: Number(r.pointsFixed),
-        meta: { promoId: promo._id }
-      });
+      const pts = Number(r.pointsFixed);
+      if (pts > 0) {
+        actions.push({
+          type: 'award_points',
+          points: Math.trunc(pts),
+          meta: { promoId: promo._id }
+        });
+      }
       impact.note += (impact.note ? '; ' : '') + `Poin ${r.pointsFixed}`;
     } else if (Number.isFinite(Number(r.pointsPercent))) {
       const pts = Math.floor((sub * Number(r.pointsPercent || 0)) / 100);
-      if (pts > 0)
+      if (pts > 0) {
         actions.push({
           type: 'award_points',
-          amount: pts,
+          points: Math.trunc(pts),
           meta: { promoId: promo._id }
         });
+      }
       impact.note += (impact.note ? '; ' : '') + `Poin ${r.pointsPercent}%`;
     }
 
@@ -334,7 +346,7 @@ async function executePromoActions(
   for (const a of actions) {
     if (a.type === 'award_points') {
       if (!memberId) continue;
-      const add = Number(a.amount || 0);
+      const add = Math.trunc(Number(a.points ?? a.amount ?? 0));
       if (add <= 0) continue;
       await MemberModel.updateOne(
         { _id: memberId },
@@ -347,19 +359,6 @@ async function executePromoActions(
         grantedAt: now,
         promoId: a.meta?.promoId || null
       });
-    } else if (a.type === 'grant_membership') {
-      if (!memberId) continue;
-      await MemberModel.updateOne(
-        { _id: memberId },
-        { $set: { loyalty_card: true, loyalty_awarded_at: now } },
-        { session }
-      );
-      rewards.push({
-        type: 'membership',
-        grantedAt: now,
-        promoId: a.meta?.promoId || null
-      });
-      order.granted_membership = true;
     }
   }
 
