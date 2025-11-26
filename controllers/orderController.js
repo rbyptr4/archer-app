@@ -1395,12 +1395,6 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
 
 /* ===================== CHECKOUT ===================== */
 exports.checkout = asyncHandler(async (req, res) => {
-  console.log('[checkout] start', {
-    path: req.path,
-    member: req.member?.id || null
-  });
-
-  // --- destructure input ---
   const {
     name,
     phone,
@@ -1941,48 +1935,76 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // --- build discounts array & applied_voucher_ids (voucher ids, bukan claim ids) ---
   const discounts = [];
   const appliedVoucherIdSet = new Set();
 
-  const claimIdsNeeded = breakdown
-    .map((b) => b.claimId || b.claim_id || b.claim)
+  const engineDiscounts = Array.isArray(priced.discounts)
+    ? priced.discounts
+    : Array.isArray(priced.breakdown)
+    ? priced.breakdown
+    : [];
+
+  // build a map claimId -> voucherClaimDoc for convenience (if any claimIds referenced)
+  const claimIdsNeeded = engineDiscounts
+    .flatMap((d) => (d.items || []).map((it) => it.claimId || it.claimId) || [])
     .filter(Boolean)
     .map(String);
+
   let claimDocsMap = {};
   if (claimIdsNeeded.length) {
-    const claimDocs = await VoucherClaim.find({
-      _id: { $in: claimIdsNeeded }
-    }).lean();
+    const claimDocs = await VoucherClaim.find({ _id: { $in: claimIdsNeeded } })
+      .lean()
+      .catch(() => []);
     claimDocsMap = claimDocs.reduce((acc, cd) => {
       acc[String(cd._id)] = cd;
       return acc;
     }, {});
-    console.log('[checkout] claimDocsMap built for breakdown', {
-      claimDocsCount: claimDocs.length
-    });
   }
 
-  for (const b of breakdown) {
-    const claimId = b.claimId || b.claim_id || b.claim || null;
-    let voucherId = b.voucherId || b.voucher_id || b.voucher || null;
+  for (const d of engineDiscounts) {
+    // normalize fields differences from older engine.breakdown
+    const id = d.id || d.claimId || d.claim_id || null;
+    const source = d.source || (d.voucherId || d.voucher ? 'voucher' : 'promo');
+    const label = d.label || d.name || d.title || '';
+    const amount = Number(d.amount ?? d.amountTotal ?? d.itemsDiscount ?? 0);
+    const items = Array.isArray(d.items)
+      ? d.items.map((it) => ({
+          menuId: it.menuId || it.menu || it.menu_id || null,
+          qty: Number(it.qty || it.quantity || 0),
+          amount: int(it.amount || it.line_discount || 0)
+        }))
+      : [];
 
-    if (!voucherId && claimId && claimDocsMap[claimId]) {
-      voucherId = claimDocsMap[claimId].voucher || null;
+    discounts.push({
+      claimId: id && source === 'voucher' ? String(id) : null,
+      voucherId:
+        id && source === 'voucher' && claimDocsMap[String(id)]
+          ? String(claimDocsMap[String(id)].voucher || null)
+          : null,
+      id: id ? String(id) : null,
+      source,
+      label,
+      amount: int(amount),
+      items,
+      meta: d.meta || {},
+      raw: d
+    });
+
+    // collect voucher ids for appliedVouchers array
+    if (source === 'voucher') {
+      // if engine provided voucherId directly
+      if (d.voucherId || d.voucher_id || d.voucher) {
+        appliedVoucherIdSet.add(
+          String(d.voucherId || d.voucher_id || d.voucher)
+        );
+      } else if (
+        id &&
+        claimDocsMap[String(id)] &&
+        claimDocsMap[String(id)].voucher
+      ) {
+        appliedVoucherIdSet.add(String(claimDocsMap[String(id)].voucher));
+      }
     }
-
-    const item = {
-      claimId: claimId ? String(claimId) : null,
-      voucherId: voucherId ? String(voucherId) : null,
-      name: b.name || b.title || '',
-      itemsDiscount: int(b.itemsDiscount ?? b.items_discount ?? 0),
-      shippingDiscount: int(b.shippingDiscount ?? b.shipping_discount ?? 0),
-      note: b.note || null,
-      raw: b
-    };
-
-    discounts.push(item);
-    if (voucherId) appliedVoucherIdSet.add(String(voucherId));
   }
 
   const appliedVoucherIds = Array.from(appliedVoucherIdSet);
@@ -2059,6 +2081,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   const initialPaymentStatus = initialIsPaid ? 'paid' : 'unpaid';
   const initialPaidAt = initialIsPaid ? new Date() : null;
 
+  const itemAdjustmentsMap = priced.itemAdjustments || {}; // menuId -> [ { type, amount, reason, promoId, voucherClaimId, qty } ]
   const orderItems = (cart.items || []).map((it) => {
     const menuBase = Number(it.base_price ?? it.unit_price ?? it.price ?? 0);
     const addons = Array.isArray(it.addons) ? it.addons : [];
@@ -2068,19 +2091,38 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
     const unit_price = Math.round(menuBase + addonsPerUnit);
     const qty = Number(it.quantity ?? it.qty ?? 0) || 0;
+    const menuId = it.menu;
+
+    const lineSubtotal = int(unit_price * qty);
+    // fetch adjustments from engine map by menuId (stringified)
+    const adjustments = itemAdjustmentsMap?.[String(menuId)] || [];
+
+    // calc adj total
+    const adjTotal = (adjustments || []).reduce(
+      (s, a) => s + Number(a.amount || 0),
+      0
+    );
 
     return {
-      menu: it.menu,
+      menu: menuId,
       menu_code: it.menu_code || it.menuCode || null,
       name: it.name || null,
       imageUrl: it.imageUrl || null,
-      base_price: int(menuBase), // simpan base menu (tanpa addons)
+      base_price: int(menuBase),
       quantity: qty,
       addons: it.addons || [],
       notes: String(it.notes || '').trim(),
       category: it.category || null,
-      // gunakan line_subtotal yang konsisten dg unit_price*qty (mengikut style existing)
-      line_subtotal: int(unit_price * qty)
+      line_subtotal: int(lineSubtotal),
+      adjustments: (adjustments || []).map((a) => ({
+        type: a.type || 'promo',
+        amount: int(a.amount || 0),
+        reason: a.reason || a.label || '',
+        promoId: a.promoId || a.promo || null,
+        voucherClaimId: a.voucherClaimId || a.claimId || null,
+        qty: Number(a.qty || 0)
+      })),
+      line_total_after_adjustments: Math.max(0, int(lineSubtotal - adjTotal))
     };
   });
 
@@ -2196,9 +2238,25 @@ exports.checkout = asyncHandler(async (req, res) => {
         delivery_fee: int(uiTotals.delivery_fee || 0),
         shipping_discount: int(uiTotals.shipping_discount || 0),
         discounts: discounts || [],
-        applied_voucher_ids: appliedVoucherIds || [],
-        appliedPromo: appliedPromoSnapshot,
-        promoRewards: promoRewards || [],
+        appliedVouchers: (appliedVoucherIds || []).map((id) => ({
+          voucherId: id,
+          voucherSnapshot: {}
+        })),
+        appliedVouchersIds: appliedVoucherIds || [], // optional, keep older field if used elsewhere
+        appliedPromo: priced.promoApplied
+          ? {
+              promoId:
+                priced.promoApplied.promoId || priced.promoApplied.promoId,
+              promoSnapshot: priced.promoApplied
+            }
+          : appliedPromoSnapshot || { promoId: null, promoSnapshot: {} },
+        promoRewards: priced.promoRewards || promoRewards || [],
+        points_awarded_details: priced.points_awarded_details || {
+          total: 0,
+          actions: []
+        },
+        engineSnapshot: priced.engineSnapshot || {},
+
         ownerVerified, // existing logic
         ownerVerifiedBy: ownerVerified ? req.user?.id || null : null,
         ownerVerifiedAt: ownerVerified ? new Date() : null,
@@ -2260,20 +2318,27 @@ exports.checkout = asyncHandler(async (req, res) => {
         }
       }
 
-      // Compute points_awarded from applied promo actions (if any)
       const promoActions =
-        appliedPromoSnapshot?.actions || priced?.promoApplied?.actions || [];
-      const points_awarded = sumPointsAwardedFromPromoActions(promoActions);
-      const points_awarded_details = promoActions?.length
-        ? { actions: promoActions }
-        : {};
+        priced.points_awarded_details && priced.points_awarded_details.actions
+          ? priced.points_awarded_details.actions
+          : appliedPromoSnapshot?.actions ||
+            priced?.promoApplied?.actions ||
+            [];
+      const points_awarded = Math.max(
+        0,
+        Math.round(
+          priced?.points_awarded_details?.total ??
+            sumPointsAwardedFromPromoActions(promoActions)
+        )
+      );
+      const points_awarded_details =
+        priced.points_awarded_details ||
+        (promoActions?.length
+          ? { actions: promoActions, total: points_awarded }
+          : {});
 
-      // compute total_spend_delta:
-      // business decision: total_spend only increases by amount actually paid by customer (after points)
-      // uiTotals.grand_total is final amount customer pays (0 if fully covered by points)
       const total_spend_delta = Number(uiTotals.grand_total || 0);
 
-      // attach snapshot to payload (so order doc already has these)
       payload.member_level_before = member_level_before;
       payload.total_spend_before = total_spend_before;
       payload.total_spend_delta = int(total_spend_delta);
@@ -3254,7 +3319,9 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         menuId: it.menu || it.menuId || it.id || null,
         qty: Number(it.quantity ?? it.qty ?? 0),
         price: unitPrice,
-        category: it.category ?? it.cat ?? null
+        category: it.category ?? it.cat ?? null,
+        // keep some metadata for FE trace/debug
+        name: it.name || null
       };
     })
   };
@@ -3447,10 +3514,11 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     grand_total_with_delivery: Number(t.grandTotal || t.grand_total || 0)
   };
 
-  // ===== build promo info for UI =====
+  // ===== build promo info for UI (backward-compatible) =====
   const appliedPromo = result.promoApplied || null;
+  const autoAppliedPromoFinal = autoAppliedPromo || null;
 
-  // promo_breakdown & promo_rewards normalized
+  // legacy items for backward-compat (keperluan FE lama)
   const promo_breakdown = [];
   const promo_rewards = [];
 
@@ -3497,7 +3565,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     }
   }
 
-  // voucher info from engine
+  // voucher info from engine (normalize)
   const voucherInfo = (result.voucherResult && {
     chosenClaimIds:
       result.chosenClaimIds || result.voucherResult.chosenClaimIds || [],
@@ -3507,21 +3575,104 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     breakdown: result.breakdown || []
   };
 
-  // eligiblePromos summary (ringkasan untuk FE)
-  const eligiblePromosSummary = (eligiblePromosList || []).map((p) => ({
-    id: String(p._id),
-    name: p.name,
-    type: p.type,
-    blocksVoucher: !!p.blocksVoucher,
-    autoApply: !!p.autoApply,
-    priority: Number(p.priority || 0),
-    rewardSummary:
-      Array.isArray(p.rewards) && p.rewards.length
-        ? p.rewards
-        : p.reward
-        ? [p.reward]
-        : []
-  }));
+  // --- NEW: unified promo summary (single source of truth for FE) ---
+  // prefer structured fields from engine if available
+  const engineDiscounts = Array.isArray(result.discounts)
+    ? result.discounts
+    : Array.isArray(result.breakdown)
+    ? result.breakdown
+    : [];
+
+  const itemAdjustments = result.itemAdjustments || {}; // map menuId -> adjustments[]
+  const engineRewards = Array.isArray(result.promoRewards)
+    ? result.promoRewards
+    : [];
+
+  // Normalisasi rewards: buat bentuk konsisten untuk FE
+  const normalizedRewards = [];
+  // 1) dari engine.promoRewards (already normalized by engine)
+  for (const r of engineRewards) {
+    normalizedRewards.push({
+      type: r.type || 'unknown',
+      amount: r.amount ?? null,
+      label: r.label || null,
+      meta: r.meta || {}
+    });
+  }
+  // 2) jika engineRewards kosong, fallback build dari appliedPromo
+  if (!normalizedRewards.length && appliedPromo && appliedPromo.impact) {
+    const imp = appliedPromo.impact;
+    if (Array.isArray(imp.addedFreeItems)) {
+      for (const f of imp.addedFreeItems) {
+        normalizedRewards.push({
+          type: 'free_item',
+          amount: 0,
+          label: `Gratis ${f.menuId}`,
+          meta: { menuId: f.menuId, qty: Number(f.qty || 1) }
+        });
+      }
+    }
+    if (Array.isArray(appliedPromo.actions)) {
+      for (const a of appliedPromo.actions) {
+        if (a.type === 'award_points') {
+          normalizedRewards.push({
+            type: 'points',
+            amount: Number(a.points ?? a.amount ?? 0),
+            label: 'Poin promo',
+            meta: a.meta || {}
+          });
+        } else if (a.type === 'grant_membership') {
+          normalizedRewards.push({
+            type: 'membership',
+            amount: null,
+            label: 'Grant membership',
+            meta: a.meta || {}
+          });
+        } else {
+          normalizedRewards.push({
+            type: a.type || 'action',
+            amount: a.amount ?? null,
+            label: a.label || null,
+            meta: a.meta || {}
+          });
+        }
+      }
+    }
+    if (Number(imp.itemsDiscount || imp.cartDiscount || 0) > 0) {
+      normalizedRewards.push({
+        type: 'discount',
+        amount: Number(imp.itemsDiscount || imp.cartDiscount || 0),
+        label: 'Potongan promo',
+        meta: {}
+      });
+    }
+  }
+
+  // Points details (engine may include a points_awarded_details object)
+  const points_awarded_details = result.points_awarded_details || {
+    total: 0,
+    actions: []
+  };
+
+  // build single promo summary object
+  const promoSummary = {
+    // what engine applied (if any)
+    appliedPromo: appliedPromo || null,
+    // server's preview suggestion (auto apply)
+    autoAppliedPromo: autoAppliedPromoFinal,
+    // normalized list of rewards (free items, points, membership, discounts)
+    rewards: normalizedRewards,
+    // discounts / voucher breakdown (prefer engine structured discounts)
+    discounts: engineDiscounts,
+    // per-item adjustments (map)
+    itemAdjustments,
+    // voucher chosen claims
+    chosenClaimIds: voucherInfo.chosenClaimIds || [],
+    // points detail
+    points_awarded_details,
+    // raw snapshot for debugging/audit
+    engineSnapshot: result.engineSnapshot || {}
+  };
 
   // ===== response =====
   return res.status(200).json({
@@ -3531,11 +3682,14 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     eligiblePromosCount,
     eligiblePromos: eligiblePromosSummary,
     // auto-applied preview (server suggestion berdasarkan autoApply+priority)
-    autoAppliedPromo,
+    autoAppliedPromo: autoAppliedPromo, // backward compat
     // what engine applied as promo (if any)
-    appliedPromo,
-    promo_breakdown,
-    promo_rewards,
+    appliedPromo: appliedPromo, // backward compat
+    promo_breakdown, // legacy
+    promo_rewards, // legacy
+    // new unified promo summary (single source of truth)
+    promo: promoSummary,
+    // voucher: preserve existing shape for backward compat
     voucher: voucherInfo,
     breakdown:
       result.breakdown ||

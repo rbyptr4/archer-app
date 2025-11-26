@@ -32,7 +32,30 @@ const orderItemSchema = new mongoose.Schema(
     notes: { type: String, trim: true, default: '' },
 
     // line subtotal = (base + addons per unit) * qty
-    line_subtotal: { type: Number, min: 0, required: true, set: int, get: int }
+    line_subtotal: { type: Number, min: 0, required: true, set: int, get: int },
+    adjustments: {
+      type: [
+        {
+          type: { type: String, trim: true, default: 'promo' }, // promo|voucher|manual
+          amount: { type: Number, default: 0, set: int, get: int },
+          reason: { type: String, trim: true, default: '' },
+          promoId: { type: String, default: null },
+          voucherClaimId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'VoucherClaim',
+            default: null
+          },
+          qty: { type: Number, default: 0 }
+        }
+      ],
+      default: []
+    },
+    line_total_after_adjustments: {
+      type: Number,
+      default: null,
+      set: int,
+      get: int
+    }
   },
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
 );
@@ -81,16 +104,60 @@ const deliverySchema = new mongoose.Schema(
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
 );
 
+const discountItemSchema = new mongoose.Schema(
+  {
+    menuId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Menu',
+      required: false
+    },
+    qty: { type: Number, default: 1 },
+    amount: { type: Number, default: 0, set: int, get: int } // line discount amount (Rp)
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
+);
+
 const discountBreakdownSchema = new mongoose.Schema(
   {
-    claimId: { type: mongoose.Schema.Types.ObjectId, ref: 'VoucherClaim' },
-    voucherId: { type: mongoose.Schema.Types.ObjectId, ref: 'Voucher' },
-    name: { type: String, trim: true },
+    // backward-compatible refs
+    claimId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'VoucherClaim',
+      default: null
+    },
+    voucherId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Voucher',
+      default: null
+    },
+
+    // new standardized fields for engine output
+    id: { type: String, default: null }, // promoId | voucherClaimId | manual
+    source: {
+      type: String,
+      enum: ['promo', 'voucher', 'manual', 'note'],
+      default: 'promo'
+    },
+    orderIdx: { type: Number, default: 1 }, // execution order: promo=1, voucher=2
+    type: {
+      type: String,
+      enum: ['percent', 'amount', 'free_item', 'points', 'membership', 'note'],
+      default: 'amount'
+    },
+    label: { type: String, trim: true, default: '' },
+
+    // amount fields
+    amount: { type: Number, default: 0, set: int, get: int }, // total money amount (Rp) that this discount reduces
+    items: { type: [discountItemSchema], default: [] }, // per-line distribution
+
+    // legacy / convenience fields
+    name: { type: String, trim: true }, // legacy alias
     itemsDiscount: { type: Number, default: 0, set: int, get: int },
     shippingDiscount: { type: Number, default: 0, set: int, get: int },
     amountTotal: { type: Number, default: 0, set: int, get: int },
+
     appliedAt: { type: Date, default: Date.now },
-    meta: { type: Object, default: {} },
+    meta: { type: mongoose.Schema.Types.Mixed, default: {} },
     note: { type: String, trim: true, default: '' }
   },
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } }
