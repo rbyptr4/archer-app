@@ -81,12 +81,119 @@ async function applyPromoThenVoucher({
     applicable = [];
   }
 
+  // ========== DEBUG: log snapshot untuk membandingkan preview vs checkout ==========
+  try {
+    console.log(
+      '[priceEngine.debug] selectedPromoId:',
+      String(selectedPromoId)
+    );
+  } catch (e) {}
+  console.log(
+    '[priceEngine.debug] effectiveMember:',
+    JSON.stringify(effectiveMember)
+  );
+  console.log(
+    '[priceEngine.debug] fulfillmentType:',
+    fulfillmentType,
+    'deliveryFee:',
+    deliveryFee
+  );
+  console.log(
+    '[priceEngine.debug] cart.items:',
+    JSON.stringify(cart.items || [])
+  );
+  console.log(
+    '[priceEngine.debug] applicableIds:',
+    (applicable || []).map((p) => String(p._id))
+  );
+  // =======================================================================
+
   let promoApplied = null;
+  let selectedPromoRejected = false;
+  let selectedPromoReplacedBy = null;
+
   if (selectedPromoId) {
     promoApplied =
       applicable.find((p) => String(p._id) === String(selectedPromoId)) || null;
-    if (!promoApplied)
-      throwError('Promo yang dipilih tidak berlaku untuk cart ini', 400);
+
+    if (!promoApplied) {
+      console.warn(
+        '[priceEngine.warn] selectedPromoId tidak ada di applicable, akan coba fetch+apply langsung',
+        {
+          selectedPromoId,
+          applicableIds: (applicable || []).map((p) => String(p._id))
+        }
+      );
+
+      // coba ambil promo langsung dari DB (sesuaikan path model jika perlu)
+      let promoFromDb = null;
+      try {
+        const PromoModel = require('./promoModel'); // jika beda path, sesuaikan
+        promoFromDb = await PromoModel.findById(selectedPromoId).lean();
+      } catch (e) {
+        promoFromDb = null;
+      }
+
+      if (promoFromDb) {
+        try {
+          // coba apply langsung; applyPromoRaw biasanya throw kalau tidak applicable
+          await applyPromoRaw(promoFromDb, cart);
+          // jika tidak throw => anggap valid, gunakan promoFromDb
+          promoApplied = promoFromDb;
+          promoApplied._id = promoFromDb._id;
+          selectedPromoReplacedBy = String(promoFromDb._id);
+          console.log(
+            '[priceEngine.info] selectedPromo berhasil diaplikasikan via direct applyPromoRaw',
+            selectedPromoReplacedBy
+          );
+        } catch (e) {
+          console.warn(
+            '[priceEngine.warn] direct applyPromoRaw gagal untuk selectedPromo',
+            { selectedPromoId, err: e?.message || e }
+          );
+          selectedPromoRejected = true;
+        }
+      } else {
+        console.warn(
+          '[priceEngine.warn] selectedPromoId tidak ditemukan di DB',
+          { selectedPromoId }
+        );
+        selectedPromoRejected = true;
+      }
+
+      // jika masih rejected, coba auto-best sebagai fallback
+      if (selectedPromoRejected) {
+        let best = null;
+        let bestValue = -1;
+        if (Array.isArray(applicable) && applicable.length) {
+          for (const p of applicable) {
+            try {
+              const { impact } = await applyPromoRaw(p, cart);
+              const v =
+                Number(impact.itemsDiscount || 0) +
+                Number(impact.cartDiscount || 0);
+              if (v > bestValue) {
+                bestValue = v;
+                best = { promo: p, impact };
+              }
+            } catch (e) {
+              // ignore failing promo
+            }
+          }
+        }
+        if (best) {
+          promoApplied = best.promo;
+          selectedPromoReplacedBy = String(best.promo._id);
+          console.log(
+            '[priceEngine.info] selectedPromo diganti oleh auto-best',
+            selectedPromoReplacedBy
+          );
+        } else {
+          // tetap nol -> lanjut tanpa promo
+          promoApplied = null;
+        }
+      }
+    }
   } else if (autoApplyPromo && Array.isArray(applicable) && applicable.length) {
     let best = null;
     let bestValue = -1;
