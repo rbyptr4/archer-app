@@ -3453,7 +3453,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     );
   }
 
-  // build ui_totals (fallback)
+  // build ui_totals (fallback)  -- REPLACEMENT START
   const t =
     (result && result.totals) ||
     (result.voucherResult && result.voucherResult.totals) ||
@@ -3463,19 +3463,56 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     ? Number(deliveryFeeFromEngine)
     : Number(effectiveDeliveryFee || 0);
 
+  // compute voucherDiscount (sum dari voucher breakdown amounts) - robust parsing
+  const voucherBreakdown =
+    (result.voucherResult && result.voucherResult.breakdown) ||
+    result.breakdown ||
+    [];
+  const voucherDiscount = Array.isArray(voucherBreakdown)
+    ? voucherBreakdown.reduce((acc, it) => {
+        const maybeAmount = Number(it.amount ?? it.discount ?? it.value ?? 0);
+        return acc + (Number.isFinite(maybeAmount) ? maybeAmount : 0);
+      }, 0)
+    : 0;
+
+  // compute promoDiscount using promoApplied.impact if available (preferred),
+  // otherwise fallback to totals.itemsDiscount - voucherDiscount
+  let promoDiscount = 0;
+  if (result.promoApplied && result.promoApplied.impact) {
+    try {
+      const imp = result.promoApplied.impact || {};
+      promoDiscount =
+        Number(imp.itemsDiscount || 0) + Number(imp.cartDiscount || 0);
+    } catch (e) {
+      promoDiscount = 0;
+    }
+  } else {
+    // fallback: engine totals may combine promo + voucher into itemsDiscount
+    promoDiscount = Number(t.itemsDiscount || 0) - Number(voucherDiscount || 0);
+    if (!Number.isFinite(promoDiscount) || promoDiscount < 0) promoDiscount = 0;
+  }
+
+  const itemsSubtotal = Number(t.baseSubtotal || 0);
+  const itemsSubtotalAfterPromo = Math.max(0, itemsSubtotal - promoDiscount);
+
   const ui_totals = {
-    items_subtotal: Number(t.baseSubtotal || 0),
-    items_subtotal_after_discount: Number(
-      t.items_subtotal_after_discount || t.baseSubtotalAfterDiscount || 0
-    ),
-    items_discount: Number(t.itemsDiscount || 0),
+    // original subtotal (before promo)
+    items_subtotal: itemsSubtotal,
+    // subtotal after applying promo (voucher discounts are reflected separately)
+    items_subtotal_after_discount: itemsSubtotalAfterPromo,
+    // promo discount (sum of cartDiscount + itemsDiscount from promo)
+    promo_discount: Number(promoDiscount || 0),
+    // item-level discounts coming from vouchers only (so FE can show voucher discounts separately)
+    items_discount: Number(voucherDiscount || 0),
     service_fee: Number(t.service_fee || 0),
     tax_amount: Number(t.tax_amount || 0),
     delivery_fee: finalDeliveryFee,
     shipping_discount: Number(t.shippingDiscount || 0),
     rounding_delta: Number(t.rounding_delta || 0),
+    // grand total must remain authoritative from engine (after promo + voucher + fees + tax + rounding)
     grand_total: Number(t.grandTotal || t.grand_total || 0)
   };
+  // REPLACEMENT END
 
   // normalize voucher info
   const voucherInfo = (result.voucherResult && {

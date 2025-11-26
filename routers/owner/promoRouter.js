@@ -12,7 +12,7 @@ router.post('/create-promo', ctrl.create);
 router.get('/list', ctrl.list);
 router.patch('/:id/activate', ctrl.activate);
 router.patch('/:id/deactivate', ctrl.deactivate);
-router.patch('/update/:id', ctrl.evaluate);
-router.delete('/remove/:id', ctrl.evaluate);
+router.patch('/update/:id', ctrl.update);
+router.delete('/remove/:id', ctrl.remove);
 
 module.exports = router;
