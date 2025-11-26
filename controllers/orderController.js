@@ -3301,8 +3301,41 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   };
 
   // ===== hitung eligible promos list dulu (agar FE bisa tahu berapa banyak tersedia) =====
-  const now = new Date();
+  console.log(
+    '[previewPrice] normalizedCart for promo engine:',
+    JSON.stringify(normalizedCart)
+  );
+  console.log(
+    '[previewPrice] MemberDoc:',
+    JSON.stringify({
+      id: MemberDoc?._id,
+      level: MemberDoc?.level,
+      total_spend: MemberDoc?.total_spend,
+      promoUsageHistoryCount: (MemberDoc?.promoUsageHistory || []).length
+    })
+  );
+
   let eligiblePromosList = [];
+  try {
+    eligiblePromosList = await findApplicablePromos(
+      normalizedCart,
+      MemberDoc,
+      now,
+      { fetchers: promoUsageFetchers }
+    );
+    console.log(
+      '[previewPrice] findApplicablePromos returned:',
+      (eligiblePromosList || []).map((p) => ({
+        id: String(p._id),
+        name: p.name,
+        conditions: p.conditions
+      }))
+    );
+  } catch (e) {
+    console.warn('[previewPrice] findApplicablePromos failed', e?.message || e);
+    eligiblePromosList = [];
+  }
+
   try {
     eligiblePromosList = await findApplicablePromos(
       normalizedCart,
