@@ -71,12 +71,12 @@ async function applyPromoThenVoucher({
   // 1) cari promo yang eligible
   let applicable = [];
   try {
-    applicable = await findApplicablePromos(
-      cart,
-      memberId ? { _id: memberId } : null,
-      now,
-      { fetchers: promoUsageFetchers }
-    );
+    const effectiveMember =
+      args.memberDoc || (memberId ? { _id: memberId } : null);
+
+    applicable = await findApplicablePromos(cart, effectiveMember, now, {
+      fetchers: promoUsageFetchers
+    });
   } catch (e) {
     console.warn('[priceEngine] findApplicablePromos failed', e?.message || e);
   }

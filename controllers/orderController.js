@@ -3390,6 +3390,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
 
     result = await applyPromoThenVoucher({
       memberId: memberId,
+      memberDoc: MemberDoc || null,
       cart: normalizedCart,
       fulfillmentType,
       deliveryFee:
