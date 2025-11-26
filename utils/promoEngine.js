@@ -163,9 +163,16 @@ async function findApplicablePromos(
       }
     }
 
-    // 8) globalStock check (lifetime)
-    if (Number.isFinite(Number(p.globalStock))) {
-      if ((p.globalStock || 0) <= 0) continue;
+    // 8) globalStock check (lifetime) - only enforce when globalStock is explicitly set (not null/undefined)
+    if (p.globalStock != null) {
+      const stockNum = Number(p.globalStock);
+      // if it's not a finite number -> treat as unlimited (skip check)
+      if (Number.isFinite(stockNum)) {
+        if (stockNum <= 0) {
+          // no stock left -> not eligible
+          continue;
+        }
+      }
     }
 
     // passed all checks -> eligible
