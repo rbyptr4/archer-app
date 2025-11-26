@@ -102,7 +102,7 @@ router.get(
 );
 
 router.get('/my-order', authMemberRequired, order.listMyOrders);
-router.post('/price-preview', authMemberRequired, order.previewPrice);
+router.post('/price-preview', authMemberOptional, order.previewPrice);
 
 router.post(
   '/dine-in/cashier',

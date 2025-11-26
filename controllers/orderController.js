@@ -3128,8 +3128,8 @@ exports.homeDashboard = asyncHandler(async (req, res) => {
           // Omzet: hanya ambil order yang sudah dibayar hari ini
           {
             $match: {
-              payment_status: { $in: ['paid', 'verified'] },
-              // payment_status: 'verified' },
+              // payment_status: { $in: ['verified'] },
+              payment_status: 'verified',
               paid_at: { $gte: startOfDay, $lte: endOfDay }
             }
           },
@@ -3192,31 +3192,37 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
 });
 
 exports.previewPrice = asyncHandler(async (req, res) => {
-  // pastikan user login sebagai member
-  if (!req.member?.id) throwError('Harus login sebagai member', 401);
-
   const {
     cart,
     fulfillmentType = 'dine_in',
     voucherClaimIds = [],
     delivery_mode: deliveryModeFromBody = null,
-    selectedPromoId = null // FE boleh kirim selectedPromoId untuk preview apply
+    selectedPromoId = null
   } = req.body || {};
 
   if (!cart?.items?.length) throwError('Cart kosong', 400);
+
+  // ===== resolve member identity (support guest) =====
+  const memberId = req.member?.id || null;
 
   // ===== filter voucher milik member & masih valid (fallback) =====
   let eligible = [];
   const now = new Date();
   if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
-    const raw = await VoucherClaim.find({
-      _id: { $in: voucherClaimIds },
-      member: req.member.id,
-      status: 'claimed'
-    }).lean();
-    eligible = raw
-      .filter((c) => !c.validUntil || new Date(c.validUntil) > now)
-      .map((c) => String(c._id));
+    if (!memberId) {
+      // guest trying to pass voucher ids -> ignore them (guest tidak boleh pakai voucher)
+      console.warn('[previewPrice] guest attempted voucherClaimIds - ignored');
+      eligible = [];
+    } else {
+      const raw = await VoucherClaim.find({
+        _id: { $in: voucherClaimIds },
+        member: memberId,
+        status: 'claimed'
+      }).lean();
+      eligible = raw
+        .filter((c) => !c.validUntil || new Date(c.validUntil) > now)
+        .map((c) => String(c._id));
+    }
   }
 
   // ===== tentukan delivery_mode efektif =====
@@ -3242,7 +3248,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         return s + ap * aq;
       }, 0);
       const unitBase = Number(it.base_price ?? it.price ?? it.unit_price ?? 0);
-      const unitPrice = int(unitBase + addonsPerUnit);
+      const unitPrice = Math.round(unitBase + addonsPerUnit);
       return {
         menuId: it.menu || it.menuId || it.id || null,
         qty: Number(it.quantity ?? it.qty ?? 0),
@@ -3252,14 +3258,22 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     })
   };
 
-  // ambil MemberDoc lengkap (untuk usage history dsb)
-  const MemberDoc = await Member.findById(req.member.id).lean();
+  // ambil MemberDoc lengkap (untuk usage history dsb) — hanya jika ada member
+  let MemberDoc = null;
+  if (memberId) {
+    MemberDoc = await Member.findById(memberId)
+      .lean()
+      .catch((e) => {
+        console.warn('[previewPrice] gagal ambil MemberDoc', e?.message || e);
+        return null;
+      });
+  }
 
   // ===== promo usage fetchers (dipassing ke priceEngine) =====
   const promoUsageFetchers = {
-    getMemberUsageCount: async (promoId, memberId, sinceDate) => {
+    getMemberUsageCount: async (promoId, mId, sinceDate) => {
       try {
-        if (!memberId) return 0;
+        if (!mId) return 0;
         // gunakan member.promoUsageHistory jika tersedia (cheap)
         if (MemberDoc && Array.isArray(MemberDoc.promoUsageHistory)) {
           return MemberDoc.promoUsageHistory.filter(
@@ -3271,7 +3285,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         // fallback: hitung order dengan appliedPromo.promoId
         const q = {
           'appliedPromo.promoId': promoId,
-          member: memberId,
+          member: mId,
           createdAt: { $gte: sinceDate }
         };
         return await Order.countDocuments(q);
@@ -3308,15 +3322,16 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   console.log(
     '[previewPrice] MemberDoc:',
     JSON.stringify({
-      id: MemberDoc?._id,
-      level: MemberDoc?.level,
-      total_spend: MemberDoc?.total_spend,
+      id: MemberDoc?._id || null,
+      level: MemberDoc?.level || null,
+      total_spend: MemberDoc?.total_spend || 0,
       promoUsageHistoryCount: (MemberDoc?.promoUsageHistory || []).length
     })
   );
 
   let eligiblePromosList = [];
   try {
+    // pass member object jika ada, else null -> promoEngine akan treat guest correctly
     eligiblePromosList = await findApplicablePromos(
       normalizedCart,
       MemberDoc,
@@ -3336,17 +3351,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     eligiblePromosList = [];
   }
 
-  try {
-    eligiblePromosList = await findApplicablePromos(
-      normalizedCart,
-      MemberDoc,
-      now,
-      { fetchers: promoUsageFetchers }
-    );
-  } catch (e) {
-    console.warn('[previewPrice] findApplicablePromos failed', e?.message || e);
-    eligiblePromosList = [];
-  }
   const eligiblePromosCount = Array.isArray(eligiblePromosList)
     ? eligiblePromosList.length
     : 0;
@@ -3377,7 +3381,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   let result;
   try {
     console.log('[previewPrice] calling priceEngine.applyPromoThenVoucher', {
-      memberId: req.member.id,
+      memberId: memberId,
       itemCount: normalizedCart.items.length,
       deliveryFee: effectiveDeliveryFee,
       voucherClaimIds: Array.isArray(eligible) ? eligible.length : 0,
@@ -3385,12 +3389,12 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     });
 
     result = await applyPromoThenVoucher({
-      memberId: req.member.id,
+      memberId: memberId,
       cart: normalizedCart,
       fulfillmentType,
       deliveryFee:
         fulfillmentType === 'delivery' ? Number(effectiveDeliveryFee || 0) : 0,
-      voucherClaimIds: eligible, // array of eligible claim ids (from earlier)
+      voucherClaimIds: eligible, // array of eligible claim ids (from earlier) - empty for guest
       selectedPromoId: selectedPromoId || null,
       autoApplyPromo: selectedPromoId ? false : true,
       promoUsageFetchers
@@ -3535,7 +3539,14 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       result.breakdown ||
       (result.voucherResult && result.voucherResult.breakdown) ||
       [],
-    ui_totals
+    ui_totals,
+    // helper: apakah caller guest (FE bisa gunakan ini untuk adjust UI)
+    guest: !memberId,
+    // jika guest lalu kirim voucherIds, FE akan mendapat info ini — optional
+    note:
+      !memberId && Array.isArray(voucherClaimIds) && voucherClaimIds.length
+        ? 'Voucher IDs diabaikan untuk guest'
+        : undefined
   });
 });
 
