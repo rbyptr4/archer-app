@@ -221,17 +221,85 @@ async function applyPromoThenVoucher({
   let promoAppliedSnapshot = null;
 
   if (promoApplied) {
+    // terapkan promo lewat engine
     const { impact, actions } = await applyPromoRaw(promoApplied, cart);
-    console.log(
-      '[priceEngine.debug] applyPromoRaw returned for promo',
-      String(promoApplied._id),
-      {
-        impact,
-        actions
-      }
-    );
     promoImpact = impact || {};
-    promoActions = actions || [];
+    promoActions = Array.isArray(actions) ? actions.slice() : [];
+
+    // ===================== fallback inference untuk award_points =====================
+    // Jika engine tidak mengembalikan actions (mis. empty array) tapi
+    // definisi promo (promoApplied) punya rewards/points, maka infer actions
+    try {
+      const rewardsDef =
+        promoApplied.rewards ||
+        (promoApplied.reward ? [promoApplied.reward] : []);
+      if (
+        (!promoActions || promoActions.length === 0) &&
+        Array.isArray(rewardsDef) &&
+        rewardsDef.length
+      ) {
+        const inferred = [];
+        // tentukan base untuk perhitungan poin: gunakan subtotal setelah discount jika tersedia,
+        // fallback ke baseSubtotal (hitung dari cart items)
+        const baseSubtotal = (cart.items || []).reduce(
+          (s, it) => s + Number(it.price || 0) * Number(it.qty || 0),
+          0
+        );
+
+        for (const r of rewardsDef) {
+          // contoh mapping: pointsPercent -> grant_points with calculated amount
+          if (r.pointsFixed && Number(r.pointsFixed) > 0) {
+            inferred.push({
+              type: 'grant_points',
+              amount: Number(r.pointsFixed),
+              meta: { appliesTo: r.appliesTo || 'cart' }
+            });
+          } else if (r.pointsPercent && Number(r.pointsPercent) > 0) {
+            const percent = Number(r.pointsPercent);
+            // hitung poin sebagai (percent% * baseSubtotal) / 100
+            // tergantung bisnis, kamu bisa ubah rumus jadi (percent of item price => converted to points)
+            const amt = Math.floor((baseSubtotal * percent) / 100);
+            inferred.push({
+              type: 'grant_points',
+              amount: amt,
+              meta: { percent, baseSubtotal, appliesTo: r.appliesTo || 'cart' }
+            });
+          } else if (r.pointsRatio) {
+            // kalau ada definisi lain (mis. 1 point per X Rp), coba infer
+            const ratio = Number(r.pointsRatio || 0);
+            if (ratio > 0) {
+              const amt = Math.floor(baseSubtotal / ratio);
+              inferred.push({
+                type: 'grant_points',
+                amount: amt,
+                meta: { ratio, baseSubtotal, appliesTo: r.appliesTo || 'cart' }
+              });
+            }
+          }
+          // tambahkan mapping lain sesuai struktur reward di DB jika perlu
+        }
+
+        if (inferred.length) {
+          promoActions = promoActions.concat(inferred);
+          // lengkapi impact note agar UI bisa menampilkan sesuatu
+          promoImpact = promoImpact || {};
+          promoImpact.note =
+            promoImpact.note || 'Reward inferred from promo definition';
+          console.log(
+            '[priceEngine.info] inferred promoActions for promo',
+            String(promoApplied._id),
+            inferred
+          );
+        }
+      }
+    } catch (e) {
+      console.warn(
+        '[priceEngine.warn] failed to infer promo actions',
+        e?.message || e
+      );
+    }
+    // ==============================================================================
+
     promoAppliedSnapshot = {
       promoId: String(promoApplied._id),
       name: promoApplied.name || null,

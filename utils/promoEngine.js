@@ -182,13 +182,6 @@ async function findApplicablePromos(
   return eligible;
 }
 
-/**
- * applyPromo(promo, cartSnapshot = {}, pricing = {})
- * - returns { impact, actions }
- *
- * impact: { itemsDiscount, cartDiscount, addedFreeItems: [{menuId, qty, category}], note }
- * actions: array of side-effect instructions e.g. award_points/grant_membership
- */
 async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
   if (!promo) throw new Error('promo required');
   const impact = {
@@ -202,17 +195,31 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
   const { items_subtotal, items } = snapshotTotals(cartSnapshot);
   const sub = Number(items_subtotal || 0);
 
-  // support model with single reward object: promo.reward (preferred)
-  // but keep fallback compatibility if some docs still use promo.rewards (array)
+  // ==== ambil definisi rewards dari beberapa kemungkinan field ====
   const rewards =
-    promo && promo.reward && typeof promo.reward === 'object'
+    promo && typeof promo.reward === 'object' && promo.reward
       ? [promo.reward]
       : Array.isArray(promo.rewards) && promo.rewards.length
       ? promo.rewards
+      : Array.isArray(promo.rewardSummary) && promo.rewardSummary.length
+      ? promo.rewardSummary
+      : Array.isArray(promo.reward_summary) && promo.reward_summary.length
+      ? promo.reward_summary
       : [];
+
+  // debug (bisa dimatikan jika terlalu verbose)
+  // console.log('[promoEngine.debug] applyPromo rewardsDef:', { promoId: String(promo._id), rewardsLen: rewards.length });
 
   for (const r of rewards) {
     if (!r) continue;
+
+    // helper: parse angka yang mungkin mengandung simbol
+    const parseNumber = (v) => {
+      if (v == null) return NaN;
+      // accept numbers or strings like "10", "10%", "Rp 10.000", "1,000"
+      const cleaned = String(v).replace(/[^0-9.\-]+/g, '');
+      return cleaned === '' ? NaN : Number(cleaned);
+    };
 
     // free item (covers free_item and buy_x_get_y)
     if (r.freeMenuId) {
@@ -226,8 +233,8 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
     }
 
     // cart percent / scoped percent
-    if (Number.isFinite(Number(r.percent))) {
-      const pct = Math.max(0, Math.min(100, Number(r.percent)));
+    if (Number.isFinite(Number(parseNumber(r.percent)))) {
+      const pct = Math.max(0, Math.min(100, Number(parseNumber(r.percent))));
       // if reward appliesTo menu/category, compute subtotal of that scope
       let scopeSub = sub;
       if (r.appliesTo === 'menu' && r.appliesToMenuId) {
@@ -252,16 +259,16 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
         );
       }
       let amt = Math.floor((scopeSub * pct) / 100);
-      if (Number.isFinite(Number(r.maxDiscountAmount)))
-        amt = Math.min(amt, Number(r.maxDiscountAmount));
+      if (Number.isFinite(Number(parseNumber(r.maxDiscountAmount))))
+        amt = Math.min(amt, Number(parseNumber(r.maxDiscountAmount)));
       impact.cartDiscount += amt;
       impact.itemsDiscount += amt;
       impact.note += (impact.note ? '; ' : '') + `Diskon ${pct}% (${amt})`;
     }
 
     // flat amount (cart_amount)
-    if (Number.isFinite(Number(r.amount))) {
-      let amt = Math.max(0, Number(r.amount));
+    if (Number.isFinite(Number(parseNumber(r.amount)))) {
+      let amt = Math.max(0, Number(parseNumber(r.amount)));
       // if scoped, restrict by scope subtotal
       if (r.appliesTo === 'menu' && r.appliesToMenuId) {
         const scopeSub = (items || []).reduce(
@@ -293,27 +300,34 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
       impact.note += (impact.note ? '; ' : '') + `Potongan Rp ${amt}`;
     }
 
-    // pointsFixed / pointsPercent => action (standar: use 'points' field)
-    if (Number.isFinite(Number(r.pointsFixed))) {
-      const pts = Number(r.pointsFixed);
+    // pointsFixed / pointsPercent => action (standar: use 'award_points' field)
+    const parsedPointsFixed = parseNumber(r.pointsFixed);
+    const parsedPointsPercent = parseNumber(r.pointsPercent);
+
+    if (Number.isFinite(parsedPointsFixed) && parsedPointsFixed > 0) {
+      const pts = Math.trunc(parsedPointsFixed);
+      actions.push({
+        type: 'award_points',
+        points: pts,
+        meta: { promoId: promo._id }
+      });
+      impact.note += (impact.note ? '; ' : '') + `Poin ${pts}`;
+    } else if (
+      Number.isFinite(parsedPointsPercent) &&
+      parsedPointsPercent > 0
+    ) {
+      const pct = Number(parsedPointsPercent);
+      const pts = Math.trunc((sub * pct) / 100);
       if (pts > 0) {
         actions.push({
           type: 'award_points',
-          points: Math.trunc(pts),
-          meta: { promoId: promo._id }
+          points: pts,
+          meta: { promoId: promo._id, percent: pct }
         });
+        impact.note += (impact.note ? '; ' : '') + `Poin ${pct}% (~${pts})`;
+      } else {
+        impact.note += (impact.note ? '; ' : '') + `Poin ${pct}% (0)`;
       }
-      impact.note += (impact.note ? '; ' : '') + `Poin ${r.pointsFixed}`;
-    } else if (Number.isFinite(Number(r.pointsPercent))) {
-      const pts = Math.floor((sub * Number(r.pointsPercent || 0)) / 100);
-      if (pts > 0) {
-        actions.push({
-          type: 'award_points',
-          points: Math.trunc(pts),
-          meta: { promoId: promo._id }
-        });
-      }
-      impact.note += (impact.note ? '; ' : '') + `Poin ${r.pointsPercent}%`;
     }
 
     // grant membership
