@@ -607,12 +607,13 @@ exports.logoutMember = asyncHandler(async (req, res) => {
 
 exports.member = asyncHandler(async (req, res) => {
   const m = await Member.findById(req.member.id).select(
-    'name phone gender address points total_spend last_visit_at updatedAt birthday birthday_editable'
+    'name level phone gender address points total_spend last_visit_at updatedAt birthday birthday_editable'
   );
   if (!m) throwError('Member tidak ditemukan!', 404);
   res.status(200).json({
     id: m._id,
     name: m.name,
+    level: m.level,
     phone: m.phone,
     gender: m.gender || null,
     address: m.address || '',

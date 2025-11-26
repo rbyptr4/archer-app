@@ -653,6 +653,7 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
         name: 1,
         phone: 1,
         gender: 1,
+        level: 1,
         total_spend: 1,
         createdAt: 1
       }
@@ -681,6 +682,7 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
     name: r.name || '',
     phone: r.phone || '',
     total_spend: r.total_spend || 0,
+    level: r.level,
     gender: r.gender,
     createdAt: r.createdAt
   }));
@@ -822,6 +824,7 @@ exports.getMemberFullDetail = asyncHandler(async (req, res) => {
     member_profile: {
       id: member._id,
       name: member.name,
+      level: member.level,
       phone: member.phone,
       gender: member.gender,
       createdAt: member.createdAt,
@@ -887,6 +890,7 @@ exports.topSpendersThisMonth = asyncHandler(async (req, res) => {
         member_id: '$_id',
         name: '$member.name',
         phone: '$member.phone',
+        level: '$member.level',
         address: '$member.address',
         gender: '$member.gender',
         total_orders: 1,
