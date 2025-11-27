@@ -1406,7 +1406,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     usePoints = false
   } = req.body || {};
 
-  const guestToken =
+  let guestToken =
     (req.body && String(req.body.guestToken || '').trim()) ||
     (req.headers && String(req.headers['x-guest-token'] || '').trim()) ||
     (req.cookies && String(req.cookies.guestToken || '').trim()) ||
@@ -1436,13 +1436,61 @@ exports.checkout = asyncHandler(async (req, res) => {
   }
 
   const method = String(payment_method || '').toLowerCase();
-  if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method)) {
-    console.error('[checkout] payment method not allowed', {
-      method,
-      source: iden0.source,
-      ft
-    });
-    throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
+
+  const originallyLoggedIn = !!iden0.memberId;
+  const wantRegister = String(register_decision || 'register') === 'register';
+  let MemberDoc = null;
+  let customer_name = '';
+  let customer_phone = '';
+
+  try {
+    if (originallyLoggedIn || wantRegister) {
+      const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
+      MemberDoc = await ensureMemberForCheckout(req, res, joinChannel);
+      console.log('[checkout] Member found/ensured', {
+        memberId: MemberDoc ? MemberDoc._id : null
+      });
+    } else {
+      customer_name = String(name || '').trim();
+      const rawPhone = String(phone || '').trim();
+      if (!customer_name && !rawPhone) {
+        console.error('[checkout] missing name & phone for guest');
+        throwError('Tanpa member: isi minimal nama atau no. telp', 400);
+      }
+      if (rawPhone) {
+        const digits = rawPhone.replace(/\D+/g, '');
+        if (!digits) {
+          console.error('[checkout] invalid phone format', rawPhone);
+          throwError('Nomor telepon harus berupa angka', 400);
+        }
+        customer_phone = normalizePhone(rawPhone);
+      } else {
+        customer_phone = '';
+      }
+      console.log('[checkout] guest customer', {
+        customer_name,
+        customer_phone
+      });
+    }
+  } catch (e) {
+    console.error('[checkout] ensureMemberForCheckout failed', e?.message || e);
+    throw e;
+  }
+
+  if (method === 'points') {
+    if (!MemberDoc) {
+      console.error('[checkout] guest attempted to pay with points');
+      throwError('Pembayaran dengan poin hanya untuk member terdaftar', 400);
+    }
+  } else {
+    if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method)) {
+      console.error('[checkout] payment method not allowed', {
+        method,
+        source: iden0.source,
+        ft
+      });
+      throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
+    }
   }
 
   // --- identitas / member ---
