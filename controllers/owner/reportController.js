@@ -385,9 +385,10 @@ exports.totalTransactions = asyncHandler(async (req, res) => {
 
   const rows = await Order.find(findQuery)
     .select(
-      'member customer_name customer_phone grand_total transaction_code verified_at createdAt'
+      'member customer_name customer_phone grand_total transaction_code verified_at createdAt verified_by'
     )
     .populate('member', 'name phone')
+    .populate('verified_by', 'name') // populate verifier's name
     .sort({ verified_at: -1, _id: -1 })
     .limit(limit + 1)
     .lean();
@@ -406,12 +407,16 @@ exports.totalTransactions = asyncHandler(async (req, res) => {
     const member = r.member;
     const name = member?.name || r.customer_name || '';
     const phone = member?.phone || r.customer_phone || '';
+    const verifier = r.verified_by;
     return {
       name,
       phone,
       grand_total: r.grand_total || 0,
       transaction_code: r.transaction_code || '',
       verified_at: r.verified_at || r.createdAt || null,
+      verified_by: verifier
+        ? { id: String(verifier._id || verifier), name: verifier.name || null }
+        : null,
       _id: r._id
     };
   });
@@ -690,7 +695,7 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
 
 //  list member
 exports.listMemberSummary = asyncHandler(async (req, res) => {
-  let { limit = 10, search = '', cursor } = req.query;
+  let { limit = 50, search = '', cursor } = req.query;
   limit = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 200);
 
   const baseMatch = buildMemberMatch({ search });
