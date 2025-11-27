@@ -1493,47 +1493,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // --- identitas / member ---
-  const originallyLoggedIn = !!iden0.memberId;
-  const wantRegister = String(register_decision || 'register') === 'register';
-  let MemberDoc = null;
-  let customer_name = '';
-  let customer_phone = '';
-
-  try {
-    if (originallyLoggedIn || wantRegister) {
-      const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
-      MemberDoc = await ensureMemberForCheckout(req, res, joinChannel);
-      console.log('[checkout] Member found/ensured', {
-        memberId: MemberDoc ? MemberDoc._id : null
-      });
-    } else {
-      customer_name = String(name || '').trim();
-      const rawPhone = String(phone || '').trim();
-      if (!customer_name && !rawPhone) {
-        console.error('[checkout] missing name & phone for guest');
-        throwError('Tanpa member: isi minimal nama atau no. telp', 400);
-      }
-      if (rawPhone) {
-        const digits = rawPhone.replace(/\D+/g, '');
-        if (!digits) {
-          console.error('[checkout] invalid phone format', rawPhone);
-          throwError('Nomor telepon harus berupa angka', 400);
-        }
-        customer_phone = normalizePhone(rawPhone);
-      } else {
-        customer_phone = '';
-      }
-      console.log('[checkout] guest customer', {
-        customer_name,
-        customer_phone
-      });
-    }
-  } catch (e) {
-    console.error('[checkout] ensureMemberForCheckout failed', e?.message || e);
-    throw e;
-  }
-
   if (usePoints && !MemberDoc) {
     console.error('[checkout] guest attempted to use points');
     throwError('Poin hanya dapat digunakan oleh member terdaftar', 400);
