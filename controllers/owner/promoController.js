@@ -406,12 +406,12 @@ exports.remove = asyncHandler(async (req, res) => {
   res.json({ ok: true, deleted: true });
 });
 
-/**
- * POST /promos/evaluate
- * body: { cart, memberId? }
- *
- * Mengembalikan ringkasan eligible promos untuk FE. rewardSummary sekarang dari p.reward (object tunggal)
- */
+exports.getPromo = asyncHandler(async (req, res) => {
+  const p = await Promo.findById(req.params.id).lean();
+  if (!p || p.isDeleted) throwError('Promo tidak ditemukan', 404);
+  res.json({ promo: p });
+});
+
 exports.evaluate = asyncHandler(async (req, res) => {
   const { cart, memberId } = req.body || {};
   if (!cart || !Array.isArray(cart.items))

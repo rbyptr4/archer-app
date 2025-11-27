@@ -3462,7 +3462,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     delivery_mode: deliveryModeFromBody = null,
     selectedPromoId = null,
     usePoints = false,
-    applyPromos = true // toggle baru: default true
+    applyPromos = true
   } = req.body || {};
 
   if (!cart?.items?.length) throwError('Cart kosong', 400);
