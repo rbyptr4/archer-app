@@ -18,7 +18,7 @@ router.post(
   '/create-employee',
   requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('employees'),
-  validate(registerSchema),
+  // validate(registerSchema),
   emp.createEmployee
 );
 
@@ -40,7 +40,7 @@ router.patch(
   '/update/:id',
   requireRole('owner', 'courier', 'kitchen', 'cashier'),
   requirePageAccess('employees'),
-  validate(updateEmployeeSchema),
+  // validate(updateEmployeeSchema),
   emp.updateEmployee
 );
 
