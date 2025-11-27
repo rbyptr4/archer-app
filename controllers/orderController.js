@@ -3231,9 +3231,32 @@ exports.createQrisFromCart = asyncHandler(async (req, res, next) => {
 
 exports.assignTable = asyncHandler(async (req, res) => {
   const iden = getIdentity(req);
-  const table_number = Number(req.body?.table_number) || 0;
-  if (!table_number) throwError('table_number wajib', 400);
 
+  let table_number = req.body?.table_number;
+
+  // ===== VALIDASI table_number =====
+  if (table_number === undefined || table_number === null)
+    throwError('table_number wajib', 400);
+
+  // tidak boleh huruf atau tipe selain number
+  if (typeof table_number === 'string') {
+    // cek jika string numerik, kalau tidak, error
+    if (!/^[0-9]+$/.test(table_number.trim())) {
+      throwError('Nomor meja harus angka (1–50)', 400);
+    }
+    table_number = Number(table_number);
+  }
+
+  if (typeof table_number !== 'number' || Number.isNaN(table_number))
+    throwError('Nomor meja harus angka valid', 400);
+
+  // batasan nilai meja: 1–50
+  if (table_number < 1 || table_number > 50)
+    throwError('Nomor meja harus antara 1 sampai 50', 400);
+
+  // =================================
+
+  // ambil / buat session/device id
   let sessionId = iden.session_id || req.cookies?.[DEVICE_COOKIE];
   if (!sessionId && !iden.memberId) {
     sessionId = crypto.randomUUID();
@@ -3244,9 +3267,11 @@ exports.assignTable = asyncHandler(async (req, res) => {
     });
   }
 
+  // filter cart berdasarkan session/member
   const filter = iden.memberId
     ? { status: 'active', member: iden.memberId }
     : { status: 'active', session_id: sessionId };
+
   let cart = await Cart.findOne(filter);
 
   if (!cart) {
@@ -3272,7 +3297,10 @@ exports.assignTable = asyncHandler(async (req, res) => {
     await cart.save();
   }
 
-  res.json({ message: 'Nomor meja diset', cart: cart.toObject() });
+  res.json({
+    message: 'Nomor meja diset',
+    cart: cart.toObject()
+  });
 });
 
 exports.changeTable = asyncHandler(async (req, res) => {
@@ -3840,7 +3868,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   });
 });
 
-/* ===================== STAFF / OWNER ENDPOINTS ===================== */
 exports.listOrders = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
@@ -3877,8 +3904,7 @@ exports.listOrders = asyncHandler(async (req, res) => {
   // safety cap limit
   const lim = Math.min(parseInt(limit, 10) || 50, 200);
 
-  // Pilih hanya field yang diperlukan untuk response ringkas
-  // note: include member.name via populate (light)
+  // Ambil raw orders (sama seperti sebelumnya)
   const raw = await Order.find(q)
     .select(
       'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt delivery.mode ownerVerified'
@@ -3888,44 +3914,80 @@ exports.listOrders = asyncHandler(async (req, res) => {
     .populate({ path: 'member', select: 'name phone' })
     .lean();
 
-  // Map ke bentuk yang lebih frontend-friendly / kecil
-  const items = (Array.isArray(raw) ? raw : []).map((o) => ({
-    id: String(o._id),
-    transaction_code: o.transaction_code || '',
-    // aman: pakai optional chaining, fallback berdasarkan fulfillment_type
-    delivery_mode:
-      (o.delivery && o.delivery.mode) ||
-      o.delivery?.mode ||
-      (o.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
-    grand_total: Number(o.grand_total || 0),
-    fulfillment_type: o.fulfillment_type || null, // 'dine_in' | 'delivery'
-    customer_name: (o.member && o.member.name) || o.customer_name || '',
-    customer_phone: (o.member && o.member.phone) || o.customer_phone || '',
-    placed_at: o.placed_at || o.createdAt || null,
-    table_number:
-      o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
-    payment_status: o.payment_status || null,
-    ownerVerified: o.ownerVerified,
-    status: o.status || null,
-    total_quantity: Number(o.total_quantity || 0),
-    pickup_window:
-      o.delivery && o.delivery.pickup_window
-        ? {
-            from: o.delivery.pickup_window.from || null,
-            to: o.delivery.pickup_window.to || null
-          }
-        : null,
-    delivery_slot_label: o.delivery ? o.delivery.slot_label || null : null,
-    member_id: o.member ? String(o.member._id) : null
-  }));
+  // helper: hitung batas hari ini di timezone Asia/Jakarta
+  const JAKARTA_OFFSET_MS = 7 * 60 * 60 * 1000;
+  const jNow = new Date(Date.now() + JAKARTA_OFFSET_MS);
+  const Y = jNow.getUTCFullYear();
+  const M = jNow.getUTCMonth(); // 0-based
+  const D = jNow.getUTCDate();
+  // UTC ms yang merepresentasikan 00:00 Jakarta hari ini:
+  const startOfTodayJakartaMs = Date.UTC(Y, M, D) - JAKARTA_OFFSET_MS;
+  const endOfTodayJakartaMs = startOfTodayJakartaMs + 24 * 60 * 60 * 1000;
+
+  // Map ke bentuk frontend-friendly dan langsung klasifikasi today / other
+  const today = [];
+  const other = [];
+
+  const mapped = (Array.isArray(raw) ? raw : []).map((o) => {
+    const placedAt = o.placed_at || o.createdAt || null;
+    const placedMs = placedAt ? new Date(placedAt).getTime() : null;
+
+    const out = {
+      id: String(o._id),
+      transaction_code: o.transaction_code || '',
+      delivery_mode:
+        (o.delivery && o.delivery.mode) ||
+        o.delivery?.mode ||
+        (o.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
+      grand_total: Number(o.grand_total || 0),
+      fulfillment_type: o.fulfillment_type || null,
+      customer_name: (o.member && o.member.name) || o.customer_name || '',
+      customer_phone: (o.member && o.member.phone) || o.customer_phone || '',
+      placed_at: placedAt,
+      table_number:
+        o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
+      payment_status: o.payment_status || null,
+      ownerVerified: o.ownerVerified,
+      status: o.status || null,
+      total_quantity: Number(o.total_quantity || 0),
+      pickup_window:
+        o.delivery && o.delivery.pickup_window
+          ? {
+              from: o.delivery.pickup_window.from || null,
+              to: o.delivery.pickup_window.to || null
+            }
+          : null,
+      delivery_slot_label: o.delivery ? o.delivery.slot_label || null : null,
+      member_id: o.member ? String(o.member._id) : null,
+      createdAt: o.createdAt
+    };
+
+    // klasifikasi: masuk today jika placed_at berada di [startOfTodayJakartaMs, endOfTodayJakartaMs)
+    if (
+      placedMs !== null &&
+      placedMs >= startOfTodayJakartaMs &&
+      placedMs < endOfTodayJakartaMs
+    ) {
+      today.push(out);
+    } else {
+      other.push(out);
+    }
+
+    return out;
+  });
+
+  // next_cursor: ambil dari akhir other (karena other adalah yang lebih lama)
+  const next_cursor =
+    other.length > 0
+      ? new Date(
+          other[other.length - 1].placed_at || other[other.length - 1].createdAt
+        ).toISOString()
+      : null;
 
   return res.status(200).json({
-    items,
-    next_cursor: items.length
-      ? new Date(
-          items[items.length - 1].placed_at || raw[items.length - 1].createdAt
-        ).toISOString()
-      : null
+    today,
+    other,
+    next_cursor
   });
 });
 

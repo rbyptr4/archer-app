@@ -142,21 +142,13 @@ exports.createExpense = asyncHandler(async (req, res) => {
 
 exports.getExpenses = asyncHandler(async (req, res) => {
   const { q, limit = 20, cursor } = req.query;
-  const { start: s, end: e } = getRangeFromQuery(req.query);
 
   const lim = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 200);
 
-  // build pipeline
+  // build pipeline singkat: optional cursor, lookup type (biar bisa search type.name), optional search, sort+limit
   const pipeline = [];
 
-  // 1) match by date range
-  pipeline.push({
-    $match: {
-      date: { $gte: s, $lte: e }
-    }
-  });
-
-  // 2) optional cursor paging (based on createdAt descending)
+  // optional cursor paging (based on createdAt descending)
   if (cursor) {
     const d = new Date(cursor);
     if (!isNaN(d.getTime())) {
@@ -166,10 +158,10 @@ exports.getExpenses = asyncHandler(async (req, res) => {
     }
   }
 
-  // 3) lookup type to enable searching by type.name
+  // lookup type (agar bisa search by type.name)
   pipeline.push({
     $lookup: {
-      from: 'expensetypes', // koleksi ExpenseType (mongoose pluralize)
+      from: 'expensetypes',
       localField: 'type',
       foreignField: '_id',
       as: 'type'
@@ -179,7 +171,7 @@ exports.getExpenses = asyncHandler(async (req, res) => {
     $unwind: { path: '$type', preserveNullAndEmptyArrays: true }
   });
 
-  // 4) search q on note OR type.name (case-insensitive)
+  // optional search q pada note ATAU type.name (case-insensitive)
   if (q && String(q).trim()) {
     const regex = new RegExp(String(q).trim(), 'i');
     pipeline.push({
@@ -189,11 +181,11 @@ exports.getExpenses = asyncHandler(async (req, res) => {
     });
   }
 
-  // 5) sort & limit (lim+1 to detect next_cursor)
+  // sort & limit (lim+1 untuk detect next_cursor)
   pipeline.push({ $sort: { createdAt: -1 } });
   pipeline.push({ $limit: lim + 1 });
 
-  // 6) project shape (include type.name)
+  // project shape (include type.name)
   pipeline.push({
     $project: {
       _id: 1,
@@ -217,7 +209,6 @@ exports.getExpenses = asyncHandler(async (req, res) => {
     : null;
 
   res.json({
-    period: { start: s, end: e },
     data,
     next_cursor,
     limit: lim

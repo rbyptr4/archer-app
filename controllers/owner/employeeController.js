@@ -1,3 +1,4 @@
+// controllers/owner/employeeController.js
 const asyncHandler = require('express-async-handler');
 const bcrypt = require('bcrypt');
 const User = require('../../models/userModel');
@@ -18,6 +19,9 @@ const ALLOWED_PAGES = [
   'voucher'
 ];
 
+// NOTE: jangan masukkan 'owner' di sini agar FE / API tidak bisa create owner lewat endpoint ini
+const ROLES = ['courier', 'kitchen', 'cashier'];
+
 const isPlainObject = (v) => v && typeof v === 'object' && !Array.isArray(v);
 const normalizePagesOut = (pages) =>
   pages instanceof Map ? Object.fromEntries(pages) : pages || {};
@@ -31,7 +35,6 @@ const validatePages = (pagesObj) => {
   }
 };
 
-const ROLES = ['courier', 'kitchen', 'cashier'];
 exports.createEmployee = asyncHandler(async (req, res) => {
   const { name, email, password, phone, role, pages } = req.body || {};
 
@@ -94,13 +97,13 @@ exports.listEmployees = asyncHandler(async (req, res) => {
   } = req.query;
   limit = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 100);
 
-  const filter = { role: 'employee' };
+  // exclude owner accounts from list
+  const filter = { role: { $ne: 'owner' } };
   if (search) {
     const re = new RegExp(String(search), 'i');
     filter.$or = [{ name: re }, { email: re }, { phone: re }];
   }
 
-  const sortDirection = String(sortDir).toLowerCase() === 'asc' ? 1 : -1;
   // we'll still use createdAt cursor even jika sortBy berbeda, for consistency
   const matchCursor = {};
   if (cursor) {
@@ -112,7 +115,7 @@ exports.listEmployees = asyncHandler(async (req, res) => {
 
   const items = await User.find(q)
     .select('name email phone role pages createdAt updatedAt')
-    .sort({ createdAt: -1, _id: -1 }) // keep stable order for cursor
+    .sort({ createdAt: -1, _id: -1 }) // stable order for cursor
     .limit(limit + 1)
     .lean();
 
@@ -135,7 +138,8 @@ exports.listEmployees = asyncHandler(async (req, res) => {
 });
 
 exports.getEmployee = asyncHandler(async (req, res) => {
-  const emp = await User.findOne({ _id: req.params.id, role: 'employee' })
+  // jangan filter role di sini supaya bisa lihat detail courier/kitchen/cashier
+  const emp = await User.findOne({ _id: req.params.id })
     .select('name email phone role pages createdAt updatedAt')
     .lean();
   if (!emp) throwError('Karyawan tidak ditemukan', 404);
@@ -149,8 +153,6 @@ exports.updateEmployee = asyncHandler(async (req, res) => {
 
   const emp = await User.findOne({
     _id: req.params.id
-    // kalau role bukan "employee" lagi, jangan pakai filter role di sini
-    // agar courier / kitchen / cashier bisa diupdate juga
   }).select('+password');
 
   if (!emp) throwError('Karyawan tidak ditemukan', 404);
@@ -176,7 +178,7 @@ exports.updateEmployee = asyncHandler(async (req, res) => {
     emp.phone = phone;
   }
 
-  // update role
+  // update role (allow change between allowed roles; disallow switching to owner)
   if (role !== undefined) {
     if (!ROLES.includes(role))
       throwError(
@@ -207,7 +209,7 @@ exports.setEmployeePages = asyncHandler(async (req, res) => {
     throwError('pages wajib berupa object boolean', 400);
   validatePages(pages);
 
-  const emp = await User.findOne({ _id: req.params.id, role: 'employee' });
+  const emp = await User.findOne({ _id: req.params.id });
   if (!emp) throwError('Karyawan tidak ditemukan', 404);
 
   if (merge) {
@@ -236,8 +238,11 @@ exports.setEmployeePages = asyncHandler(async (req, res) => {
 });
 
 exports.deleteEmployee = asyncHandler(async (req, res) => {
-  const emp = await User.findOne({ _id: req.params.id, role: 'employee' });
+  const emp = await User.findOne({ _id: req.params.id });
   if (!emp) throwError('Karyawan tidak ditemukan', 404);
+
+  if (String(emp.role) === 'owner')
+    throwError('Tidak boleh menghapus akun owner', 403);
 
   await User.findByIdAndDelete(emp._id);
   res.json({ message: 'Karyawan dihapus' });
