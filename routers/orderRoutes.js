@@ -135,6 +135,14 @@ router.get(
 );
 
 router.get(
+  '/list-order/dine-in',
+  validateToken,
+  requireRole('owner', 'cashier'),
+  requirePageAccess('orders'),
+  order.dineInBoard
+);
+
+router.get(
   '/kitchen',
   validateToken,
   requireRole('owner', 'kitchen'),

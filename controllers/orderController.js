@@ -3505,6 +3505,65 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       ? envDeliveryFee
       : 0;
 
+  // --- VALIDASI: voucher ongkir hanya untuk delivery ---
+  if (Array.isArray(eligible) && eligible.length > 0) {
+    try {
+      // fetch voucher claim docs with populated voucher if possible
+      const vcDocs = await VoucherClaim.find({ _id: { $in: eligible } })
+        .populate('voucher') // best-effort: if schema has ref
+        .lean();
+
+      // helper deteksi voucher shipping (defensive - cek beberapa field umum)
+      const isShippingVoucherDoc = (vc) => {
+        // voucher may be embedded in claim or claim itself may have flags
+        const v = vc.voucher || vc.voucherDoc || vc; // try multiple shapes
+        const meta = v && v.meta ? v.meta : vc.meta ? vc.meta : {};
+
+        const typeStr = String(
+          v?.type || v?.category || v?.applies_to || v?.discount_for || ''
+        ).toLowerCase();
+
+        const flag =
+          Boolean(v?.isShipping) ||
+          Boolean(meta?.isShipping) ||
+          typeStr === 'shipping' ||
+          typeStr === 'delivery' ||
+          typeStr.includes('ship') ||
+          typeStr.includes('ongkir') ||
+          String(v?.category || '')
+            .toLowerCase()
+            .includes('ship') ||
+          String(v?.applies_to || '')
+            .toLowerCase()
+            .includes('delivery') ||
+          String(v?.discount_for || '')
+            .toLowerCase()
+            .includes('shipping');
+
+        return flag;
+      };
+
+      const foundShipping = vcDocs.some(isShippingVoucherDoc);
+
+      if (foundShipping && deliveryMode !== 'delivery') {
+        // kalau ada voucher ongkir dan mode bukan delivery -> reject
+        throwError(
+          'Voucher ongkir hanya dapat dipakai untuk mode pengantaran (delivery). Hapus voucher atau ubah mode pengantaran.',
+          400
+        );
+      }
+    } catch (e) {
+      // jika error dari throwError di atas, biarkan meneruskan
+      if (e && e.statusCode) throw e;
+      console.warn(
+        '[previewPrice] voucher shipping validation failed',
+        e?.message || e
+      );
+      // non-fatal: lanjutkan tanpa memblokir (tapi ini seharusnya tidak terjadi)
+    }
+  }
+  // --- end validasi voucher ongkir ---
+
   // normalize cart for engine
   const normalizedCart = {
     items: (Array.isArray(cart.items) ? cart.items : []).map((it) => {
@@ -3988,6 +4047,92 @@ exports.listOrders = asyncHandler(async (req, res) => {
     today,
     other,
     next_cursor
+  });
+});
+
+exports.dineInBoard = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const {
+    status,
+    payment_status,
+    table,
+    from,
+    to,
+    limit = 50,
+    cursor,
+    source
+    // note: kita tidak menerima fulfillment_type dari client; selalu dine_in
+  } = req.query || {};
+
+  const q = { fulfillment_type: 'dine_in' }; // <-- dipaksa dine_in
+
+  if (status)
+    q.status = Array.isArray(status)
+      ? { $in: status.filter((s) => ALLOWED_STATUSES.includes(s)) }
+      : status;
+  if (payment_status && ALLOWED_PAY_STATUS.includes(payment_status))
+    q.payment_status = payment_status;
+  if (table) q.table_number = Number(table);
+  if (source) q.source = source;
+
+  if (from || to) {
+    q.createdAt = {};
+    if (from) q.createdAt.$gte = new Date(from);
+    if (to) q.createdAt.$lte = new Date(to);
+  }
+  if (cursor) q.createdAt = { ...(q.createdAt || {}), $lt: new Date(cursor) };
+
+  // safety cap limit
+  const lim = Math.min(parseInt(limit, 10) || 50, 200);
+
+  // Pilih hanya field yang diperlukan untuk response ringkas
+  const raw = await Order.find(q)
+    .select(
+      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt delivery.mode ownerVerified'
+    )
+    .sort({ createdAt: -1 })
+    .limit(lim)
+    .populate({ path: 'member', select: 'name phone' })
+    .lean();
+
+  // Map ke bentuk yang sama seperti listOrders
+  const items = (Array.isArray(raw) ? raw : []).map((o) => ({
+    id: String(o._id),
+    transaction_code: o.transaction_code || '',
+    delivery_mode:
+      (o.delivery && o.delivery.mode) ||
+      o.delivery?.mode ||
+      (o.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
+    grand_total: Number(o.grand_total || 0),
+    fulfillment_type: o.fulfillment_type || null,
+    customer_name: (o.member && o.member.name) || o.customer_name || '',
+    customer_phone: (o.member && o.member.phone) || o.customer_phone || '',
+    placed_at: o.placed_at || o.createdAt || null,
+    table_number:
+      o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
+    payment_status: o.payment_status || null,
+    ownerVerified: o.ownerVerified,
+    status: o.status || null,
+    total_quantity: Number(o.total_quantity || 0),
+    pickup_window:
+      o.delivery && o.delivery.pickup_window
+        ? {
+            from: o.delivery.pickup_window.from || null,
+            to: o.delivery.pickup_window.to || null
+          }
+        : null,
+    delivery_slot_label: o.delivery ? o.delivery.slot_label || null : null,
+    member_id: o.member ? String(o.member._id) : null
+  }));
+
+  return res.status(200).json({
+    items,
+    next_cursor: items.length
+      ? new Date(
+          items[items.length - 1].placed_at || raw[items.length - 1].createdAt
+        ).toISOString()
+      : null
   });
 });
 
