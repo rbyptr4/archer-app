@@ -1402,7 +1402,8 @@ exports.checkout = asyncHandler(async (req, res) => {
     payment_method,
     idempotency_key,
     voucherClaimIds = [],
-    register_decision = 'register'
+    register_decision = 'register',
+    usePoints = false
   } = req.body || {};
 
   const guestToken =
@@ -1483,6 +1484,11 @@ exports.checkout = asyncHandler(async (req, res) => {
   } catch (e) {
     console.error('[checkout] ensureMemberForCheckout failed', e?.message || e);
     throw e;
+  }
+
+  if (usePoints && !MemberDoc) {
+    console.error('[checkout] guest attempted to use points');
+    throwError('Poin hanya dapat digunakan oleh member terdaftar', 400);
   }
 
   const iden = {
@@ -2147,7 +2153,27 @@ exports.checkout = asyncHandler(async (req, res) => {
     discounts // langsung dari engine (normalisasi)
   };
 
-  // --- create order (trust engine totals & discounts) ---
+  const memberPointsBalance = Math.floor(Number(MemberDoc?.points || 0)); // pakai integer (floor)
+  const grandBeforePoints = Number(uiTotals.grand_total || 0); // engine rounded total
+
+  const points_candidate_use = usePoints
+    ? Math.min(memberPointsBalance, Math.max(0, Math.round(grandBeforePoints)))
+    : 0;
+
+  const raw_after_points = Math.max(
+    0,
+    grandBeforePoints - points_candidate_use
+  );
+
+  const grand_after_points = roundRupiahCustom(Math.round(raw_after_points));
+  const rounding_delta_after =
+    Number(grand_after_points) - Number(raw_after_points);
+
+  uiTotals.grand_total_before_points = int(grandBeforePoints);
+  uiTotals.points_candidate_use = int(points_candidate_use);
+  uiTotals.grand_total_after_points = int(grand_after_points);
+  uiTotals.rounding_delta_after_points = int(rounding_delta_after);
+
   const initialIsPaid = !needProof(method);
   const initialPaymentStatus = initialIsPaid ? 'paid' : 'unpaid';
   const initialPaidAt = initialIsPaid ? new Date() : null;
@@ -2361,25 +2387,77 @@ exports.checkout = asyncHandler(async (req, res) => {
         ? Number(MemberDoc.total_spend || 0)
         : 0;
 
-      // Determine points_used request (FE may send points_used OR priceEngine may include pointsUsed)
-      const pointsUsedReq =
-        Number(req.body?.points_used ?? priced?.totals?.points_used ?? 0) || 0;
+      // ---------------------------
+      // Compute pointsUsedReq (safe inside txn) + rounding AFTER deduction
+      // ---------------------------
+      // Re-fetch member inside transaction to avoid race condition
+      const freshMember = await Member.findById(MemberDoc._id).session(session);
+      if (!freshMember) throwError('Member tidak ditemukan', 404);
+
+      // pastikan integer points (floor)
+      const memberPointsInt = Math.floor(Number(freshMember.points || 0));
+
+      // engine grand BEFORE points (sudah rounded by engine earlier)
+      const engineGrandBefore = Number(uiTotals.grand_total || 0);
+
+      // compute candidate points to use
+      let pointsUsedReq = 0;
+      if (usePoints) {
+        pointsUsedReq = Math.min(
+          memberPointsInt,
+          Math.max(0, Math.round(engineGrandBefore))
+        );
+      } else {
+        // legacy: allow FE to explicitly pass points_used (floor it)
+        pointsUsedReq = Math.floor(
+          Number(req.body?.points_used ?? priced?.totals?.points_used ?? 0) || 0
+        );
+      }
+
+      // raw after deduction (integer math)
+      const raw_after_points = Math.max(0, engineGrandBefore - pointsUsedReq);
+
+      // perform final rounding AFTER points deduction
+      const grand_after_points = roundRupiahCustom(
+        Math.round(raw_after_points)
+      );
+      const rounding_delta_after =
+        Number(grand_after_points) - Number(raw_after_points);
+
+      // buat nilai ini tersedia untuk dipakai ketika membangun payload di bawah
+      // (kamu sebelumnya pakai grandBefore/pointsUsedReq; sekarang gunakan grand_after_points)
 
       // If payment_method = 'points', enforce rules:
       if (String(method) === 'points') {
         if (!MemberDoc)
           throwError('Pembayaran dengan point hanya untuk member', 400);
-        // grand total must be 0 (engine already applied discounts)
-        if (Number(uiTotals.grand_total || 0) !== 0) {
+
+        // Jika FE memilih payment_method='points', pastikan final amount after points adalah 0.
+        // Namun karena kita support toggle, final grand after points dihitung sebagai:
+        const engineGrandBefore = Number(uiTotals.grand_total || 0);
+        const candidatePointsUse = usePoints
+          ? Math.min(
+              Number(MemberDoc?.points || 0),
+              Math.max(0, Math.round(engineGrandBefore))
+            )
+          : Number(req.body?.points_used ?? 0);
+
+        const grandAfterPoints = Math.max(
+          0,
+          engineGrandBefore - candidatePointsUse
+        );
+        if (grandAfterPoints !== 0) {
           throwError(
-            'Pembayaran dengan point hanya bisa jika grand total = 0',
+            'Pembayaran dengan point hanya bisa jika grand total setelah menggunakan poin = 0',
             400
           );
         }
+
+        // ensure pointsUsedReq (computed previously) is positive and member has sufficient balance
         if (pointsUsedReq <= 0) {
           throwError('points_used wajib untuk payment_method=points', 400);
         }
-        // check fresh member points inside transaction
+
         const freshMember = await Member.findById(MemberDoc._id).session(
           session
         );
@@ -2417,6 +2495,43 @@ exports.checkout = asyncHandler(async (req, res) => {
       payload.points_used = int(pointsUsedReq);
       payload.points_awarded = int(points_awarded);
       payload.points_awarded_details = points_awarded_details;
+
+      // --- APPLY POINTS INTO PAYLOAD (if any) ---
+      payload.points_used = int(pointsUsedReq || 0);
+
+      // gunakan hasil rounding-after-deduction sebagai grand_total final
+      payload.rounding_delta = int(
+        (payload.rounding_delta || 0) + rounding_delta_after
+      );
+      payload.grand_total = int(grand_after_points);
+
+      // push discount entry for points (so receipts & reports show it)
+      const pointsDiscountEntry = {
+        id: null,
+        source: 'manual',
+        orderIdx: 3,
+        type: 'points',
+        label: 'Poin',
+        amount: int(pointsUsedReq || 0),
+        items: [],
+        meta: { via: 'points_toggle' }
+      };
+      payload.discounts = Array.isArray(payload.discounts)
+        ? payload.discounts
+        : [];
+      if (pointsUsedReq > 0) payload.discounts.push(pointsDiscountEntry);
+
+      // if grand_after_points == 0 => mark paid by points (override payment fields)
+      if (Number(grand_after_points) === 0) {
+        payload.payment_method = 'points';
+        payload.payment_status = 'paid';
+        payload.paid_at = new Date();
+      } else {
+        // biarkan payment_method = method (request)
+        payload.payment_method = method;
+        payload.payment_status =
+          payload.payment_status || (initialIsPaid ? 'paid' : 'unpaid');
+      }
 
       // Create order document inside session
       const [doc] = await Order.create([payload], { session });
@@ -3318,6 +3433,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     voucherClaimIds = [],
     delivery_mode: deliveryModeFromBody = null,
     selectedPromoId = null,
+    usePoints = false,
     debug: debugFromBody = false
   } = req.body || {};
 
@@ -3594,6 +3710,33 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     grand_total: int(grand)
   };
 
+  // === POINTS SIMULATION (usePoints toggle) - floor points & rounding AFTER deduction ===
+  const memberPoints = Math.floor(Number(MemberDoc?.points || 0)); // floor supaya tidak pakai pecahan
+  const grandBeforePoints = Number(ui_totals.grand_total || 0); // engine rounded total
+
+  const points_candidate_use = usePoints
+    ? Math.min(memberPoints, Math.max(0, Math.round(grandBeforePoints)))
+    : 0;
+
+  // raw after deduction
+  const raw_after_points = Math.max(
+    0,
+    grandBeforePoints - points_candidate_use
+  );
+
+  // final rounding setelah pengurangan poin
+  const grand_total_after_points = roundRupiahCustom(
+    Math.round(raw_after_points)
+  );
+  const rounding_delta_after =
+    Number(grand_total_after_points) - Number(raw_after_points);
+
+  // attach ke ui_totals supaya FE bisa render kondisional dan menampilkan rounding delta
+  ui_totals.grand_total_before_points = int(grandBeforePoints);
+  ui_totals.points_candidate_use = int(points_candidate_use);
+  ui_totals.grand_total_after_points = int(grand_total_after_points);
+  ui_totals.rounding_delta_after_points = int(rounding_delta_after);
+
   // normalize voucher info
   const voucherInfo = (result.voucherResult && {
     chosenClaimIds:
@@ -3684,84 +3827,15 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     chosenClaimIds: voucherInfo.chosenClaimIds || []
   };
 
-  if (debug) {
-    const heavy = {
-      appliedPromo: appliedPromo || null,
-      autoAppliedPromo: autoAppliedPromo || null,
-      promo_breakdown: (() => {
-        const arr = [];
-        if (appliedPromo && appliedPromo.impact) {
-          const imp = appliedPromo.impact;
-          if (Number(imp.itemsDiscount || imp.cartDiscount || 0) > 0) {
-            arr.push({
-              type: 'promo_discount',
-              promoId: appliedPromo.promoId,
-              amount: Number(imp.itemsDiscount || imp.cartDiscount || 0)
-            });
-          }
-          if (Array.isArray(imp.addedFreeItems)) {
-            for (const f of imp.addedFreeItems) {
-              arr.push({
-                type: 'promo_free_item',
-                promoId: appliedPromo.promoId,
-                menuId: f.menuId,
-                qty: Number(f.qty || 1)
-              });
-            }
-          }
-        }
-        if (Array.isArray(appliedPromo?.actions)) {
-          for (const a of appliedPromo.actions) {
-            arr.push({
-              type: 'promo_action',
-              promoId: appliedPromo?.promoId || null,
-              action: a.type,
-              amount: a.amount ?? null
-            });
-          }
-        }
-        return arr;
-      })(),
-      promo_rewards: normalizedRewards,
-      engineSnapshot: result.engineSnapshot || {},
-      breakdown: result.breakdown || [],
-      voucher_breakdown: voucherInfo.breakdown || []
-    };
-
-    return res.status(200).json({
-      ok: true,
-      reasons: result.reasons || result.voucherResult?.reasons || [],
-      eligiblePromosCount,
-      eligiblePromos: eligiblePromosSummary,
-      autoAppliedPromo: autoAppliedPromo || null,
-      appliedPromo: appliedPromo || null,
-      promo_breakdown: heavy.promo_breakdown,
-      promo_rewards: heavy.promo_rewards,
-      promo: {
-        compact: promoCompact,
-        engineSnapshot: heavy.engineSnapshot
-      },
-      voucher: {
-        chosenClaimIds: voucherInfo.chosenClaimIds || [],
-        breakdown: heavy.voucher_breakdown
-      },
-      breakdown: heavy.breakdown,
-      ui_totals,
-      guest: !memberId
-    });
-  }
-
-  // default (compact) response
   return res.status(200).json({
     ok: true,
     reasons: result.reasons || result.voucherResult?.reasons || [],
     eligiblePromosCount,
     eligiblePromos: eligiblePromosSummary,
-    // compact promo single source of truth
     promo: promoCompact,
-    // voucher chosen ids (if any)
     voucher: { chosenClaimIds: voucherInfo.chosenClaimIds || [] },
     ui_totals,
+    member_points: Number(MemberDoc?.points || 0),
     guest: !memberId
   });
 });

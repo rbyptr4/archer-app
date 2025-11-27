@@ -35,10 +35,6 @@ const ROLES = ['owner', 'courier', 'kitchen', 'cashier'];
 exports.createEmployee = asyncHandler(async (req, res) => {
   const { name, email, password, phone, role, pages } = req.body || {};
 
-  if (!name || !email || !password || !phone || !role)
-    throwError('name, email, password, phone, role wajib diisi', 400);
-
-  // validasi role
   if (!ROLES.includes(role))
     throwError(
       `Role tidak valid. Gunakan salah satu: ${ROLES.join(', ')}`,
@@ -65,7 +61,7 @@ exports.createEmployee = asyncHandler(async (req, res) => {
   const emp = await User.create({
     name,
     email: lower,
-    role, // <--- yang baru
+    role,
     password: hash,
     phone,
     pages: initialPages
