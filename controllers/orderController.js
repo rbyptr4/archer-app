@@ -3462,13 +3462,8 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     delivery_mode: deliveryModeFromBody = null,
     selectedPromoId = null,
     usePoints = false,
-    debug: debugFromBody = false
+    applyPromos = true // toggle baru: default true
   } = req.body || {};
-
-  const debug =
-    debugFromBody ||
-    String(req.query?.debug || '').toLowerCase() === 'true' ||
-    false;
 
   if (!cart?.items?.length) throwError('Cart kosong', 400);
 
@@ -3476,49 +3471,46 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   const memberId = req.member?.id || null;
   const now = new Date();
 
-  // filter vouchers (guest cannot use vouchers)
+  // ===== filter vouchers (guest cannot use vouchers) =====
   let eligible = [];
   if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
     if (!memberId) {
       console.warn('[previewPrice] guest attempted voucherClaimIds - ignored');
       eligible = [];
     } else {
-      const raw = await VoucherClaim.find({
+      const rawClaims = await VoucherClaim.find({
         _id: { $in: voucherClaimIds },
         member: memberId,
         status: 'claimed'
       }).lean();
-      eligible = raw
+      eligible = rawClaims
         .filter((c) => !c.validUntil || new Date(c.validUntil) > now)
         .map((c) => String(c._id));
     }
   }
 
-  // delivery mode & fee
+  // ===== delivery mode & fee =====
   const deliveryMode =
     (typeof deliveryModeFromBody === 'string' &&
       deliveryModeFromBody.trim().toLowerCase()) ||
     (fulfillmentType === 'delivery' ? 'delivery' : 'none');
+
   const envDeliveryFee = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
   const effectiveDeliveryFee =
     fulfillmentType === 'delivery' && deliveryMode === 'delivery'
       ? envDeliveryFee
       : 0;
 
-  // --- VALIDASI: voucher ongkir hanya untuk delivery ---
+  // ===== VALIDASI: voucher ongkir hanya untuk delivery =====
   if (Array.isArray(eligible) && eligible.length > 0) {
     try {
-      // fetch voucher claim docs with populated voucher if possible
       const vcDocs = await VoucherClaim.find({ _id: { $in: eligible } })
-        .populate('voucher') // best-effort: if schema has ref
+        .populate('voucher')
         .lean();
 
-      // helper deteksi voucher shipping (defensive - cek beberapa field umum)
       const isShippingVoucherDoc = (vc) => {
-        // voucher may be embedded in claim or claim itself may have flags
-        const v = vc.voucher || vc.voucherDoc || vc; // try multiple shapes
-        const meta = v && v.meta ? v.meta : vc.meta ? vc.meta : {};
-
+        const v = vc.voucher || vc.voucherDoc || vc;
+        const meta = (v && v.meta) || vc.meta || {};
         const typeStr = String(
           v?.type || v?.category || v?.applies_to || v?.discount_for || ''
         ).toLowerCase();
@@ -3546,25 +3538,22 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       const foundShipping = vcDocs.some(isShippingVoucherDoc);
 
       if (foundShipping && deliveryMode !== 'delivery') {
-        // kalau ada voucher ongkir dan mode bukan delivery -> reject
         throwError(
           'Voucher ongkir hanya dapat dipakai untuk mode pengantaran (delivery). Hapus voucher atau ubah mode pengantaran.',
           400
         );
       }
     } catch (e) {
-      // jika error dari throwError di atas, biarkan meneruskan
       if (e && e.statusCode) throw e;
       console.warn(
         '[previewPrice] voucher shipping validation failed',
         e?.message || e
       );
-      // non-fatal: lanjutkan tanpa memblokir (tapi ini seharusnya tidak terjadi)
+      // non-fatal: lanjutkan
     }
   }
-  // --- end validasi voucher ongkir ---
 
-  // normalize cart for engine
+  // ===== normalize cart for engine =====
   const normalizedCart = {
     items: (Array.isArray(cart.items) ? cart.items : []).map((it) => {
       const addons = Array.isArray(it.addons) ? it.addons : [];
@@ -3585,7 +3574,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     })
   };
 
-  // optional MemberDoc for fetchers
+  // ===== optional MemberDoc for fetchers =====
   let MemberDoc = null;
   if (memberId) {
     MemberDoc = await Member.findById(memberId)
@@ -3593,7 +3582,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       .catch(() => null);
   }
 
-  // promo usage fetchers
+  // ===== promo usage fetchers =====
   const promoUsageFetchers = {
     getMemberUsageCount: async (promoId, mId, sinceDate) => {
       try {
@@ -3636,28 +3625,39 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     }
   };
 
-  // eligiblePromos list (for FE summary)
+  // ===== eligiblePromos list (for FE summary) =====
   let eligiblePromosList = [];
-  try {
-    eligiblePromosList = await findApplicablePromos(
-      normalizedCart,
-      MemberDoc,
-      now,
-      { fetchers: promoUsageFetchers }
-    );
-  } catch (e) {
-    console.warn('[previewPrice] findApplicablePromos failed', e?.message || e);
+  if (applyPromos) {
+    try {
+      eligiblePromosList = await findApplicablePromos(
+        normalizedCart,
+        MemberDoc,
+        now,
+        { fetchers: promoUsageFetchers }
+      );
+    } catch (e) {
+      console.warn(
+        '[previewPrice] findApplicablePromos failed',
+        e?.message || e
+      );
+      eligiblePromosList = [];
+    }
+  } else {
+    // promos disabled by toggle -> treat as none
     eligiblePromosList = [];
   }
-
   const eligiblePromosCount = Array.isArray(eligiblePromosList)
     ? eligiblePromosList.length
     : 0;
 
-  // autoApplied suggestion (pick highest priority autoApply)
+  // ===== autoApplied suggestion (pick highest priority autoApply) =====
   let autoAppliedPromo = null;
-  try {
-    if (Array.isArray(eligiblePromosList) && eligiblePromosList.length) {
+  if (
+    applyPromos &&
+    Array.isArray(eligiblePromosList) &&
+    eligiblePromosList.length
+  ) {
+    try {
       const autos = eligiblePromosList.filter((p) => !!p.autoApply);
       if (autos.length) {
         autos.sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0));
@@ -3670,33 +3670,29 @@ exports.previewPrice = asyncHandler(async (req, res) => {
           actions: actions || []
         };
       }
+    } catch (e) {
+      console.warn('[previewPrice] autoApply preview failed', e?.message || e);
+      autoAppliedPromo = null;
     }
-  } catch (e) {
-    console.warn('[previewPrice] autoApply preview failed', e?.message || e);
-    autoAppliedPromo = null;
   }
 
-  // ===== validasi: jika FE kirim voucherClaimIds tapi ada promo autoApply/selected yang memblokir voucher -> reject early =====
+  // ===== validasi: promo yang memblokir voucher jika user mengirim voucherClaimIds =====
   (function () {
-    // jika caller mengirim voucherClaimIds (nyoba pakai voucher)
     const attemptedVoucherUse =
       Array.isArray(voucherClaimIds) && voucherClaimIds.length > 0;
+    if (!applyPromos) return; // promos disabled -> skip this validation
 
-    // cek selected promo dari request dulu (prioritas)
     if (selectedPromoId) {
       const sel = (eligiblePromosList || []).find(
         (p) => String(p._id) === String(selectedPromoId)
       );
       if (sel && sel.blocksVoucher && attemptedVoucherUse) {
-        // user memilih promo yang memblok voucher namun juga mengirim voucher -> reject
         throwError(
           'Promo yang dipilih memblokir penggunaan voucher. Hapus voucher atau pilih promo lain.',
           400
         );
       }
     } else if (attemptedVoucherUse) {
-      // jika ada voucher yang dikirim dan tidak ada selectedPromoId, pastikan tidak ada auto-applied promo (highest priority) yang memblokir
-      // cari autoApply promos dari eligible list yang akan dijadikan saran
       const highestAuto = (eligiblePromosList || [])
         .filter((p) => !!p.autoApply)
         .sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0))[0];
@@ -3711,19 +3707,20 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     }
   })();
 
-  // call engine
+  // ===== call engine =====
   let result;
   try {
     result = await applyPromoThenVoucher({
-      memberId: memberId,
+      memberId,
       memberDoc: MemberDoc || null,
       cart: normalizedCart,
       fulfillmentType,
       deliveryFee:
         fulfillmentType === 'delivery' ? Number(effectiveDeliveryFee || 0) : 0,
       voucherClaimIds: eligible,
-      selectedPromoId: selectedPromoId || null,
-      autoApplyPromo: selectedPromoId ? false : true,
+      // if promos disabled, ignore selectedPromoId and autoApply
+      selectedPromoId: applyPromos ? selectedPromoId || null : null,
+      autoApplyPromo: applyPromos ? (selectedPromoId ? false : true) : false,
       promoUsageFetchers
     });
   } catch (err) {
@@ -3745,13 +3742,12 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     );
   }
 
-  // ===== build ui_totals (deterministic fallback & normalize) =====
+  // ===== build ui_totals (simplified single-source grand_total + rounding) =====
   const t =
     (result && result.totals) ||
     (result.voucherResult && result.voucherResult.totals) ||
     {};
 
-  // engine fields (safely normalize)
   const baseSubtotal = Number(t.baseSubtotal ?? t.base_subtotal ?? 0);
   const itemsDiscount = Number(t.itemsDiscount ?? t.items_discount ?? 0);
   const items_subtotal_after_discount = Number(
@@ -3763,68 +3759,53 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     t.shippingDiscount ?? t.shipping_discount ?? 0
   );
 
-  // delivery fee (engine may omit; use effectiveDeliveryFee as fallback)
+  // deliveryFee: prefer engine, fallback effectiveDeliveryFee
   const deliveryFeeFromEngine = Number(
-    t.deliveryFee ?? t.delivery_fee ?? finalDeliveryFee ?? 0
+    t.deliveryFee ?? t.delivery_fee ?? effectiveDeliveryFee ?? 0
   );
   const deliveryFee = Number.isFinite(deliveryFeeFromEngine)
     ? deliveryFeeFromEngine
     : Number(effectiveDeliveryFee || 0);
 
-  // taxable base follows same logic as order compute: items_subtotal - items_discount
+  // taxable items (same logic as order compute)
   const taxableItems = Math.max(0, baseSubtotal - itemsDiscount);
-
-  // compute service fee & tax deterministically (same as order model)
   const service_fee = Math.round(taxableItems * SERVICE_FEE_RATE);
   const tax_amount = Math.round(taxableItems * parsePpnRate());
 
-  // compute before rounding + grand total using rounding util
-  const beforeRound = Math.round(
+  // raw before rounding & before points
+  const raw_before_points = Math.round(
     taxableItems + service_fee + deliveryFee - shippingDiscount + tax_amount
   );
-  const grand = roundRupiahCustom(beforeRound);
-  const rounding_delta = grand - beforeRound;
+
+  // points simulation (floor + cap)
+  const memberPoints = Math.floor(Number(MemberDoc?.points || 0));
+  const points_used = usePoints
+    ? Math.min(memberPoints, Math.max(0, Math.round(raw_before_points)))
+    : 0;
+
+  // raw after points before final rounding
+  const raw_after_points = Math.max(0, raw_before_points - points_used);
+
+  // final rounding -> single grand_total
+  const grand_total = roundRupiahCustom(Math.round(raw_after_points));
+
+  // single rounding delta
+  const rounding_delta = Number(grand_total) - Math.round(raw_after_points);
 
   const ui_totals = {
     items_subtotal: int(baseSubtotal),
-    items_subtotal_after_discount: int(items_subtotal_after_discount),
     items_discount: int(itemsDiscount),
+    items_subtotal_after_discount: int(items_subtotal_after_discount),
     service_fee: int(service_fee),
     tax_amount: int(tax_amount),
     delivery_fee: int(deliveryFee),
     shipping_discount: int(shippingDiscount),
-    rounding_delta: int(rounding_delta),
-    grand_total: int(grand)
+    points_used: int(points_used),
+    grand_total: int(grand_total),
+    rounding_delta: int(rounding_delta)
   };
 
-  // === POINTS SIMULATION (usePoints toggle) - floor points & rounding AFTER deduction ===
-  const memberPoints = Math.floor(Number(MemberDoc?.points || 0)); // floor supaya tidak pakai pecahan
-  const grandBeforePoints = Number(ui_totals.grand_total || 0); // engine rounded total
-
-  const points_candidate_use = usePoints
-    ? Math.min(memberPoints, Math.max(0, Math.round(grandBeforePoints)))
-    : 0;
-
-  // raw after deduction
-  const raw_after_points = Math.max(
-    0,
-    grandBeforePoints - points_candidate_use
-  );
-
-  // final rounding setelah pengurangan poin
-  const grand_total_after_points = roundRupiahCustom(
-    Math.round(raw_after_points)
-  );
-  const rounding_delta_after =
-    Number(grand_total_after_points) - Number(raw_after_points);
-
-  // attach ke ui_totals supaya FE bisa render kondisional dan menampilkan rounding delta
-  ui_totals.grand_total_before_points = int(grandBeforePoints);
-  ui_totals.points_candidate_use = int(points_candidate_use);
-  ui_totals.grand_total_after_points = int(grand_total_after_points);
-  ui_totals.rounding_delta_after_points = int(rounding_delta_after);
-
-  // normalize voucher info
+  // ===== normalize voucher info =====
   const voucherInfo = (result.voucherResult && {
     chosenClaimIds:
       result.chosenClaimIds || result.voucherResult.chosenClaimIds || [],
@@ -3834,7 +3815,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     breakdown: result.breakdown || []
   };
 
-  // build minimal promo single source of truth
+  // ===== promo / rewards normalization =====
   const appliedPromo = result.promoApplied || null;
   const engineRewards = Array.isArray(result.promoRewards)
     ? result.promoRewards
@@ -3847,7 +3828,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
           .reduce((s, a) => s + Number(a.points ?? a.amount ?? 0), 0)
       : 0);
 
-  // normalized reward (single item if points-only or free-items)
   const normalizedRewards = [];
   if (engineRewards.length) {
     for (const r of engineRewards) {
@@ -3859,7 +3839,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       });
     }
   } else if (appliedPromo) {
-    // fallback: summarize
     if (appliedPromo.actions && Array.isArray(appliedPromo.actions)) {
       for (const a of appliedPromo.actions) {
         if (String(a.type || '').toLowerCase() === 'award_points') {
@@ -3879,7 +3858,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         }
       }
     }
-    // addedFreeItems fallback
     if (
       appliedPromo.impact &&
       Array.isArray(appliedPromo.impact.addedFreeItems)
@@ -3895,7 +3873,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     }
   }
 
-  // eligiblePromos summary (compact)
+  // eligible promos summary
   const eligiblePromosSummary = (eligiblePromosList || []).map((p) => ({
     id: String(p._id),
     name: p.name,
@@ -3904,7 +3882,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     priority: Number(p.priority || 0)
   }));
 
-  // build compact promo object for default response
   const promoCompact = {
     appliedPromoId: appliedPromo ? appliedPromo.promoId : null,
     appliedPromoName: appliedPromo ? appliedPromo.name || null : null,
@@ -3923,7 +3900,8 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     voucher: { chosenClaimIds: voucherInfo.chosenClaimIds || [] },
     ui_totals,
     member_points: Number(MemberDoc?.points || 0),
-    guest: !memberId
+    guest: !memberId,
+    applied_promos_enabled: !!applyPromos
   });
 });
 
