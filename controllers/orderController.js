@@ -5372,12 +5372,14 @@ exports.completeOrder = asyncHandler(async (req, res) => {
 exports.acceptAndVerify = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
-  const order = await Order.findById(req.params.id).lean(); // pakai lean dulu untuk cek
+  // ambil lean untuk validasi awal
+  const order = await Order.findById(req.params.id).lean();
   if (!order) throwError('Order tidak ditemukan', 404);
 
   if (order.status !== 'created') {
     throwError('Hanya pesanan berstatus created yang bisa diterima', 409);
   }
+
   // prevent accept if owner verification required but not yet done
   const requiresOwner = paymentRequiresOwnerVerify(order.payment_method);
   if (requiresOwner && !order.ownerVerified) {
@@ -5387,19 +5389,25 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     );
   }
 
-  // existing payment status guard (optional, sesuaikan policy)
+  // existing payment status guard (sesuaikan policy)
   if (order.payment_status !== 'paid') {
     throwError('Pembayaran belum paid. Tidak bisa verifikasi.', 409);
   }
 
+  // ambil doc non-lean untuk update
   const doc = await Order.findById(req.params.id);
+  if (!doc) throwError('Order tidak ditemukan (second fetch)', 404);
+
+  // set status & verification
   doc.status = 'accepted';
   doc.payment_status = 'verified';
   doc.verified_by = req.user._id;
   doc.verified_at = new Date();
   if (!doc.placed_at) doc.placed_at = new Date();
+
   await doc.save();
 
+  // prepare payload untuk emits
   const payload = {
     id: String(doc._id),
     transaction_code: doc.transaction_code,
@@ -5408,8 +5416,9 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     verified_by: { id: String(req.user._id), name: req.user.name },
     at: doc.verified_at
   };
+
   try {
-    // existing toasts
+    // notifikasi / stream
     emitToCashier('staff:notify', {
       message: 'Pesanan telah diterima & diverifikasi.'
     });
@@ -5417,7 +5426,6 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
       message: 'Pesanan baru telah diterima kasir, silakan cek kitchen.'
     });
 
-    // stream update (kasir & kitchen)
     const summaryUpdate = {
       id: payload.id,
       status: payload.status,
@@ -5427,41 +5435,30 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     const summary = {
       id: String(order._id),
       transaction_code: order.transaction_code || '',
-
       delivery_mode:
         order.delivery?.mode ||
         (order.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
-
       grand_total: Number(order.grand_total || 0),
       fulfillment_type: order.fulfillment_type || null,
-
       customer_name:
         (order.member && order.member.name) || order.customer_name || '',
-
       customer_phone:
         (order.member && order.member.phone) || order.customer_phone || '',
-
       placed_at: order.placed_at || order.createdAt || null,
-
       table_number:
         order.fulfillment_type === 'dine_in'
           ? order.table_number || null
           : null,
-
       payment_status: order.payment_status || null,
       status: order.status || null,
-
       total_quantity: Number(order.total_quantity || 0),
-
       pickup_window: order.delivery?.pickup_window
         ? {
             from: order.delivery.pickup_window.from || null,
             to: order.delivery.pickup_window.to || null
           }
         : null,
-
       delivery_slot_label: order.delivery?.slot_label || null,
-
       member_id: order.member ? String(order.member) : null
     };
 
@@ -5476,9 +5473,7 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
       item: summary
     });
 
-    // member/guest already emitted below
     emitToStaff('order:accepted', payload);
-    // emitToKitchen('order:accepted', payload);
     emitToCashier('order:accepted', payload);
 
     if (doc.member) emitToMember(String(doc.member), 'order:accepted', payload);
@@ -5487,12 +5482,12 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     console.error('[emit][acceptAndVerify]', err?.message || err);
   }
 
+  // kirim WA receipt non-blocking
   (async () => {
     try {
       const full = await Order.findById(doc._id).lean();
       const phone = (full.customer_phone || '').trim();
       if (!phone) return;
-
       const wa = toWa62(phone);
       const message = buildOrderReceiptMessage(full);
       await sendText(wa, message);
@@ -5501,9 +5496,14 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     }
   })();
 
+  // ambil order final (opsional populate minimal) untuk response
+  const orderForResp = await Order.findById(doc._id)
+    .populate('verified_by', 'name email')
+    .lean();
+
   res
     .status(200)
-    .json({ message: 'Pesanan diterima & diverifikasi', order: doc });
+    .json({ message: 'Pesanan diterima & diverifikasi', order: orderForResp });
 });
 
 exports.assignDelivery = asyncHandler(async (req, res) => {

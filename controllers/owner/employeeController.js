@@ -31,18 +31,30 @@ const validatePages = (pagesObj) => {
   }
 };
 
-const ROLES = ['owner', 'courier', 'kitchen', 'cashier'];
+const ROLES = ['courier', 'kitchen', 'cashier']; // jika file ini memang sumber truth, biarkan; kalau ada global lain, periksa
 exports.createEmployee = asyncHandler(async (req, res) => {
-  const { name, email, password, phone, role, pages } = req.body || {};
+  const { name, email, password, phone, role: rawRole, pages } = req.body || {};
 
-  if (!ROLES.includes(role))
+  console.log('[createEmployee] incoming role raw:', JSON.stringify(rawRole));
+  console.log('[createEmployee] ROLES in-scope:', ROLES);
+
+  const role = typeof rawRole === 'string' ? rawRole.trim().toLowerCase() : '';
+
+  if (!role || !ROLES.includes(role)) {
     throwError(
       `Role tidak valid. Gunakan salah satu: ${ROLES.join(', ')}`,
       400
     );
+  }
+
+  if (!email) throwError('Email wajib diisi', 400);
+  if (!password) throwError('Password wajib diisi', 400);
+  // optional: basic phone check
+  if (phone && typeof phone !== 'string') throwError('Phone harus string', 400);
 
   const lower = String(email).toLowerCase();
 
+  // cek duplikat
   const emailUsed = await User.exists({ email: lower });
   if (emailUsed) throwError('Email sudah terpakai', 409);
 
