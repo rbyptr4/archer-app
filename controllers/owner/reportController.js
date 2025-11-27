@@ -66,13 +66,13 @@ exports.turnover = asyncHandler(async (req, res) => {
   const { start, end } = getRangeFromQuery(req.query);
   if (!start || !end) throwError('Range tanggal tidak valid', 400);
 
-  // ambil orders yang counted sebagai omset
+  // ambil orders yang counted sebagai omset (completed + verified, berdasarkan verified_at)
   const orders = await Order.find({
-    payment_status: { $in: ['paid', 'verified'] },
-    status: { $ne: 'cancelled' },
-    paid_at: { $gte: start, $lte: end }
+    status: 'completed',
+    payment_status: 'verified',
+    verified_at: { $gte: start, $lte: end }
   })
-    .select('paid_at grand_total transaction_code customer_name member')
+    .select('verified_at grand_total transaction_code customer_name member')
     .populate('member', 'name')
     .lean();
 
@@ -80,7 +80,7 @@ exports.turnover = asyncHandler(async (req, res) => {
   let totalOmset = 0;
 
   for (const o of orders || []) {
-    const dt = o.paid_at || o.placed_at || o.createdAt;
+    const dt = o.verified_at || o.paid_at || o.placed_at || o.createdAt;
     if (!dt) continue;
     const key = toDayKey(dt);
     const bucket = days.find((d) => d.key === key);
@@ -116,15 +116,15 @@ exports.revenue = asyncHandler(async (req, res) => {
   const { start, end } = getRangeFromQuery(req.query);
   if (!start || !end) throwError('Range tanggal tidak valid', 400);
 
-  // ambil orders & expenses in parallel
+  // ambil orders & expenses in parallel (orders: completed + verified berdasarkan verified_at)
   const [orders, expenses] = await Promise.all([
     Order.find({
-      payment_status: { $in: ['paid', 'verified'] },
-      status: { $ne: 'cancelled' },
-      paid_at: { $gte: start, $lte: end }
+      status: 'completed',
+      payment_status: 'verified',
+      verified_at: { $gte: start, $lte: end }
     })
       .select(
-        'paid_at grand_total transaction_code customer_name member payment_method'
+        'verified_at grand_total transaction_code customer_name member payment_method'
       )
       .populate('member', 'name')
       .lean(),
@@ -143,7 +143,7 @@ exports.revenue = asyncHandler(async (req, res) => {
 
   // orders -> fill omset and order list
   for (const o of orders || []) {
-    const dt = o.paid_at || o.placed_at || o.createdAt;
+    const dt = o.verified_at || o.paid_at || o.placed_at || o.createdAt;
     if (!dt) continue;
     const key = toDayKey(dt);
     const bucket = days.find((d) => d.key === key);
@@ -198,7 +198,7 @@ exports.revenue = asyncHandler(async (req, res) => {
   });
 });
 
-// Pengeluaran
+// Pengeluaran (tidak berubah — tetap berdasarkan date)
 exports.expense = asyncHandler(async (req, res) => {
   const { start, end } = getRangeFromQuery(req.query);
   if (!start || !end) throwError('Range tanggal tidak valid', 400);
@@ -244,11 +244,69 @@ exports.expense = asyncHandler(async (req, res) => {
   });
 });
 
+// Laba Rugi
+exports.profitLoss = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+  if (!start || !end) throwError('Range tanggal tidak valid', 400);
+
+  // Hitung omzet dari order yang dihitung (completed + verified) berdasarkan verified_at
+  const [orderAgg] = await Order.aggregate([
+    {
+      $match: {
+        status: 'completed',
+        payment_status: 'verified',
+        verified_at: { $gte: start, $lte: end }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        omzet: { $sum: { $ifNull: ['$grand_total', 0] } },
+        count: { $sum: 1 }
+      }
+    }
+  ]);
+
+  const grand_total = Number(orderAgg?.omzet || 0);
+
+  // Hitung total expense pada periode (field date)
+  const [expenseAgg] = await Expense.aggregate([
+    {
+      $match: {
+        date: { $gte: start, $lte: end },
+        isDeleted: { $ne: true } // jaga-jaga kalau ada flag hapus
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        expense_total: { $sum: { $ifNull: ['$amount', 0] } }
+      }
+    }
+  ]);
+
+  const expense_total = Number(expenseAgg?.expense_total || 0);
+
+  const profit_loss = grand_total - expense_total;
+
+  return res.json({
+    period: { start, end },
+    total_transactions_count: Number(orderAgg?.count || 0),
+    grand_total,
+    expense_total,
+    profit_loss
+  });
+});
+
 // Data dashboard laporan
 exports.reportDashboard = asyncHandler(async (req, res) => {
   const { start, end } = getRangeFromQuery(req.query);
 
-  const orderMatch = { paid_at: { $gte: start, $lte: end } };
+  const orderMatch = {
+    status: 'completed',
+    payment_status: 'verified',
+    verified_at: { $gte: start, $lte: end }
+  };
 
   const orderPipeline = [
     { $match: orderMatch },
@@ -297,7 +355,8 @@ exports.totalTransactions = asyncHandler(async (req, res) => {
 
   const match = {
     status: 'completed',
-    paid_at: { $gte: start, $lte: end }
+    payment_status: 'verified',
+    verified_at: { $gte: start, $lte: end }
   };
 
   const [agg] = await Order.aggregate([
@@ -326,10 +385,10 @@ exports.totalTransactions = asyncHandler(async (req, res) => {
 
   const rows = await Order.find(findQuery)
     .select(
-      'member customer_name customer_phone grand_total transaction_code createdAt'
+      'member customer_name customer_phone grand_total transaction_code verified_at createdAt'
     )
     .populate('member', 'name phone')
-    .sort({ createdAt: -1, _id: -1 })
+    .sort({ verified_at: -1, _id: -1 })
     .limit(limit + 1)
     .lean();
 
@@ -351,8 +410,8 @@ exports.totalTransactions = asyncHandler(async (req, res) => {
       name,
       phone,
       grand_total: r.grand_total || 0,
-      transaction_code: r.transaction_code || r.transaction_code || '',
-      created_at: r.createdAt || r.created_at || null,
+      transaction_code: r.transaction_code || '',
+      verified_at: r.verified_at || r.createdAt || null,
       _id: r._id
     };
   });
@@ -368,116 +427,6 @@ exports.totalTransactions = asyncHandler(async (req, res) => {
   });
 });
 
-// Detail order
-exports.getDetailOrder = asyncHandler(async (req, res) => {
-  const id = req.params.id;
-  if (!req.user) throwError('Unauthorized', 401);
-  if (!mongoose.Types.ObjectId.isValid(id)) throwError('ID tidak valid', 400);
-
-  // populate member (ambil hanya name & phone)
-  const order = await Order.findById(id)
-    .populate({ path: 'member', select: 'name phone' })
-    .lean();
-  if (!order) throwError('Order tidak ditemukan', 404);
-
-  const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
-
-  // Susun response yang bersih / minimal (aggregate approach)
-  const slim = {
-    id: String(order._id),
-    transaction_code: order.transaction_code,
-    customer: {
-      // prioritas: member (populate) -> explicit customer_name/phone di order
-      name: order.member?.name || order.customer_name || null,
-      phone: order.member?.phone || order.customer_phone || null
-    },
-    fulfillment_type: order.fulfillment_type || null,
-    table_number: order.table_number ?? null,
-    payment_status: order.payment_status ?? null,
-    // items: show base price, addons and line_subtotal (no per-item tax/service)
-    items: (order.items || []).map((it) => {
-      const qty = safeNumber(it.quantity || 0);
-      const basePrice = safeNumber(it.base_price || 0);
-
-      const addons_unit = (it.addons || []).reduce(
-        (s, a) => s + (Number.isFinite(+a.price) ? +a.price : 0) * (a.qty || 1),
-        0
-      );
-
-      const unit_before_tax = basePrice + addons_unit;
-      const line_subtotal = Number(it.line_subtotal ?? unit_before_tax * qty);
-
-      return {
-        name: it.name,
-        menu: String(it.menu || ''),
-        menu_code: it.menu_code || '',
-        imageUrl: it.imageUrl || '',
-        qty,
-        base_price: basePrice,
-        addons: (it.addons || []).map((a) => ({
-          name: a.name,
-          price: safeNumber(a.price),
-          qty: a.qty || 1
-        })),
-        notes: it.notes || '',
-        line_subtotal
-      };
-    }),
-    totals: {
-      items_subtotal: safeNumber(order.items_subtotal || 0), // BEFORE tax
-      service_fee: safeNumber(order.service_fee || 0),
-      delivery_fee: safeNumber(order.delivery_fee || 0),
-      items_discount: safeNumber(order.items_discount || 0),
-      shipping_discount: safeNumber(order.shipping_discount || 0),
-      tax_rate_percent: safeNumber(
-        order.tax_rate_percent || Math.round((parsePpnRate() || 0.11) * 100)
-      ),
-      tax_amount: safeNumber(order.tax_amount || 0),
-      rounding_delta: safeNumber(order.rounding_delta || 0),
-      grand_total: safeNumber(order.grand_total || 0)
-    },
-    payment: {
-      method: order.payment_method || null,
-      provider: order.payment_provider || null,
-      status: order.payment_status || null,
-      proof_url: order.payment_proof_url || null,
-      paid_at: order.paid_at || null
-    },
-    status: order.status || null,
-    placed_at: order.placed_at || null,
-    created_at: order.createdAt || null,
-    updated_at: order.updatedAt || null,
-    delivery: order.delivery
-      ? {
-          mode: order.delivery.mode || null,
-          address_text: order.delivery.address_text || null,
-          location:
-            order.delivery.location &&
-            typeof order.delivery.location.lat === 'number'
-              ? {
-                  lat: order.delivery.location.lat,
-                  lng: order.delivery.location.lng
-                }
-              : null,
-          distance_km: order.delivery.distance_km ?? null,
-          delivery_fee: order.delivery.delivery_fee ?? null,
-          slot_label: order.delivery.slot_label || null,
-          scheduled_at: order.delivery.scheduled_at || null,
-          status: order.delivery.status || null,
-          // <-- pickup_window ditambahkan di sini (safe check)
-          pickup_window: order.delivery.pickup_window
-            ? {
-                from: order.delivery.pickup_window.from || null,
-                to: order.delivery.pickup_window.to || null
-              }
-            : null
-        }
-      : null
-  };
-
-  return res.status(200).json({ success: true, order: slim });
-});
-
 // Ringkasan per layanan
 exports.orderDeliveryCounts = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
@@ -486,8 +435,11 @@ exports.orderDeliveryCounts = asyncHandler(async (req, res) => {
 
   const pipeline = [
     {
+      // Hanya order yang completed & verified berdasarkan verified_at
       $match: {
-        placed_at: { $gte: start, $lte: end }
+        status: 'completed',
+        payment_status: 'verified',
+        verified_at: { $gte: start, $lte: end }
       }
     },
     // normalisasi mode delivery
@@ -624,6 +576,116 @@ exports.orderDeliveryCounts = asyncHandler(async (req, res) => {
       total
     }
   });
+});
+
+// Detail order
+exports.getDetailOrder = asyncHandler(async (req, res) => {
+  const id = req.params.id;
+  if (!req.user) throwError('Unauthorized', 401);
+  if (!mongoose.Types.ObjectId.isValid(id)) throwError('ID tidak valid', 400);
+
+  // populate member (ambil hanya name & phone)
+  const order = await Order.findById(id)
+    .populate({ path: 'member', select: 'name phone' })
+    .lean();
+  if (!order) throwError('Order tidak ditemukan', 404);
+
+  const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
+
+  // Susun response yang bersih / minimal (aggregate approach)
+  const slim = {
+    id: String(order._id),
+    transaction_code: order.transaction_code,
+    customer: {
+      // prioritas: member (populate) -> explicit customer_name/phone di order
+      name: order.member?.name || order.customer_name || null,
+      phone: order.member?.phone || order.customer_phone || null
+    },
+    fulfillment_type: order.fulfillment_type || null,
+    table_number: order.table_number ?? null,
+    payment_status: order.payment_status ?? null,
+    // items: show base price, addons and line_subtotal (no per-item tax/service)
+    items: (order.items || []).map((it) => {
+      const qty = safeNumber(it.quantity || 0);
+      const basePrice = safeNumber(it.base_price || 0);
+
+      const addons_unit = (it.addons || []).reduce(
+        (s, a) => s + (Number.isFinite(+a.price) ? +a.price : 0) * (a.qty || 1),
+        0
+      );
+
+      const unit_before_tax = basePrice + addons_unit;
+      const line_subtotal = Number(it.line_subtotal ?? unit_before_tax * qty);
+
+      return {
+        name: it.name,
+        menu: String(it.menu || ''),
+        menu_code: it.menu_code || '',
+        imageUrl: it.imageUrl || '',
+        qty,
+        base_price: basePrice,
+        addons: (it.addons || []).map((a) => ({
+          name: a.name,
+          price: safeNumber(a.price),
+          qty: a.qty || 1
+        })),
+        notes: it.notes || '',
+        line_subtotal
+      };
+    }),
+    totals: {
+      items_subtotal: safeNumber(order.items_subtotal || 0), // BEFORE tax
+      service_fee: safeNumber(order.service_fee || 0),
+      delivery_fee: safeNumber(order.delivery_fee || 0),
+      items_discount: safeNumber(order.items_discount || 0),
+      shipping_discount: safeNumber(order.shipping_discount || 0),
+      tax_rate_percent: safeNumber(
+        order.tax_rate_percent || Math.round((parsePpnRate() || 0.11) * 100)
+      ),
+      tax_amount: safeNumber(order.tax_amount || 0),
+      rounding_delta: safeNumber(order.rounding_delta || 0),
+      grand_total: safeNumber(order.grand_total || 0)
+    },
+    payment: {
+      method: order.payment_method || null,
+      provider: order.payment_provider || null,
+      status: order.payment_status || null,
+      proof_url: order.payment_proof_url || null,
+      paid_at: order.paid_at || null
+    },
+    status: order.status || null,
+    placed_at: order.placed_at || null,
+    created_at: order.createdAt || null,
+    updated_at: order.updatedAt || null,
+    delivery: order.delivery
+      ? {
+          mode: order.delivery.mode || null,
+          address_text: order.delivery.address_text || null,
+          location:
+            order.delivery.location &&
+            typeof order.delivery.location.lat === 'number'
+              ? {
+                  lat: order.delivery.location.lat,
+                  lng: order.delivery.location.lng
+                }
+              : null,
+          distance_km: order.delivery.distance_km ?? null,
+          delivery_fee: order.delivery.delivery_fee ?? null,
+          slot_label: order.delivery.slot_label || null,
+          scheduled_at: order.delivery.scheduled_at || null,
+          status: order.delivery.status || null,
+          // <-- pickup_window ditambahkan di sini (safe check)
+          pickup_window: order.delivery.pickup_window
+            ? {
+                from: order.delivery.pickup_window.from || null,
+                to: order.delivery.pickup_window.to || null
+              }
+            : null
+        }
+      : null
+  };
+
+  return res.status(200).json({ success: true, order: slim });
 });
 
 //  list member
@@ -959,238 +1021,6 @@ exports.bestSeller = asyncHandler(async (req, res) => {
     period: { start, end },
     total: final.length,
     items: final
-  });
-});
-
-// Omset
-exports.turnover = asyncHandler(async (req, res) => {
-  const { start, end } = getRangeFromQuery(req.query);
-  if (!start || !end) throwError('Range tanggal tidak valid', 400);
-
-  // ambil orders yang counted sebagai omset
-  const orders = await Order.find({
-    payment_status: { $in: ['paid', 'verified'] },
-    status: { $ne: 'cancelled' },
-    paid_at: { $gte: start, $lte: end }
-  })
-    .select('paid_at grand_total transaction_code customer_name member')
-    .populate('member', 'name')
-    .lean();
-
-  const days = buildDaysArray(start, end);
-  let totalOmset = 0;
-
-  for (const o of orders || []) {
-    const dt = o.paid_at || o.placed_at || o.createdAt;
-    if (!dt) continue;
-    const key = toDayKey(dt);
-    const bucket = days.find((d) => d.key === key);
-    const amt = Number(o.grand_total || 0);
-
-    if (bucket) {
-      bucket.omset += amt;
-      bucket.orders.push({
-        code: o.transaction_code || '',
-        customer: (o.member && o.member.name) || o.customer_name || '',
-        grand_total: amt
-      });
-    }
-    totalOmset += amt;
-  }
-
-  // map output items with only required fields
-  const items = days.map((d) => ({
-    key: d.key,
-    omset: d.omset,
-    orders: d.orders
-  }));
-
-  res.json({
-    period: { start, end },
-    total_omset: totalOmset,
-    items
-  });
-});
-
-// Pendapatan
-exports.revenue = asyncHandler(async (req, res) => {
-  const { start, end } = getRangeFromQuery(req.query);
-  if (!start || !end) throwError('Range tanggal tidak valid', 400);
-
-  // ambil orders & expenses in parallel
-  const [orders, expenses] = await Promise.all([
-    Order.find({
-      payment_status: { $in: ['paid', 'verified'] },
-      status: { $ne: 'cancelled' },
-      paid_at: { $gte: start, $lte: end }
-    })
-      .select(
-        'paid_at grand_total transaction_code customer_name member payment_method'
-      )
-      .populate('member', 'name')
-      .lean(),
-    Expense.find({
-      date: { $gte: start, $lte: end }
-    })
-      .select('date amount note createdBy')
-      .populate('createdBy', 'name') // optional, if createdBy is user ref
-      .lean()
-  ]);
-
-  const days = buildDaysArray(start, end);
-
-  let totalOmset = 0;
-  let totalExpense = 0;
-
-  // orders -> fill omset and order list
-  for (const o of orders || []) {
-    const dt = o.paid_at || o.placed_at || o.createdAt;
-    if (!dt) continue;
-    const key = toDayKey(dt);
-    const bucket = days.find((d) => d.key === key);
-    const amt = Number(o.grand_total || 0);
-    if (bucket) {
-      bucket.omset += amt;
-      bucket.orders.push({
-        code: o.transaction_code || '',
-        customer: (o.member && o.member.name) || o.customer_name || '',
-        grand_total: amt,
-        payment_method: o.payment_method || null
-      });
-    }
-    totalOmset += amt;
-  }
-
-  // expenses -> fill expense list
-  for (const e of expenses || []) {
-    const dt = e.date;
-    if (!dt) continue;
-    const key = toDayKey(dt);
-    const bucket = days.find((d) => d.key === key);
-    const amt = Number(e.amount || 0);
-    if (bucket) {
-      bucket.expense += amt;
-      bucket.expenses.push({
-        name: e.note || 'Expense',
-        amount: amt,
-        createdBy: e.createdBy ? e.createdBy.name || String(e.createdBy) : null
-      });
-    }
-    totalExpense += amt;
-  }
-
-  // compute pendapatan per day and totals
-  let totalPendapatan = 0;
-  const items = days.map((d) => {
-    const pendapatan = Number(d.omset || 0) - Number(d.expense || 0);
-    totalPendapatan += pendapatan;
-    return {
-      key: d.key,
-      pendapatan,
-      orders: d.orders,
-      expenses: d.expenses
-    };
-  });
-
-  res.json({
-    period: { start, end },
-    total_pendapatan: totalPendapatan,
-    items
-  });
-});
-
-// Pengeluaran
-exports.expense = asyncHandler(async (req, res) => {
-  const { start, end } = getRangeFromQuery(req.query);
-  if (!start || !end) throwError('Range tanggal tidak valid', 400);
-
-  const expenses = await Expense.find({
-    date: { $gte: start, $lte: end }
-  })
-    .select('date amount note createdBy')
-    .populate('createdBy', 'name')
-    .lean();
-
-  const days = buildDaysArray(start, end);
-  let totalExpense = 0;
-
-  for (const e of expenses || []) {
-    const dt = e.date;
-    if (!dt) continue;
-    const key = toDayKey(dt);
-    const bucket = days.find((d) => d.key === key);
-    const amt = Number(e.amount || 0);
-    if (bucket) {
-      bucket.expense += amt;
-      bucket.expenses.push({
-        name: e.note || 'Expense',
-        amount: amt,
-        createdBy: e.createdBy ? e.createdBy.name || String(e.createdBy) : null,
-        date: key
-      });
-    }
-    totalExpense += amt;
-  }
-
-  const items = days.map((d) => ({
-    key: d.key,
-    expense: d.expense,
-    expenses: d.expenses
-  }));
-
-  res.json({
-    period: { start, end },
-    total_expense: totalExpense,
-    items
-  });
-});
-
-// Laba rugi
-exports.profitLoss = asyncHandler(async (req, res) => {
-  const { start, end } = getRangeFromQuery(req.query);
-
-  // ----------------- ORDER / OMZET -----------------
-  const [orderAgg] = await Order.aggregate([
-    {
-      $match: {
-        payment_status: 'verified',
-        paid_at: { $gte: start, $lte: end }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        omzet: { $sum: { $ifNull: ['$grand_total', 0] } }
-      }
-    }
-  ]);
-
-  const grand_total = Number(orderAgg?.omzet || 0);
-
-  // ----------------- EXPENSE -----------------
-  const [expenseAgg] = await Expense.aggregate([
-    {
-      $match: {
-        date: { $gte: start, $lte: end }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        expense_total: { $sum: { $ifNull: ['$amount', 0] } }
-      }
-    }
-  ]);
-
-  const expense_total = Number(expenseAgg?.expense_total || 0);
-
-  const profit_loss = grand_total - expense_total;
-
-  res.json({
-    period: { start, end },
-    grand_total,
-    expense_total,
-    profit_loss
   });
 });
 
