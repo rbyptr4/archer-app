@@ -3787,7 +3787,18 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       fulfillmentType === 'delivery' ? Number(effectiveDeliveryFee || 0) : 0,
     voucherClaimIds: eligible
   });
-
+  console.log(
+    '[previewPrice] calling price engine with params:',
+    JSON.stringify({
+      memberId,
+      selectedPromoId,
+      autoApplyPromo: applyPromos ? (selectedPromoId ? false : true) : false,
+      cart: normalizedCart,
+      fulfillmentType,
+      deliveryFee: fulfillmentType === 'delivery' ? effectiveDeliveryFee : 0,
+      voucherClaimIds: eligible
+    })
+  );
   let result;
   try {
     result = await applyPromoThenVoucher({
@@ -3804,7 +3815,10 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       promoUsageFetchers
     });
   } catch (err) {
-    console.error('[previewPrice] price engine error', err?.message || err);
+    console.error(
+      '[previewPrice] price engine error (FULL):',
+      err && err.stack ? err.stack : err
+    );
     throwError(
       err?.message
         ? `Gagal menghitung preview harga: ${String(err.message)}`
@@ -3813,25 +3827,30 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     );
   }
 
-  console.log('[previewPrice] engine result snapshot:', {
+  console.log(
+    '[previewPrice] price engine returned result (top-level keys):',
+    Object.keys(result || {}).sort()
+  );
+  console.log('[previewPrice] price engine result snapshot:', {
     ok: result?.ok,
     reasonsLen: (result?.reasons || []).length,
     promoApplied: result?.promoApplied
       ? { promoId: result.promoApplied.promoId, name: result.promoApplied.name }
       : null,
-    promoImpactKeys: result?.promoImpact
-      ? Object.keys(result.promoImpact || {})
-      : Object.keys(result?.promoApplied?.impact || {}),
-    promoActionsLen: (
-      result?.promoActions ||
-      result?.promoApplied?.actions ||
-      []
-    ).length,
+    promoImpactKeys: result?.promoApplied?.impact
+      ? Object.keys(result.promoApplied.impact || {})
+      : [],
+    promoActionsLen: Array.isArray(result?.promoApplied?.actions)
+      ? result.promoApplied.actions.length
+      : Array.isArray(result?.promoActions)
+      ? result.promoActions.length
+      : 0,
     voucherResKeys: result?.voucherRes
-      ? Object.keys(result.voucherRes || {})
-      : Object.keys(result?.voucherResult || {})
+      ? Object.keys(result.voucherRes)
+      : result?.voucherResult
+      ? Object.keys(result.voucherResult)
+      : []
   });
-
   if (!result || !result.ok) {
     console.error('[previewPrice] price engine returned failure', result);
     throwError(
