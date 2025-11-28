@@ -1,4 +1,3 @@
-// utils/priceEngine.js
 const {
   applyPromo: applyPromoRaw,
   findApplicablePromos,
@@ -224,11 +223,11 @@ async function applyPromoThenVoucher({
       const res = await applyPromoRaw(promoApplied, originalForDist);
       promoImpact = res.impact || {};
       promoActions = Array.isArray(res.actions) ? res.actions.slice() : [];
-      console.log(
-        '[priceEngine.debug] applyPromoRaw returned for promo',
-        String(promoApplied._id),
-        { impact: promoImpact, actions: promoActions }
-      );
+      console.log('=== [PE] APPLY PROMO RESULT ===');
+      console.log('promoApplied:', promoApplied?._id, promoApplied?.name);
+      console.log('promoImpact:', JSON.stringify(promoImpact, null, 2));
+      console.log('promoActions:', JSON.stringify(promoActions, null, 2));
+      console.log('===============================');
     }
   } catch (e) {
     console.warn(
@@ -703,6 +702,18 @@ async function applyPromoThenVoucher({
     .filter((r) => r.type === 'points')
     .reduce((s, r) => s + Number(r.amount || 0), 0);
 
+  // === Fallback: jika promoActions kosong tapi promoApplied.actions ada di object => gunakan itu
+  const effectivePromoActions =
+    Array.isArray(promoActions) && promoActions.length
+      ? promoActions
+      : promoApplied && Array.isArray(promoApplied.actions)
+      ? promoApplied.actions
+      : [];
+
+  const pointsTotalFromActions = effectivePromoActions
+    .filter((a) => String(a.type || '').toLowerCase() === 'award_points')
+    .reduce((s, a) => s + Number(a.points ?? a.amount ?? 0), 0);
+
   const final = {
     ok: voucherRes?.ok ?? true,
     reasons: (voucherRes?.reasons || []).slice(),
@@ -712,7 +723,7 @@ async function applyPromoThenVoucher({
           name: promoApplied.name || null,
           description: promoApplied.notes || promoApplied.description || null,
           impact: promoImpact,
-          actions: promoActions || [],
+          actions: effectivePromoActions || [],
           freeItemsSnapshot:
             Array.isArray(promoImpact?.addedFreeItems) &&
             promoImpact.addedFreeItems.length
@@ -733,8 +744,9 @@ async function applyPromoThenVoucher({
     itemAdjustments: itemAdjustmentsMap,
     promoRewards,
     points_awarded_details: {
-      total: pointsTotal,
-      actions: promoActions || []
+      // prefer explicit mapping from promoActions/promoRewards, fall back to computed pointsTotal
+      total: Math.max(0, Math.round(pointsTotalFromActions || pointsTotal)),
+      actions: effectivePromoActions || []
     },
     engineSnapshot: {
       applicableIds: (applicable || []).map((p) => String(p._id)),
@@ -744,10 +756,22 @@ async function applyPromoThenVoucher({
       cartBefore: originalForDist,
       cartAfterPromo,
       promoImpact,
-      promoActions,
+      promoActions: effectivePromoActions,
       voucherRes
     }
   };
+
+  // debug final promo-related pieces
+  console.log('=== [PE] FINAL PROMO RESULT ===');
+  console.log('appliedPromo:', final.promoApplied);
+  console.log('promoRewards:', JSON.stringify(final.promoRewards, null, 2));
+  console.log(
+    'points_awarded_details:',
+    JSON.stringify(final.points_awarded_details, null, 2)
+  );
+  console.log('chosenClaimIds:', final.chosenClaimIds);
+  console.log('voucher breakdown:', JSON.stringify(final.breakdown, null, 2));
+  console.log('================================');
 
   return final;
 }

@@ -4,6 +4,7 @@ const dayjs = require('dayjs');
 
 const Expense = require('../../models/expenseModel');
 const Order = require('../../models/orderModel');
+const Menu = require('../../models/menuModel');
 const Member = require('../../models/memberModel');
 
 const throwError = require('../../utils/throwError');
