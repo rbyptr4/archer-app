@@ -490,7 +490,6 @@ async function applyPromoThenVoucher({
 
   // if promo blocks voucher -> return minimal snapshot
   if (promoApplied && promoApplied.blocksVoucher) {
-    console.log('[PE] promo blocksVoucher true, preparing minimal snapshot');
     const baseSubtotal = originalForDist.reduce(
       (s, it) => s + Number(it.price || 0) * Number(it.qty || 0),
       0
@@ -574,6 +573,58 @@ async function applyPromoThenVoucher({
       }
     }
 
+    const promoRewardsLocal = [];
+    if (Array.isArray(promoActions) && promoActions.length) {
+      for (const a of promoActions) {
+        if (a.type === 'award_points') {
+          promoRewardsLocal.push({
+            type: 'points',
+            amount: Number(a.points || a.amount || 0),
+            label: 'Poin promo',
+            meta: a.meta || {}
+          });
+        } else if (a.type === 'grant_membership') {
+          promoRewardsLocal.push({
+            type: 'membership',
+            amount: null,
+            label: 'Grant membership',
+            meta: a.meta || {}
+          });
+        } else {
+          promoRewardsLocal.push({
+            type: a.type || 'action',
+            amount: a.amount || null,
+            label: a.label || a.type || 'Reward',
+            meta: a.meta || {}
+          });
+        }
+      }
+    }
+
+    if (
+      promoImpact &&
+      Array.isArray(promoImpact.addedFreeItems) &&
+      promoImpact.addedFreeItems.length
+    ) {
+      for (const f of promoImpact.addedFreeItems) {
+        promoRewardsLocal.push({
+          type: 'free_item',
+          amount: 0,
+          label: f.name || `Gratis: ${String(f.menuId || '')}`,
+          meta: { menuId: f.menuId, qty: Number(f.qty || 1) }
+        });
+      }
+    }
+
+    if (totalPromoDiscount && totalPromoDiscount > 0) {
+      promoRewardsLocal.push({
+        type: 'discount',
+        amount: int(totalPromoDiscount),
+        label: 'Diskon promo',
+        meta: { promoId }
+      });
+    }
+
     return {
       ok: true,
       reasons: [`Promo (${promoApplied.name}) memblokir penggunaan voucher.`],
@@ -614,31 +665,7 @@ async function applyPromoThenVoucher({
       chosenClaimIds: [],
       discounts,
       itemAdjustments: itemAdjustmentsMap,
-      promoRewards:
-        promoActions && promoActions.length
-          ? promoActions.map((a) => {
-              if (a.type === 'award_points')
-                return {
-                  type: 'points',
-                  amount: Number(a.points || a.amount || 0),
-                  label: 'Poin promo',
-                  meta: a.meta || {}
-                };
-              if (a.type === 'grant_membership')
-                return {
-                  type: 'membership',
-                  amount: null,
-                  label: 'Grant membership',
-                  meta: a.meta || {}
-                };
-              return {
-                type: a.type || 'unknown',
-                amount: a.amount || null,
-                label: a.label || a.type || 'reward',
-                meta: a.meta || {}
-              };
-            })
-          : [],
+      promoRewards: promoRewardsLocal,
       points_awarded_details: {
         total: promoActions
           ? promoActions
