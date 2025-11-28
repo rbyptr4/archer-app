@@ -2,9 +2,6 @@
 const Promo = require('../models/promoModel');
 const throwError = require('../utils/throwError');
 
-/**
- * snapshotTotals(cart)
- */
 function snapshotTotals(cart) {
   const items = Array.isArray(cart.items) ? cart.items : [];
   const items_subtotal = items.reduce(
@@ -29,50 +26,169 @@ async function findApplicablePromos(
 ) {
   const { items_subtotal, totalQty, items } = snapshotTotals(cart);
 
+  // debug top-level cart
+  try {
+    console.log('[promoEngine.debug] findApplicablePromos called');
+    console.log('[promoEngine.debug] cart snapshot:', {
+      items_subtotal,
+      totalQty,
+      items_sample: (items || []).slice(0, 10)
+    });
+    console.log(
+      '[promoEngine.debug] member snapshot:',
+      member
+        ? { id: String(member._id || member.id), level: member.level }
+        : null
+    );
+  } catch (e) {
+    /* ignore logging errors */
+  }
+
+  // ambil semua promo aktif
   const promos = await Promo.find({ isActive: true })
     .sort({ priority: -1 })
     .lean();
+
+  console.log(
+    '[promoEngine.debug] promos fetched count:',
+    Array.isArray(promos) ? promos.length : 0
+  );
 
   const eligible = [];
   const memberId = member ? String(member._id || member.id) : null;
   const fetchers = options.fetchers || {};
 
   for (const p of promos) {
+    // prepare per-promo debug record
+    const debug = {
+      promoId: String(p._id),
+      name: p.name,
+      isActive: !!p.isActive,
+      priority: p.priority,
+      reasonSkipped: null,
+      checks: {}
+    };
+
     // 1) absolute period
-    if (p.conditions?.startAt && new Date(p.conditions.startAt) > now) continue;
-    if (p.conditions?.endAt && new Date(p.conditions.endAt) < now) continue;
+    if (p.conditions?.startAt && new Date(p.conditions.startAt) > now) {
+      debug.reasonSkipped = 'startAt_future';
+      debug.checks.startAt = { ok: false, startAt: p.conditions.startAt };
+      console.log('[promoEngine.debug][SKIP]', debug);
+      continue;
+    } else {
+      debug.checks.startAt = {
+        ok: true,
+        startAt: p.conditions?.startAt || null
+      };
+    }
+    if (p.conditions?.endAt && new Date(p.conditions.endAt) < now) {
+      debug.reasonSkipped = 'endAt_passed';
+      debug.checks.endAt = { ok: false, endAt: p.conditions.endAt };
+      console.log('[promoEngine.debug][SKIP]', debug);
+      continue;
+    } else {
+      debug.checks.endAt = { ok: true, endAt: p.conditions?.endAt || null };
+    }
 
     // 2) audience
-    if (p.conditions?.audience === 'members' && !member) continue;
+    if (p.conditions?.audience === 'members' && !member) {
+      debug.reasonSkipped = 'audience_members_only_but_no_member';
+      debug.checks.audience = { ok: false, audience: p.conditions?.audience };
+      console.log('[promoEngine.debug][SKIP]', debug);
+      continue;
+    }
+    debug.checks.audience = {
+      ok: true,
+      audience: p.conditions?.audience || 'all'
+    };
+
     // 2.b) memberLevels filter (optional)
-    // jika promo punya kondisi memberLevels: ['bronze','silver','gold'], hanya berlaku utk member tsb
     if (
       Array.isArray(p.conditions?.memberLevels) &&
       p.conditions.memberLevels.length > 0
     ) {
-      // jika tidak ada member, promo tidak berlaku
-      if (!member || !member.level) continue;
-
+      if (!member || !member.level) {
+        debug.reasonSkipped = 'memberLevels_requires_member_missing_level';
+        debug.checks.memberLevels = {
+          ok: false,
+          required: p.conditions.memberLevels,
+          memberLevel: member?.level || null
+        };
+        console.log('[promoEngine.debug][SKIP]', debug);
+        continue;
+      }
       const allowed = new Set(
         p.conditions.memberLevels.map((l) => String(l || '').toLowerCase())
       );
-      if (!allowed.has(String(member.level || '').toLowerCase())) continue;
+      if (!allowed.has(String(member.level || '').toLowerCase())) {
+        debug.reasonSkipped = 'member_level_not_allowed';
+        debug.checks.memberLevels = {
+          ok: false,
+          required: p.conditions.memberLevels,
+          memberLevel: member.level
+        };
+        console.log('[promoEngine.debug][SKIP]', debug);
+        continue;
+      }
+      debug.checks.memberLevels = {
+        ok: true,
+        required: p.conditions.memberLevels,
+        memberLevel: member.level
+      };
+    } else {
+      debug.checks.memberLevels = {
+        ok: true,
+        required: [],
+        memberLevel: member?.level || null
+      };
     }
 
     // 3) minTotal
     if (
       p.conditions?.minTotal &&
       Number(items_subtotal) < Number(p.conditions.minTotal)
-    )
+    ) {
+      debug.reasonSkipped = 'minTotal_not_met';
+      debug.checks.minTotal = {
+        ok: false,
+        items_subtotal,
+        required: Number(p.conditions.minTotal)
+      };
+      console.log('[promoEngine.debug][SKIP]', debug);
       continue;
+    } else {
+      debug.checks.minTotal = {
+        ok: true,
+        items_subtotal,
+        required: Number(p.conditions?.minTotal || 0)
+      };
+    }
 
     // 4) minQty
-    if (p.conditions?.minQty && Number(totalQty) < Number(p.conditions.minQty))
+    if (
+      p.conditions?.minQty &&
+      Number(totalQty) < Number(p.conditions.minQty)
+    ) {
+      debug.reasonSkipped = 'minQty_not_met';
+      debug.checks.minQty = {
+        ok: false,
+        totalQty,
+        required: Number(p.conditions.minQty)
+      };
+      console.log('[promoEngine.debug][SKIP]', debug);
       continue;
+    } else {
+      debug.checks.minQty = {
+        ok: true,
+        totalQty,
+        required: Number(p.conditions?.minQty || 0)
+      };
+    }
 
     // 5) item-specific conditions
     if (Array.isArray(p.conditions?.items) && p.conditions.items.length) {
       let ok = true;
+      const itemChecks = [];
       for (const cond of p.conditions.items) {
         const need = Number(cond.qty || 1);
         if (cond.menuId) {
@@ -84,6 +200,7 @@ async function findApplicablePromos(
                 : 0),
             0
           );
+          itemChecks.push({ type: 'menuId', menuId: cond.menuId, found, need });
           if (found < need) {
             ok = false;
             break;
@@ -97,30 +214,71 @@ async function findApplicablePromos(
                 : 0),
             0
           );
+          itemChecks.push({
+            type: 'category',
+            category: cond.category,
+            found,
+            need
+          });
           if (found < need) {
             ok = false;
             break;
           }
+        } else {
+          itemChecks.push({ type: 'unknown_cond', cond });
         }
       }
-      if (!ok) continue;
+      if (!ok) {
+        debug.reasonSkipped = 'item_conditions_not_met';
+        debug.checks.itemConditions = { ok: false, details: itemChecks };
+        console.log('[promoEngine.debug][SKIP]', debug);
+        continue;
+      } else {
+        debug.checks.itemConditions = { ok: true, details: itemChecks };
+      }
+    } else {
+      debug.checks.itemConditions = { ok: true, details: [] };
     }
 
-    // 6) perMemberLimit (lifetime) using member.promoUsageHistory if available
+    // 6) perMemberLimit (lifetime)
     if (p.perMemberLimit && member) {
       const used = Array.isArray(member.promoUsageHistory)
         ? member.promoUsageHistory.filter(
             (h) => String(h.promoId) === String(p._id)
           ).length
         : 0;
-      if (used >= Number(p.perMemberLimit)) continue;
+      if (used >= Number(p.perMemberLimit)) {
+        debug.reasonSkipped = 'perMemberLimit_exceeded';
+        debug.checks.perMemberLimit = {
+          ok: false,
+          used,
+          limit: Number(p.perMemberLimit)
+        };
+        console.log('[promoEngine.debug][SKIP]', debug);
+        continue;
+      }
+      debug.checks.perMemberLimit = {
+        ok: true,
+        used,
+        limit: Number(p.perMemberLimit)
+      };
+    } else {
+      debug.checks.perMemberLimit = {
+        ok: true,
+        used: 0,
+        limit: p.perMemberLimit || 0
+      };
     }
 
     // 7) usageWindowDays / usageLimitGlobal / usageLimitPerMember
     if (Number(p.conditions?.usageWindowDays) > 0) {
       const windowDays = Number(p.conditions.usageWindowDays || 0);
       const sinceDate = new Date(now.getTime() - windowDays * 24 * 3600 * 1000);
-      // per-member usage
+      debug.checks.usageWindow = {
+        windowDays,
+        sinceDate: sinceDate.toISOString()
+      };
+
       if (
         Number(p.conditions?.usageLimitPerMember) > 0 &&
         fetchers.getMemberUsageCount &&
@@ -132,17 +290,26 @@ async function findApplicablePromos(
             memberId,
             sinceDate
           );
-          if (cnt >= Number(p.conditions.usageLimitPerMember)) continue;
+          debug.checks.usageWindow.memberCount = cnt;
+          if (cnt >= Number(p.conditions.usageLimitPerMember)) {
+            debug.reasonSkipped = 'usageLimitPerMember_exceeded';
+            debug.checks.usageWindow.memberOk = false;
+            console.log('[promoEngine.debug][SKIP]', debug);
+            continue;
+          } else {
+            debug.checks.usageWindow.memberOk = true;
+          }
         } catch (e) {
-          // if fetcher fails, conservative: skip promo
           console.warn(
-            '[promoEngine] getMemberUsageCount failed',
+            '[promoEngine.debug] getMemberUsageCount failed, skipping promo conservatively',
             e?.message || e
           );
+          debug.reasonSkipped = 'fetcher_member_failed';
+          console.log('[promoEngine.debug][SKIP]', debug);
           continue;
         }
       }
-      // global usage
+
       if (
         Number(p.conditions?.usageLimitGlobal) > 0 &&
         fetchers.getGlobalUsageCount
@@ -152,45 +319,57 @@ async function findApplicablePromos(
             String(p._id),
             sinceDate
           );
-          if (gcnt >= Number(p.conditions.usageLimitGlobal)) continue;
+          debug.checks.usageWindow.globalCount = gcnt;
+          if (gcnt >= Number(p.conditions.usageLimitGlobal)) {
+            debug.reasonSkipped = 'usageLimitGlobal_exceeded';
+            debug.checks.usageWindow.globalOk = false;
+            console.log('[promoEngine.debug][SKIP]', debug);
+            continue;
+          } else {
+            debug.checks.usageWindow.globalOk = true;
+          }
         } catch (e) {
           console.warn(
-            '[promoEngine] getGlobalUsageCount failed',
+            '[promoEngine.debug] getGlobalUsageCount failed, skipping promo conservatively',
             e?.message || e
           );
+          debug.reasonSkipped = 'fetcher_global_failed';
+          console.log('[promoEngine.debug][SKIP]', debug);
           continue;
         }
       }
     }
 
-    // 8) globalStock check (lifetime) - only enforce when globalStock is explicitly set (not null/undefined)
+    // 8) globalStock check
     if (p.globalStock != null) {
       const stockNum = Number(p.globalStock);
-      // if it's not a finite number -> treat as unlimited (skip check)
       if (Number.isFinite(stockNum)) {
         if (stockNum <= 0) {
-          // no stock left -> not eligible
+          debug.reasonSkipped = 'globalStock_empty';
+          debug.checks.globalStock = { ok: false, stock: stockNum };
+          console.log('[promoEngine.debug][SKIP]', debug);
           continue;
+        } else {
+          debug.checks.globalStock = { ok: true, stock: stockNum };
         }
+      } else {
+        debug.checks.globalStock = { ok: true, stock: p.globalStock };
       }
+    } else {
+      debug.checks.globalStock = { ok: true, stock: null };
     }
 
-    // passed all checks -> eligible
+    // lulus semua check -> eligible
+    debug.reasonSkipped = null;
+    debug.checks.eligible = true;
+    console.log('[promoEngine.debug][PASS]', debug);
     eligible.push(p);
-  }
+  } // end for promos
 
-  // LOG eligible promos
-  try {
-    console.log(
-      '[promoEngine] findApplicablePromos -> eligible count:',
-      eligible.length,
-      'ids:',
-      eligible.map((x) => String(x._id))
-    );
-  } catch (e) {
-    /* ignore logging error */
-  }
-
+  console.log(
+    '[promoEngine.debug] findApplicablePromos finished. eligible count:',
+    eligible.length
+  );
   return eligible;
 }
 
