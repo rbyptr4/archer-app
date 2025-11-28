@@ -568,17 +568,44 @@ async function applyPromoThenVoucher({
       promoImpact.addedFreeItems.length
     ) {
       for (const f of promoImpact.addedFreeItems) {
-        const menuDoc = menuMap[String(f.menuId)];
+        // ensure Menu model is available (di top file: const Menu = require('../models/menuModel'); )
+        let menuDoc = menuMap[String(f.menuId)];
+
+        // jika belum ada di menuMap, coba fetch dari DB (robust fallback)
+        if (!menuDoc && f.menuId) {
+          try {
+            const Menu = require('../models/menuModel');
+            const found = await Menu.findById(f.menuId)
+              .select('name imageUrl code')
+              .lean()
+              .catch(() => null);
+            if (found) {
+              menuDoc = found;
+              // simpan ke menuMap agar lookup berikutnya lebih cepat
+              menuMap[String(f.menuId)] = menuDoc;
+            }
+          } catch (e) {
+            // jangan crash — cuma log
+            console.warn(
+              '[PE] fetch menu for free item failed',
+              String(f.menuId),
+              e?.message || e
+            );
+          }
+        }
+
+        const labelName = menuDoc?.name || f.name || String(f.menuId || '');
         discounts.push({
           id: promoId,
           source: 'promo',
           orderIdx: 1,
           type: 'free_item',
-          label: `Gratis: ${menuDoc ? menuDoc.name : f.name || f.menuId}`,
+          label: `Gratis: ${labelName}`,
           amount: 0,
           items: [{ menuId: f.menuId, qty: Number(f.qty || 1), amount: 0 }],
           meta: { promoId, menuId: f.menuId, menuSnapshot: menuDoc || null }
         });
+
         itemAdjustmentsMap[f.menuId] = itemAdjustmentsMap[f.menuId] || [];
         itemAdjustmentsMap[f.menuId].push({
           type: 'promo_free_item',
@@ -604,7 +631,7 @@ async function applyPromoThenVoucher({
           promoRewardsLocal.push({
             type: 'membership',
             amount: null,
-            label: 'Grant membership',
+            label: 'Gratis membership',
             meta: a.meta || {}
           });
         } else {
