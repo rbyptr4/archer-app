@@ -3777,22 +3777,34 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     }
   })();
 
+  // ---- NEW: pilih selectedPromo yang akan dikirim ke engine
+  // prefer selectedPromoId dari body; kalau gak ada tapi autoAppliedPromo ada, gunakan itu
+  const selectedForEngine = applyPromos
+    ? selectedPromoId ||
+      (autoAppliedPromo ? String(autoAppliedPromo.promoId) : null)
+    : null;
+  const autoApplyForEngine = applyPromos
+    ? selectedForEngine
+      ? false
+      : true
+    : false;
+
   // ===== call engine =====
   console.log('[previewPrice] calling price engine with params:', {
     memberId,
-    selectedPromoId: applyPromos ? selectedPromoId || null : null,
-    autoApplyPromo: applyPromos ? (selectedPromoId ? false : true) : false,
+    selectedForEngine,
+    autoApplyForEngine,
     fulfillmentType,
     deliveryFee:
       fulfillmentType === 'delivery' ? Number(effectiveDeliveryFee || 0) : 0,
     voucherClaimIds: eligible
   });
   console.log(
-    '[previewPrice] calling price engine with params:',
+    '[previewPrice] calling price engine with params (full):',
     JSON.stringify({
       memberId,
-      selectedPromoId,
-      autoApplyPromo: applyPromos ? (selectedPromoId ? false : true) : false,
+      selectedForEngine,
+      autoApplyForEngine,
       cart: normalizedCart,
       fulfillmentType,
       deliveryFee: fulfillmentType === 'delivery' ? effectiveDeliveryFee : 0,
@@ -3809,9 +3821,9 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       deliveryFee:
         fulfillmentType === 'delivery' ? Number(effectiveDeliveryFee || 0) : 0,
       voucherClaimIds: eligible,
-      // if promos disabled, ignore selectedPromoId and autoApply
-      selectedPromoId: applyPromos ? selectedPromoId || null : null,
-      autoApplyPromo: applyPromos ? (selectedPromoId ? false : true) : false,
+      // gunakan selectedForEngine dan autoApplyForEngine (sinkron dengan preview)
+      selectedPromoId: selectedForEngine,
+      autoApplyPromo: autoApplyForEngine,
       promoUsageFetchers
     });
   } catch (err) {
