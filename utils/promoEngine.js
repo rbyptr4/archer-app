@@ -182,8 +182,6 @@ async function findApplicablePromos(
   return eligible;
 }
 
-// Ganti seluruh fungsi applyPromo(...) yang ada dengan versi ini:
-
 async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
   if (!promo) throw new Error('promo required');
   const impact = {
@@ -194,218 +192,201 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
   };
   const actions = [];
 
-  const { items_subtotal, items } = snapshotTotals(cartSnapshot);
-  const sub = Number(items_subtotal || 0);
+  // ambil snapshot totals
+  const { items_subtotal: sub, items } = snapshotTotals(cartSnapshot);
+  const subtotal = Number(sub || 0);
 
-  // ==== ambil definisi rewards dari beberapa kemungkinan field ====
-  const rewardsRaw =
+  // === Ambil rewards array ===
+  const rewards =
     promo && typeof promo.reward === 'object' && promo.reward
       ? [promo.reward]
-      : Array.isArray(promo.rewards) && promo.rewards.length
+      : Array.isArray(promo.rewards)
       ? promo.rewards
-      : Array.isArray(promo.rewardSummary) && promo.rewardSummary.length
+      : Array.isArray(promo.rewardSummary)
       ? promo.rewardSummary
-      : Array.isArray(promo.reward_summary) && promo.reward_summary.length
+      : Array.isArray(promo.reward_summary)
       ? promo.reward_summary
       : [];
 
-  // normalize rewards to consistent objects
-  const rewards = (rewardsRaw || []).map((r) => {
-    if (!r || typeof r !== 'object') return {};
-    // create normalized copy with common keys
-    return {
-      ...r,
-      // common aliases
-      percent:
-        r.percent ??
-        r.percentAmount ??
-        r.pointsPercent ??
-        r.points_percent ??
-        null,
-      amount:
-        r.amount ??
-        r.cartAmount ??
-        r.pointsFixed ??
-        r.points_fixed ??
-        r.value ??
-        null,
-      pointsFixed:
-        r.pointsFixed ?? r.points_fixed ?? r.amount ?? r.points ?? null,
-      pointsPercent: r.pointsPercent ?? r.points_percent ?? r.percent ?? null,
-      freeMenuId: r.freeMenuId ?? r.free_menu_id ?? r.free_menu ?? null,
-      appliesTo: r.appliesTo ?? r.scope ?? null,
-      appliesToMenuId:
-        r.appliesToMenuId ?? r.menuId ?? r.applies_to_menu_id ?? null,
-      appliesToCategory:
-        r.appliesToCategory ?? r.category ?? r.applies_to_category ?? null,
-      grantMembership: r.grantMembership ?? r.grant_membership ?? false
-    };
-  });
-
-  // helper: parse angka yang mungkin mengandung simbol
+  // helper parse angka
   const parseNumber = (v) => {
     if (v == null) return NaN;
-    // accept numbers or strings like "10", "10%", "Rp 10.000", "1,000"
     const cleaned = String(v).replace(/[^0-9.\-]+/g, '');
     return cleaned === '' ? NaN : Number(cleaned);
   };
 
-  for (const r of rewards) {
-    if (!r) continue;
+  // ----------------------------------------
+  // LOOP REWARD
+  // ----------------------------------------
+  for (const raw of rewards) {
+    if (!raw || typeof raw !== 'object') continue;
 
-    // FREE ITEM (sama seperti sebelumnya)
-    if (r.freeMenuId) {
-      const qty = Math.max(0, Number(r.freeQty || r.qty || 1));
+    const r = { ...raw };
+
+    // ======================================
+    // 1) FREE ITEM
+    // ======================================
+    const freeMenuId =
+      r.freeMenuId ||
+      r.free_menu_id ||
+      r.menuId ||
+      r.menu_id ||
+      r.free_menu ||
+      null;
+    const freeQty = Number(
+      r.freeQty || r.qty || r.quantity || r.free_qty || r.free_quantity || 0
+    );
+
+    if (freeMenuId && freeQty > 0) {
       impact.addedFreeItems.push({
-        menuId: r.freeMenuId,
-        qty,
-        category: r.appliesToCategory || null
+        menuId: String(freeMenuId),
+        qty: freeQty,
+        category: r.appliesToCategory || r.applies_to_category || null,
+        name: r.name || null,
+        imageUrl: r.imageUrl || null
       });
-      impact.note += (impact.note ? '; ' : '') + `Gratis item x${qty}`;
+
+      impact.note += (impact.note ? '; ' : '') + `Gratis ${freeQty} item`;
     }
 
-    // DISCOUNT (percent atau amount) — tidak berubah
-    if (Number.isFinite(Number(parseNumber(r.percent)))) {
-      const pct = Math.max(0, Math.min(100, Number(parseNumber(r.percent))));
-      let scopeSub = sub;
-      if (r.appliesTo === 'menu' && r.appliesToMenuId) {
+    // ======================================
+    // 2) DISCOUNT (percent / flat)
+    // ======================================
+    // PENTING: percent & amount = DISKON, bukan poin
+    const percentVal = parseNumber(
+      r.percent || r.discountPercent || r.percent_val
+    );
+
+    if (Number.isFinite(percentVal) && percentVal > 0) {
+      let scopeSub = subtotal;
+
+      // scope to menu
+      const menuTarget = r.appliesToMenuId || r.applies_to_menu_id;
+      if (menuTarget) {
         scopeSub = (items || []).reduce(
           (s, it) =>
             s +
-            (String(it.menu || it.menuId) === String(r.appliesToMenuId)
-              ? Number(it.price || it.unit_price || it.base_price || 0) *
-                Number(it.qty || it.quantity || 0)
-              : 0),
-          0
-        );
-      } else if (r.appliesTo === 'category' && r.appliesToCategory) {
-        scopeSub = (items || []).reduce(
-          (s, it) =>
-            s +
-            (String(it.category) === String(r.appliesToCategory)
-              ? Number(it.price || it.unit_price || it.base_price || 0) *
-                Number(it.qty || it.quantity || 0)
+            (String(it.menu || it.menuId) === String(menuTarget)
+              ? Number(it.base_price || it.unit_price || it.price || 0) *
+                Number(it.quantity || it.qty || 0)
               : 0),
           0
         );
       }
-      let amt = Math.floor((scopeSub * pct) / 100);
-      const maxDisc = Number(r.maxDiscountAmount ?? NaN);
-      if (Number.isFinite(maxDisc) && maxDisc > 0) {
-        amt = Math.min(amt, maxDisc);
+
+      // scope to category
+      const catTarget = r.appliesToCategory || r.applies_to_category;
+      if (catTarget) {
+        scopeSub = (items || []).reduce(
+          (s, it) =>
+            s +
+            (String(it.category) === String(catTarget)
+              ? Number(it.base_price || it.unit_price || it.price || 0) *
+                Number(it.quantity || it.qty || 0)
+              : 0),
+          0
+        );
       }
-      impact.cartDiscount += amt;
+
+      let amt = Math.floor((scopeSub * percentVal) / 100);
+
+      // limit maksimum diskon
+      const maxDisc = parseNumber(r.maxDiscountAmount || r.max_discount_amount);
+      if (Number.isFinite(maxDisc) && maxDisc > 0) amt = Math.min(amt, maxDisc);
+
       impact.itemsDiscount += amt;
-      impact.note += (impact.note ? '; ' : '') + `Diskon ${pct}% (${amt})`;
+      impact.cartDiscount += amt;
+
+      impact.note +=
+        (impact.note ? '; ' : '') + `Diskon ${percentVal}% (${amt})`;
     }
 
-    if (Number.isFinite(Number(parseNumber(r.amount)))) {
-      let amt = Math.max(0, Number(parseNumber(r.amount)));
-      if (r.appliesTo === 'menu' && r.appliesToMenuId) {
+    // flat amount
+    const flat = parseNumber(
+      r.amount || r.flat || r.flatAmount || r.discountAmount
+    );
+    if (Number.isFinite(flat) && flat > 0) {
+      let amt = flat;
+
+      // scope menu
+      const menuTarget = r.appliesToMenuId || r.applies_to_menu_id;
+      if (menuTarget) {
         const scopeSub = (items || []).reduce(
           (s, it) =>
             s +
-            (String(it.menu || it.menuId) === String(r.appliesToMenuId)
-              ? Number(it.price || it.unit_price || it.base_price || 0) *
-                Number(it.qty || it.quantity || 0)
+            (String(it.menu || it.menuId) === String(menuTarget)
+              ? Number(it.base_price || it.unit_price || it.price || 0) *
+                Number(it.quantity || it.qty || 0)
               : 0),
           0
         );
         amt = Math.min(amt, scopeSub);
-      } else if (r.appliesTo === 'category' && r.appliesToCategory) {
+      }
+
+      // scope category
+      const catTarget = r.appliesToCategory || r.applies_to_category;
+      if (catTarget) {
         const scopeSub = (items || []).reduce(
           (s, it) =>
             s +
-            (String(it.category) === String(r.appliesToCategory)
-              ? Number(it.price || it.unit_price || it.base_price || 0) *
-                Number(it.qty || it.quantity || 0)
+            (String(it.category) === String(catTarget)
+              ? Number(it.base_price || it.unit_price || it.price || 0) *
+                Number(it.quantity || it.qty || 0)
               : 0),
           0
         );
         amt = Math.min(amt, scopeSub);
-      } else {
-        amt = Math.min(amt, sub);
       }
-      impact.cartDiscount += amt;
+
+      amt = Math.min(amt, subtotal);
       impact.itemsDiscount += amt;
+      impact.cartDiscount += amt;
+
       impact.note += (impact.note ? '; ' : '') + `Potongan Rp ${amt}`;
     }
 
-    // === POINTS handling (NORMALIZED) ===
-    // try multiple aliases: pointsFixed, pointsFixed via amount, explicit points, pointsPercent, percent (as fallback)
-    const parsedPointsFixed = parseNumber(
-      r.pointsFixed ?? r.pointsFixed ?? r.pointsFixed
-    );
-    const parsedPointsFixedAlt = parseNumber(
-      r.pointsFixed || r.pointsFixed || r.amount || r.points || null
-    );
-    const parsedPointsPercent =
-      parseNumber(
-        r.pointsPercent ??
-          r.points_percent ??
-          r.pointsPercent ??
-          r.pointsPercent
-      ) ||
-      parseNumber(r.pointsPercent ?? r.percent ?? null) ||
-      parseNumber(r.pointsPercent ?? r.percent ?? r.pointsPercent ?? null);
-    // better unified attempts:
-    const ptsFixed =
-      Number.isFinite(parsedPointsFixed) && parsedPointsFixed > 0
-        ? parsedPointsFixed
-        : Number.isFinite(parsedPointsFixedAlt) && parsedPointsFixedAlt > 0
-        ? parsedPointsFixedAlt
-        : NaN;
-
-    let ptsFromPercent = NaN;
-    // first try explicit pointsPercent keys
-    const candidatePercentKeys = [
-      r.pointsPercent,
-      r.points_percent,
-      r.pointspercent,
-      r.pointsPercentAlt,
-      r.percent // fallback
-    ];
-    for (const c of candidatePercentKeys) {
-      const p = parseNumber(c);
-      if (Number.isFinite(p) && p > 0) {
-        ptsFromPercent = Math.trunc((sub * p) / 100);
-        break;
-      }
-    }
-
-    // decide which to apply
-    if (Number.isFinite(ptsFixed) && ptsFixed > 0) {
-      const pts = Math.trunc(ptsFixed);
+    // ======================================
+    // 3) POINTS (HANYA jika fields-nya ada)
+    // ======================================
+    const ptsFix = parseNumber(r.pointsFixed || r.points_fixed);
+    if (Number.isFinite(ptsFix) && ptsFix > 0) {
+      const pts = Math.round(ptsFix);
       actions.push({
         type: 'award_points',
         points: pts,
         meta: { promoId: promo._id }
       });
-      impact.note += (impact.note ? '; ' : '') + `Poin ${pts} (fixed)`;
-    } else if (Number.isFinite(ptsFromPercent) && ptsFromPercent > 0) {
-      const pts = Math.trunc(ptsFromPercent);
-      actions.push({
-        type: 'award_points',
-        points: pts,
-        meta: { promoId: promo._id, percent: true }
-      });
-      const pctLabel = r.pointsPercent ?? r.percent ?? 'pct';
-      impact.note += (impact.note ? '; ' : '') + `Poin ${pctLabel}% (~${pts})`;
-    } else {
+      impact.note += (impact.note ? '; ' : '') + `Poin +${pts}`;
     }
 
-    // grant membership
-    if (r.grantMembership) {
-      actions.push({ type: 'grant_membership', meta: { promoId: promo._id } });
+    const ptsPercent = parseNumber(r.pointsPercent || r.points_percent);
+    if (Number.isFinite(ptsPercent) && ptsPercent > 0) {
+      const pts = Math.floor((subtotal * ptsPercent) / 100);
+      if (pts > 0) {
+        actions.push({
+          type: 'award_points',
+          points: pts,
+          meta: { promoId: promo._id, percent: ptsPercent }
+        });
+        impact.note +=
+          (impact.note ? '; ' : '') + `Poin ${ptsPercent}% (~${pts})`;
+      }
+    }
+
+    // ======================================
+    // 4) GRANT MEMBERSHIP
+    // ======================================
+    if (r.grantMembership || r.grant_membership) {
+      actions.push({
+        type: 'grant_membership',
+        meta: { promoId: promo._id }
+      });
       impact.note += (impact.note ? '; ' : '') + `Grant membership`;
     }
   }
 
-  // safety: cap itemsDiscount to subtotal
-  impact.itemsDiscount = Math.max(
-    0,
-    Math.min(Number(impact.itemsDiscount || 0), sub)
-  );
+  // safety: cap diskon max subtotal
+  impact.itemsDiscount = Math.max(0, Math.min(impact.itemsDiscount, subtotal));
 
   return { impact, actions };
 }
