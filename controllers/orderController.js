@@ -1479,7 +1479,7 @@ exports.checkout = asyncHandler(async (req, res) => {
 
   if (method === 'points') {
     if (!MemberDoc) {
-      console.error('[checkout] guest attempted to pay with points');
+      console.error('[checkout] payment_method=points attempted by guest');
       throwError('Pembayaran dengan poin hanya untuk member terdaftar', 400);
     }
   } else {
@@ -2185,7 +2185,23 @@ exports.checkout = asyncHandler(async (req, res) => {
     discounts // langsung dari engine (normalisasi)
   };
 
-  const memberPointsBalance = Math.floor(Number(MemberDoc?.points || 0)); // pakai integer (floor)
+  // safe read points dari MemberDoc
+  let memberPointsBalance = 0;
+  try {
+    if (MemberDoc) {
+      // pastikan MemberDoc bukan null dan memiliki field points
+      memberPointsBalance = Math.floor(Number(MemberDoc.points ?? 0));
+    } else {
+      memberPointsBalance = 0;
+    }
+  } catch (e) {
+    console.warn(
+      '[checkout] failed read MemberDoc.points, default to 0',
+      e?.message || e
+    );
+    memberPointsBalance = 0;
+  }
+
   const grandBeforePoints = Number(uiTotals.grand_total || 0); // engine rounded total
 
   const points_candidate_use = usePoints
@@ -2419,19 +2435,18 @@ exports.checkout = asyncHandler(async (req, res) => {
         ? Number(MemberDoc.total_spend || 0)
         : 0;
 
-      // ---------------------------
-      // Compute pointsUsedReq (safe inside txn) + rounding AFTER deduction
-      // ---------------------------
-      // Re-fetch member inside transaction to avoid race condition
-      // Re-fetch member inside transaction to avoid race condition (only if MemberDoc exists)
       let freshMember = null;
       if (MemberDoc) {
         freshMember = await Member.findById(MemberDoc._id).session(session);
-        if (!freshMember) throwError('Member tidak ditemukan', 404);
+        if (!freshMember) throwError('Member tidak ditemukan saat commit', 404);
+      } else {
+        freshMember = null;
       }
 
       // pastikan integer points (floor)
-      const memberPointsInt = Math.floor(Number(freshMember.points || 0));
+      const memberPointsInt = freshMember
+        ? Math.floor(Number(freshMember.points || 0))
+        : 0;
 
       // engine grand BEFORE points (sudah rounded by engine earlier)
       const engineGrandBefore = Number(uiTotals.grand_total || 0);
@@ -2439,8 +2454,16 @@ exports.checkout = asyncHandler(async (req, res) => {
       // compute candidate points to use
       let pointsUsedReq = 0;
       if (usePoints) {
+        if (!freshMember && !MemberDoc) {
+          throwError('Poin hanya dapat digunakan oleh member terdaftar', 400);
+        }
+        const memberForPoints = freshMember || MemberDoc;
+        const memberBalance = Math.max(
+          0,
+          Math.floor(Number(memberForPoints?.points || 0))
+        );
         pointsUsedReq = Math.min(
-          memberPointsInt,
+          memberBalance,
           Math.max(0, Math.round(engineGrandBefore))
         );
       } else {
