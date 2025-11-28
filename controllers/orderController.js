@@ -1960,6 +1960,31 @@ exports.checkout = asyncHandler(async (req, res) => {
       promoApplied: priced.promoApplied ? priced.promoApplied.promoId : null
     });
 
+    try {
+      if (
+        !MemberDoc && // user bukan member
+        priced &&
+        priced.promoApplied &&
+        Array.isArray(priced.promoApplied.actions)
+      ) {
+        const hasGrantMembership = priced.promoApplied.actions.some(
+          (a) => String(a.type || '').toLowerCase() === 'grant_membership'
+        );
+        if (hasGrantMembership) {
+          console.error(
+            '[checkout] promo grants membership but user is guest - require login/register',
+            { promoId: priced.promoApplied.promoId }
+          );
+          throwError(
+            'Promo ini memberikan membership. Silakan login atau pilih opsi "Daftar" untuk menerima membership saat checkout.',
+            400
+          );
+        }
+      }
+    } catch (err) {
+      throw err; // biarkan error bubble ke handler utama
+    }
+
     // log promo impact explicitly
     console.log(
       '[checkout][engine] promoApplied impact:',
@@ -2398,8 +2423,12 @@ exports.checkout = asyncHandler(async (req, res) => {
       // Compute pointsUsedReq (safe inside txn) + rounding AFTER deduction
       // ---------------------------
       // Re-fetch member inside transaction to avoid race condition
-      const freshMember = await Member.findById(MemberDoc._id).session(session);
-      if (!freshMember) throwError('Member tidak ditemukan', 404);
+      // Re-fetch member inside transaction to avoid race condition (only if MemberDoc exists)
+      let freshMember = null;
+      if (MemberDoc) {
+        freshMember = await Member.findById(MemberDoc._id).session(session);
+        if (!freshMember) throwError('Member tidak ditemukan', 404);
+      }
 
       // pastikan integer points (floor)
       const memberPointsInt = Math.floor(Number(freshMember.points || 0));
