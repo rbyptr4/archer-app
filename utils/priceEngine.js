@@ -1,20 +1,13 @@
+// utils/priceEngine.js
 const {
   applyPromo: applyPromoRaw,
-  findApplicablePromos,
-  executePromoActions: _noop
-} = require('./promoEngine');
+  findApplicablePromos
+} = require('./promoEngine'); // applyPromoRaw berasal dari promoEngine.applyPromo
 const { validateAndPrice } = require('./voucherEngine');
-const Menu = require('../models/menuModel');
-
 const throwError = require('./throwError');
 
 const int = (v) => Math.round(Number(v || 0));
 
-/** distributeDiscountToItems: proporsional distribusi potongan ke tiap line
- * items: [{ menuId, qty, price }]
- * discount: number (total amount to distribute)
- * returns: [{ menuId, qty, amount }]
- */
 function distributeDiscountToItems(items, discount) {
   if (!Array.isArray(items) || items.length === 0 || !discount) return [];
   const totals = items.map((it) => ({
@@ -48,20 +41,17 @@ function distributeDiscountToItems(items, discount) {
   return out;
 }
 
-/** helper: create a safe cart snapshot shape that promoEngine expects */
 function makeSafeCartForPromo(items = []) {
   return {
     items: (Array.isArray(items) ? items : []).map((it) => {
       const price = Number(it.price ?? it.unit_price ?? it.base_price ?? 0);
       const qty = Number(it.qty ?? it.quantity ?? 0);
       return {
-        // fields promoEngine.snapshotTotals reads:
         base_price: price,
         unit_price: price,
         price: price,
         quantity: qty,
         qty: qty,
-        // keep metadata to help promo logic
         menuId: it.menuId ?? it.menu ?? null,
         name: it.name ?? null,
         category: it.category ?? null,
@@ -72,9 +62,6 @@ function makeSafeCartForPromo(items = []) {
   };
 }
 
-/**
- * applyPromoThenVoucher
- */
 async function applyPromoThenVoucher({
   memberId = null,
   memberDoc = null,
@@ -89,7 +76,6 @@ async function applyPromoThenVoucher({
 } = {}) {
   const effectiveMember = memberDoc || (memberId ? { _id: memberId } : null);
 
-  // ensure cart.items is array with normalized shapes (menuId, qty, price, category, name?)
   const originalCart = {
     items: (Array.isArray(cart.items) ? cart.items : []).map((it) => ({
       menuId: it.menuId ?? it.menu ?? it.id ?? null,
@@ -98,11 +84,11 @@ async function applyPromoThenVoucher({
       category: it.category ?? null,
       name: it.name ?? null,
       imageUrl: it.imageUrl ?? null,
-      menu_code: it.menu_code ?? it.menuCode ?? null
+      menu_code: it.menu_code ?? it.menuCode ?? null,
+      raw: it.rawItem ?? null
     }))
   };
 
-  // prebuild originalForDist (basis distribusi diskon selalu pre-promo)
   const originalForDist = originalCart.items.map((it) => ({
     menuId: it.menuId,
     qty: Number(it.qty || 0),
@@ -116,46 +102,136 @@ async function applyPromoThenVoucher({
       originalForDist,
       effectiveMember,
       now,
-      {
-        fetchers: promoUsageFetchers
-      }
+      { fetchers: promoUsageFetchers }
     );
   } catch (e) {
     console.warn('[priceEngine] findApplicablePromos failed', e?.message || e);
     applicable = [];
   }
 
+  // === LOG START ===
+  console.log('=== [PE] START ===');
+  console.log('[PE] selectedPromoId:', String(selectedPromoId || 'null'));
   console.log(
-    '[priceEngine.debug] selectedPromoId:',
-    String(selectedPromoId || 'null')
+    '[PE] effectiveMember snapshot:',
+    JSON.stringify(effectiveMember || null)
   );
   console.log(
-    '[priceEngine.debug] effectiveMember:',
-    JSON.stringify(effectiveMember)
+    '[PE] cart originalForDist:',
+    JSON.stringify(originalForDist, null, 2)
   );
   console.log(
-    '[priceEngine.debug] cart.items:',
-    JSON.stringify(originalForDist)
+    '[PE] applicable promos ids:',
+    (applicable || []).map((p) => ({
+      id: String(p._id),
+      name: p.name,
+      type: p.type,
+      autoApply: p.autoApply,
+      priority: p.priority
+    }))
   );
-  console.log(
-    '[priceEngine.debug] applicableIds:',
-    (applicable || []).map((p) => String(p._id))
-  );
+  // === LOG END ===
 
-  // 2) choose promo: selected or best auto
+  // choose promo
   let promoApplied = null;
   let promoImpact = null;
   let promoActions = [];
   let selectedPromoRejected = false;
   let selectedPromoReplacedBy = null;
 
+  // helper to evaluate promo and compute value score including free items value
+  async function evaluatePromoValue(promoCandidate) {
+    try {
+      const safeCart = makeSafeCartForPromo(originalForDist);
+      const res = await applyPromoRaw(promoCandidate, safeCart);
+      const impact = res.impact || {};
+      const actions = Array.isArray(res.actions) ? res.actions.slice() : [];
+
+      // estimate free items value
+      let freeValue = 0;
+      if (
+        impact &&
+        Array.isArray(impact.addedFreeItems) &&
+        impact.addedFreeItems.length
+      ) {
+        for (const fi of impact.addedFreeItems) {
+          const menuId = String(fi.menuId || '');
+          const qty = Number(fi.qty || 1);
+          const found = originalForDist.find(
+            (x) => String(x.menuId) === menuId
+          );
+          if (found && Number(found.price || 0) > 0) {
+            freeValue += Number(found.price || 0) * qty;
+          } else {
+            // try db fallback (best-effort)
+            try {
+              const Menu = require('../models/menuModel');
+              const mdoc = await Menu.findById(menuId)
+                .lean()
+                .catch(() => null);
+              if (mdoc) {
+                freeValue += Number(mdoc.base_price || mdoc.price || 0) * qty;
+              } else {
+                freeValue += 0;
+              }
+            } catch (e) {
+              freeValue += 0;
+            }
+          }
+        }
+      }
+
+      const discountValue = Number(
+        impact.itemsDiscount || impact.cartDiscount || 0
+      );
+      const score =
+        Number(Math.round(discountValue || 0)) +
+        Number(Math.round(freeValue || 0));
+
+      // === LOG evaluate result ===
+      console.log(
+        '[PE][evaluatePromoValue] promoId:',
+        String(promoCandidate._id),
+        'name:',
+        promoCandidate.name,
+        'discountValue:',
+        discountValue,
+        'freeValue:',
+        freeValue,
+        'score:',
+        score,
+        'impactKeys:',
+        Object.keys(impact || {}),
+        'actionsLen:',
+        actions.length
+      );
+      // === END LOG ===
+
+      return { impact, actions, discountValue, freeValue, score };
+    } catch (e) {
+      console.warn(
+        '[PE] evaluatePromoValue failed for promo',
+        String(promoCandidate._id),
+        e?.message || e
+      );
+      return {
+        impact: null,
+        actions: [],
+        discountValue: 0,
+        freeValue: 0,
+        score: -1
+      };
+    }
+  }
+
+  // selection logic when selectedPromoId given
   if (selectedPromoId) {
     promoApplied =
       (applicable || []).find(
         (p) => String(p._id) === String(selectedPromoId)
       ) || null;
     if (!promoApplied) {
-      // try fetch promo directly and try apply (use safe cart)
+      // try fetch directly from DB and apply as fallback
       try {
         const PromoModel = require('../models/promoModel');
         const promoFromDb = await PromoModel.findById(selectedPromoId).lean();
@@ -171,18 +247,16 @@ async function applyPromoThenVoucher({
             promoActions = Array.isArray(actions) ? actions.slice() : [];
             selectedPromoReplacedBy = String(promoFromDb._id);
             console.log(
-              '[priceEngine.info] selectedPromo applied directly from DB:',
-              selectedPromoReplacedBy
-            );
-            console.log(
-              '[priceEngine.debug] direct-apply result impact:',
-              JSON.stringify(promoImpact),
-              'actions:',
-              JSON.stringify(promoActions)
+              '[PE] selectedPromo applied directly from DB:',
+              selectedPromoReplacedBy,
+              'impactKeys:',
+              Object.keys(promoImpact || {}),
+              'actionsLen:',
+              promoActions.length
             );
           } catch (e) {
             console.warn(
-              '[priceEngine.warn] direct applyPromoRaw failed for selected promo',
+              '[PE] direct applyPromoRaw failed for selected promo',
               e?.message || e
             );
             selectedPromoRejected = true;
@@ -191,82 +265,36 @@ async function applyPromoThenVoucher({
           selectedPromoRejected = true;
         }
       } catch (e) {
-        console.warn(
-          '[priceEngine.warn] fetch promoFromDb failed',
-          e?.message || e
-        );
+        console.warn('[PE] fetch promoFromDb failed', e?.message || e);
         selectedPromoRejected = true;
       }
 
-      // fallback auto-best if rejected
       if (selectedPromoRejected) {
         if (Array.isArray(applicable) && applicable.length) {
           let best = null;
           let bestValue = -1;
           for (const p of applicable) {
-            try {
-              const safeCartEval = makeSafeCartForPromo(originalForDist);
-              const { impact } = await applyPromoRaw(p, safeCartEval);
-
-              // estimate free items value (try fetch menu prices from menuMap or fallback to original cart price)
-              let freeValue = 0;
-              if (
-                impact &&
-                Array.isArray(impact.addedFreeItems) &&
-                impact.addedFreeItems.length
-              ) {
-                for (const fi of impact.addedFreeItems) {
-                  const menuId = String(fi.menuId || '');
-                  const qty = Number(fi.qty || 1);
-                  // attempt to find price from originalForDist (same menu in cart)
-                  const found = originalForDist.find(
-                    (x) => String(x.menuId) === menuId
-                  );
-                  if (found && Number(found.price || 0) > 0) {
-                    freeValue += Number(found.price || 0) * qty;
-                  } else {
-                    // fallback: try menuModel lookup (sync await)
-                    try {
-                      const mdoc = await Menu.findById(menuId)
-                        .lean()
-                        .catch(() => null);
-                      if (
-                        mdoc &&
-                        Number(mdoc.price || mdoc.base_price || 0) > 0
-                      ) {
-                        freeValue +=
-                          Number(mdoc.price || mdoc.base_price || 0) * qty;
-                      } else {
-                        // fallback conservative estimate (e.g. 0)
-                        freeValue += 0;
-                      }
-                    } catch (e) {
-                      freeValue += 0;
-                    }
-                  }
-                }
-              }
-
-              const v =
-                Number(impact.itemsDiscount || 0) +
-                Number(impact.cartDiscount || 0) +
-                Number(Math.round(freeValue || 0));
-
-              if (v > bestValue) {
-                bestValue = v;
-                best = { promo: p, impact };
-              }
-            } catch (e) {
-              /* ignore */
+            const ev = await evaluatePromoValue(p);
+            console.log('[PE] eval candidate:', {
+              id: p._id,
+              name: p.name,
+              discountValue: ev.discountValue,
+              freeValue: ev.freeValue,
+              score: ev.score
+            });
+            if (ev.score > bestValue) {
+              bestValue = ev.score;
+              best = { promo: p, impact: ev.impact, actions: ev.actions };
             }
           }
-
           if (best) {
             promoApplied = best.promo;
             selectedPromoReplacedBy = String(best.promo._id);
             console.log(
-              '[priceEngine.info] selectedPromo replaced by auto-best',
-              selectedPromoReplacedBy
+              '[PE] selectedPromo replaced by auto-best',
+              selectedPromoReplacedBy,
+              'score:',
+              bestValue
             );
           } else {
             promoApplied = null;
@@ -275,67 +303,35 @@ async function applyPromoThenVoucher({
       }
     }
   } else if (autoApplyPromo && Array.isArray(applicable) && applicable.length) {
+    // choose best by discount + freeValue
     let best = null;
     let bestValue = -1;
     for (const p of applicable) {
-      try {
-        const safeCartEval = makeSafeCartForPromo(originalForDist);
-        const { impact } = await applyPromoRaw(p, safeCartEval);
-
-        // estimate free items value (try fetch menu prices from menuMap or fallback to original cart price)
-        let freeValue = 0;
-        if (
-          impact &&
-          Array.isArray(impact.addedFreeItems) &&
-          impact.addedFreeItems.length
-        ) {
-          for (const fi of impact.addedFreeItems) {
-            const menuId = String(fi.menuId || '');
-            const qty = Number(fi.qty || 1);
-            // attempt to find price from originalForDist (same menu in cart)
-            const found = originalForDist.find(
-              (x) => String(x.menuId) === menuId
-            );
-            if (found && Number(found.price || 0) > 0) {
-              freeValue += Number(found.price || 0) * qty;
-            } else {
-              // fallback: try menuModel lookup (sync await)
-              try {
-                const mdoc = await Menu.findById(menuId)
-                  .lean()
-                  .catch(() => null);
-                if (mdoc && Number(mdoc.price || mdoc.base_price || 0) > 0) {
-                  freeValue += Number(mdoc.price || mdoc.base_price || 0) * qty;
-                } else {
-                  // fallback conservative estimate (e.g. 0)
-                  freeValue += 0;
-                }
-              } catch (e) {
-                freeValue += 0;
-              }
-            }
-          }
-        }
-
-        const v =
-          Number(impact.itemsDiscount || 0) +
-          Number(impact.cartDiscount || 0) +
-          Number(Math.round(freeValue || 0));
-
-        if (v > bestValue) {
-          bestValue = v;
-          best = { promo: p, impact };
-        }
-      } catch (e) {
-        /* ignore */
+      const ev = await evaluatePromoValue(p);
+      console.log('[PE] eval candidate:', {
+        id: p._id,
+        name: p.name,
+        discountValue: ev.discountValue,
+        freeValue: ev.freeValue,
+        score: ev.score
+      });
+      if (ev.score > bestValue) {
+        bestValue = ev.score;
+        best = { promo: p, impact: ev.impact, actions: ev.actions };
       }
     }
-
-    if (best) promoApplied = best.promo;
+    if (best) {
+      promoApplied = best.promo;
+      console.log('[PE] auto-best selected promo:', {
+        id: promoApplied._id,
+        name: promoApplied.name,
+        score: bestValue
+      });
+    }
   }
 
-  // 3) apply promo if not yet applied
-  let cartAfterPromo = JSON.parse(JSON.stringify(originalCart)); // clone so originalForDist still intact
+  // apply promo finally (if not already have impact/actions)
+  let cartAfterPromo = JSON.parse(JSON.stringify(originalCart));
   try {
     if (promoApplied && (!promoImpact || !promoActions.length)) {
       const safeCart = makeSafeCartForPromo(originalForDist);
@@ -353,13 +349,12 @@ async function applyPromoThenVoucher({
       '[priceEngine.warn] applyPromoRaw failed when applying promo',
       e?.message || e
     );
-    // treat as no-promo
     promoApplied = null;
     promoImpact = null;
     promoActions = [];
   }
 
-  // Prefetch Menu docs for any free items (so we can show names instead of ids)
+  // prefetch menuMap for free items
   let menuMap = {};
   try {
     if (
@@ -372,6 +367,7 @@ async function applyPromoThenVoucher({
       );
       if (freeIds.length) {
         try {
+          const Menu = require('../models/menuModel');
           const menus = await Menu.find({ _id: { $in: freeIds } })
             .lean()
             .catch(() => []);
@@ -380,7 +376,6 @@ async function applyPromoThenVoucher({
             return acc;
           }, {});
         } catch (e) {
-          // try alternative path if model filename differs
           try {
             const Menu = require('../models/Menu');
             const menus = await Menu.find({ _id: { $in: freeIds } })
@@ -392,7 +387,7 @@ async function applyPromoThenVoucher({
             }, {});
           } catch (ee) {
             console.warn(
-              '[priceEngine] prefetch Menu attempt failed',
+              '[PE] prefetch Menu attempt failed',
               ee?.message || ee
             );
             menuMap = {};
@@ -401,14 +396,11 @@ async function applyPromoThenVoucher({
       }
     }
   } catch (e) {
-    console.warn(
-      '[priceEngine] prefetch Menu for free items failed',
-      e?.message || e
-    );
+    console.warn('[PE] prefetch Menu for free items failed', e?.message || e);
     menuMap = {};
   }
 
-  // add free items (with metadata) and build cartAfterPromo pricing if promo applies
+  // build cartAfterPromo based on promoImpact (free items & discounts)
   if (promoApplied && promoImpact) {
     if (
       Array.isArray(promoImpact.addedFreeItems) &&
@@ -432,9 +424,7 @@ async function applyPromoThenVoucher({
       promoImpact.itemsDiscount || promoImpact.cartDiscount || 0
     );
     if (discount > 0) {
-      // distribute discount always based on originalForDist (pre-promo prices)
       const itemsDist = distributeDiscountToItems(originalForDist, discount);
-      // construct cartAfterPromo items as price-after-discount per unit (non-negative)
       cartAfterPromo.items = originalForDist.map((it) => {
         const dist = itemsDist.find(
           (d) => String(d.menuId) === String(it.menuId)
@@ -453,7 +443,6 @@ async function applyPromoThenVoucher({
         };
       });
 
-      // append free items (they were pushed above, ensure they remain)
       if (
         Array.isArray(promoImpact.addedFreeItems) &&
         promoImpact.addedFreeItems.length
@@ -474,7 +463,7 @@ async function applyPromoThenVoucher({
     }
   }
 
-  // 4) if promo blocks voucher -> compute totals and return early
+  // if promo blocks voucher -> return minimal snapshot
   if (promoApplied && promoApplied.blocksVoucher) {
     const baseSubtotal = originalForDist.reduce(
       (s, it) => s + Number(it.price || 0) * Number(it.qty || 0),
@@ -485,7 +474,6 @@ async function applyPromoThenVoucher({
       0,
       baseSubtotal - itemsDiscount
     );
-
     const deliveryAfter = Math.max(0, Number(deliveryFee || 0));
     const money = require('./money');
     const service_fee = Math.round(
@@ -500,7 +488,6 @@ async function applyPromoThenVoucher({
     const grand = money.roundRupiahCustom(beforeRound);
     const rounding_delta = grand - beforeRound;
 
-    // build minimal discounts/itemAdjustments/promoRewards
     const discounts = [];
     const itemAdjustmentsMap = {};
     const promoId = String(promoApplied._id);
@@ -509,7 +496,6 @@ async function applyPromoThenVoucher({
       promoImpact.cartDiscount || promoImpact.itemsDiscount || 0
     );
     if (totalPromoDiscount > 0) {
-      // distribute based on originalForDist
       const itemsDist = distributeDiscountToItems(
         originalForDist,
         totalPromoDiscount
@@ -535,7 +521,6 @@ async function applyPromoThenVoucher({
       }
     }
 
-    // also include free item discounts metadata using menuMap
     if (
       Array.isArray(promoImpact.addedFreeItems) &&
       promoImpact.addedFreeItems.length
@@ -650,7 +635,7 @@ async function applyPromoThenVoucher({
     };
   }
 
-  // 5) call voucher engine with cartAfterPromo (cartAfterPromo.items already has name/image for free items)
+  // 5) call voucher engine
   const voucherRes = await validateAndPrice({
     memberId,
     cart: {
@@ -667,11 +652,10 @@ async function applyPromoThenVoucher({
     voucherClaimIds
   });
 
-  // 6) combine promo + voucher results -> discounts, itemAdjustments, promoRewards
+  // combine promo + voucher results
   const discounts = [];
   const itemAdjustmentsMap = {};
 
-  // promo (orderIdx:1)
   if (promoApplied && promoImpact) {
     const promoId = String(promoApplied._id);
     const promoName = promoApplied.name || 'Promo';
@@ -679,7 +663,6 @@ async function applyPromoThenVoucher({
       promoImpact.cartDiscount || promoImpact.itemsDiscount || 0
     );
     if (totalPromoDiscount > 0) {
-      // distribute based on originalForDist to keep consistency
       const itemsDist = distributeDiscountToItems(
         originalForDist,
         totalPromoDiscount
@@ -705,7 +688,6 @@ async function applyPromoThenVoucher({
       }
     }
 
-    // free items (use menuMap for human label)
     if (
       Array.isArray(promoImpact.addedFreeItems) &&
       promoImpact.addedFreeItems.length
@@ -734,7 +716,6 @@ async function applyPromoThenVoucher({
     }
   }
 
-  // voucher (orderIdx:2)
   if (
     voucherRes &&
     Array.isArray(voucherRes.breakdown) &&
@@ -767,7 +748,6 @@ async function applyPromoThenVoucher({
     }
   }
 
-  // bonus: if promo blocks voucher but voucherRes returned entries, add note
   if (
     promoApplied &&
     promoApplied.blocksVoucher &&
@@ -787,7 +767,7 @@ async function applyPromoThenVoucher({
     });
   }
 
-  // promoRewards from promoActions
+  // build promoRewards
   const promoRewards = [];
   if (Array.isArray(promoActions) && promoActions.length) {
     for (const a of promoActions) {
@@ -807,28 +787,45 @@ async function applyPromoThenVoucher({
         });
       } else {
         promoRewards.push({
-          type: a.type || 'unknown',
+          type: a.type || 'action',
           amount: a.amount || null,
-          label: a.label || a.type || 'reward',
+          label: a.label || a.type || 'Reward',
           meta: a.meta || {}
         });
       }
     }
   }
 
-  const pointsTotal = promoRewards
-    .filter((r) => r.type === 'points')
-    .reduce((s, r) => s + Number(r.amount || 0), 0);
+  if (
+    promoImpact &&
+    Array.isArray(promoImpact.addedFreeItems) &&
+    promoImpact.addedFreeItems.length
+  ) {
+    for (const f of promoImpact.addedFreeItems) {
+      promoRewards.push({
+        type: 'free_item',
+        amount: 0,
+        label: f.name || `Gratis: ${String(f.menuId || '')}`,
+        meta: { menuId: f.menuId, qty: Number(f.qty || 1) }
+      });
+    }
+  }
 
-  // === Fallback: jika promoActions kosong tapi promoApplied.actions ada di object => gunakan itu
-  const effectivePromoActions =
-    Array.isArray(promoActions) && promoActions.length
-      ? promoActions
-      : promoApplied && Array.isArray(promoApplied.actions)
-      ? promoApplied.actions
-      : [];
+  const discountValue = Number(
+    promoImpact?.cartDiscount || promoImpact?.itemsDiscount || 0
+  );
+  if (discountValue && discountValue > 0) {
+    promoRewards.push({
+      type: 'discount',
+      amount: int(discountValue),
+      label: `Diskon promo`,
+      meta: { promoId: promoApplied ? String(promoApplied._id) : null }
+    });
+  }
 
-  const pointsTotalFromActions = effectivePromoActions
+  const pointsTotalFromActions = (
+    Array.isArray(promoActions) ? promoActions : []
+  )
     .filter((a) => String(a.type || '').toLowerCase() === 'award_points')
     .reduce((s, a) => s + Number(a.points ?? a.amount ?? 0), 0);
 
@@ -841,7 +838,7 @@ async function applyPromoThenVoucher({
           name: promoApplied.name || null,
           description: promoApplied.notes || promoApplied.description || null,
           impact: promoImpact,
-          actions: effectivePromoActions || [],
+          actions: promoActions || [],
           freeItemsSnapshot:
             Array.isArray(promoImpact?.addedFreeItems) &&
             promoImpact.addedFreeItems.length
@@ -862,9 +859,8 @@ async function applyPromoThenVoucher({
     itemAdjustments: itemAdjustmentsMap,
     promoRewards,
     points_awarded_details: {
-      // prefer explicit mapping from promoActions/promoRewards, fall back to computed pointsTotal
-      total: Math.max(0, Math.round(pointsTotalFromActions || pointsTotal)),
-      actions: effectivePromoActions || []
+      total: Math.max(0, Math.round(pointsTotalFromActions || 0)),
+      actions: promoActions || []
     },
     engineSnapshot: {
       applicableIds: (applicable || []).map((p) => String(p._id)),
@@ -874,12 +870,12 @@ async function applyPromoThenVoucher({
       cartBefore: originalForDist,
       cartAfterPromo,
       promoImpact,
-      promoActions: effectivePromoActions,
+      promoActions,
       voucherRes
     }
   };
 
-  // debug final promo-related pieces
+  // === LOG FINAL SNAPSHOT ===
   console.log('=== [PE] FINAL PROMO RESULT ===');
   console.log('appliedPromo:', final.promoApplied);
   console.log('promoRewards:', JSON.stringify(final.promoRewards, null, 2));
@@ -889,7 +885,9 @@ async function applyPromoThenVoucher({
   );
   console.log('chosenClaimIds:', final.chosenClaimIds);
   console.log('voucher breakdown:', JSON.stringify(final.breakdown, null, 2));
+  console.log('engineSnapshot:', JSON.stringify(final.engineSnapshot, null, 2));
   console.log('================================');
+  // === END LOG ===
 
   return final;
 }

@@ -3472,11 +3472,25 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     applyPromos = true
   } = req.body || {};
 
+  console.log(
+    '[previewPrice] START - body snapshot:',
+    JSON.stringify({
+      cartSummary: { items: (cart?.items || []).length },
+      fulfillmentType,
+      voucherClaimIds,
+      deliveryModeFromBody,
+      selectedPromoId,
+      usePoints,
+      applyPromos
+    })
+  );
+
   if (!cart?.items?.length) throwError('Cart kosong', 400);
 
   // resolve identity (support guest)
   const memberId = req.member?.id || null;
   const now = new Date();
+  console.log('[previewPrice] identity:', { memberId, now: now.toISOString() });
 
   // ===== filter vouchers (guest cannot use vouchers) =====
   let eligible = [];
@@ -3495,6 +3509,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         .map((c) => String(c._id));
     }
   }
+  console.log('[previewPrice] eligible voucher IDs after filter:', eligible);
 
   // ===== delivery mode & fee =====
   const deliveryMode =
@@ -3507,6 +3522,10 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     fulfillmentType === 'delivery' && deliveryMode === 'delivery'
       ? envDeliveryFee
       : 0;
+  console.log('[previewPrice] delivery:', {
+    deliveryMode,
+    effectiveDeliveryFee
+  });
 
   // ===== VALIDASI: voucher ongkir hanya untuk delivery =====
   if (Array.isArray(eligible) && eligible.length > 0) {
@@ -3545,6 +3564,9 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       const foundShipping = vcDocs.some(isShippingVoucherDoc);
 
       if (foundShipping && deliveryMode !== 'delivery') {
+        console.warn(
+          '[previewPrice] voucher shipping found but mode not delivery'
+        );
         throwError(
           'Voucher ongkir hanya dapat dipakai untuk mode pengantaran (delivery). Hapus voucher atau ubah mode pengantaran.',
           400
@@ -3580,6 +3602,10 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       };
     })
   };
+  console.log(
+    '[previewPrice] normalizedCart:',
+    JSON.stringify(normalizedCart, null, 2)
+  );
 
   // ===== optional MemberDoc for fetchers =====
   let MemberDoc = null;
@@ -3588,6 +3614,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       .lean()
       .catch(() => null);
   }
+  console.log('[previewPrice] MemberDoc present?:', !!MemberDoc);
 
   // ===== promo usage fetchers =====
   const promoUsageFetchers = {
@@ -3656,6 +3683,16 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   const eligiblePromosCount = Array.isArray(eligiblePromosList)
     ? eligiblePromosList.length
     : 0;
+  console.log('[previewPrice] eligiblePromosList count & ids:', {
+    count: eligiblePromosCount,
+    promos: (eligiblePromosList || []).map((p) => ({
+      id: String(p._id),
+      name: p.name,
+      type: p.type,
+      autoApply: p.autoApply,
+      priority: p.priority
+    }))
+  });
 
   // ===== autoApplied suggestion (pick highest priority autoApply) =====
   let autoAppliedPromo = null;
@@ -3682,6 +3719,17 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       autoAppliedPromo = null;
     }
   }
+  console.log(
+    '[previewPrice] autoAppliedPromo preview:',
+    autoAppliedPromo
+      ? {
+          promoId: autoAppliedPromo.promoId,
+          name: autoAppliedPromo.name,
+          impactKeys: Object.keys(autoAppliedPromo.impact || {}),
+          actionsLen: (autoAppliedPromo.actions || []).length
+        }
+      : null
+  );
 
   // ===== validasi: promo yang memblokir voucher jika user mengirim voucherClaimIds =====
   (function () {
@@ -3693,6 +3741,11 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       const sel = (eligiblePromosList || []).find(
         (p) => String(p._id) === String(selectedPromoId)
       );
+      console.log('[previewPrice] selectedPromoId check:', {
+        selectedPromoId,
+        selExists: !!sel,
+        selBlocksVoucher: sel?.blocksVoucher || false
+      });
       if (sel && sel.blocksVoucher && attemptedVoucherUse) {
         throwError(
           'Promo yang dipilih memblokir penggunaan voucher. Hapus voucher atau pilih promo lain.',
@@ -3703,6 +3756,16 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       const highestAuto = (eligiblePromosList || [])
         .filter((p) => !!p.autoApply)
         .sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0))[0];
+      console.log(
+        '[previewPrice] highestAuto (for voucher validation):',
+        highestAuto
+          ? {
+              id: String(highestAuto._id),
+              name: highestAuto.name,
+              blocksVoucher: highestAuto.blocksVoucher
+            }
+          : null
+      );
       if (highestAuto && highestAuto.blocksVoucher) {
         throwError(
           `Promo "${
@@ -3715,6 +3778,16 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   })();
 
   // ===== call engine =====
+  console.log('[previewPrice] calling price engine with params:', {
+    memberId,
+    selectedPromoId: applyPromos ? selectedPromoId || null : null,
+    autoApplyPromo: applyPromos ? (selectedPromoId ? false : true) : false,
+    fulfillmentType,
+    deliveryFee:
+      fulfillmentType === 'delivery' ? Number(effectiveDeliveryFee || 0) : 0,
+    voucherClaimIds: eligible
+  });
+
   let result;
   try {
     result = await applyPromoThenVoucher({
@@ -3739,6 +3812,25 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       err?.status || 500
     );
   }
+
+  console.log('[previewPrice] engine result snapshot:', {
+    ok: result?.ok,
+    reasonsLen: (result?.reasons || []).length,
+    promoApplied: result?.promoApplied
+      ? { promoId: result.promoApplied.promoId, name: result.promoApplied.name }
+      : null,
+    promoImpactKeys: result?.promoImpact
+      ? Object.keys(result.promoImpact || {})
+      : Object.keys(result?.promoApplied?.impact || {}),
+    promoActionsLen: (
+      result?.promoActions ||
+      result?.promoApplied?.actions ||
+      []
+    ).length,
+    voucherResKeys: result?.voucherRes
+      ? Object.keys(result.voucherRes || {})
+      : Object.keys(result?.voucherResult || {})
+  });
 
   if (!result || !result.ok) {
     console.error('[previewPrice] price engine returned failure', result);
@@ -3811,6 +3903,8 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     grand_total: int(grand_total),
     rounding_delta: int(rounding_delta)
   };
+
+  console.log('[previewPrice] computed ui_totals:', ui_totals);
 
   // ===== normalize voucher info =====
   const voucherInfo = (result.voucherResult && {
@@ -3897,6 +3991,25 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     points_total: Number(pointsTotalFromEngine || 0),
     chosenClaimIds: voucherInfo.chosenClaimIds || []
   };
+
+  // LOG final response payload (not too big)
+  try {
+    console.log('[previewPrice] FINAL RESPONSE PREPARED:', {
+      reasons: result.reasons || result.voucherResult?.reasons || [],
+      eligiblePromosCount,
+      eligiblePromos: eligiblePromosSummary,
+      promo: {
+        appliedPromoId: promoCompact.appliedPromoId,
+        appliedPromoName: promoCompact.appliedPromoName,
+        rewardsLen: promoCompact.rewards.length,
+        points_total: promoCompact.points_total
+      },
+      voucherChosen: promoCompact.chosenClaimIds,
+      ui_totals
+    });
+  } catch (e) {
+    /* ignore logging error */
+  }
 
   return res.status(200).json({
     ok: true,

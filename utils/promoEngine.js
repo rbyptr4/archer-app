@@ -179,6 +179,18 @@ async function findApplicablePromos(
     eligible.push(p);
   }
 
+  // LOG eligible promos
+  try {
+    console.log(
+      '[promoEngine] findApplicablePromos -> eligible count:',
+      eligible.length,
+      'ids:',
+      eligible.map((x) => String(x._id))
+    );
+  } catch (e) {
+    /* ignore logging error */
+  }
+
   return eligible;
 }
 
@@ -208,6 +220,24 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
       ? promo.reward_summary
       : [];
 
+  // LOG promo header
+  try {
+    console.log(
+      '[promoEngine.applyPromo] promoId:',
+      String(promo._id),
+      'name:',
+      promo.name,
+      'type:',
+      promo.type,
+      'subtotal:',
+      subtotal,
+      'rewardsLen:',
+      rewards.length
+    );
+  } catch (e) {
+    /* ignore */
+  }
+
   // helper parse angka
   const parseNumber = (v) => {
     if (v == null) return NaN;
@@ -222,6 +252,12 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
     if (!raw || typeof raw !== 'object') continue;
 
     const r = { ...raw };
+
+    // LOG raw reward
+    console.log(
+      '[promoEngine.applyPromo] processing reward:',
+      JSON.stringify(r)
+    );
 
     // ======================================
     // 1) FREE ITEM
@@ -247,6 +283,12 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
       });
 
       impact.note += (impact.note ? '; ' : '') + `Gratis ${freeQty} item`;
+      console.log(
+        '[promoEngine.applyPromo] addedFreeItem ->',
+        freeMenuId,
+        'qty',
+        freeQty
+      );
     }
 
     // ======================================
@@ -299,6 +341,12 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
 
       impact.note +=
         (impact.note ? '; ' : '') + `Diskon ${percentVal}% (${amt})`;
+
+      console.log('[promoEngine.applyPromo] percent discount applied:', {
+        percentVal,
+        scopeSub,
+        amt
+      });
     }
 
     // flat amount
@@ -343,6 +391,7 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
       impact.cartDiscount += amt;
 
       impact.note += (impact.note ? '; ' : '') + `Potongan Rp ${amt}`;
+      console.log('[promoEngine.applyPromo] flat discount applied:', { amt });
     }
 
     // ======================================
@@ -357,6 +406,7 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
         meta: { promoId: promo._id }
       });
       impact.note += (impact.note ? '; ' : '') + `Poin +${pts}`;
+      console.log('[promoEngine.applyPromo] pointsFixed applied:', pts);
     }
 
     const ptsPercent = parseNumber(r.pointsPercent || r.points_percent);
@@ -370,6 +420,16 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
         });
         impact.note +=
           (impact.note ? '; ' : '') + `Poin ${ptsPercent}% (~${pts})`;
+        console.log('[promoEngine.applyPromo] pointsPercent applied:', {
+          ptsPercent,
+          pts
+        });
+      } else {
+        impact.note += (impact.note ? '; ' : '') + `Poin ${ptsPercent}% (0)`;
+        console.log(
+          '[promoEngine.applyPromo] pointsPercent zero result:',
+          ptsPercent
+        );
       }
     }
 
@@ -382,11 +442,20 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
         meta: { promoId: promo._id }
       });
       impact.note += (impact.note ? '; ' : '') + `Grant membership`;
+      console.log('[promoEngine.applyPromo] grantMembership added');
     }
   }
 
   // safety: cap diskon max subtotal
   impact.itemsDiscount = Math.max(0, Math.min(impact.itemsDiscount, subtotal));
+
+  // LOG final impact/actions
+  console.log(
+    '[promoEngine.applyPromo] final impact:',
+    JSON.stringify(impact),
+    'actions:',
+    JSON.stringify(actions)
+  );
 
   return { impact, actions };
 }
