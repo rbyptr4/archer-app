@@ -2542,6 +2542,52 @@ exports.checkout = asyncHandler(async (req, res) => {
 
       // Create order document inside session
       const [doc] = await Order.create([payload], { session });
+      // ==============================
+      // FORCE SET order totals dari uiTotals (agar konsisten dengan orderPriceSnapshot)
+      // ==============================
+      try {
+        await Order.updateOne(
+          { _id: doc._id },
+          {
+            $set: {
+              // utama — ambil dari uiTotals yang sudah dihitung sebelumnya
+              items_subtotal: int(uiTotals.items_subtotal || 0),
+              items_discount: int(uiTotals.items_discount || 0),
+              items_subtotal_after_discount: int(
+                uiTotals.items_subtotal_after_discount || 0
+              ),
+
+              delivery_fee: int(uiTotals.delivery_fee || 0),
+              shipping_discount: int(uiTotals.shipping_discount || 0),
+
+              service_fee: int(uiTotals.service_fee || 0),
+              tax_rate_percent: Number(uiTotals.tax_rate_percent || 0),
+              tax_amount: int(uiTotals.tax_amount || 0),
+
+              rounding_delta: int(uiTotals.rounding_delta || 0),
+              grand_total: int(uiTotals.grand_total || 0),
+
+              // simpan snapshot lengkap juga (opsional, sudah Anda persiapkan sebelumnya)
+              orderPriceSnapshot: orderPriceSnapshot
+            }
+          },
+          { session }
+        );
+
+        // debug: verifikasi singkat (opsional)
+        const check = await Order.findById(doc._id).session(session).lean();
+        console.log('[checkout][debug] order totals forced from uiTotals:', {
+          orderId: doc._id,
+          saved_items_subtotal: check.items_subtotal,
+          saved_grand_total: check.grand_total
+        });
+      } catch (e) {
+        console.warn(
+          '[checkout] failed to force-set order totals from uiTotals',
+          e?.message || e
+        );
+        throwError('Gagal menyimpan order totals', 500);
+      }
 
       // Update member (if exists): apply point deduction, award points, update total_spend, evaluate level after
       if (MemberDoc) {
@@ -4378,12 +4424,17 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
 const buildOrderReceipt = (order) => {
   if (!order) return null;
 
+  // Ambil pelanggan
   const displayName = order.member?.name || order.customer_name || '';
   const displayPhone = order.member?.phone || order.customer_phone || '';
 
+  // Ambil authoritative ui_totals jika ada (orderPriceSnapshot.ui_totals)
+  const snapshotUi = order.orderPriceSnapshot?.ui_totals || null;
+
+  // items array
   const items = Array.isArray(order.items) ? order.items : [];
 
-  // compute items_subtotal from items (fallback jika order.items_subtotal tidak ada)
+  // helper compute per-line fallback (menghitung dari base_price + addons)
   const computeLineSubtotal = (it) => {
     const unitBase = Number(it.base_price || 0);
     const addonsUnit = (it.addons || []).reduce(
@@ -4394,69 +4445,170 @@ const buildOrderReceipt = (order) => {
     return int((unitBase + addonsUnit) * qty);
   };
 
+  // fallback subtotal dari items (termasuk addons)
   const items_subtotal_fallback = items.reduce(
     (s, it) => s + computeLineSubtotal(it),
     0
   );
 
-  // Ambil dari order attributes (checkout sudah memasukkan hasil buildUiTotals)
-  // Namun: jika order.items_subtotal ada tapi lebih kecil dari hasil perhitungan items
-  // (kemungkinan karena order.items_subtotal tidak memasukkan addons), pilih yg
-  // memasukkan addons supaya diskon juga ikut ke addons.
+  // ambil items_subtotal authoritative: prioritas snapshot.ui_totals, lalu order.items_subtotal, lalu computed fallback
   const items_subtotal_fromOrder = int(
     order.items_subtotal ?? items_subtotal_fallback
   );
+  const items_subtotal = snapshotUi
+    ? int(snapshotUi.items_subtotal ?? items_subtotal_fromOrder)
+    : Math.max(items_subtotal_fromOrder, items_subtotal_fallback);
 
-  // Pastikan kita pakai subtotal yang mencakup addons:
-  // - jika fallback (dari items) lebih besar, gunakan fallback
-  // - else gunakan order value (jika sama/lebih besar)
-  const items_subtotal = Math.max(
-    items_subtotal_fromOrder,
-    items_subtotal_fallback
-  );
-
-  const items_discount = int(order.items_discount ?? 0);
-  const delivery_fee = int(
-    // prefer root delivery_fee; fallback nested delivery.delivery_fee; else 0
-    order.delivery_fee ?? order.delivery?.delivery_fee ?? 0
-  );
-  const delivery_fee_raw = int(
-    order.delivery?.delivery_fee_raw ??
-      order.delivery_fee ?? // jika tidak punya raw, samain dengan delivery_fee
-      0
-  );
-  const shipping_discount = int(order.shipping_discount ?? 0);
-
-  // Gunakan items_subtotal yang sudah "dikoreksi" saat hitung service & tax
-  const items_subtotal_after_discount = Math.max(
-    0,
-    items_subtotal - items_discount
-  );
-
-  const service_fee = int(
-    order.service_fee ??
-      Math.round(items_subtotal_after_discount * SERVICE_FEE_RATE)
-  );
-  const tax_amount = int(
-    order.tax_amount ??
-      Math.round(items_subtotal_after_discount * parsePpnRate())
-  );
-  const tax_rate_percent = Number(
-    order.tax_rate_percent ?? Math.round(parsePpnRate() * 100)
-  );
-  const rounding_delta = int(order.rounding_delta ?? 0);
-  const grand_total = int(
-    order.grand_total ??
-      roundRupiahCustom(
-        items_subtotal_after_discount +
-          service_fee +
-          (delivery_fee_raw || delivery_fee) -
-          shipping_discount +
-          tax_amount
+  // ambil discount & subtotal after discount dari snapshot bila ada
+  const items_discount = snapshotUi
+    ? int(snapshotUi.items_discount ?? order.items_discount ?? 0)
+    : int(order.items_discount ?? 0);
+  const items_subtotal_after_discount = snapshotUi
+    ? int(
+        snapshotUi.items_subtotal_after_discount ??
+          Math.max(0, items_subtotal - items_discount)
       )
+    : Math.max(0, items_subtotal - items_discount);
+
+  // delivery fee (prefer snapshot), shipping discount etc.
+  const delivery_fee = snapshotUi
+    ? int(
+        snapshotUi.delivery_fee ??
+          order.delivery_fee ??
+          order.delivery?.delivery_fee ??
+          0
+      )
+    : int(order.delivery_fee ?? order.delivery?.delivery_fee ?? 0);
+
+  const delivery_fee_raw = snapshotUi
+    ? int(
+        snapshotUi.delivery_fee ??
+          order.delivery?.delivery_fee_raw ??
+          order.delivery_fee ??
+          0
+      )
+    : int(order.delivery?.delivery_fee_raw ?? order.delivery_fee ?? 0);
+
+  const shipping_discount = snapshotUi
+    ? int(snapshotUi.shipping_discount ?? order.shipping_discount ?? 0)
+    : int(order.shipping_discount ?? 0);
+
+  // service_fee & tax dari snapshot (jika ada) agar persis sama dengan UI
+  const service_fee = snapshotUi
+    ? int(
+        snapshotUi.service_fee ??
+          order.service_fee ??
+          Math.round(items_subtotal_after_discount * SERVICE_FEE_RATE)
+      )
+    : int(
+        order.service_fee ??
+          Math.round(items_subtotal_after_discount * SERVICE_FEE_RATE)
+      );
+
+  const tax_amount = snapshotUi
+    ? int(
+        snapshotUi.tax_amount ??
+          order.tax_amount ??
+          Math.round(items_subtotal_after_discount * parsePpnRate())
+      )
+    : int(
+        order.tax_amount ??
+          Math.round(items_subtotal_after_discount * parsePpnRate())
+      );
+
+  const tax_rate_percent = snapshotUi
+    ? Number(snapshotUi.tax_rate_percent ?? Math.round(parsePpnRate() * 100))
+    : Number(order.tax_rate_percent ?? Math.round(parsePpnRate() * 100));
+
+  // rounding & grand total (prefer snapshot)
+  const rounding_delta = snapshotUi
+    ? int(snapshotUi.rounding_delta ?? order.rounding_delta ?? 0)
+    : int(order.rounding_delta ?? 0);
+
+  const grand_total = snapshotUi
+    ? int(
+        snapshotUi.grand_total ??
+          order.grand_total ??
+          roundRupiahCustom(
+            items_subtotal_after_discount +
+              service_fee +
+              (delivery_fee_raw || delivery_fee) -
+              shipping_discount +
+              tax_amount
+          )
+      )
+    : int(
+        order.grand_total ??
+          roundRupiahCustom(
+            items_subtotal_after_discount +
+              service_fee +
+              (delivery_fee_raw || delivery_fee) -
+              shipping_discount +
+              tax_amount
+          )
+      );
+
+  const raw_total_before_rounding = int(
+    items_subtotal_after_discount +
+      service_fee +
+      (delivery_fee_raw || delivery_fee) -
+      shipping_discount +
+      tax_amount
   );
 
-  // Build detailed items
+  // ------- Build discount details (normalized) -------
+  // prefer snapshot discounts (ui_totals.discounts) jika ada, else gunakan order.discounts
+  const engineDiscounts = snapshotUi?.discounts || order.discounts || [];
+
+  // Normalize each discount entry agar konsisten di receipt
+  const discounts = (Array.isArray(engineDiscounts) ? engineDiscounts : []).map(
+    (d) => {
+      // support multiple legacy shapes
+      const id = d.id || d.claimId || d.claim_id || null;
+      const source =
+        d.source || (d.voucherId || d.voucher ? 'voucher' : 'promo');
+      const label =
+        d.label ||
+        d.name ||
+        d.title ||
+        (source === 'promo' ? 'Promo' : 'Voucher');
+      const amount = int(
+        Number(d.amount ?? d.amountTotal ?? d.itemsDiscount ?? 0)
+      );
+      const itemsDetail = Array.isArray(d.items)
+        ? d.items.map((it) => ({
+            menuId: it.menuId || it.menu || it.menu_id || null,
+            qty: Number(it.qty || it.quantity || 0),
+            amount: int(it.amount || it.line_discount || 0)
+          }))
+        : [];
+
+      return {
+        claimId: source === 'voucher' ? (id ? String(id) : null) : null,
+        voucherId:
+          source === 'voucher' && (d.voucherId || d.voucher)
+            ? String(d.voucherId || d.voucher)
+            : null,
+        id: id ? String(id) : null,
+        source,
+        orderIdx: d.orderIdx ?? d.order_index ?? null,
+        type: d.type ?? 'amount',
+        label,
+        amount,
+        items: itemsDetail,
+        meta: d.meta || d.raw?.meta || {},
+        note:
+          d.note ||
+          d.meta?.note ||
+          (d.raw && d.raw.meta && d.raw.meta.note) ||
+          '',
+        appliedAt: d.appliedAt || d.applied_at || null,
+        raw: d.raw || d
+      };
+    }
+  );
+
+  // ------- per-item detailed view (sertakan adjustments jika ada) -------
   const detailedItems = items.map((it) => {
     const qty = Number(it.quantity || it.qty || 0);
     const unit_base = Number(it.base_price || 0);
@@ -4467,9 +4619,27 @@ const buildOrderReceipt = (order) => {
     const unit_before_tax = int(unit_base + addons_unit);
     const line_before_tax = int(it.line_subtotal ?? computeLineSubtotal(it));
 
+    // adjustments array on item (engine provides adjustments per menuId)
+    const adjustmentsRaw = Array.isArray(it.adjustments)
+      ? it.adjustments
+      : it._adjustments || [];
+    const adjustments = (adjustmentsRaw || []).map((a) => ({
+      type: a.type || 'promo',
+      amount: int(a.amount || 0),
+      reason: a.reason || a.label || '',
+      promoId: a.promoId || a.promo || null,
+      voucherClaimId: a.voucherClaimId || a.claimId || null,
+      qty: Number(a.qty || 0)
+    }));
+
+    const adjTotal = (adjustments || []).reduce(
+      (s, a) => s + Number(a.amount || 0),
+      0
+    );
+
     return {
       name: it.name,
-      menu_code: it.menu_code || '',
+      menu_code: it.menu_code || it.menuCode || '',
       quantity: qty,
       addons: (it.addons || []).map((ad) => ({
         name: ad.name,
@@ -4477,51 +4647,91 @@ const buildOrderReceipt = (order) => {
         qty: int(ad.qty || 1)
       })),
       unit_price: unit_before_tax,
-      line_before_tax
+      line_before_tax,
+      adjustments,
+      line_total_after_adjustments: Math.max(0, int(line_before_tax - adjTotal))
     };
   });
 
-  return {
+  // ------- applied promos & vouchers summary -------
+  // order.appliedPromo / order.applied_promo shapes
+  const appliedPromo = order.appliedPromo || order.applied_promo || null;
+  const appliedPromos = [];
+  if (appliedPromo) {
+    // normalize
+    const ap =
+      appliedPromo.promoSnapshot || appliedPromo.promoSnapshot || appliedPromo;
+    appliedPromos.push({
+      promoId:
+        ap.promoId ||
+        ap.promoId ||
+        ap.promo_id ||
+        (ap.promoId ? String(ap.promoId) : null) ||
+        (ap.id ? String(ap.id) : null),
+      name: ap.name || ap.promoName || null,
+      description: ap.description || ap.notes || null,
+      impact: ap.impact || ap.promoSnapshot?.impact || {},
+      actions: ap.actions || ap.promoSnapshot?.actions || []
+    });
+  }
+
+  // vouchers summary (applied_voucher_ids and order.appliedVouchers)
+  const appliedVoucherEntries = [];
+  if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
+    for (const av of order.appliedVouchers) {
+      appliedVoucherEntries.push({
+        voucherId: av.voucherId
+          ? String(av.voucherId)
+          : av.voucher
+          ? String(av.voucher)
+          : null,
+        snapshot: av.voucherSnapshot || av.snapshot || {}
+      });
+    }
+  } else if (
+    Array.isArray(order.applied_voucher_ids) &&
+    order.applied_voucher_ids.length
+  ) {
+    for (const vid of order.applied_voucher_ids) {
+      appliedVoucherEntries.push({ voucherId: String(vid), snapshot: {} });
+    }
+  }
+
+  // ------- final receipt object -------
+  const receipt = {
     id: String(order._id),
     transaction_code: order.transaction_code || '',
     status: order.status,
     payment_status: order.payment_status,
     payment_method: order.payment_method,
-
     pricing: {
       items_subtotal: int(items_subtotal),
       items_subtotal_after_discount: int(items_subtotal_after_discount),
       items_discount: int(items_discount),
-      service_fee: service_fee,
-      delivery_fee: delivery_fee, // NET
-      delivery_fee_raw: delivery_fee_raw,
-      shipping_discount: shipping_discount,
-      tax_amount: tax_amount,
-      tax_rate_percent: tax_rate_percent,
-      rounding_delta: rounding_delta,
-      grand_total: grand_total,
-      raw_total_before_rounding: int(
-        items_subtotal_after_discount +
-          service_fee +
-          (delivery_fee_raw || delivery_fee) -
-          shipping_discount +
-          tax_amount
-      )
+      service_fee: int(service_fee),
+      delivery_fee: int(delivery_fee),
+      delivery_fee_raw: int(delivery_fee_raw),
+      shipping_discount: int(shipping_discount),
+      tax_amount: int(tax_amount),
+      tax_rate_percent: Number(tax_rate_percent || 0),
+      rounding_delta: int(rounding_delta),
+      grand_total: int(grand_total),
+      raw_total_before_rounding: int(raw_total_before_rounding)
     },
-
     customer: {
       name: displayName,
       phone: displayPhone
     },
-
     fulfillment: {
-      type: order.fulfillment_type,
+      type: order.fulfillment_type || order.delivery?.mode || null,
       table_number:
         order.fulfillment_type === 'dine_in'
           ? order.table_number || null
           : null,
       delivery:
-        order.fulfillment_type === 'delivery' && order.delivery
+        (order.fulfillment_type === 'delivery' ||
+          order.delivery?.mode === 'delivery') &&
+        order.delivery
           ? {
               address_text: order.delivery.address_text || '',
               distance_km: order.delivery.distance_km || null,
@@ -4532,17 +4742,25 @@ const buildOrderReceipt = (order) => {
             }
           : null
     },
-
     items: detailedItems,
-
     timestamps: {
       placed_at: order.placed_at,
       paid_at: order.paid_at || null
     },
-
-    discounts: order.discounts || [],
-    applied_voucher_ids: order.applied_voucher_ids || []
+    // normalized discounts for receipt (detailed)
+    discounts,
+    // applied promos & vouchers (summary)
+    applied_promos: appliedPromos,
+    applied_vouchers: appliedVoucherEntries,
+    applied_voucher_ids: Array.isArray(order.applied_voucher_ids)
+      ? order.applied_voucher_ids
+      : appliedVoucherEntries.map((v) => v.voucherId),
+    meta: {
+      note: order.notes || order.note || ''
+    }
   };
+
+  return receipt;
 };
 
 exports.getOrderReceipt = asyncHandler(async (req, res) => {
