@@ -1781,185 +1781,164 @@ exports.checkout = asyncHandler(async (req, res) => {
   console.log('[checkout] incoming voucherClaimIds:', voucherClaimIds);
   console.log('[checkout] eligibleClaimIds after filter:', eligibleClaimIds);
 
-  // --- PANGGIL price engine (sumber kebenaran) ---
-  let priced;
-  try {
-    // --- normalize items for engine: price = menu_base + addonsPerUnit ---
-    const normalizedForEngine = {
-      items: (cart.items || []).map((it) => {
-        const menuBase = Number(
-          it.base_price ?? it.unit_price ?? it.price ?? 0
-        );
-        const addons = Array.isArray(it.addons) ? it.addons : [];
-        const addonsPerUnit = addons.reduce(
-          (s, a) =>
-            s + Number(a?.price || 0) * Math.max(1, Number(a?.qty || 1)),
-          0
-        );
-        const unit_price = Math.round(menuBase + addonsPerUnit);
-        return {
-          menuId: it.menu,
-          name: it.name || null,
-          qty: Number(it.quantity ?? it.qty ?? 0),
-          price: unit_price,
-          category: it.category || null,
-          addons: addons.map((a) => ({
-            name: a.name,
-            price: Number(a.price || 0),
-            qty: Number(a.qty || 1)
-          }))
-        };
-      })
-    };
-
-    console.log(
-      '[checkout] calling priceEngine.applyPromoThenVoucher (checkout)',
-      {
-        memberId: MemberDoc ? MemberDoc._id : null,
-        itemsCount: normalizedForEngine.items.length,
-        deliveryFee: deliveryObj.delivery_fee || 0,
-        incomingVoucherRequests: voucherClaimIds?.length || 0
-      }
-    );
-
-    const promoUsageFetchers = {
-      getMemberUsageCount: async (promoId, memberId, sinceDate) => {
-        try {
-          if (!memberId) return 0;
-          if (MemberDoc && Array.isArray(MemberDoc.promoUsageHistory)) {
-            return MemberDoc.promoUsageHistory.filter(
-              (h) =>
-                String(h.promoId) === String(promoId) &&
-                new Date(h.usedAt || h.date) >= sinceDate
-            ).length;
-          }
-          const q = {
-            'appliedPromo.promoId': promoId,
-            member: memberId,
-            createdAt: { $gte: sinceDate }
-          };
-          return await Order.countDocuments(q);
-        } catch (e) {
-          console.warn(
-            '[checkout] getMemberUsageCount failed',
-            e?.message || e
-          );
-          return 0;
-        }
-      },
-      getGlobalUsageCount: async (promoId, sinceDate) => {
-        try {
-          const q = {
-            'appliedPromo.promoId': promoId,
-            createdAt: { $gte: sinceDate }
-          };
-          return await Order.countDocuments(q);
-        } catch (e) {
-          console.warn(
-            '[checkout] getGlobalUsageCount failed',
-            e?.message || e
-          );
-          return 0;
-        }
-      }
-    };
-    let eligiblePromosList = [];
-    try {
-      eligiblePromosList = await findApplicablePromos(
-        normalizedForEngine,
-        MemberDoc,
-        new Date(),
-        { fetchers: promoUsageFetchers }
+  const normalizedForEngine = {
+    items: (cart.items || []).map((it) => {
+      const menuBase = Number(it.base_price ?? it.unit_price ?? it.price ?? 0);
+      const addons = Array.isArray(it.addons) ? it.addons : [];
+      const addonsPerUnit = addons.reduce(
+        (s, a) => s + Number(a?.price || 0) * Math.max(1, Number(a?.qty || 1)),
+        0
       );
-    } catch (e) {
-      console.warn('[checkout] findApplicablePromos failed', e?.message || e);
-      eligiblePromosList = [];
-    }
-
-    // --- VALIDASI: jika user mengirim voucherClaimIds tapi dia juga memilih selectedPromoId yang memblokir voucher -> reject
-    const attemptedVoucherUse =
-      Array.isArray(voucherClaimIds) && voucherClaimIds.length > 0;
-    const selectedPromoIdFromReq = req.body?.selectedPromoId || null;
-
-    if (attemptedVoucherUse && selectedPromoIdFromReq) {
-      // ambil promo doc untuk selectedPromoId (jangan andalkan eligible list)
+      const unit_price = Math.round(menuBase + addonsPerUnit);
+      return {
+        // gunakan field names kompatibel dengan promoEngine.snapshotTotals
+        base_price: menuBase,
+        unit_price: unit_price,
+        price: unit_price,
+        quantity: Number(it.quantity ?? it.qty ?? 0),
+        qty: Number(it.quantity ?? it.qty ?? 0),
+        menuId: it.menu || it.menuId || it.id || null,
+        name: it.name || null,
+        category: it.category || null
+      };
+    })
+  };
+  
+  // ----------------------
+  // PROMO USAGE FETCHERS (sama seperti previewPrice) - reuse yang sudah ada
+  // ----------------------
+  const promoUsageFetchers = {
+    getMemberUsageCount: async (promoId, memberId, sinceDate) => {
       try {
-        const promoDoc = await Promo.findById(
-          String(selectedPromoIdFromReq)
-        ).lean();
-        if (promoDoc && promoDoc.blocksVoucher) {
-          console.error(
-            '[checkout] selected promo blocks voucher but vouchers provided',
-            {
-              selectedPromoId: selectedPromoIdFromReq,
-              voucherClaimIds
-            }
-          );
-          throwError(
-            'Promo yang dipilih memblokir penggunaan voucher. Hapus voucher atau pilih promo lain.',
-            400
-          );
+        if (!memberId) return 0;
+        if (MemberDoc && Array.isArray(MemberDoc.promoUsageHistory)) {
+          return MemberDoc.promoUsageHistory.filter(
+            (h) =>
+              String(h.promoId) === String(promoId) &&
+              new Date(h.usedAt || h.date) >= sinceDate
+          ).length;
         }
+        const q = {
+          'appliedPromo.promoId': promoId,
+          member: memberId,
+          createdAt: { $gte: sinceDate }
+        };
+        return await Order.countDocuments(q);
       } catch (e) {
-        // jika promo tidak ditemukan, biarkan engine yang nanti akan validasi; tapi kita log saja
-        console.warn(
-          '[checkout] selectedPromoId not found (will let engine decide):',
-          selectedPromoIdFromReq
-        );
+        console.warn('[checkout] getMemberUsageCount failed', e?.message || e);
+        return 0;
+      }
+    },
+    getGlobalUsageCount: async (promoId, sinceDate) => {
+      try {
+        const q = {
+          'appliedPromo.promoId': promoId,
+          createdAt: { $gte: sinceDate }
+        };
+        return await Order.countDocuments(q);
+      } catch (e) {
+        console.warn('[checkout] getGlobalUsageCount failed', e?.message || e);
+        return 0;
       }
     }
-
-    if (
-      attemptedVoucherUse &&
-      !selectedPromoIdFromReq &&
-      Array.isArray(eligiblePromosList) &&
-      eligiblePromosList.length
-    ) {
-      const highestAuto = eligiblePromosList
-        .filter((p) => !!p.autoApply)
-        .sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0))[0];
-      if (highestAuto && highestAuto.blocksVoucher) {
-        console.error(
-          '[checkout] attempted voucher but auto-applied promo blocks voucher',
-          {
-            promoId: highestAuto._id,
-            voucherClaimIds
-          }
-        );
-        throwError(
-          `Promo otomatis "${
-            highestAuto.name || highestAuto._id
-          }" akan dipakai dan memblokir voucher. Hapus voucher atau pilih promo lain.`,
-          400
-        );
+  };
+  
+  // ----------------------
+  // FIND APPLICABLE PROMOS (sebelum engine apply) - buat eligiblePromosList & autoAppliedPromo sama seperti preview
+  // ----------------------
+  let eligiblePromosList = [];
+  try {
+    eligiblePromosList = await findApplicablePromos(
+      normalizedForEngine,
+      MemberDoc,
+      new Date(),
+      { fetchers: promoUsageFetchers }
+    );
+  } catch (e) {
+    console.warn('[checkout] findApplicablePromos failed', e?.message || e);
+    eligiblePromosList = [];
+  }
+  console.log('[checkout] eligiblePromosList count & ids:', {
+    count: eligiblePromosList.length,
+    promos: (eligiblePromosList || []).map((p) => ({
+      id: String(p._id),
+      name: p.name,
+      type: p.type,
+      autoApply: p.autoApply,
+      priority: p.priority
+    }))
+  });
+  
+  // ===== pilih autoAppliedPromo preview-style (sama seperti previewPrice) =====
+  let autoAppliedPromo = null;
+  try {
+    if (Array.isArray(eligiblePromosList) && eligiblePromosList.length) {
+      const autos = eligiblePromosList.filter((p) => !!p.autoApply);
+      if (autos.length) {
+        autos.sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0));
+        const chosen = autos[0];
+        // gunakan applyPromo untuk preview impact (non-mutating)
+        const { impact, actions } = await applyPromo(chosen, {
+          items: normalizedForEngine.items
+        });
+        autoAppliedPromo = {
+          promoId: String(chosen._id),
+          name: chosen.name || null,
+          impact,
+          actions: actions || []
+        };
       }
     }
-
-    priced = await applyPromoThenVoucher({
-      memberId: MemberDoc ? MemberDoc._id : null,
-      memberDoc: MemberDoc || null,
-      cart: normalizedForEngine,
-      fulfillmentType: ft,
-      deliveryFee: deliveryObj.delivery_fee || 0,
-      voucherClaimIds: eligibleClaimIds,
-      selectedPromoId: req.body?.selectedPromoId || null,
-      autoApplyPromo: req.body?.selectedPromoId ? false : true,
-      promoUsageFetchers
-    });
-
-    console.log('[checkout] priceEngine returned', {
-      ok: priced?.ok,
-      reasons: priced?.reasons,
-      totals_keys: Object.keys(priced?.totals || {}),
-      breakdown_length: Array.isArray(priced?.breakdown)
-        ? priced.breakdown.length
-        : 0,
-      chosenClaimIds: Array.isArray(priced?.chosenClaimIds)
-        ? priced.chosenClaimIds.length
-        : 0,
-      promoApplied: priced.promoApplied ? priced.promoApplied.promoId : null
-    });
-
+  } catch (e) {
+    console.warn('[checkout] autoApply preview failed', e?.message || e);
+    autoAppliedPromo = null;
+  }
+  console.log('[checkout] autoAppliedPromo preview:', autoAppliedPromo ? {
+    promoId: autoAppliedPromo.promoId,
+    name: autoAppliedPromo.name
+  } : null);
+  
+  // ----------------------
+  // DETERMINE selectedForEngine & autoApplyForEngine (sinkron dengan previewPrice)
+  // Prefer: FE selectedPromoId > else autoAppliedPromo > else null
+  // ----------------------
+  const selectedForEngine = (req.body?.selectedPromoId)
+    ? req.body?.selectedPromoId
+    : (autoAppliedPromo ? String(autoAppliedPromo.promoId) : null);
+  
+  const autoApplyForEngine = (req.body?.selectedPromoId)
+    ? false
+    : (selectedForEngine ? false : true);
+  
+  console.log('[checkout] selectedForEngine, autoApplyForEngine', {
+    selectedForEngine,
+    autoApplyForEngine
+  });
+  
+  // ----------------------
+  // TERAKHIR: panggil applyPromoThenVoucher dengan parameter sinkron
+  // ----------------------
+  priced = await applyPromoThenVoucher({
+    memberId: MemberDoc ? MemberDoc._id : null,
+    memberDoc: MemberDoc || null,
+    cart: normalizedForEngine,
+    fulfillmentType: ft,
+    deliveryFee: deliveryObj.delivery_fee || 0,
+    voucherClaimIds: eligibleClaimIds,
+    selectedPromoId: selectedForEngine,
+    autoApplyPromo: autoApplyForEngine,
+    promoUsageFetchers
+  });
+  
+  console.log('[checkout] priceEngine returned', {
+    ok: priced?.ok,
+    reasons: priced?.reasons,
+    totals_keys: Object.keys(priced?.totals || {}),
+    breakdown_length: Array.isArray(priced?.breakdown) ? priced.breakdown.length : 0,
+    chosenClaimIds: Array.isArray(priced?.chosenClaimIds) ? priced.chosenClaimIds.length : 0,
+    promoApplied: priced.promoApplied ? priced.promoApplied.promoId : null
+  });
+  
     try {
       if (
         !MemberDoc && // user bukan member
