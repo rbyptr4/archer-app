@@ -1781,6 +1781,8 @@ exports.checkout = asyncHandler(async (req, res) => {
   console.log('[checkout] incoming voucherClaimIds:', voucherClaimIds);
   console.log('[checkout] eligibleClaimIds after filter:', eligibleClaimIds);
 
+  // --- PANGGIL price engine (sumber kebenaran) ---
+  // Normalisasi cart: pakai shape sama seperti previewPrice agar hasil konsisten
   const normalizedForEngine = {
     items: (cart.items || []).map((it) => {
       const menuBase = Number(it.base_price ?? it.unit_price ?? it.price ?? 0);
@@ -1791,7 +1793,6 @@ exports.checkout = asyncHandler(async (req, res) => {
       );
       const unit_price = Math.round(menuBase + addonsPerUnit);
       return {
-        // gunakan field names kompatibel dengan promoEngine.snapshotTotals
         base_price: menuBase,
         unit_price: unit_price,
         price: unit_price,
@@ -1803,10 +1804,8 @@ exports.checkout = asyncHandler(async (req, res) => {
       };
     })
   };
-  
-  // ----------------------
-  // PROMO USAGE FETCHERS (sama seperti previewPrice) - reuse yang sudah ada
-  // ----------------------
+
+  // promo usage fetchers (sama seperti preview)
   const promoUsageFetchers = {
     getMemberUsageCount: async (promoId, memberId, sinceDate) => {
       try {
@@ -1842,10 +1841,7 @@ exports.checkout = asyncHandler(async (req, res) => {
       }
     }
   };
-  
-  // ----------------------
-  // FIND APPLICABLE PROMOS (sebelum engine apply) - buat eligiblePromosList & autoAppliedPromo sama seperti preview
-  // ----------------------
+
   let eligiblePromosList = [];
   try {
     eligiblePromosList = await findApplicablePromos(
@@ -1868,8 +1864,8 @@ exports.checkout = asyncHandler(async (req, res) => {
       priority: p.priority
     }))
   });
-  
-  // ===== pilih autoAppliedPromo preview-style (sama seperti previewPrice) =====
+
+  // auto-apply preview (sama seperti previewPrice)
   let autoAppliedPromo = null;
   try {
     if (Array.isArray(eligiblePromosList) && eligiblePromosList.length) {
@@ -1877,7 +1873,7 @@ exports.checkout = asyncHandler(async (req, res) => {
       if (autos.length) {
         autos.sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0));
         const chosen = autos[0];
-        // gunakan applyPromo untuk preview impact (non-mutating)
+        // applyPromo hanya untuk preview impact (non-mutating)
         const { impact, actions } = await applyPromo(chosen, {
           items: normalizedForEngine.items
         });
@@ -1893,31 +1889,36 @@ exports.checkout = asyncHandler(async (req, res) => {
     console.warn('[checkout] autoApply preview failed', e?.message || e);
     autoAppliedPromo = null;
   }
-  console.log('[checkout] autoAppliedPromo preview:', autoAppliedPromo ? {
-    promoId: autoAppliedPromo.promoId,
-    name: autoAppliedPromo.name
-  } : null);
-  
-  // ----------------------
-  // DETERMINE selectedForEngine & autoApplyForEngine (sinkron dengan previewPrice)
-  // Prefer: FE selectedPromoId > else autoAppliedPromo > else null
-  // ----------------------
-  const selectedForEngine = (req.body?.selectedPromoId)
+  console.log(
+    '[checkout] autoAppliedPromo preview:',
+    autoAppliedPromo
+      ? {
+          promoId: autoAppliedPromo.promoId,
+          name: autoAppliedPromo.name
+        }
+      : null
+  );
+
+  // tentukan selectedForEngine & autoApplyForEngine (sinkron dgn previewPrice)
+  // Prioritas: FE selectedPromoId > autoAppliedPromo > null
+  const selectedForEngine = req.body?.selectedPromoId
     ? req.body?.selectedPromoId
-    : (autoAppliedPromo ? String(autoAppliedPromo.promoId) : null);
-  
-  const autoApplyForEngine = (req.body?.selectedPromoId)
+    : autoAppliedPromo
+    ? String(autoAppliedPromo.promoId)
+    : null;
+
+  const autoApplyForEngine = req.body?.selectedPromoId
     ? false
-    : (selectedForEngine ? false : true);
-  
+    : selectedForEngine
+    ? false
+    : true;
+
   console.log('[checkout] selectedForEngine, autoApplyForEngine', {
     selectedForEngine,
     autoApplyForEngine
   });
-  
-  // ----------------------
-  // TERAKHIR: panggil applyPromoThenVoucher dengan parameter sinkron
-  // ----------------------
+
+  // panggil engine dengan param sinkron
   priced = await applyPromoThenVoucher({
     memberId: MemberDoc ? MemberDoc._id : null,
     memberDoc: MemberDoc || null,
@@ -1929,61 +1930,21 @@ exports.checkout = asyncHandler(async (req, res) => {
     autoApplyPromo: autoApplyForEngine,
     promoUsageFetchers
   });
-  
+
   console.log('[checkout] priceEngine returned', {
     ok: priced?.ok,
     reasons: priced?.reasons,
     totals_keys: Object.keys(priced?.totals || {}),
-    breakdown_length: Array.isArray(priced?.breakdown) ? priced.breakdown.length : 0,
-    chosenClaimIds: Array.isArray(priced?.chosenClaimIds) ? priced.chosenClaimIds.length : 0,
+    breakdown_length: Array.isArray(priced?.breakdown)
+      ? priced.breakdown.length
+      : 0,
+    chosenClaimIds: Array.isArray(priced?.chosenClaimIds)
+      ? priced.chosenClaimIds.length
+      : 0,
     promoApplied: priced.promoApplied ? priced.promoApplied.promoId : null
   });
-  
-    try {
-      if (
-        !MemberDoc && // user bukan member
-        priced &&
-        priced.promoApplied &&
-        Array.isArray(priced.promoApplied.actions)
-      ) {
-        const hasGrantMembership = priced.promoApplied.actions.some(
-          (a) => String(a.type || '').toLowerCase() === 'grant_membership'
-        );
-        if (hasGrantMembership) {
-          console.error(
-            '[checkout] promo grants membership but user is guest - require login/register',
-            { promoId: priced.promoApplied.promoId }
-          );
-          throwError(
-            'Promo ini memberikan membership. Silakan login atau pilih opsi "Daftar" untuk menerima membership saat checkout.',
-            400
-          );
-        }
-      }
-    } catch (err) {
-      throw err; // biarkan error bubble ke handler utama
-    }
 
-    // log promo impact explicitly
-    console.log(
-      '[checkout][engine] promoApplied impact:',
-      priced.promoApplied ? priced.promoApplied.impact : null
-    );
-    console.log(
-      '[checkout][engine] voucher breakdown sample:',
-      Array.isArray(priced.breakdown)
-        ? priced.breakdown.slice(0, 3)
-        : priced.breakdown
-    );
-  } catch (err) {
-    console.error('[checkout] priceEngine threw', err?.message || err);
-    throwError(
-      err?.message
-        ? `Gagal menghitung harga: ${String(err.message)}`
-        : 'Gagal menghitung harga',
-      err?.status || 500
-    );
-  }
+  // --- END PANGGIL price engine ---
 
   if (!priced || !priced.ok) {
     console.error('[checkout] price engine failed:', priced?.reasons || priced);
