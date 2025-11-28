@@ -171,6 +171,7 @@ async function applyPromoThenVoucher({
       const impact = res.impact || {};
       const actions = Array.isArray(res.actions) ? res.actions.slice() : [];
 
+      // estimate free items value (sama seperti sebelumnya)
       let freeValue = 0;
       if (
         impact &&
@@ -206,10 +207,34 @@ async function applyPromoThenVoucher({
       const discountValue = Number(
         impact.itemsDiscount || impact.cartDiscount || 0
       );
+
+      // ===== NEW: value for actions (award_points / grant_membership etc.)
+      // beri bobot agar non-monetary rewards juga dihargai saat auto-pick.
+      let actionsValue = 0;
+      if (Array.isArray(actions) && actions.length) {
+        for (const a of actions) {
+          const t = String(a.type || '').toLowerCase();
+          if (t === 'award_points') {
+            // konversi poin ke nilai kasar (1 poin = 0.5 rupiah) — sesuaikan jika perlu
+            const pts = Number(a.points ?? a.amount ?? 0) || 0;
+            actionsValue += Math.round(pts * 0.5);
+          } else if (t === 'grant_membership') {
+            // grant_membership beri boost besar supaya diprioritaskan
+            actionsValue += 1000;
+          } else {
+            // reward jenis lain beri sedikit nilai
+            actionsValue += 100;
+          }
+        }
+      }
+
+      // final score = discount + free items value + actions value
       const score =
-        Number(Math.round(discountValue || 0)) +
-        Number(Math.round(freeValue || 0));
-      return { impact, actions, discountValue, freeValue, score };
+        Math.round(discountValue || 0) +
+        Math.round(freeValue || 0) +
+        Math.round(actionsValue || 0);
+
+      return { impact, actions, discountValue, freeValue, actionsValue, score };
     } catch (e) {
       console.warn(
         '[PE] evaluatePromoValue failed for promo',
@@ -221,7 +246,8 @@ async function applyPromoThenVoucher({
         actions: [],
         discountValue: 0,
         freeValue: 0,
-        score: -1
+        actionsValue: 0,
+        score: -999999
       };
     }
   }
@@ -269,7 +295,7 @@ async function applyPromoThenVoucher({
       if (selectedPromoRejected) {
         if (Array.isArray(applicable) && applicable.length) {
           let best = null;
-          let bestValue = -1;
+          let bestValue = -Infinity;
           for (const p of applicable) {
             const ev = await evaluatePromoValue(p);
             console.log('[PE] eval candidate:', {
@@ -277,8 +303,10 @@ async function applyPromoThenVoucher({
               name: p.name,
               discountValue: ev.discountValue,
               freeValue: ev.freeValue,
+              actionsValue: ev.actionsValue,
               score: ev.score
             });
+
             if (ev.score > bestValue) {
               bestValue = ev.score;
               best = { promo: p, impact: ev.impact, actions: ev.actions };

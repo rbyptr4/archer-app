@@ -4323,6 +4323,138 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
   if (!order) throwError('Order tidak ditemukan', 404);
 
   const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
+  const intVal = (v) => Math.round(Number(v || 0));
+
+  // normalisasi discounts dari order (bisa berasal dari order.discounts / order.breakdown)
+  const rawDiscounts = Array.isArray(order.discounts)
+    ? order.discounts
+    : Array.isArray(order.breakdown)
+    ? order.breakdown
+    : [];
+
+  const discounts = (rawDiscounts || []).map((d) => {
+    const id = d.id || d.claimId || d.claim_id || null;
+    const source = d.source || (d.voucherId || d.voucher ? 'voucher' : 'promo');
+    const label =
+      d.label ||
+      d.name ||
+      d.title ||
+      (source === 'promo' ? 'Promo' : 'Voucher');
+    const amount = intVal(d.amount ?? d.amountTotal ?? d.itemsDiscount ?? 0);
+    const items = Array.isArray(d.items)
+      ? d.items.map((it) => ({
+          menuId: it.menuId || it.menu || it.menu_id || null,
+          qty: Number(it.qty || it.quantity || 0),
+          amount: intVal(it.amount || it.line_discount || 0),
+          claimId: it.claimId || it.claim_id || null
+        }))
+      : [];
+    return {
+      claimId: source === 'voucher' ? (id ? String(id) : null) : null,
+      voucherId:
+        source === 'voucher' && (d.voucherId || d.voucher)
+          ? String(d.voucherId || d.voucher)
+          : null,
+      id: id ? String(id) : null,
+      source,
+      orderIdx: d.orderIdx ?? d.order_index ?? null,
+      type: d.type ?? 'amount',
+      label,
+      amount,
+      items,
+      meta: d.meta || d.raw?.meta || {},
+      note: d.note || d.meta?.note || '',
+      appliedAt: d.appliedAt || d.applied_at || null,
+      raw: d.raw || d
+    };
+  });
+
+  // applied promos normalization
+  const appliedPromos = [];
+  // support multiple shapes: order.appliedPromo / order.applied_promo / order.appliedPromos
+  const apSource =
+    order.appliedPromos ||
+    (order.appliedPromo ? [order.appliedPromo] : null) ||
+    (order.applied_promo ? [order.applied_promo] : null) ||
+    null;
+
+  if (Array.isArray(apSource) && apSource.length) {
+    for (const ap of apSource) {
+      // ap may be either snapshot object or { promoId, promoSnapshot } shape
+      let snap = ap;
+      if (ap.promoSnapshot) snap = ap.promoSnapshot;
+      if (ap.promo) snap = ap.promo; // older shape
+      appliedPromos.push({
+        promoId: snap.promoId || snap.promoId || snap.id || null,
+        name: snap.name || snap.promoName || null,
+        description: snap.description || snap.notes || null,
+        impact: snap.impact || snap.promoSnapshot?.impact || {},
+        actions: snap.actions || snap.promoSnapshot?.actions || [],
+        freeItemsSnapshot:
+          snap.freeItemsSnapshot && Array.isArray(snap.freeItemsSnapshot)
+            ? snap.freeItemsSnapshot
+            : (snap.impact && snap.impact.addedFreeItems) || []
+      });
+    }
+  } else if (order.appliedPromo) {
+    // single object case
+    const ap = order.appliedPromo;
+    const snap = ap.promoSnapshot || ap;
+    appliedPromos.push({
+      promoId: snap.promoId || snap.promoId || snap.id || null,
+      name: snap.name || snap.promoName || null,
+      description: snap.description || snap.notes || null,
+      impact: snap.impact || snap.promoSnapshot?.impact || {},
+      actions: snap.actions || snap.promoSnapshot?.actions || [],
+      freeItemsSnapshot:
+        snap.freeItemsSnapshot && Array.isArray(snap.freeItemsSnapshot)
+          ? snap.freeItemsSnapshot
+          : (snap.impact && snap.impact.addedFreeItems) || []
+    });
+  }
+
+  // applied vouchers normalization
+  const appliedVouchers = [];
+  // prefer stored detailed entries order.appliedVouchers -> else fallback to applied_voucher_ids
+  if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
+    for (const av of order.appliedVouchers) {
+      appliedVouchers.push({
+        voucherId: av.voucherId
+          ? String(av.voucherId)
+          : av.voucher
+          ? String(av.voucher)
+          : null,
+        snapshot: av.voucherSnapshot || av.snapshot || av || {}
+      });
+    }
+  } else if (
+    Array.isArray(order.applied_voucher_ids) &&
+    order.applied_voucher_ids.length
+  ) {
+    // best-effort enrich: fetch voucher docs for these ids
+    try {
+      const vids = order.applied_voucher_ids.map((v) => String(v));
+      const Voucher = require('../models/voucherModel');
+      const vdocs = await Voucher.find({ _id: { $in: vids } })
+        .lean()
+        .catch(() => []);
+      const vmap = (vdocs || []).reduce((acc, v) => {
+        acc[String(v._id)] = v;
+        return acc;
+      }, {});
+      for (const vid of vids) {
+        appliedVouchers.push({
+          voucherId: String(vid),
+          snapshot: vmap[String(vid)] || {}
+        });
+      }
+    } catch (e) {
+      // non-fatal: jika fetch gagal, masih kirim id saja
+      for (const vid of order.applied_voucher_ids) {
+        appliedVouchers.push({ voucherId: String(vid), snapshot: {} });
+      }
+    }
+  }
 
   // Susun response yang bersih / minimal (aggregate approach)
   const slim = {
@@ -4363,7 +4495,8 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
           qty: a.qty || 1
         })),
         notes: it.notes || '',
-        line_subtotal
+        line_subtotal,
+        adjustments: Array.isArray(it.adjustments) ? it.adjustments : []
       };
     }),
     totals: {
@@ -4407,7 +4540,6 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
           slot_label: order.delivery.slot_label || null,
           scheduled_at: order.delivery.scheduled_at || null,
           status: order.delivery.status || null,
-          // <-- pickup_window ditambahkan di sini (safe check)
           pickup_window: order.delivery.pickup_window
             ? {
                 from: order.delivery.pickup_window.from || null,
@@ -4415,7 +4547,12 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
               }
             : null
         }
-      : null
+      : null,
+
+    // tambahan: promo & voucher info
+    discounts, // detailed discounts (promo + voucher) - normalized
+    applied_promos: appliedPromos,
+    applied_vouchers: appliedVouchers
   };
 
   return res.status(200).json({ success: true, order: slim });

@@ -243,8 +243,6 @@ function validateRewardByType(reward = {}, type) {
   }
 }
 
-/* ---------------- controller handlers ---------------- */
-
 exports.create = asyncHandler(async (req, res) => {
   let payload = normalizeCommon(req.body || {}, { isUpdate: false });
 
@@ -252,19 +250,139 @@ exports.create = asyncHandler(async (req, res) => {
     throwError('Field "name" wajib', 400);
   if (!payload.type) throwError('Field "type" wajib', 400);
 
+  // bersihkan field yang tidak relevan menurut tipe (tetap seperti sebelumnya)
   payload = cleanseIrrelevantFieldsByType(payload, String(payload.type));
 
+  // normalisasi kondisi: pastikan startAt/endAt null jika tidak ada / kosong
+  if (!payload.conditions || typeof payload.conditions !== 'object') {
+    payload.conditions = payload.conditions || {};
+  }
+  const cond = payload.conditions;
+
+  // jika startAt diberikan dan valid -> ubah ke Date, jika falsy -> null
+  if (cond.startAt) {
+    const d = new Date(cond.startAt);
+    cond.startAt = isNaN(d.getTime()) ? null : d;
+  } else {
+    cond.startAt = null;
+  }
+
+  if (cond.endAt) {
+    const d2 = new Date(cond.endAt);
+    cond.endAt = isNaN(d2.getTime()) ? null : d2;
+  } else {
+    cond.endAt = null;
+  }
+
+  // jika startAt > endAt -> error
+  if (
+    cond.startAt &&
+    cond.endAt &&
+    new Date(cond.startAt) > new Date(cond.endAt)
+  )
+    throwError('conditions.startAt tidak boleh setelah conditions.endAt', 400);
+
+  // validate conditions & reward as before
   validateConditions(payload.conditions);
   validateRewardByType(payload.reward || {}, String(payload.type));
 
+  // normal default flags
   if (payload.isActive == null) payload.isActive = false;
   if (payload.stackable == null) payload.stackable = false;
   if (payload.autoApply == null) payload.autoApply = true;
+
+  // special: globalStock normalization:
+  // - jika user mengirim angka 0 -> kita simpan sebagai null (artinya "tidak di-set / unlimited")
+  // - jika nilai non-numeric atau null/undefined, biarkan null
+  if ('globalStock' in payload) {
+    const gsRaw = payload.globalStock;
+    const gsNum = Number.isFinite(Number(gsRaw)) ? Number(gsRaw) : null;
+    payload.globalStock = gsNum === 0 ? null : gsNum;
+  } else {
+    // jika tidak dikirim, pastikan tetap null (atau biarkan undefined jika memang mau)
+    payload.globalStock =
+      payload.globalStock == null ? null : payload.globalStock;
+  }
 
   if (req.user && req.user.id) payload.createdBy = req.user.id;
 
   const doc = await Promo.create(payload);
   res.status(201).json({ promo: doc.toObject() });
+});
+
+exports.update = asyncHandler(async (req, res) => {
+  const p = await Promo.findById(req.params.id);
+  if (!p) throwError('Promo tidak ditemukan', 404);
+
+  let incoming = normalizeCommon(req.body || {}, { isUpdate: true });
+
+  const incomingType = incoming.type
+    ? String(incoming.type).toLowerCase()
+    : undefined;
+  if (incomingType && incomingType !== String(p.type) && p.isActive) {
+    throwError('Promo sudah aktif, tidak boleh mengubah type.', 400);
+  }
+  const finalType = incomingType || String(p.type);
+
+  incoming = cleanseIrrelevantFieldsByType(incoming, finalType);
+
+  // Normalisasi conditions pada update: jika dikirim -> terapkan normalisasi startAt/endAt
+  if (incoming.conditions && typeof incoming.conditions === 'object') {
+    const ic = incoming.conditions;
+
+    if ('startAt' in ic) {
+      if (ic.startAt) {
+        const d = new Date(ic.startAt);
+        ic.startAt = isNaN(d.getTime()) ? null : d;
+      } else {
+        ic.startAt = null;
+      }
+    }
+
+    if ('endAt' in ic) {
+      if (ic.endAt) {
+        const d2 = new Date(ic.endAt);
+        ic.endAt = isNaN(d2.getTime()) ? null : d2;
+      } else {
+        ic.endAt = null;
+      }
+    }
+
+    // jika user tidak mengirim startAt/endAt mereka akan tetap pada nilai lama di p.conditions
+  }
+
+  // validate using either incoming.conditions (if provided) or existing p.conditions
+  validateConditions(incoming.conditions || p.conditions);
+  validateRewardByType(incoming.reward || p.reward || {}, finalType);
+
+  // apply incoming fields
+  Object.keys(incoming).forEach((k) => {
+    p[k] = incoming[k];
+  });
+
+  // After applying, ensure condition dates are normalized on the saved doc too
+  if (!p.conditions) p.conditions = {};
+  if (!p.conditions.startAt) p.conditions.startAt = null;
+  if (!p.conditions.endAt) p.conditions.endAt = null;
+
+  // special: globalStock normalization on update
+  if ('globalStock' in incoming) {
+    const gsRaw = incoming.globalStock;
+    const gsNum = Number.isFinite(Number(gsRaw)) ? Number(gsRaw) : null;
+    // if user explicitly sets 0 -> store null; else set numeric or null
+    p.globalStock = gsNum === 0 ? null : gsNum;
+  }
+
+  if (
+    p.conditions &&
+    p.conditions.startAt &&
+    p.conditions.endAt &&
+    new Date(p.conditions.startAt) > new Date(p.conditions.endAt)
+  )
+    throwError('conditions.startAt tidak boleh setelah conditions.endAt', 400);
+
+  await p.save();
+  res.json({ promo: p.toObject() });
 });
 
 exports.list = asyncHandler(async (req, res) => {
@@ -306,41 +424,6 @@ exports.list = asyncHandler(async (req, res) => {
     pageSize: perPage,
     totalPages: Math.max(1, Math.ceil(total / perPage))
   });
-});
-
-exports.update = asyncHandler(async (req, res) => {
-  const p = await Promo.findById(req.params.id);
-  if (!p) throwError('Promo tidak ditemukan', 404);
-
-  let incoming = normalizeCommon(req.body || {}, { isUpdate: true });
-
-  const incomingType = incoming.type
-    ? String(incoming.type).toLowerCase()
-    : undefined;
-  if (incomingType && incomingType !== String(p.type) && p.isActive) {
-    throwError('Promo sudah aktif, tidak boleh mengubah type.', 400);
-  }
-  const finalType = incomingType || String(p.type);
-
-  incoming = cleanseIrrelevantFieldsByType(incoming, finalType);
-
-  validateConditions(incoming.conditions || p.conditions);
-  validateRewardByType(incoming.reward || p.reward || {}, finalType);
-
-  Object.keys(incoming).forEach((k) => {
-    p[k] = incoming[k];
-  });
-
-  if (
-    p.conditions &&
-    p.conditions.startAt &&
-    p.conditions.endAt &&
-    new Date(p.conditions.startAt) > new Date(p.conditions.endAt)
-  )
-    throwError('conditions.startAt tidak boleh setelah conditions.endAt', 400);
-
-  await p.save();
-  res.json({ promo: p.toObject() });
 });
 
 exports.activate = asyncHandler(async (req, res) => {
