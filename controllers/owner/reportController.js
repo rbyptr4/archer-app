@@ -379,7 +379,7 @@ exports.totalTransactions = asyncHandler(async (req, res) => {
 
   if (cursor) {
     if (!mongoose.Types.ObjectId.isValid(cursor)) {
-      return res.status(400).json({ error: 'Invalid cursor' });
+      throwError('Invalid cursor', 400);
     }
     findQuery._id = { $lt: new mongoose.Types.ObjectId(cursor) };
   }
@@ -415,6 +415,7 @@ exports.totalTransactions = asyncHandler(async (req, res) => {
       grand_total: r.grand_total || 0,
       transaction_code: r.transaction_code || '',
       verified_at: r.verified_at || r.createdAt || null,
+      created_at: r.createdAt || null, // <-- tambahan: tanggal order dibuat
       verified_by: verifier
         ? { id: String(verifier._id || verifier), name: verifier.name || null }
         : null,
