@@ -4,6 +4,8 @@ const {
   executePromoActions: _noop
 } = require('./promoEngine');
 const { validateAndPrice } = require('./voucherEngine');
+const Menu = require('../models/menuModel');
+
 const throwError = require('./throwError');
 
 const int = (v) => Math.round(Number(v || 0));
@@ -203,11 +205,53 @@ async function applyPromoThenVoucher({
           let bestValue = -1;
           for (const p of applicable) {
             try {
-              const safeCart = makeSafeCartForPromo(originalForDist);
-              const { impact } = await applyPromoRaw(p, safeCart);
+              const safeCartEval = makeSafeCartForPromo(originalForDist);
+              const { impact } = await applyPromoRaw(p, safeCartEval);
+
+              // estimate free items value (try fetch menu prices from menuMap or fallback to original cart price)
+              let freeValue = 0;
+              if (
+                impact &&
+                Array.isArray(impact.addedFreeItems) &&
+                impact.addedFreeItems.length
+              ) {
+                for (const fi of impact.addedFreeItems) {
+                  const menuId = String(fi.menuId || '');
+                  const qty = Number(fi.qty || 1);
+                  // attempt to find price from originalForDist (same menu in cart)
+                  const found = originalForDist.find(
+                    (x) => String(x.menuId) === menuId
+                  );
+                  if (found && Number(found.price || 0) > 0) {
+                    freeValue += Number(found.price || 0) * qty;
+                  } else {
+                    // fallback: try menuModel lookup (sync await)
+                    try {
+                      const mdoc = await Menu.findById(menuId)
+                        .lean()
+                        .catch(() => null);
+                      if (
+                        mdoc &&
+                        Number(mdoc.price || mdoc.base_price || 0) > 0
+                      ) {
+                        freeValue +=
+                          Number(mdoc.price || mdoc.base_price || 0) * qty;
+                      } else {
+                        // fallback conservative estimate (e.g. 0)
+                        freeValue += 0;
+                      }
+                    } catch (e) {
+                      freeValue += 0;
+                    }
+                  }
+                }
+              }
+
               const v =
                 Number(impact.itemsDiscount || 0) +
-                Number(impact.cartDiscount || 0);
+                Number(impact.cartDiscount || 0) +
+                Number(Math.round(freeValue || 0));
+
               if (v > bestValue) {
                 bestValue = v;
                 best = { promo: p, impact };
@@ -216,6 +260,7 @@ async function applyPromoThenVoucher({
               /* ignore */
             }
           }
+
           if (best) {
             promoApplied = best.promo;
             selectedPromoReplacedBy = String(best.promo._id);
@@ -234,18 +279,58 @@ async function applyPromoThenVoucher({
     let bestValue = -1;
     for (const p of applicable) {
       try {
-        const safeCart = makeSafeCartForPromo(originalForDist);
-        const { impact } = await applyPromoRaw(p, safeCart);
+        const safeCartEval = makeSafeCartForPromo(originalForDist);
+        const { impact } = await applyPromoRaw(p, safeCartEval);
+
+        // estimate free items value (try fetch menu prices from menuMap or fallback to original cart price)
+        let freeValue = 0;
+        if (
+          impact &&
+          Array.isArray(impact.addedFreeItems) &&
+          impact.addedFreeItems.length
+        ) {
+          for (const fi of impact.addedFreeItems) {
+            const menuId = String(fi.menuId || '');
+            const qty = Number(fi.qty || 1);
+            // attempt to find price from originalForDist (same menu in cart)
+            const found = originalForDist.find(
+              (x) => String(x.menuId) === menuId
+            );
+            if (found && Number(found.price || 0) > 0) {
+              freeValue += Number(found.price || 0) * qty;
+            } else {
+              // fallback: try menuModel lookup (sync await)
+              try {
+                const mdoc = await Menu.findById(menuId)
+                  .lean()
+                  .catch(() => null);
+                if (mdoc && Number(mdoc.price || mdoc.base_price || 0) > 0) {
+                  freeValue += Number(mdoc.price || mdoc.base_price || 0) * qty;
+                } else {
+                  // fallback conservative estimate (e.g. 0)
+                  freeValue += 0;
+                }
+              } catch (e) {
+                freeValue += 0;
+              }
+            }
+          }
+        }
+
         const v =
-          Number(impact.itemsDiscount || 0) + Number(impact.cartDiscount || 0);
+          Number(impact.itemsDiscount || 0) +
+          Number(impact.cartDiscount || 0) +
+          Number(Math.round(freeValue || 0));
+
         if (v > bestValue) {
           bestValue = v;
           best = { promo: p, impact };
         }
       } catch (e) {
-        // ignore failing promo
+        /* ignore */
       }
     }
+
     if (best) promoApplied = best.promo;
   }
 
@@ -287,7 +372,6 @@ async function applyPromoThenVoucher({
       );
       if (freeIds.length) {
         try {
-          const Menu = require('../models/menuModel');
           const menus = await Menu.find({ _id: { $in: freeIds } })
             .lean()
             .catch(() => []);
