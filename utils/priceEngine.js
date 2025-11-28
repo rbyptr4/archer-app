@@ -1,12 +1,39 @@
-// utils/priceEngine.js (partial) - applyPromoThenVoucher with extra logs
+// utils/priceEngine.js
 const {
   applyPromo: applyPromoRaw,
   findApplicablePromos
-} = require('./promoEngine'); // applyPromoRaw berasal dari promoEngine.applyPromo
+} = require('./promoEngine');
 const { validateAndPrice } = require('./voucherEngine');
 const throwError = require('./throwError');
 
 const int = (v) => Math.round(Number(v || 0));
+
+/**
+ * Helper: ambil menu dari cache menuMap atau DB lalu cache hasilnya.
+ * - menuMap: object yang dimodifikasi in-place (kunci = String(menuId))
+ * - mengembalikan menuDoc atau null
+ */
+async function ensureMenuInMap(menuMap, menuId) {
+  if (!menuId) return null;
+  const key = String(menuId);
+  if (menuMap && menuMap[key]) return menuMap[key];
+  try {
+    const Menu = require('../models/menuModel');
+    const m = await Menu.findById(menuId)
+      .select('name imageUrl code category price base_price')
+      .lean()
+      .catch(() => null);
+    if (m) {
+      menuMap = menuMap || {};
+      menuMap[key] = m;
+      return m;
+    }
+    return null;
+  } catch (e) {
+    console.warn('[PE] ensureMenuInMap failed for', menuId, e?.message || e);
+    return null;
+  }
+}
 
 function distributeDiscountToItems(items, discount) {
   if (!Array.isArray(items) || items.length === 0 || !discount) return [];
@@ -171,7 +198,7 @@ async function applyPromoThenVoucher({
       const impact = res.impact || {};
       const actions = Array.isArray(res.actions) ? res.actions.slice() : [];
 
-      // estimate free items value (sama seperti sebelumnya)
+      // estimate free items value
       let freeValue = 0;
       if (
         impact &&
@@ -193,6 +220,7 @@ async function applyPromoThenVoucher({
                 .lean()
                 .catch(() => null);
               if (mdoc) {
+                // prefer snapshots if ada
                 freeValue += Number(mdoc.base_price || mdoc.price || 0) * qty;
               } else {
                 freeValue += 0;
@@ -208,27 +236,22 @@ async function applyPromoThenVoucher({
         impact.itemsDiscount || impact.cartDiscount || 0
       );
 
-      // ===== NEW: value for actions (award_points / grant_membership etc.)
-      // beri bobot agar non-monetary rewards juga dihargai saat auto-pick.
+      // value for actions (award_points / grant_membership etc.)
       let actionsValue = 0;
       if (Array.isArray(actions) && actions.length) {
         for (const a of actions) {
           const t = String(a.type || '').toLowerCase();
           if (t === 'award_points') {
-            // konversi poin ke nilai kasar (1 poin = 0.5 rupiah) — sesuaikan jika perlu
             const pts = Number(a.points ?? a.amount ?? 0) || 0;
             actionsValue += Math.round(pts * 0.5);
           } else if (t === 'grant_membership') {
-            // grant_membership beri boost besar supaya diprioritaskan
             actionsValue += 1000;
           } else {
-            // reward jenis lain beri sedikit nilai
             actionsValue += 100;
           }
         }
       }
 
-      // final score = discount + free items value + actions value
       const score =
         Math.round(discountValue || 0) +
         Math.round(freeValue || 0) +
@@ -442,6 +465,21 @@ async function applyPromoThenVoucher({
     menuMap = {};
   }
 
+  // ===== ensure cache: fill menuMap for any free items that may still be missing =====
+  try {
+    if (
+      promoImpact &&
+      Array.isArray(promoImpact.addedFreeItems) &&
+      promoImpact.addedFreeItems.length
+    ) {
+      for (const f of promoImpact.addedFreeItems) {
+        await ensureMenuInMap(menuMap, f.menuId);
+      }
+    }
+  } catch (e) {
+    console.warn('[PE] ensure filling menuMap failed', e?.message || e);
+  }
+
   // build cartAfterPromo based on promoImpact (free items & discounts)
   if (promoApplied && promoImpact) {
     if (
@@ -449,7 +487,7 @@ async function applyPromoThenVoucher({
       promoImpact.addedFreeItems.length
     ) {
       for (const f of promoImpact.addedFreeItems) {
-        const menuDoc = menuMap[String(f.menuId)];
+        const menuDoc = await ensureMenuInMap(menuMap, f.menuId);
         cartAfterPromo.items.push({
           menuId: f.menuId,
           qty: Number(f.qty || 1),
@@ -490,7 +528,7 @@ async function applyPromoThenVoucher({
         promoImpact.addedFreeItems.length
       ) {
         for (const f of promoImpact.addedFreeItems) {
-          const menuDoc = menuMap[String(f.menuId)];
+          const menuDoc = await ensureMenuInMap(menuMap, f.menuId);
           cartAfterPromo.items.push({
             menuId: f.menuId,
             qty: Number(f.qty || 1),
@@ -568,32 +606,8 @@ async function applyPromoThenVoucher({
       promoImpact.addedFreeItems.length
     ) {
       for (const f of promoImpact.addedFreeItems) {
-        // ensure Menu model is available (di top file: const Menu = require('../models/menuModel'); )
-        let menuDoc = menuMap[String(f.menuId)];
-
-        // jika belum ada di menuMap, coba fetch dari DB (robust fallback)
-        if (!menuDoc && f.menuId) {
-          try {
-            const Menu = require('../models/menuModel');
-            const found = await Menu.findById(f.menuId)
-              .select('name imageUrl code')
-              .lean()
-              .catch(() => null);
-            if (found) {
-              menuDoc = found;
-              // simpan ke menuMap agar lookup berikutnya lebih cepat
-              menuMap[String(f.menuId)] = menuDoc;
-            }
-          } catch (e) {
-            // jangan crash — cuma log
-            console.warn(
-              '[PE] fetch menu for free item failed',
-              String(f.menuId),
-              e?.message || e
-            );
-          }
-        }
-
+        // pastikan menuDoc ada di cache / DB
+        const menuDoc = await ensureMenuInMap(menuMap, f.menuId);
         const labelName = menuDoc?.name || f.name || String(f.menuId || '');
         discounts.push({
           id: promoId,
@@ -651,11 +665,19 @@ async function applyPromoThenVoucher({
       promoImpact.addedFreeItems.length
     ) {
       for (const f of promoImpact.addedFreeItems) {
+        const menuDoc = await ensureMenuInMap(menuMap, f.menuId);
+        const labelName = menuDoc?.name || f.name || String(f.menuId || '');
         promoRewardsLocal.push({
           type: 'free_item',
           amount: 0,
-          label: f.name || `Gratis: ${String(f.menuId || '')}`,
-          meta: { menuId: f.menuId, qty: Number(f.qty || 1) }
+          label: labelName
+            ? `Gratis: ${labelName}`
+            : `Gratis: ${String(f.menuId || '')}`,
+          meta: {
+            menuId: f.menuId,
+            qty: Number(f.qty || 1),
+            menuSnapshot: menuDoc || null
+          }
         });
       }
     }
@@ -682,12 +704,17 @@ async function applyPromoThenVoucher({
             freeItemsSnapshot:
               Array.isArray(promoImpact.addedFreeItems) &&
               promoImpact.addedFreeItems.length
-                ? promoImpact.addedFreeItems.map((f) => ({
-                    menuId: f.menuId,
-                    qty: Number(f.qty || 1),
-                    name: menuMap[String(f.menuId)]?.name || f.name || null,
-                    imageUrl: menuMap[String(f.menuId)]?.imageUrl || null
-                  }))
+                ? await Promise.all(
+                    promoImpact.addedFreeItems.map(async (f) => {
+                      const md = await ensureMenuInMap(menuMap, f.menuId);
+                      return {
+                        menuId: f.menuId,
+                        qty: Number(f.qty || 1),
+                        name: md?.name || f.name || null,
+                        imageUrl: md?.imageUrl || null
+                      };
+                    })
+                  )
                 : []
           }
         : null,
@@ -800,13 +827,14 @@ async function applyPromoThenVoucher({
       promoImpact.addedFreeItems.length
     ) {
       for (const f of promoImpact.addedFreeItems) {
-        const menuDoc = menuMap[String(f.menuId)];
+        const menuDoc = await ensureMenuInMap(menuMap, f.menuId);
+        const labelName = menuDoc?.name || f.name || String(f.menuId || '');
         discounts.push({
           id: promoId,
           source: 'promo',
           orderIdx: 1,
           type: 'free_item',
-          label: `Gratis: ${menuDoc ? menuDoc.name : f.name || f.menuId}`,
+          label: `Gratis: ${labelName}`,
           amount: 0,
           items: [{ menuId: f.menuId, qty: Number(f.qty || 1), amount: 0 }],
           meta: { promoId, menuId: f.menuId, menuSnapshot: menuDoc || null }
@@ -909,11 +937,19 @@ async function applyPromoThenVoucher({
     promoImpact.addedFreeItems.length
   ) {
     for (const f of promoImpact.addedFreeItems) {
+      const menuDoc = await ensureMenuInMap(menuMap, f.menuId);
+      const labelName = menuDoc?.name || f.name || String(f.menuId || '');
       promoRewards.push({
         type: 'free_item',
         amount: 0,
-        label: f.name || `Gratis: ${String(f.menuId || '')}`,
-        meta: { menuId: f.menuId, qty: Number(f.qty || 1) }
+        label: labelName
+          ? `Gratis: ${labelName}`
+          : `Gratis: ${String(f.menuId || '')}`,
+        meta: {
+          menuId: f.menuId,
+          qty: Number(f.qty || 1),
+          menuSnapshot: menuDoc || null
+        }
       });
     }
   }
@@ -942,7 +978,6 @@ async function applyPromoThenVoucher({
   try {
     const money = require('./money');
 
-    // baseSubtotal: prefer voucherRes.totals.baseSubtotal (if voucher engine returned), else compute from originalForDist
     const voucherTotals = (voucherRes && voucherRes.totals) || {};
     const baseSubtotalFromVoucher = Number(
       voucherTotals.baseSubtotal ?? voucherTotals.base_subtotal ?? NaN
@@ -955,31 +990,26 @@ async function applyPromoThenVoucher({
       ? baseSubtotalFromVoucher
       : baseSubtotalComputed;
 
-    // promo discount
     const promoDiscountTotal = Number(
       promoImpact && (promoImpact.cartDiscount || promoImpact.itemsDiscount)
         ? promoImpact.cartDiscount || promoImpact.itemsDiscount
         : 0
     );
 
-    // voucher discount (if voucherTotals provides itemsDiscount)
     const voucherItemsDiscount = Number(
       voucherTotals.itemsDiscount ?? voucherTotals.items_discount ?? 0
     );
 
-    // merged items discount (sum of voucher + promo)
     const mergedItemsDiscount = Math.max(
       0,
       Math.round(voucherItemsDiscount + promoDiscountTotal)
     );
 
-    // subtotal after discount
     const items_subtotal_after_discount = Math.max(
       0,
       Math.round(baseSubtotal - mergedItemsDiscount)
     );
 
-    // delivery & shipping (prefer voucher totals if provided)
     const deliveryAfter = Number(
       voucherTotals.deliveryFee ??
         voucherTotals.delivery_fee ??
@@ -990,7 +1020,6 @@ async function applyPromoThenVoucher({
       voucherTotals.shippingDiscount ?? voucherTotals.shipping_discount ?? 0
     );
 
-    // service fee & tax using same formula as previewPrice
     const service_fee = Math.round(
       items_subtotal_after_discount * money.SERVICE_FEE_RATE
     );
@@ -1042,12 +1071,17 @@ async function applyPromoThenVoucher({
             freeItemsSnapshot:
               Array.isArray(promoImpact?.addedFreeItems) &&
               promoImpact.addedFreeItems.length
-                ? promoImpact.addedFreeItems.map((f) => ({
-                    menuId: f.menuId,
-                    qty: Number(f.qty || 1),
-                    name: menuMap[String(f.menuId)]?.name || f.name || null,
-                    imageUrl: menuMap[String(f.menuId)]?.imageUrl || null
-                  }))
+                ? await Promise.all(
+                    promoImpact.addedFreeItems.map(async (f) => {
+                      const md = await ensureMenuInMap(menuMap, f.menuId);
+                      return {
+                        menuId: f.menuId,
+                        qty: Number(f.qty || 1),
+                        name: md?.name || f.name || null,
+                        imageUrl: md?.imageUrl || null
+                      };
+                    })
+                  )
                 : []
           }
         : null,
@@ -1095,7 +1129,6 @@ async function applyPromoThenVoucher({
 
     return final;
   } catch (err) {
-    // jika proses merge totals gagal, fallback aman: return voucherRes shape + promoApplied info
     console.error('[PE] merge totals failed', err?.message || err);
     const fallback = {
       ok: voucherRes?.ok ?? true,
@@ -1110,12 +1143,17 @@ async function applyPromoThenVoucher({
             freeItemsSnapshot:
               Array.isArray(promoImpact?.addedFreeItems) &&
               promoImpact.addedFreeItems.length
-                ? promoImpact.addedFreeItems.map((f) => ({
-                    menuId: f.menuId,
-                    qty: Number(f.qty || 1),
-                    name: menuMap[String(f.menuId)]?.name || f.name || null,
-                    imageUrl: menuMap[String(f.menuId)]?.imageUrl || null
-                  }))
+                ? await Promise.all(
+                    promoImpact.addedFreeItems.map(async (f) => {
+                      const md = await ensureMenuInMap(menuMap, f.menuId);
+                      return {
+                        menuId: f.menuId,
+                        qty: Number(f.qty || 1),
+                        name: md?.name || f.name || null,
+                        imageUrl: md?.imageUrl || null
+                      };
+                    })
+                  )
                 : []
           }
         : null,
