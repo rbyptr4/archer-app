@@ -216,14 +216,28 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
     return {
       ...r,
       // common aliases
-      percent: r.percent ?? r.percentAmount ?? r.pointsPercent ?? r.points_percent ?? null,
-      amount: r.amount ?? r.cartAmount ?? r.pointsFixed ?? r.points_fixed ?? r.value ?? null,
-      pointsFixed: r.pointsFixed ?? r.points_fixed ?? r.amount ?? r.points ?? null,
+      percent:
+        r.percent ??
+        r.percentAmount ??
+        r.pointsPercent ??
+        r.points_percent ??
+        null,
+      amount:
+        r.amount ??
+        r.cartAmount ??
+        r.pointsFixed ??
+        r.points_fixed ??
+        r.value ??
+        null,
+      pointsFixed:
+        r.pointsFixed ?? r.points_fixed ?? r.amount ?? r.points ?? null,
       pointsPercent: r.pointsPercent ?? r.points_percent ?? r.percent ?? null,
       freeMenuId: r.freeMenuId ?? r.free_menu_id ?? r.free_menu ?? null,
       appliesTo: r.appliesTo ?? r.scope ?? null,
-      appliesToMenuId: r.appliesToMenuId ?? r.menuId ?? r.applies_to_menu_id ?? null,
-      appliesToCategory: r.appliesToCategory ?? r.category ?? r.applies_to_category ?? null,
+      appliesToMenuId:
+        r.appliesToMenuId ?? r.menuId ?? r.applies_to_menu_id ?? null,
+      appliesToCategory:
+        r.appliesToCategory ?? r.category ?? r.applies_to_category ?? null,
       grantMembership: r.grantMembership ?? r.grant_membership ?? false
     };
   });
@@ -319,18 +333,28 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
 
     // === POINTS handling (NORMALIZED) ===
     // try multiple aliases: pointsFixed, pointsFixed via amount, explicit points, pointsPercent, percent (as fallback)
-    const parsedPointsFixed = parseNumber(r.pointsFixed ?? r.pointsFixed ?? r.pointsFixed);
-    const parsedPointsFixedAlt = parseNumber(r.pointsFixed || r.pointsFixed || r.amount || r.points || null);
+    const parsedPointsFixed = parseNumber(
+      r.pointsFixed ?? r.pointsFixed ?? r.pointsFixed
+    );
+    const parsedPointsFixedAlt = parseNumber(
+      r.pointsFixed || r.pointsFixed || r.amount || r.points || null
+    );
     const parsedPointsPercent =
-      parseNumber(r.pointsPercent ?? r.points_percent ?? r.pointsPercent ?? r.pointsPercent) ||
+      parseNumber(
+        r.pointsPercent ??
+          r.points_percent ??
+          r.pointsPercent ??
+          r.pointsPercent
+      ) ||
       parseNumber(r.pointsPercent ?? r.percent ?? null) ||
       parseNumber(r.pointsPercent ?? r.percent ?? r.pointsPercent ?? null);
     // better unified attempts:
-    const ptsFixed = Number.isFinite(parsedPointsFixed) && parsedPointsFixed > 0
-      ? parsedPointsFixed
-      : Number.isFinite(parsedPointsFixedAlt) && parsedPointsFixedAlt > 0
-      ? parsedPointsFixedAlt
-      : NaN;
+    const ptsFixed =
+      Number.isFinite(parsedPointsFixed) && parsedPointsFixed > 0
+        ? parsedPointsFixed
+        : Number.isFinite(parsedPointsFixedAlt) && parsedPointsFixedAlt > 0
+        ? parsedPointsFixedAlt
+        : NaN;
 
     let ptsFromPercent = NaN;
     // first try explicit pointsPercent keys
@@ -365,9 +389,9 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
         points: pts,
         meta: { promoId: promo._id, percent: true }
       });
-      impact.note += (impact.note ? '; ' : '') + `Poin ${r.pointsPercent ?? r.percent || 'pct'}% (~${pts})`;
+      const pctLabel = r.pointsPercent ?? r.percent ?? 'pct';
+      impact.note += (impact.note ? '; ' : '') + `Poin ${pctLabel}% (~${pts})`;
     } else {
-
     }
 
     // grant membership
@@ -385,7 +409,6 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
 
   return { impact, actions };
 }
-
 
 /**
  * executePromoActions(order, MemberModel, { session })
