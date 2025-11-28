@@ -4927,19 +4927,18 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
 
   if (cursor) {
     const cDate = new Date(cursor);
-    if (isNaN(cDate.getTime()))
-      throwError('cursor tidak valid (harus ISO date)', 400);
+    if (isNaN(cDate.getTime())) throwError('cursor tidak valid (harus ISO date)', 400);
     q.placed_at = { $lt: cDate };
   }
 
   const raw = await Order.find(q)
     .select(
-      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label delivery.scheduled_at delivery.status status member createdAt items delivery.mode'
+      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label delivery.scheduled_at delivery.status status member createdAt items delivery.mode discounts'
     )
     .sort({ placed_at: -1 })
     .limit(lim)
     .populate({ path: 'member', select: 'name phone' })
-    .populate('items.menu', 'name image')
+    .populate('items.menu', 'name imageUrl') // populate menu pada item jika ada ref
     .lean();
 
   const items = (Array.isArray(raw) ? raw : []).map((o) => {
@@ -4947,11 +4946,12 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
       (o.delivery && o.delivery.mode) ||
       (o.fulfillment_type === 'dine_in' ? 'none' : 'delivery');
 
+    // map item normal
     const orderItems = (Array.isArray(o.items) ? o.items : []).map((it) => ({
       menu: it.menu ? String(it.menu._id || it.menu) : null,
       name: (it.menu && it.menu.name) || it.name || '',
       menu_code: it.menu_code || '',
-      image: (it.menu && it.menu.image) || null,
+      image: (it.menu && (it.menu.imageUrl || it.menu.image)) || it.imageUrl || null,
       quantity: Number(it.quantity || 0),
       base_price: Number(it.base_price || 0),
       addons: Array.isArray(it.addons)
@@ -4962,7 +4962,79 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
           }))
         : [],
       notes: it.notes || '',
-      line_subtotal: Number(it.line_subtotal || 0)
+      line_subtotal: Number(it.line_subtotal || 0),
+      // include adjustments (raw) so kitchen can see reason if perlu
+      adjustments: Array.isArray(it.adjustments) ? it.adjustments : [],
+      // mark whether this item is free (base_price == 0 and quantity > 0 and line_subtotal == 0)
+      is_free_item: Number(it.base_price || 0) === 0 && Number(it.quantity || 0) > 0 && Number(it.line_subtotal || 0) === 0
+    }));
+
+    // 1) Ambil free items dari discounts (promo free_item)
+    const freeFromDiscounts = (Array.isArray(o.discounts) ? o.discounts : [])
+      .filter((d) => String(d.source || '').toLowerCase() === 'promo' && (d.type === 'free_item' || (d.type === 'note' && String(d.label || '').toLowerCase().includes('gratis'))))
+      .flatMap((d) => {
+        const itemsArr = Array.isArray(d.items) ? d.items : [];
+        return itemsArr.map((it) => ({
+          menuId: String(it.menuId || (d.meta && d.meta.menuId) || ''),
+          qty: Number(it.qty || (d.meta && d.meta.qty) || 1),
+          name: (d.meta && d.meta.name) || (d.label ? String(d.label).replace(/^Gratis:\s*/i, '') : null) || null,
+          imageUrl: (d.meta && d.meta.imageUrl) || null,
+          source: 'discount'
+        }));
+      });
+
+    // 2) Ambil free items dari item yang memang line price 0 atau flagged is_free_item
+    const freeFromItems = (Array.isArray(o.items) ? o.items : [])
+      .filter((it) => Number(it.base_price || 0) === 0 && Number(it.quantity || 0) > 0)
+      .map((it) => ({
+        menuId: String((it.menu && it.menu._id) || it.menu || ''),
+        qty: Number(it.quantity || 1),
+        name: it.name || (it.menu && it.menu.name) || null,
+        imageUrl: it.imageUrl || (it.menu && it.menu.imageUrl) || null,
+        source: 'item'
+      }));
+
+    // 3) Ambil free items dari adjustments tiap item (promo_free_item)
+    const freeFromAdjustments = (Array.isArray(o.items) ? o.items : [])
+      .flatMap((it) => {
+        const adj = Array.isArray(it.adjustments) ? it.adjustments : [];
+        return adj
+          .filter((a) => String(a.type || '').toLowerCase() === 'promo_free_item')
+          .map((a) => ({
+            menuId: String((it.menu && it.menu._id) || it.menu || a.menuId || ''),
+            qty: Number(a.qty || a.amount || 1),
+            name: it.name || (it.menu && it.menu.name) || (a.name || null) || null,
+            imageUrl: it.imageUrl || (it.menu && it.menu.imageUrl) || (a.imageUrl || null),
+            source: 'adjustment'
+          }));
+      });
+
+    // gabungkan semua sumber jadi satu map (aggregate qty jika duplikat menuId)
+    const freeMap = {};
+    const pushFree = (f) => {
+      if (!f || !f.menuId) return;
+      const k = String(f.menuId);
+      if (!freeMap[k]) {
+        freeMap[k] = { menuId: k, qty: 0, name: f.name || null, imageUrl: f.imageUrl || null, sources: {} };
+      }
+      freeMap[k].qty += Number(f.qty || 0);
+      // prefer name/image jika belum ada
+      if (!freeMap[k].name && f.name) freeMap[k].name = f.name;
+      if (!freeMap[k].imageUrl && f.imageUrl) freeMap[k].imageUrl = f.imageUrl;
+      freeMap[k].sources[f.source] = (freeMap[k].sources[f.source] || 0) + Number(f.qty || 0);
+    };
+
+    freeFromDiscounts.forEach(pushFree);
+    freeFromItems.forEach(pushFree);
+    freeFromAdjustments.forEach(pushFree);
+
+    // built final array
+    const free_items = Object.keys(freeMap).map((k) => ({
+      menuId: freeMap[k].menuId,
+      name: freeMap[k].name || '',
+      imageUrl: freeMap[k].imageUrl || null,
+      qty: freeMap[k].qty,
+      sources: freeMap[k].sources // optional: menunjukkan asal (discount/item/adjustment)
     }));
 
     return {
@@ -4973,35 +5045,29 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
       customer_name: (o.member && o.member.name) || o.customer_name || '',
       customer_phone: (o.member && o.member.phone) || o.customer_phone || '',
       placed_at: o.placed_at || o.createdAt || null,
-      table_number:
-        o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
+      table_number: o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
       payment_status: o.payment_status || null,
       status: o.status || null,
       total_quantity: Number(o.total_quantity || 0),
       pickup_window:
         o.delivery && o.delivery.pickup_window
-          ? {
-              from: o.delivery.pickup_window.from || null,
-              to: o.delivery.pickup_window.to || null
-            }
+          ? { from: o.delivery.pickup_window.from || null, to: o.delivery.pickup_window.to || null }
           : null,
       delivery_slot_label: o.delivery ? o.delivery.slot_label || null : null,
-      delivery_scheduled_at: o.delivery
-        ? o.delivery.scheduled_at || null
-        : null,
+      delivery_scheduled_at: o.delivery ? o.delivery.scheduled_at || null : null,
       delivery_status: o.delivery ? o.delivery.status || null : null,
       member_id: o.member ? String(o.member._id) : null,
-      items: orderItems
+      items: orderItems,
+      free_items 
     };
   });
 
   return res.status(200).json({
     items,
-    next_cursor: items.length
-      ? new Date(items[items.length - 1].placed_at).toISOString()
-      : null
+    next_cursor: items.length ? new Date(items[items.length - 1].placed_at).toISOString() : null
   });
 });
+
 
 exports.createPosDineIn = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);

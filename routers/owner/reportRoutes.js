@@ -5,11 +5,11 @@ const requireRole = require('../../utils/requireRole');
 const requirePageAccess = require('../../utils/requirePageAccess');
 const rpt = require('../../controllers/owner/reportController');
 
-router.use(
-  validateToken,
-  requireRole('owner', 'courier', 'kitchen', 'cashier'),
-  requirePageAccess('reports')
-);
+// router.use(
+//   validateToken,
+//   requireRole('owner', 'courier', 'kitchen', 'cashier'),
+//   requirePageAccess('reports')
+// );
 
 router.get('/orders/dashboard', rpt.reportDashboard);
 router.get('/orders/transactions', rpt.totalTransactions);

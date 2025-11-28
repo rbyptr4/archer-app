@@ -381,7 +381,7 @@ exports.totalTransactions = asyncHandler(async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(cursor)) {
       return res.status(400).json({ error: 'Invalid cursor' });
     }
-    findQuery._id = { $lt: mongoose.Types.ObjectId(cursor) };
+    findQuery._id = { $lt: new mongoose.Types.ObjectId(cursor) };
   }
 
   const rows = await Order.find(findQuery)
