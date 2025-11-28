@@ -609,6 +609,13 @@ async function applyPromoThenVoucher({
         // pastikan menuDoc ada di cache / DB
         const menuDoc = await ensureMenuInMap(menuMap, f.menuId);
         const labelName = menuDoc?.name || f.name || String(f.menuId || '');
+        const meta = {
+          promoId,
+          menuId: f.menuId,
+          qty: Number(f.qty || 1),
+          name: menuDoc?.name || f.name || null,
+          imageUrl: menuDoc?.imageUrl || f.imageUrl || null
+        };
         discounts.push({
           id: promoId,
           source: 'promo',
@@ -617,7 +624,7 @@ async function applyPromoThenVoucher({
           label: `Gratis: ${labelName}`,
           amount: 0,
           items: [{ menuId: f.menuId, qty: Number(f.qty || 1), amount: 0 }],
-          meta: { promoId, menuId: f.menuId, menuSnapshot: menuDoc || null }
+          meta
         });
 
         itemAdjustmentsMap[f.menuId] = itemAdjustmentsMap[f.menuId] || [];
@@ -676,7 +683,8 @@ async function applyPromoThenVoucher({
           meta: {
             menuId: f.menuId,
             qty: Number(f.qty || 1),
-            menuSnapshot: menuDoc || null
+            name: menuDoc?.name || f.name || null,
+            imageUrl: menuDoc?.imageUrl || f.imageUrl || null
           }
         });
       }
@@ -711,7 +719,7 @@ async function applyPromoThenVoucher({
                         menuId: f.menuId,
                         qty: Number(f.qty || 1),
                         name: md?.name || f.name || null,
-                        imageUrl: md?.imageUrl || null
+                        imageUrl: md?.imageUrl || f.imageUrl || null
                       };
                     })
                   )
@@ -829,6 +837,13 @@ async function applyPromoThenVoucher({
       for (const f of promoImpact.addedFreeItems) {
         const menuDoc = await ensureMenuInMap(menuMap, f.menuId);
         const labelName = menuDoc?.name || f.name || String(f.menuId || '');
+        const meta = {
+          promoId,
+          menuId: f.menuId,
+          qty: Number(f.qty || 1),
+          name: menuDoc?.name || f.name || null,
+          imageUrl: menuDoc?.imageUrl || f.imageUrl || null
+        };
         discounts.push({
           id: promoId,
           source: 'promo',
@@ -837,7 +852,7 @@ async function applyPromoThenVoucher({
           label: `Gratis: ${labelName}`,
           amount: 0,
           items: [{ menuId: f.menuId, qty: Number(f.qty || 1), amount: 0 }],
-          meta: { promoId, menuId: f.menuId, menuSnapshot: menuDoc || null }
+          meta
         });
         itemAdjustmentsMap[f.menuId] = itemAdjustmentsMap[f.menuId] || [];
         itemAdjustmentsMap[f.menuId].push({
@@ -948,7 +963,8 @@ async function applyPromoThenVoucher({
         meta: {
           menuId: f.menuId,
           qty: Number(f.qty || 1),
-          menuSnapshot: menuDoc || null
+          name: menuDoc?.name || f.name || null,
+          imageUrl: menuDoc?.imageUrl || f.imageUrl || null
         }
       });
     }
@@ -1078,7 +1094,7 @@ async function applyPromoThenVoucher({
                         menuId: f.menuId,
                         qty: Number(f.qty || 1),
                         name: md?.name || f.name || null,
-                        imageUrl: md?.imageUrl || null
+                        imageUrl: md?.imageUrl || f.imageUrl || null
                       };
                     })
                   )
@@ -1150,7 +1166,7 @@ async function applyPromoThenVoucher({
                         menuId: f.menuId,
                         qty: Number(f.qty || 1),
                         name: md?.name || f.name || null,
-                        imageUrl: md?.imageUrl || null
+                        imageUrl: md?.imageUrl || f.imageUrl || null
                       };
                     })
                   )
