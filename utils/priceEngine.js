@@ -5,6 +5,7 @@ const {
 } = require('./promoEngine'); // applyPromoRaw berasal dari promoEngine.applyPromo
 const { validateAndPrice } = require('./voucherEngine');
 const throwError = require('./throwError');
+const Menu = require('../models/menuModel.js');
 
 const int = (v) => Math.round(Number(v || 0));
 
@@ -76,6 +77,7 @@ async function applyPromoThenVoucher({
 } = {}) {
   const effectiveMember = memberDoc || (memberId ? { _id: memberId } : null);
 
+  // normalisasi awal: ambil menuId, qty, price (boleh kosong)
   const originalCart = {
     items: (Array.isArray(cart.items) ? cart.items : []).map((it) => ({
       menuId: it.menuId ?? it.menu ?? it.id ?? null,
@@ -85,15 +87,89 @@ async function applyPromoThenVoucher({
       name: it.name ?? null,
       imageUrl: it.imageUrl ?? null,
       menu_code: it.menu_code ?? it.menuCode ?? null,
-      raw: it.rawItem ?? null
+      raw: it.raw ?? null
     }))
   };
 
+  // jika ada item tanpa price (0 atau NaN), coba fill up dari DB Menu (best-effort)
+  const missingPriceMenuIds = Array.from(
+    new Set(
+      originalCart.items
+        .filter((it) => !Number.isFinite(it.price) || Number(it.price) <= 0)
+        .map((it) => String(it.menuId || ''))
+        .filter(Boolean)
+    )
+  );
+
+  if (missingPriceMenuIds.length) {
+    try {
+      const menus = await Menu.find({ _id: { $in: missingPriceMenuIds } })
+        .lean()
+        .catch(() => []);
+      const menuMap = (menus || []).reduce((acc, m) => {
+        acc[String(m._id)] = m;
+        return acc;
+      }, {});
+      originalCart.items = originalCart.items.map((it) => {
+        if (
+          (!Number.isFinite(it.price) || Number(it.price) <= 0) &&
+          it.menuId
+        ) {
+          const m = menuMap[String(it.menuId)];
+          if (m) {
+            const fallbackPrice = Number(m.base_price ?? m.price ?? 0);
+            it.price = Number.isFinite(fallbackPrice)
+              ? Math.round(fallbackPrice)
+              : 0;
+          } else {
+            // tetap 0 jika tidak ketemu
+            it.price = 0;
+          }
+        }
+        // ensure numeric types
+        it.qty = Number(it.qty || 0);
+        it.price = Number(it.price || 0);
+        return it;
+      });
+      console.log(
+        '[PE] filled missing prices from Menu DB for items:',
+        missingPriceMenuIds
+      );
+    } catch (e) {
+      console.warn('[PE] failed filling missing menu prices', e?.message || e);
+    }
+  }
+
+  // buat originalForDist (dipakai untuk distribusi diskon)
   const originalForDist = originalCart.items.map((it) => ({
     menuId: it.menuId,
     qty: Number(it.qty || 0),
     price: Number(it.price || 0)
   }));
+
+  // LOG penting sebelum findApplicablePromos
+  console.log('=== [PE] START ===');
+  console.log('[PE] selectedPromoId:', String(selectedPromoId || 'null'));
+  console.log(
+    '[PE] effectiveMember snapshot:',
+    JSON.stringify(effectiveMember || null)
+  );
+  console.log(
+    '[PE] cart originalForDist:',
+    JSON.stringify(originalForDist, null, 2)
+  );
+
+  // COMPUTE subtotal debug
+  const debugSubtotal = originalForDist.reduce(
+    (s, it) => s + Number(it.price || 0) * Number(it.qty || 0),
+    0
+  );
+  console.log(
+    '[PE] debugSubtotal:',
+    debugSubtotal,
+    'itemsCount:',
+    originalForDist.length
+  );
 
   // 1) find applicable promos
   let applicable = [];
@@ -108,6 +184,12 @@ async function applyPromoThenVoucher({
     console.warn('[priceEngine] findApplicablePromos failed', e?.message || e);
     applicable = [];
   }
+  console.log(
+    '[PE] findApplicablePromos returned count:',
+    (applicable || []).length,
+    'ids:',
+    (applicable || []).map((p) => String(p._id))
+  );
 
   // === LOG START ===
   console.log('=== [PE] START ===');
