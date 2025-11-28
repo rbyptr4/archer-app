@@ -46,6 +46,30 @@ function distributeDiscountToItems(items, discount) {
   return out;
 }
 
+/** helper: create a safe cart snapshot shape that promoEngine expects */
+function makeSafeCartForPromo(items = []) {
+  return {
+    items: (Array.isArray(items) ? items : []).map((it) => {
+      const price = Number(it.price ?? it.unit_price ?? it.base_price ?? 0);
+      const qty = Number(it.qty ?? it.quantity ?? 0);
+      return {
+        // fields promoEngine.snapshotTotals reads:
+        base_price: price,
+        unit_price: price,
+        price: price,
+        quantity: qty,
+        qty: qty,
+        // keep metadata to help promo logic
+        menuId: it.menuId ?? it.menu ?? null,
+        name: it.name ?? null,
+        category: it.category ?? null,
+        imageUrl: it.imageUrl ?? null,
+        menu_code: it.menu_code ?? it.menuCode ?? null
+      };
+    })
+  };
+}
+
 /**
  * applyPromoThenVoucher
  */
@@ -129,15 +153,16 @@ async function applyPromoThenVoucher({
         (p) => String(p._id) === String(selectedPromoId)
       ) || null;
     if (!promoApplied) {
-      // try fetch promo directly and try apply
+      // try fetch promo directly and try apply (use safe cart)
       try {
         const PromoModel = require('../models/promoModel');
         const promoFromDb = await PromoModel.findById(selectedPromoId).lean();
         if (promoFromDb) {
           try {
+            const safeCart = makeSafeCartForPromo(originalForDist);
             const { impact, actions } = await applyPromoRaw(
               promoFromDb,
-              originalForDist
+              safeCart
             );
             promoApplied = promoFromDb;
             promoImpact = impact || {};
@@ -146,6 +171,12 @@ async function applyPromoThenVoucher({
             console.log(
               '[priceEngine.info] selectedPromo applied directly from DB:',
               selectedPromoReplacedBy
+            );
+            console.log(
+              '[priceEngine.debug] direct-apply result impact:',
+              JSON.stringify(promoImpact),
+              'actions:',
+              JSON.stringify(promoActions)
             );
           } catch (e) {
             console.warn(
@@ -172,7 +203,8 @@ async function applyPromoThenVoucher({
           let bestValue = -1;
           for (const p of applicable) {
             try {
-              const { impact } = await applyPromoRaw(p, originalForDist);
+              const safeCart = makeSafeCartForPromo(originalForDist);
+              const { impact } = await applyPromoRaw(p, safeCart);
               const v =
                 Number(impact.itemsDiscount || 0) +
                 Number(impact.cartDiscount || 0);
@@ -202,7 +234,8 @@ async function applyPromoThenVoucher({
     let bestValue = -1;
     for (const p of applicable) {
       try {
-        const { impact } = await applyPromoRaw(p, originalForDist);
+        const safeCart = makeSafeCartForPromo(originalForDist);
+        const { impact } = await applyPromoRaw(p, safeCart);
         const v =
           Number(impact.itemsDiscount || 0) + Number(impact.cartDiscount || 0);
         if (v > bestValue) {
@@ -220,7 +253,8 @@ async function applyPromoThenVoucher({
   let cartAfterPromo = JSON.parse(JSON.stringify(originalCart)); // clone so originalForDist still intact
   try {
     if (promoApplied && (!promoImpact || !promoActions.length)) {
-      const res = await applyPromoRaw(promoApplied, originalForDist);
+      const safeCart = makeSafeCartForPromo(originalForDist);
+      const res = await applyPromoRaw(promoApplied, safeCart);
       promoImpact = res.impact || {};
       promoActions = Array.isArray(res.actions) ? res.actions.slice() : [];
       console.log('=== [PE] APPLY PROMO RESULT ===');
