@@ -697,7 +697,7 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
 
 //  list member
 exports.listMemberSummary = asyncHandler(async (req, res) => {
-  let { limit = 50, search = '', cursor } = req.query;
+  let { limit = 20, search = '', cursor } = req.query;
   limit = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 200);
 
   const baseMatch = buildMemberMatch({ search });
@@ -715,7 +715,7 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
   // pipeline: match -> sort desc -> limit+1 -> project only required fields
   const pipeline = [
     { $match: combinedMatch },
-    { $sort: { createdAt: -1, _id: -1 } },
+    { $sort: { name: 1, _id: 1 } },
     { $limit: limit + 1 },
     {
       $project: {
