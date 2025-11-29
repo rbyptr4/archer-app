@@ -24,13 +24,12 @@ const getMemberId = (req) => {
   return String(m.id || m._id || m);
 };
 
-// GET /member/vouchers/explore
 exports.explore = asyncHandler(async (req, res) => {
   const meId = getMemberId(req);
   if (!meId) throwError('Unauthorized (member)', 401);
 
   const now = new Date();
-  // only active + not deleted vouchers
+
   const list = await Voucher.find({ isDeleted: false, isActive: true })
     .sort('-createdAt')
     .lean();
@@ -38,7 +37,6 @@ exports.explore = asyncHandler(async (req, res) => {
   const visible = list.filter((v) => {
     if (!inWindow(v, now)) return false;
 
-    // include/exclude lists
     if (v.target?.excludeMemberIds?.some((id) => String(id) === meId))
       return false;
 
@@ -50,7 +48,6 @@ exports.explore = asyncHandler(async (req, res) => {
         return false;
     }
 
-    // global stock
     if (
       v.visibility?.mode === 'global_stock' &&
       (v.visibility?.globalStock || 0) <= 0
@@ -60,14 +57,170 @@ exports.explore = asyncHandler(async (req, res) => {
     return true;
   });
 
-  res.json({ vouchers: visible });
+  const out = visible.map((v) => {
+    const id = String(v._id);
+    const valid_until = v.visibility?.endAt
+      ? new Date(v.visibility.endAt).toISOString()
+      : null;
+    const stock =
+      v.visibility?.mode === 'global_stock'
+        ? typeof v.visibility?.globalStock === 'number'
+          ? v.visibility.globalStock
+          : null
+        : null;
+
+    return {
+      id,
+      name: v.name,
+      description: v.notes || null,
+      valid_until,
+      stock
+    };
+  });
+
+  return res.json({ vouchers: out });
 });
 
-/**
- * POST /member/vouchers/:voucherId/claim
- * - Requires authenticated member (req.member)
- * - No body required (server computes/records the claim)
- */
+exports.getVoucherById = asyncHandler(async (req, res) => {
+  const meId = getMemberId(req);
+  if (!meId) throwError('Unauthorized (member)', 401);
+
+  const id = req.params.id;
+  if (!mongoose.Types.ObjectId.isValid(id)) throwError('ID tidak valid', 400);
+
+  const v = await Voucher.findById(id).lean();
+  if (!v) throwError('Voucher tidak ditemukan', 404);
+
+  const now = new Date();
+
+  // cek visibility & audience rules
+  if (!inWindow(v, now)) throwError('Voucher tidak tersedia saat ini', 404);
+
+  if (v.target?.excludeMemberIds?.some((x) => String(x) === String(meId)))
+    throwError('Voucher tidak tersedia untuk member ini', 404);
+
+  if (
+    Array.isArray(v.target?.includeMemberIds) &&
+    v.target.includeMemberIds.length &&
+    !v.target.includeMemberIds.some((x) => String(x) === String(meId))
+  )
+    throwError('Voucher tidak tersedia untuk member ini', 404);
+
+  // global stock remaining
+  const globalStockRemaining =
+    v.visibility?.mode === 'global_stock' &&
+    typeof v.visibility.globalStock === 'number'
+      ? Math.max(0, v.visibility.globalStock)
+      : null;
+
+  // per-member limit & how many this member already claimed
+  const perMemberLimit =
+    typeof v.visibility?.perMemberLimit === 'number'
+      ? v.visibility.perMemberLimit
+      : null; // null treat as undefined/unlimited
+
+  let claimedByMe = 0;
+  if (perMemberLimit !== null && perMemberLimit > 0) {
+    claimedByMe = await VoucherClaim.countDocuments({
+      voucher: v._id,
+      member: meId
+    }).catch(() => 0);
+  }
+
+  const perMemberRemaining =
+    perMemberLimit === null
+      ? null
+      : Math.max(0, perMemberLimit - (claimedByMe || 0));
+
+  // simple canClaim boolean
+  const inPeriod = inWindow(v, now);
+  const notExcluded = !v.target?.excludeMemberIds?.some(
+    (x) => String(x) === String(meId)
+  );
+  const inInclude =
+    !Array.isArray(v.target?.includeMemberIds) ||
+    v.target.includeMemberIds.length === 0 ||
+    v.target.includeMemberIds.some((x) => String(x) === String(meId));
+
+  const hasGlobalStock =
+    v.visibility?.mode === 'global_stock'
+      ? typeof v.visibility.globalStock === 'number'
+        ? v.visibility.globalStock > 0
+        : false
+      : true;
+
+  const meetsPerMember =
+    perMemberLimit === null ? true : perMemberRemaining > 0;
+
+  const canClaim =
+    inPeriod && notExcluded && inInclude && hasGlobalStock && meetsPerMember;
+
+  // susun response detail rapi
+  const detail = {
+    id: String(v._id),
+    name: v.name,
+    description: v.notes || null,
+    type: v.type,
+    benefit: {
+      percent: typeof v.percent === 'number' ? v.percent : null,
+      amount: typeof v.amount === 'number' ? v.amount : null,
+      maxDiscount: typeof v.maxDiscount === 'number' ? v.maxDiscount : null,
+      shipping: v.shipping
+        ? {
+            percent: v.shipping.percent ?? 100,
+            maxAmount: v.shipping.maxAmount ?? 0
+          }
+        : null
+    },
+    visibility: {
+      mode: v.visibility?.mode || 'periodic',
+      startAt: v.visibility?.startAt
+        ? new Date(v.visibility.startAt).toISOString()
+        : null,
+      endAt: v.visibility?.endAt
+        ? new Date(v.visibility.endAt).toISOString()
+        : null,
+      globalStock:
+        typeof v.visibility?.globalStock === 'number'
+          ? v.visibility.globalStock
+          : null,
+      perMemberLimit:
+        typeof v.visibility?.perMemberLimit === 'number'
+          ? v.visibility.perMemberLimit
+          : null
+    },
+    target: {
+      audience: v.target?.audience || 'all',
+      minTransaction: v.target?.minTransaction ?? 0,
+      requiredPoints: v.target?.requiredPoints ?? 0,
+      includeCount: Array.isArray(v.target?.includeMemberIds)
+        ? v.target.includeMemberIds.length
+        : 0,
+      excludeCount: Array.isArray(v.target?.excludeMemberIds)
+        ? v.target.excludeMemberIds.length
+        : 0
+    },
+    usage: {
+      claimRequired: v.usage?.claimRequired ?? true,
+      maxUsePerClaim: v.usage?.maxUsePerClaim ?? 1,
+      useValidDaysAfterClaim: v.usage?.useValidDaysAfterClaim ?? 0,
+      stackableWithShipping: v.usage?.stackableWithShipping ?? true,
+      stackableWithOthers: v.usage?.stackableWithOthers ?? false
+    },
+    status: {
+      isActive: !!v.isActive,
+      isDeleted: !!v.isDeleted,
+      inWindow,
+      globalStockRemaining,
+      perMemberRemaining,
+      claimedByMe
+    },
+    canClaim
+  };
+
+  return res.json({ voucher: detail });
+});
+
 exports.claim = asyncHandler(async (req, res) => {
   const meId = getMemberId(req);
   if (!meId) throwError('Unauthorized (member)', 401);
@@ -219,4 +372,221 @@ exports.myWallet = asyncHandler(async (req, res) => {
   });
 
   res.json({ claims: visible });
+});
+
+exports.myVoucher = asyncHandler(async (req, res) => {
+  const meId = getMemberId(req);
+  if (!meId) throwError('Unauthorized (member)', 401);
+
+  const now = new Date();
+
+  // ambil semua klaim milik member (termasuk claimed/used/expired/revoked)
+  const claims = await VoucherClaim.find({
+    member: meId
+  })
+    .populate('voucher')
+    .sort('-createdAt')
+    .lean();
+
+  // map ke bentuk ringkas: mirip explore tapi untuk klaim
+  const out = (claims || []).map((c) => {
+    const v = c.voucher || null;
+    const voucherId = v ? String(v._id) : null;
+
+    // valid_until: prefer claim.validUntil (klaim bisa punya expiry berbeda), fallback ke voucher.visibility.endAt
+    const validUntil = c.validUntil
+      ? new Date(c.validUntil)
+      : v && v.visibility && v.visibility.endAt
+      ? new Date(v.visibility.endAt)
+      : null;
+
+    // apakah voucher aktif / terhapus menurut voucher master
+    const voucherActive = !!(v && v.isActive && !v.isDeleted);
+
+    // apakah sudah kadaluarsa (berdasarkan claim.validUntil atau voucher visibility)
+    const isExpired = validUntil ? now > validUntil : false;
+
+    // global stock info (jika ada)
+    const stock =
+      v && v.visibility && v.visibility.mode === 'global_stock'
+        ? typeof v.visibility.globalStock === 'number'
+          ? v.visibility.globalStock
+          : null
+        : null;
+
+    // ringkasan yang minimal untuk wallet list
+    return {
+      claimId: String(c._id), // id klaim (FE butuh ini untuk action/use)
+      voucherId,
+      name: v ? v.name : '(Voucher hilang)',
+      description: v ? v.notes || null : null,
+      claimedAt: c.claimedAt ? new Date(c.claimedAt).toISOString() : null,
+      valid_until: validUntil ? validUntil.toISOString() : null,
+      remainingUse: typeof c.remainingUse === 'number' ? c.remainingUse : null,
+      claimStatus: c.status || 'claimed', // 'claimed'|'used'|'expired'|'revoked'
+      voucherActive, // apakah voucher master aktif
+      isExpired, // kalkulasi kadaluarsa berdasarkan claim/voucher
+      stock, // global stock (atau null)
+      state: {
+        canUse:
+          !isExpired &&
+          c.status === 'claimed' &&
+          (c.remainingUse ?? 0) > 0 &&
+          voucherActive,
+        isDisabledStyle: isExpired || c.status !== 'claimed' || !voucherActive
+      }
+    };
+  });
+
+  return res.json({ claims: out });
+});
+
+exports.getMyVoucherClaimDetail = asyncHandler(async (req, res) => {
+  const meId = getMemberId(req);
+  if (!meId) throwError('Unauthorized (member)', 401);
+
+  const claimId = req.params.claimId;
+  if (!mongoose.Types.ObjectId.isValid(claimId))
+    throwError('ID tidak valid', 400);
+
+  // ambil klaim + populate voucher minimal
+  const claim = await VoucherClaim.findById(claimId)
+    .populate({ path: 'voucher' })
+    .lean();
+
+  if (!claim) throwError('Klaim voucher tidak ditemukan', 404);
+
+  // pastikan klaim milik member
+  if (String(claim.member) !== String(meId))
+    throwError('Tidak berhak mengakses klaim ini', 403);
+
+  const v = claim.voucher || null;
+  const now = new Date();
+
+  // basic voucher master flags
+  const voucherActive = !!(v && v.isActive && !v.isDeleted);
+  const voucherExists = !!v;
+
+  // compute validUntil: prefer claim.validUntil, fallback voucher.visibility.endAt
+  const validUntil = claim.validUntil
+    ? new Date(claim.validUntil)
+    : v && v.visibility && v.visibility.endAt
+    ? new Date(v.visibility.endAt)
+    : null;
+  const isExpired = validUntil ? now > validUntil : false;
+
+  // global stock (if applicable)
+  const globalStock =
+    v && v.visibility && v.visibility.mode === 'global_stock'
+      ? typeof v.visibility.globalStock === 'number'
+        ? v.visibility.globalStock
+        : null
+      : null;
+
+  // per-member limit from voucher master (0 => unlimited according to your model earlier? You used 0 = unlimited)
+  const perMemberLimitRaw =
+    v && v.visibility && typeof v.visibility.perMemberLimit === 'number'
+      ? v.visibility.perMemberLimit
+      : null;
+  // treat 0 as unlimited (consistent dengan model sebelumnya)
+  const perMemberLimit = perMemberLimitRaw === 0 ? null : perMemberLimitRaw;
+
+  // count how many claims this member already has for this voucher (to compute perMemberRemaining)
+  let totalClaimsByMeForVoucher = 0;
+  if (v && perMemberLimit !== null) {
+    totalClaimsByMeForVoucher = await VoucherClaim.countDocuments({
+      voucher: v._id,
+      member: meId
+    }).catch(() => 0);
+  }
+
+  const perMemberRemaining =
+    perMemberLimit === null
+      ? null
+      : Math.max(0, perMemberLimit - totalClaimsByMeForVoucher);
+
+  // canUse logic: klaim status harus 'claimed', masih ada remainingUse, belum expired, voucher master aktif
+  const canUse =
+    claim.status === 'claimed' &&
+    (typeof claim.remainingUse !== 'number' || claim.remainingUse > 0) &&
+    !isExpired &&
+    voucherActive;
+
+  // Susun response (ringkas & lengkap sesuai kebutuhan FE)
+  const response = {
+    claimId: String(claim._id),
+    voucherId: v ? String(v._id) : null,
+    claimStatus: claim.status || 'claimed', // 'claimed'|'used'|'expired'|'revoked'
+    remainingUse:
+      typeof claim.remainingUse === 'number' ? claim.remainingUse : null,
+    spentPoints: typeof claim.spentPoints === 'number' ? claim.spentPoints : 0,
+    claimedAt: claim.claimedAt ? new Date(claim.claimedAt).toISOString() : null,
+    validUntil: validUntil ? validUntil.toISOString() : null,
+    isExpired,
+    voucherActive,
+    canUse,
+    // voucher master snapshot (useful for FE detail page)
+    voucher: v
+      ? {
+          id: String(v._id),
+          name: v.name,
+          type: v.type,
+          notes: v.notes || null,
+          percent: typeof v.percent === 'number' ? v.percent : null,
+          amount: typeof v.amount === 'number' ? v.amount : null,
+          maxDiscount: typeof v.maxDiscount === 'number' ? v.maxDiscount : null,
+          shipping: v.shipping
+            ? {
+                percent: v.shipping.percent ?? 100,
+                maxAmount: v.shipping.maxAmount ?? 0
+              }
+            : null,
+          visibility: {
+            mode: v.visibility?.mode || 'periodic',
+            startAt: v.visibility?.startAt
+              ? new Date(v.visibility.startAt).toISOString()
+              : null,
+            endAt: v.visibility?.endAt
+              ? new Date(v.visibility.endAt).toISOString()
+              : null,
+            globalStock:
+              typeof v.visibility?.globalStock === 'number'
+                ? v.visibility.globalStock
+                : null,
+            perMemberLimit: perMemberLimitRaw ?? null
+          },
+          target: {
+            audience: v.target?.audience || 'all',
+            minTransaction: v.target?.minTransaction ?? 0,
+            requiredPoints: v.target?.requiredPoints ?? 0
+          },
+          usage: {
+            maxUsePerClaim: v.usage?.maxUsePerClaim ?? 1,
+            useValidDaysAfterClaim: v.usage?.useValidDaysAfterClaim ?? 0,
+            claimRequired: v.usage?.claimRequired ?? true,
+            stackableWithShipping: v.usage?.stackableWithShipping ?? true,
+            stackableWithOthers: v.usage?.stackableWithOthers ?? false
+          }
+        }
+      : null,
+    // stok / per-member info
+    globalStock,
+    perMemberLimit: perMemberLimit === null ? null : perMemberLimit,
+    totalClaimsByMeForVoucher:
+      perMemberLimit === null ? null : totalClaimsByMeForVoucher,
+    perMemberRemaining,
+    // history & raw minimal klaim (FE bisa tampilkan timeline)
+    history: Array.isArray(claim.history)
+      ? claim.history.map((h) => ({
+          at: h.at ? new Date(h.at).toISOString() : null,
+          action: h.action || null,
+          ref: h.ref || null,
+          note: h.note || null
+        }))
+      : []
+    // jika FE butuh data voucher claim mentah untuk debug, bisa pakai claim.raw (tidak disertakan)
+    // rawClaim: claim
+  };
+
+  return res.status(200).json({ success: true, claim: response });
 });

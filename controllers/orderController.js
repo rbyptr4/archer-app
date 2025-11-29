@@ -3382,20 +3382,74 @@ exports.listMyOrders = asyncHandler(async (req, res) => {
     limit = 20,
     cursor
   } = req.query || {};
+
   const q = { member: req.member.id };
   if (status && ALLOWED_STATUSES.includes(status)) q.status = status;
-  if (source) q.source = source; // 'qr' | 'pos' | 'online'
-  if (fulfillment_type) q.fulfillment_type = fulfillment_type; // 'dine_in' | 'delivery'
-  if (cursor) q.createdAt = { $lt: new Date(cursor) };
+  if (source) q.source = source;
+  if (fulfillment_type) q.fulfillment_type = fulfillment_type;
+  if (cursor) {
+    const d = new Date(cursor);
+    if (!isNaN(d.getTime())) q.createdAt = { $lt: d };
+  }
 
-  const items = await Order.find(q)
+  const lim = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+
+  // Pilih hanya field yang diperlukan supaya respon kecil
+  const raw = await Order.find(q)
+    .select(
+      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt delivery.mode verified_by verified_at'
+    )
     .sort({ createdAt: -1 })
-    .limit(Math.min(parseInt(limit, 10) || 20, 100))
+    .limit(lim)
+    .populate({ path: 'member', select: 'name phone' })
+    .populate({ path: 'verified_by', select: 'name' }) // <-- ambil nama kasir yg verifikasi
     .lean();
 
-  res.status(200).json({
+  const items = (Array.isArray(raw) ? raw : []).map((o) => {
+    const placedAt = o.placed_at || o.createdAt || null;
+    const deliveryMode =
+      (o.delivery && o.delivery.mode) ||
+      o.delivery?.mode ||
+      (o.fulfillment_type === 'dine_in' ? 'none' : 'delivery');
+
+    const memberName =
+      o.member && typeof o.member === 'object' ? o.member.name : null;
+
+    return {
+      id: String(o._id),
+      transaction_code: o.transaction_code || '',
+      delivery_mode: deliveryMode,
+      grand_total: Number(o.grand_total || 0),
+      fulfillment_type: o.fulfillment_type || null,
+      customer_name: memberName || o.customer_name || '',
+      customer_phone: (o.member && o.member.phone) || o.customer_phone || '',
+      placed_at: placedAt,
+      table_number:
+        o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
+      payment_status: o.payment_status || null,
+      status: o.status || null,
+      total_quantity: Number(o.total_quantity || 0),
+      pickup_window:
+        o.delivery && o.delivery.pickup_window
+          ? {
+              from: o.delivery.pickup_window.from || null,
+              to: o.delivery.pickup_window.to || null
+            }
+          : null,
+      delivery_slot_label: o.delivery ? o.delivery.slot_label || null : null,
+      verified_by: o.verified_by
+        ? { id: String(o.verified_by._id), name: o.verified_by.name || '' }
+        : null,
+      verified_at: o.verified_at || null,
+      createdAt: o.createdAt
+    };
+  });
+
+  const next_cursor = items.length ? items[items.length - 1].createdAt : null;
+
+  return res.status(200).json({
     items,
-    next_cursor: items.length ? items[items.length - 1].createdAt : null
+    next_cursor
   });
 });
 
@@ -3492,11 +3546,257 @@ exports.homeDashboard = asyncHandler(async (req, res) => {
 
 exports.getMyOrder = asyncHandler(async (req, res) => {
   if (!req.member?.id) throwError('Harus login sebagai member', 401);
-  const order = await Order.findById(req.params.id).lean();
+
+  const id = req.params.id;
+  if (!mongoose.Types.ObjectId.isValid(id)) throwError('ID tidak valid', 400);
+
+  // ambil order + populate member minimal + verified_by name
+  const order = await Order.findById(id)
+    .populate({ path: 'member', select: 'name phone' })
+    .populate({ path: 'verified_by', select: 'name' })
+    .lean();
   if (!order) throwError('Order tidak ditemukan', 404);
-  if (String(order.member) !== String(req.member.id))
+
+  // pastikan owner
+  if (String(order.member) !== String(req.member.id)) {
     throwError('Tidak berhak mengakses order ini', 403);
-  res.status(200).json(order);
+  }
+
+  const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
+  const intVal = (v) => Math.round(Number(v || 0));
+
+  // normalisasi discounts dari order (bisa berasal dari order.discounts / order.breakdown)
+  const rawDiscounts = Array.isArray(order.discounts)
+    ? order.discounts
+    : Array.isArray(order.breakdown)
+    ? order.breakdown
+    : [];
+
+  const discounts = (rawDiscounts || []).map((d) => {
+    const id = d.id || d.claimId || d.claim_id || null;
+    const source = d.source || (d.voucherId || d.voucher ? 'voucher' : 'promo');
+    const label =
+      d.label ||
+      d.name ||
+      d.title ||
+      (source === 'promo' ? 'Promo' : 'Voucher');
+    const amount = intVal(d.amount ?? d.amountTotal ?? d.itemsDiscount ?? 0);
+    const items = Array.isArray(d.items)
+      ? d.items.map((it) => ({
+          menuId: it.menuId || it.menu || it.menu_id || null,
+          qty: Number(it.qty || it.quantity || 0),
+          amount: intVal(it.amount || it.line_discount || 0),
+          claimId: it.claimId || it.claim_id || null
+        }))
+      : [];
+    return {
+      claimId: source === 'voucher' ? (id ? String(id) : null) : null,
+      voucherId:
+        source === 'voucher' && (d.voucherId || d.voucher)
+          ? String(d.voucherId || d.voucher)
+          : null,
+      id: id ? String(id) : null,
+      source,
+      orderIdx: d.orderIdx ?? d.order_index ?? null,
+      type: d.type ?? 'amount',
+      label,
+      amount,
+      items,
+      meta: d.meta || d.raw?.meta || {},
+      note: d.note || d.meta?.note || '',
+      appliedAt: d.appliedAt || d.applied_at || null,
+      raw: d.raw || d
+    };
+  });
+
+  // applied promos normalization
+  const appliedPromos = [];
+  const apSource =
+    order.appliedPromos ||
+    (order.appliedPromo ? [order.appliedPromo] : null) ||
+    (order.applied_promo ? [order.applied_promo] : null) ||
+    null;
+
+  if (Array.isArray(apSource) && apSource.length) {
+    for (const ap of apSource) {
+      let snap = ap;
+      if (ap.promoSnapshot) snap = ap.promoSnapshot;
+      if (ap.promo) snap = ap.promo;
+      appliedPromos.push({
+        promoId: snap.promoId || snap.promoId || snap.id || null,
+        name: snap.name || snap.promoName || null,
+        description: snap.description || snap.notes || null,
+        impact: snap.impact || snap.promoSnapshot?.impact || {},
+        actions: snap.actions || snap.promoSnapshot?.actions || [],
+        freeItemsSnapshot:
+          snap.freeItemsSnapshot && Array.isArray(snap.freeItemsSnapshot)
+            ? snap.freeItemsSnapshot
+            : (snap.impact && snap.impact.addedFreeItems) || []
+      });
+    }
+  } else if (order.appliedPromo) {
+    const ap = order.appliedPromo;
+    const snap = ap.promoSnapshot || ap;
+    appliedPromos.push({
+      promoId: snap.promoId || snap.promoId || snap.id || null,
+      name: snap.name || snap.promoName || null,
+      description: snap.description || snap.notes || null,
+      impact: snap.impact || snap.promoSnapshot?.impact || {},
+      actions: snap.actions || snap.promoSnapshot?.actions || [],
+      freeItemsSnapshot:
+        snap.freeItemsSnapshot && Array.isArray(snap.freeItemsSnapshot)
+          ? snap.freeItemsSnapshot
+          : (snap.impact && snap.impact.addedFreeItems) || []
+    });
+  }
+
+  // applied vouchers normalization
+  const appliedVouchers = [];
+  if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
+    for (const av of order.appliedVouchers) {
+      appliedVouchers.push({
+        voucherId: av.voucherId
+          ? String(av.voucherId)
+          : av.voucher
+          ? String(av.voucher)
+          : null,
+        snapshot: av.voucherSnapshot || av.snapshot || av || {}
+      });
+    }
+  } else if (
+    Array.isArray(order.applied_voucher_ids) &&
+    order.applied_voucher_ids.length
+  ) {
+    try {
+      const vids = order.applied_voucher_ids.map((v) => String(v));
+      const Voucher = require('../models/voucherModel');
+      const vdocs = await Voucher.find({ _id: { $in: vids } })
+        .lean()
+        .catch(() => []);
+      const vmap = (vdocs || []).reduce((acc, v) => {
+        acc[String(v._id)] = v;
+        return acc;
+      }, {});
+      for (const vid of vids) {
+        appliedVouchers.push({
+          voucherId: String(vid),
+          snapshot: vmap[String(vid)] || {}
+        });
+      }
+    } catch (e) {
+      for (const vid of order.applied_voucher_ids) {
+        appliedVouchers.push({ voucherId: String(vid), snapshot: {} });
+      }
+    }
+  }
+
+  // Susun response yang bersih / minimal (mirror getDetailOrder)
+  const slim = {
+    id: String(order._id),
+    transaction_code: order.transaction_code,
+    customer: {
+      name: order.member?.name || order.customer_name || null,
+      phone: order.member?.phone || order.customer_phone || null
+    },
+    ownerVerified: order.ownerVerified,
+    fulfillment_type: order.fulfillment_type || null,
+    table_number: order.table_number ?? null,
+    payment_status: order.payment_status ?? null,
+    items: (order.items || []).map((it) => {
+      const qty = safeNumber(it.quantity || 0);
+      const basePrice = safeNumber(it.base_price || 0);
+
+      const addons_unit = (it.addons || []).reduce(
+        (s, a) => s + (Number.isFinite(+a.price) ? +a.price : 0) * (a.qty || 1),
+        0
+      );
+
+      const unit_before_tax = basePrice + addons_unit;
+      const line_subtotal = Number(it.line_subtotal ?? unit_before_tax * qty);
+
+      return {
+        name: it.name,
+        menu: String(it.menu || ''),
+        menu_code: it.menu_code || '',
+        imageUrl: it.imageUrl || '',
+        qty,
+        base_price: basePrice,
+        addons: (it.addons || []).map((a) => ({
+          name: a.name,
+          price: safeNumber(a.price),
+          qty: a.qty || 1
+        })),
+        notes: it.notes || '',
+        line_subtotal,
+        adjustments: Array.isArray(it.adjustments) ? it.adjustments : []
+      };
+    }),
+    totals: {
+      items_subtotal: safeNumber(order.items_subtotal || 0),
+      service_fee: safeNumber(order.service_fee || 0),
+      delivery_fee: safeNumber(order.delivery_fee || 0),
+      items_discount: safeNumber(order.items_discount || 0),
+      shipping_discount: safeNumber(order.shipping_discount || 0),
+      tax_rate_percent: safeNumber(
+        order.tax_rate_percent || Math.round((parsePpnRate() || 0.11) * 100)
+      ),
+      tax_amount: safeNumber(order.tax_amount || 0),
+      rounding_delta: safeNumber(order.rounding_delta || 0),
+      grand_total: safeNumber(order.grand_total || 0)
+    },
+    payment: {
+      method: order.payment_method || null,
+      provider: order.payment_provider || null,
+      status: order.payment_status || null,
+      proof_url: order.payment_proof_url || null,
+      paid_at: order.paid_at || null
+    },
+    status: order.status || null,
+    placed_at: order.placed_at || null,
+    created_at: order.createdAt || null,
+    updated_at: order.updatedAt || null,
+    delivery: order.delivery
+      ? {
+          mode: order.delivery.mode || null,
+          address_text: order.delivery.address_text || null,
+          location:
+            order.delivery.location &&
+            typeof order.delivery.location.lat === 'number'
+              ? {
+                  lat: order.delivery.location.lat,
+                  lng: order.delivery.location.lng
+                }
+              : null,
+          distance_km: order.delivery.distance_km ?? null,
+          delivery_fee: order.delivery.delivery_fee ?? null,
+          slot_label: order.delivery.slot_label || null,
+          scheduled_at: order.delivery.scheduled_at || null,
+          status: order.delivery.status || null,
+          pickup_window: order.delivery.pickup_window
+            ? {
+                from: order.delivery.pickup_window.from || null,
+                to: order.delivery.pickup_window.to || null
+              }
+            : null
+        }
+      : null,
+
+    // verifikasi oleh kasir (jika ada)
+    verified_by: order.verified_by
+      ? {
+          id: String(order.verified_by._id),
+          name: order.verified_by.name || ''
+        }
+      : null,
+    verified_at: order.verified_at || null,
+
+    // tambahan: promo & voucher info
+    discounts,
+    applied_promos: appliedPromos,
+    applied_vouchers: appliedVouchers
+  };
+
+  return res.status(200).json({ success: true, order: slim });
 });
 
 exports.previewPrice = asyncHandler(async (req, res) => {
@@ -4127,30 +4427,27 @@ exports.listOrders = asyncHandler(async (req, res) => {
   }
   if (cursor) q.createdAt = { ...(q.createdAt || {}), $lt: new Date(cursor) };
 
-  // safety cap limit
   const lim = Math.min(parseInt(limit, 10) || 50, 200);
 
-  // Ambil raw orders (sama seperti sebelumnya)
   const raw = await Order.find(q)
     .select(
-      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt delivery.mode ownerVerified'
+      'transaction_code grand_total fulfillment_type customer_name customer_phone placed_at table_number payment_status total_quantity delivery.pickup_window delivery.slot_label status member createdAt delivery.mode ownerVerified verified_by verified_at'
     )
     .sort({ createdAt: -1 })
     .limit(lim)
     .populate({ path: 'member', select: 'name phone' })
+    .populate({ path: 'verified_by', select: 'name' }) // <-- kasir verifikator
     .lean();
 
-  // helper: hitung batas hari ini di timezone Asia/Jakarta
+  // Hitung batas hari ini (timezone Jakarta)
   const JAKARTA_OFFSET_MS = 7 * 60 * 60 * 1000;
   const jNow = new Date(Date.now() + JAKARTA_OFFSET_MS);
   const Y = jNow.getUTCFullYear();
-  const M = jNow.getUTCMonth(); // 0-based
+  const M = jNow.getUTCMonth();
   const D = jNow.getUTCDate();
-  // UTC ms yang merepresentasikan 00:00 Jakarta hari ini:
   const startOfTodayJakartaMs = Date.UTC(Y, M, D) - JAKARTA_OFFSET_MS;
-  const endOfTodayJakartaMs = startOfTodayJakartaMs + 24 * 60 * 60 * 1000;
+  const endOfTodayJakartaMs = startOfTodayJakartaMs + 86400000;
 
-  // Map ke bentuk frontend-friendly dan langsung klasifikasi today / other
   const today = [];
   const other = [];
 
@@ -4167,8 +4464,8 @@ exports.listOrders = asyncHandler(async (req, res) => {
         (o.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
       grand_total: Number(o.grand_total || 0),
       fulfillment_type: o.fulfillment_type || null,
-      customer_name: (o.member && o.member.name) || o.customer_name || '',
-      customer_phone: (o.member && o.member.phone) || o.customer_phone || '',
+      customer_name: o.member?.name || o.customer_name || '',
+      customer_phone: o.member?.phone || o.customer_phone || '',
       placed_at: placedAt,
       table_number:
         o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
@@ -4176,19 +4473,22 @@ exports.listOrders = asyncHandler(async (req, res) => {
       ownerVerified: o.ownerVerified,
       status: o.status || null,
       total_quantity: Number(o.total_quantity || 0),
-      pickup_window:
-        o.delivery && o.delivery.pickup_window
-          ? {
-              from: o.delivery.pickup_window.from || null,
-              to: o.delivery.pickup_window.to || null
-            }
-          : null,
-      delivery_slot_label: o.delivery ? o.delivery.slot_label || null : null,
+      pickup_window: o.delivery?.pickup_window
+        ? {
+            from: o.delivery.pickup_window.from || null,
+            to: o.delivery.pickup_window.to || null
+          }
+        : null,
+      delivery_slot_label: o.delivery?.slot_label || null,
       member_id: o.member ? String(o.member._id) : null,
+      verified_by: o.verified_by
+        ? { id: String(o.verified_by._id), name: o.verified_by.name || '' }
+        : null,
+      verified_at: o.verified_at || null,
       createdAt: o.createdAt
     };
 
-    // klasifikasi: masuk today jika placed_at berada di [startOfTodayJakartaMs, endOfTodayJakartaMs)
+    // klasifikasi today / other
     if (
       placedMs !== null &&
       placedMs >= startOfTodayJakartaMs &&
@@ -4202,7 +4502,7 @@ exports.listOrders = asyncHandler(async (req, res) => {
     return out;
   });
 
-  // next_cursor: ambil dari akhir other (karena other adalah yang lebih lama)
+  // next cursor dari yang paling lama (other)
   const next_cursor =
     other.length > 0
       ? new Date(
@@ -4927,7 +5227,8 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
 
   if (cursor) {
     const cDate = new Date(cursor);
-    if (isNaN(cDate.getTime())) throwError('cursor tidak valid (harus ISO date)', 400);
+    if (isNaN(cDate.getTime()))
+      throwError('cursor tidak valid (harus ISO date)', 400);
     q.placed_at = { $lt: cDate };
   }
 
@@ -4951,7 +5252,8 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
       menu: it.menu ? String(it.menu._id || it.menu) : null,
       name: (it.menu && it.menu.name) || it.name || '',
       menu_code: it.menu_code || '',
-      image: (it.menu && (it.menu.imageUrl || it.menu.image)) || it.imageUrl || null,
+      image:
+        (it.menu && (it.menu.imageUrl || it.menu.image)) || it.imageUrl || null,
       quantity: Number(it.quantity || 0),
       base_price: Number(it.base_price || 0),
       addons: Array.isArray(it.addons)
@@ -4966,18 +5268,32 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
       // include adjustments (raw) so kitchen can see reason if perlu
       adjustments: Array.isArray(it.adjustments) ? it.adjustments : [],
       // mark whether this item is free (base_price == 0 and quantity > 0 and line_subtotal == 0)
-      is_free_item: Number(it.base_price || 0) === 0 && Number(it.quantity || 0) > 0 && Number(it.line_subtotal || 0) === 0
+      is_free_item:
+        Number(it.base_price || 0) === 0 &&
+        Number(it.quantity || 0) > 0 &&
+        Number(it.line_subtotal || 0) === 0
     }));
 
     // 1) Ambil free items dari discounts (promo free_item)
     const freeFromDiscounts = (Array.isArray(o.discounts) ? o.discounts : [])
-      .filter((d) => String(d.source || '').toLowerCase() === 'promo' && (d.type === 'free_item' || (d.type === 'note' && String(d.label || '').toLowerCase().includes('gratis'))))
+      .filter(
+        (d) =>
+          String(d.source || '').toLowerCase() === 'promo' &&
+          (d.type === 'free_item' ||
+            (d.type === 'note' &&
+              String(d.label || '')
+                .toLowerCase()
+                .includes('gratis')))
+      )
       .flatMap((d) => {
         const itemsArr = Array.isArray(d.items) ? d.items : [];
         return itemsArr.map((it) => ({
           menuId: String(it.menuId || (d.meta && d.meta.menuId) || ''),
           qty: Number(it.qty || (d.meta && d.meta.qty) || 1),
-          name: (d.meta && d.meta.name) || (d.label ? String(d.label).replace(/^Gratis:\s*/i, '') : null) || null,
+          name:
+            (d.meta && d.meta.name) ||
+            (d.label ? String(d.label).replace(/^Gratis:\s*/i, '') : null) ||
+            null,
           imageUrl: (d.meta && d.meta.imageUrl) || null,
           source: 'discount'
         }));
@@ -4985,7 +5301,9 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
 
     // 2) Ambil free items dari item yang memang line price 0 atau flagged is_free_item
     const freeFromItems = (Array.isArray(o.items) ? o.items : [])
-      .filter((it) => Number(it.base_price || 0) === 0 && Number(it.quantity || 0) > 0)
+      .filter(
+        (it) => Number(it.base_price || 0) === 0 && Number(it.quantity || 0) > 0
+      )
       .map((it) => ({
         menuId: String((it.menu && it.menu._id) || it.menu || ''),
         qty: Number(it.quantity || 1),
@@ -4995,19 +5313,29 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
       }));
 
     // 3) Ambil free items dari adjustments tiap item (promo_free_item)
-    const freeFromAdjustments = (Array.isArray(o.items) ? o.items : [])
-      .flatMap((it) => {
+    const freeFromAdjustments = (Array.isArray(o.items) ? o.items : []).flatMap(
+      (it) => {
         const adj = Array.isArray(it.adjustments) ? it.adjustments : [];
         return adj
-          .filter((a) => String(a.type || '').toLowerCase() === 'promo_free_item')
+          .filter(
+            (a) => String(a.type || '').toLowerCase() === 'promo_free_item'
+          )
           .map((a) => ({
-            menuId: String((it.menu && it.menu._id) || it.menu || a.menuId || ''),
+            menuId: String(
+              (it.menu && it.menu._id) || it.menu || a.menuId || ''
+            ),
             qty: Number(a.qty || a.amount || 1),
-            name: it.name || (it.menu && it.menu.name) || (a.name || null) || null,
-            imageUrl: it.imageUrl || (it.menu && it.menu.imageUrl) || (a.imageUrl || null),
+            name:
+              it.name || (it.menu && it.menu.name) || a.name || null || null,
+            imageUrl:
+              it.imageUrl ||
+              (it.menu && it.menu.imageUrl) ||
+              a.imageUrl ||
+              null,
             source: 'adjustment'
           }));
-      });
+      }
+    );
 
     // gabungkan semua sumber jadi satu map (aggregate qty jika duplikat menuId)
     const freeMap = {};
@@ -5015,13 +5343,20 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
       if (!f || !f.menuId) return;
       const k = String(f.menuId);
       if (!freeMap[k]) {
-        freeMap[k] = { menuId: k, qty: 0, name: f.name || null, imageUrl: f.imageUrl || null, sources: {} };
+        freeMap[k] = {
+          menuId: k,
+          qty: 0,
+          name: f.name || null,
+          imageUrl: f.imageUrl || null,
+          sources: {}
+        };
       }
       freeMap[k].qty += Number(f.qty || 0);
       // prefer name/image jika belum ada
       if (!freeMap[k].name && f.name) freeMap[k].name = f.name;
       if (!freeMap[k].imageUrl && f.imageUrl) freeMap[k].imageUrl = f.imageUrl;
-      freeMap[k].sources[f.source] = (freeMap[k].sources[f.source] || 0) + Number(f.qty || 0);
+      freeMap[k].sources[f.source] =
+        (freeMap[k].sources[f.source] || 0) + Number(f.qty || 0);
     };
 
     freeFromDiscounts.forEach(pushFree);
@@ -5045,29 +5380,36 @@ exports.listKitchenOrders = asyncHandler(async (req, res) => {
       customer_name: (o.member && o.member.name) || o.customer_name || '',
       customer_phone: (o.member && o.member.phone) || o.customer_phone || '',
       placed_at: o.placed_at || o.createdAt || null,
-      table_number: o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
+      table_number:
+        o.fulfillment_type === 'dine_in' ? o.table_number || null : null,
       payment_status: o.payment_status || null,
       status: o.status || null,
       total_quantity: Number(o.total_quantity || 0),
       pickup_window:
         o.delivery && o.delivery.pickup_window
-          ? { from: o.delivery.pickup_window.from || null, to: o.delivery.pickup_window.to || null }
+          ? {
+              from: o.delivery.pickup_window.from || null,
+              to: o.delivery.pickup_window.to || null
+            }
           : null,
       delivery_slot_label: o.delivery ? o.delivery.slot_label || null : null,
-      delivery_scheduled_at: o.delivery ? o.delivery.scheduled_at || null : null,
+      delivery_scheduled_at: o.delivery
+        ? o.delivery.scheduled_at || null
+        : null,
       delivery_status: o.delivery ? o.delivery.status || null : null,
       member_id: o.member ? String(o.member._id) : null,
       items: orderItems,
-      free_items 
+      free_items
     };
   });
 
   return res.status(200).json({
     items,
-    next_cursor: items.length ? new Date(items[items.length - 1].placed_at).toISOString() : null
+    next_cursor: items.length
+      ? new Date(items[items.length - 1].placed_at).toISOString()
+      : null
   });
 });
-
 
 exports.createPosDineIn = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
