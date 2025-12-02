@@ -504,25 +504,24 @@ async function applyPromoThenVoucher({
       promoImpact.itemsDiscount || promoImpact.cartDiscount || 0
     );
     if (discount > 0) {
+      // hitung distribusi promo tapi JANGAN ubah unit price pada cartAfterPromo
       const itemsDist = distributeDiscountToItems(originalForDist, discount);
-      cartAfterPromo.items = originalForDist.map((it) => {
-        const dist = itemsDist.find(
-          (d) => String(d.menuId) === String(it.menuId)
-        );
-        const perUnitDiscount = dist
-          ? Math.round((dist.amount || 0) / Math.max(1, dist.qty || 1))
-          : 0;
-        return {
-          menuId: it.menuId,
-          qty: it.qty,
-          price: Math.max(0, Math.round(it.price - perUnitDiscount)),
-          category: it.category || null,
-          name: it.name || null,
-          imageUrl: it.imageUrl || null,
-          menu_code: it.menu_code || null
-        };
-      });
 
+      // simpan distribusi promo agar bisa dipakai nanti untuk discounts / itemAdjustments
+      cartAfterPromo._promoItemsDistribution = itemsDist;
+
+      // pertahankan harga asli untuk setiap item (penting agar voucher engine lihat subtotal asli)
+      cartAfterPromo.items = originalForDist.map((it) => ({
+        menuId: it.menuId,
+        qty: it.qty,
+        price: it.price,
+        category: it.category || null,
+        name: it.name || null,
+        imageUrl: it.imageUrl || null,
+        menu_code: it.menu_code || null
+      }));
+
+      // tambahkan free items (harga 0) — ini aman karena free items memang gratis
       if (
         Array.isArray(promoImpact.addedFreeItems) &&
         promoImpact.addedFreeItems.length

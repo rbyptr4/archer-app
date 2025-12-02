@@ -702,17 +702,41 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
 
   const baseMatch = buildMemberMatch({ search });
 
-  const matchCursor = {};
+  // build cursor match for (name ASC, _id ASC)
+  // cursor expected as encodeURIComponent(JSON.stringify({ name: 'Abc', _id: '64...' }))
+  let cursorMatch = {};
   if (cursor) {
-    const d = new Date(cursor);
-    if (!isNaN(d.getTime())) {
-      matchCursor.createdAt = { $lt: d };
+    try {
+      const decoded = decodeURIComponent(cursor);
+      const cur = JSON.parse(decoded);
+      const curName = cur.name ?? null;
+      const curId = cur._id ?? null;
+
+      if (curName !== null && curId && mongoose.Types.ObjectId.isValid(curId)) {
+        cursorMatch = {
+          $or: [
+            { name: { $gt: curName } },
+            {
+              $and: [
+                { name: curName },
+                { _id: { $gt: mongoose.Types.ObjectId(curId) } }
+              ]
+            }
+          ]
+        };
+      }
+    } catch (e) {
+      // malformed cursor -> ignore (treat as no cursor)
+      cursorMatch = {};
     }
   }
 
-  const combinedMatch = { $and: [baseMatch, matchCursor] };
+  const combinedMatch =
+    Object.keys(cursorMatch).length > 0
+      ? { $and: [baseMatch, cursorMatch] }
+      : baseMatch;
 
-  // pipeline: match -> sort desc -> limit+1 -> project only required fields
+  // pipeline: match -> sort by name asc, _id asc -> limit+1 -> project only required fields
   const pipeline = [
     { $match: combinedMatch },
     { $sort: { name: 1, _id: 1 } },
@@ -731,22 +755,26 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
 
   const raw = await Member.aggregate(pipeline).allowDiskUse(true);
 
-  // next_cursor logic
+  // next_cursor logic (encode { name, _id })
   let next_cursor = null;
   let rows = raw;
   if (raw.length > limit) {
-    const extra = raw[limit]; // there is an extra
-    next_cursor = extra?.createdAt
-      ? new Date(extra.createdAt).toISOString()
-      : null;
     rows = raw.slice(0, limit);
+    const last = rows[rows.length - 1];
+    if (last && last._id) {
+      next_cursor = encodeURIComponent(
+        JSON.stringify({ name: last.name || '', _id: String(last._id) })
+      );
+    } else {
+      next_cursor = null;
+    }
   }
 
   // optional total count for search (still useful for FE)
   const total = await Member.countDocuments(baseMatch);
 
   // map to minimal shape (no extra fields)
-  const data = rows.map((r) => ({
+  const data = (rows || []).map((r) => ({
     id: r._id,
     name: r.name || '',
     phone: r.phone || '',
