@@ -3786,9 +3786,6 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
         }
       : null,
     verified_at: order.verified_at || null,
-
-    // tambahan: promo & voucher info
-    discounts,
     applied_promos: appliedPromos,
     applied_vouchers: appliedVouchers
   };
