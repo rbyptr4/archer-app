@@ -3628,21 +3628,13 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
     .lean();
   if (!order) throwError('Order tidak ditemukan', 404);
 
-  // pastikan owner
-  if (String(order.member) !== String(req.member.id)) {
-    throwError('Tidak berhak mengakses order ini', 403);
-  }
+  // if (String(order.member) !== String(req.member.id)) {
+  //   throwError('Tidak berhak mengakses order ini', 403);
+  // }
 
   const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
   const intVal = (v) => Math.round(Number(v || 0));
   const int = (v) => intVal(v); // helper local mirip int()
-
-  // --- normalisasi discounts internal (TETAP hitung, tapi TIDAK dikirim ke client) ---
-  const rawDiscounts = Array.isArray(order.discounts)
-    ? order.discounts
-    : Array.isArray(order.breakdown)
-    ? order.breakdown
-    : [];
 
   // --- applied promos normalization (non-redundant, addedFreeItems single source) ---
   const appliedPromos = [];
@@ -6660,15 +6652,56 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     console.error('[emit][acceptAndVerify]', err?.message || err);
   }
 
-  // kirim WA receipt non-blocking
   (async () => {
     try {
       const full = await Order.findById(doc._id).lean();
+      if (!full) {
+        console.warn(
+          '[WA receipt] order not found when trying to send WA receipt',
+          {
+            orderId: String(doc._id)
+          }
+        );
+        return;
+      }
+
       const phone = (full.customer_phone || '').trim();
-      if (!phone) return;
+      if (!phone) {
+        console.warn('[WA receipt] no phone on order, skip WA', {
+          orderId: String(full._id)
+        });
+        return;
+      }
+
+      if (typeof toWa62 !== 'function') {
+        console.warn('[WA receipt] toWa62 helper not available, skip WA', {
+          orderId: String(full._id)
+        });
+        return;
+      }
+
       const wa = toWa62(phone);
-      const message = buildOrderReceiptMessage(full);
+
+      let message;
+      try {
+        message = buildOrderReceiptMessage(full);
+      } catch (e) {
+        console.error('[WA receipt] buildOrderReceiptMessage failed', {
+          orderId: String(full._id),
+          err: e?.message || e
+        });
+        return;
+      }
+
+      if (!message) {
+        console.warn('[WA receipt] empty message returned, skip send', {
+          orderId: String(full._1 || full._id)
+        });
+        return;
+      }
+
       await sendText(wa, message);
+      console.log('[WA receipt] sent', { orderId: String(full._id), phone });
     } catch (e) {
       console.error('[WA receipt] failed:', e?.message || e);
     }
