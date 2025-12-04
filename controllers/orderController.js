@@ -2521,7 +2521,12 @@ exports.checkout = asyncHandler(async (req, res) => {
           ? { actions: promoActions, total: points_awarded }
           : {});
 
-      const total_spend_delta = Number(uiTotals.grand_total || 0);
+      const total_spend_delta = Number(
+        payload.grand_total ||
+          uiTotals.grand_total_after_points ||
+          uiTotals.grand_total ||
+          0
+      );
 
       payload.member_level_before = member_level_before;
       payload.total_spend_before = total_spend_before;
@@ -2577,7 +2582,7 @@ exports.checkout = asyncHandler(async (req, res) => {
           { _id: doc._id },
           {
             $set: {
-              // utama — ambil dari uiTotals yang sudah dihitung sebelumnya
+              // utama — ambil dari payload final jika tersedia (payload sudah di-set sebelumnya)
               items_subtotal: int(uiTotals.items_subtotal || 0),
               items_discount: int(uiTotals.items_discount || 0),
               items_subtotal_after_discount: int(
@@ -2591,8 +2596,19 @@ exports.checkout = asyncHandler(async (req, res) => {
               tax_rate_percent: Number(uiTotals.tax_rate_percent || 0),
               tax_amount: int(uiTotals.tax_amount || 0),
 
-              rounding_delta: int(uiTotals.rounding_delta || 0),
-              grand_total: int(uiTotals.grand_total || 0),
+              // gunakan rounding/grand dari payload (final after points). fallback ke uiTotals.after_points atau uiTotals
+              rounding_delta: int(
+                payload.rounding_delta ??
+                  uiTotals.rounding_delta_after_points ??
+                  uiTotals.rounding_delta ??
+                  0
+              ),
+              grand_total: int(
+                payload.grand_total ??
+                  uiTotals.grand_total_after_points ??
+                  uiTotals.grand_total ??
+                  0
+              ),
 
               // simpan snapshot lengkap juga (opsional, sudah Anda persiapkan sebelumnya)
               orderPriceSnapshot: orderPriceSnapshot
@@ -4137,27 +4153,26 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     taxableItems + service_fee + deliveryFee - shippingDiscount + tax_amount
   );
 
-  // === IMPORTANT CHANGE: do rounding BEFORE applying points ===
-  // first round the total (engine uses roundRupiahCustom in order flow)
   const grand_before_points = roundRupiahCustom(Math.round(raw_before_points));
 
-  // points simulation: now use grand_before_points as the cap
   const memberPoints = Math.floor(Number(MemberDoc?.points || 0));
   const points_used = usePoints
     ? Math.min(memberPoints, Math.max(0, Math.round(grand_before_points)))
     : 0;
 
-  // raw after points (use rounded-before-points minus points_used)
   const raw_after_points = Math.max(
     0,
     Math.round(grand_before_points) - points_used
   );
 
-  // final rounding -> single grand_total (round result after points)
   const grand_total = roundRupiahCustom(Math.round(raw_after_points));
 
-  // rounding delta — difference between grand_total and the raw_after_points
-  const rounding_delta = Number(grand_total) - Math.round(raw_after_points);
+  const rounding_delta_pre =
+    Number(grand_before_points) - Math.round(raw_before_points);
+  const rounding_delta_after =
+    Number(grand_total) - Math.round(raw_after_points);
+  const rounding_delta_total =
+    Number(rounding_delta_pre || 0) + Number(rounding_delta_after || 0);
 
   const ui_totals = {
     items_subtotal: int(baseSubtotal),
@@ -4167,15 +4182,12 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     tax_amount: int(tax_amount),
     delivery_fee: int(deliveryFee),
     shipping_discount: int(shippingDiscount),
-    // gunakan nama points_used (sesuai expectation)
     points_used: int(points_used),
-    // cantumkan grand total (setelah points & rounding)
     grand_total: int(grand_total),
-    // juga simpan raw_before_points & grand_before_points & raw_after_points untuk debug/FE jika perlu
     raw_total_before_rounding: int(raw_before_points),
     grand_total_before_points: int(grand_before_points),
     raw_total_after_points_before_rounding: int(raw_after_points),
-    rounding_delta: int(rounding_delta)
+    rounding_delta: int(rounding_delta_total)
   };
 
   // ===== promo / rewards normalization =====
