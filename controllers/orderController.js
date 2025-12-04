@@ -1406,6 +1406,11 @@ exports.checkout = asyncHandler(async (req, res) => {
     usePoints = false
   } = req.body || {};
 
+  // Variabel scope-atas agar nilai akhir digunakan konsisten
+  let pointsUsedReq = 0;
+  let _FINAL_grand_after_points_to_persist = null;
+  let _FINAL_rounding_delta_after_to_persist = null;
+
   let guestToken =
     (req.body && String(req.body.guestToken || '').trim()) ||
     (req.headers && String(req.headers['x-guest-token'] || '').trim()) ||
@@ -2126,7 +2131,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   let memberPointsBalance = 0;
   try {
     if (MemberDoc) {
-      // pastikan MemberDoc bukan null dan memiliki field points
       memberPointsBalance = Math.floor(Number(MemberDoc.points ?? 0));
     } else {
       memberPointsBalance = 0;
@@ -2139,44 +2143,83 @@ exports.checkout = asyncHandler(async (req, res) => {
     memberPointsBalance = 0;
   }
 
-  const grandBeforePoints = Number(uiTotals.grand_total || 0); // engine rounded total
+  const grandBeforePoints = Number(uiTotals.grand_total || 0);
 
-  const points_candidate_use = usePoints
-    ? Math.min(memberPointsBalance, Math.max(0, Math.round(grandBeforePoints)))
-    : 0;
-
-  const raw_after_points = Math.max(
-    0,
-    grandBeforePoints - points_candidate_use
-  );
-
-  const grand_after_points = roundRupiahCustom(Math.round(raw_after_points));
-  const rounding_delta_after =
-    Number(grand_after_points) - Number(raw_after_points);
-
+  // Compute points candidate & final grand/rounding BEFORE transaction (so we persist consistent values)
   try {
-    uiTotals.grand_total = int(grand_after_points);
+    const points_candidate_use = usePoints
+      ? Math.min(
+          memberPointsBalance,
+          Math.max(0, Math.round(grandBeforePoints))
+        )
+      : typeof req.body?.points_used !== 'undefined' &&
+        req.body?.points_used !== null
+      ? Math.max(0, Math.floor(Number(req.body.points_used || 0)))
+      : 0;
+
+    if (String(method) === 'points') {
+      const candidateForPointsMethod = usePoints
+        ? Math.min(
+            memberPointsBalance,
+            Math.max(0, Math.round(grandBeforePoints))
+          )
+        : Math.max(0, Math.floor(Number(req.body?.points_used || 0)));
+
+      const afterCheck = Math.max(
+        0,
+        Math.round(grandBeforePoints) - candidateForPointsMethod
+      );
+      if (afterCheck !== 0) {
+        throwError(
+          'Pembayaran dengan point hanya bisa jika grand total setelah menggunakan poin = 0. Pastikan usePoints=true atau kirim points_used yang cukup.',
+          400
+        );
+      }
+    }
+
+    pointsUsedReq = Math.min(
+      memberPointsBalance,
+      Math.max(0, Math.round(points_candidate_use))
+    );
+
+    const raw_after_points = Math.max(
+      0,
+      Math.round(grandBeforePoints) - pointsUsedReq
+    );
+    const grand_after_points = roundRupiahCustom(Math.round(raw_after_points));
+    const rounding_delta_after =
+      Number(grand_after_points) - Number(raw_after_points);
+
+    _FINAL_grand_after_points_to_persist = int(grand_after_points);
+    _FINAL_rounding_delta_after_to_persist = int(rounding_delta_after);
+
+    // sync to uiTotals
+    uiTotals.points_candidate_use = int(pointsUsedReq);
+    uiTotals.grand_total_before_points = int(Math.round(grandBeforePoints));
+    uiTotals.grand_total = int(_FINAL_grand_after_points_to_persist);
     uiTotals.rounding_delta = int(
-      (uiTotals.rounding_delta || 0) + rounding_delta_after
+      (uiTotals.rounding_delta || 0) + _FINAL_rounding_delta_after_to_persist
+    );
+    uiTotals.grand_total_after_points = int(
+      _FINAL_grand_after_points_to_persist
+    );
+    uiTotals.rounding_delta_after_points = int(
+      _FINAL_rounding_delta_after_to_persist
     );
 
-    uiTotals.points_candidate_use = int(points_candidate_use || 0);
-    uiTotals.grand_total_before_points = int(
-      grandBeforePoints || uiTotals.grand_total_before_points || 0
-    );
-    uiTotals.grand_total_after_points = int(grand_after_points);
-    uiTotals.rounding_delta_after_points = int(rounding_delta_after || 0);
+    console.log('[checkout] points pre-tx computed', {
+      pointsUsedReq,
+      _FINAL_grand_after_points_to_persist,
+      _FINAL_rounding_delta_after_to_persist,
+      uiTotalsSnapshot: {
+        grand_total_before: uiTotals.grand_total_before_points,
+        grand_total_after: uiTotals.grand_total
+      }
+    });
   } catch (e) {
-    console.warn(
-      '[checkout] failed to patch uiTotals after points',
-      e?.message || e
-    );
+    console.warn('[checkout] points pre-tx compute failed', e?.message || e);
+    throw e;
   }
-
-  uiTotals.grand_total_before_points = int(grandBeforePoints);
-  uiTotals.points_candidate_use = int(points_candidate_use);
-  uiTotals.grand_total_after_points = int(grand_after_points);
-  uiTotals.rounding_delta_after_points = int(rounding_delta_after);
 
   const initialIsPaid = !needProof(method);
   const initialPaymentStatus = initialIsPaid ? 'paid' : 'unpaid';
@@ -2195,10 +2238,8 @@ exports.checkout = asyncHandler(async (req, res) => {
     const menuId = it.menu;
 
     const lineSubtotal = int(unit_price * qty);
-    // fetch adjustments from engine map by menuId (stringified)
     const adjustments = itemAdjustmentsMap?.[String(menuId)] || [];
 
-    // calc adj total
     const adjTotal = (adjustments || []).reduce(
       (s, a) => s + Number(a.amount || 0),
       0
@@ -2228,13 +2269,12 @@ exports.checkout = asyncHandler(async (req, res) => {
   });
 
   const promoApplied = priced.promoApplied || null;
-  const promoRewards = []; // untuk simpan ke order
+  const promoRewards = [];
   if (
     promoApplied &&
     promoApplied.impact &&
     Array.isArray(promoApplied.impact.addedFreeItems)
   ) {
-    // enrich free items with Menu data
     for (const f of promoApplied.impact.addedFreeItems) {
       let menuDoc = null;
       try {
@@ -2248,7 +2288,6 @@ exports.checkout = asyncHandler(async (req, res) => {
       const freeName = menuDoc?.name || f.name || 'Free item';
       const freeImage = menuDoc?.imageUrl || f.imageUrl || null;
 
-      // push into orderItems (so receipt shows name & image)
       orderItems.push({
         menu: f.menuId || null,
         menu_code: menuDoc?.code || null,
@@ -2272,7 +2311,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // Jika promo memberikan actions (points/membership), masukkan juga ke promoRewards
   if (promoApplied && Array.isArray(promoApplied.actions)) {
     for (const a of promoApplied.actions) {
       promoRewards.push({
@@ -2283,7 +2321,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // --- siapkan appliedPromo snapshot untuk disimpan ke order.appliedPromo ---
   const appliedPromoSnapshot = promoApplied
     ? {
         promoId: promoApplied.promoId || null,
@@ -2293,7 +2330,6 @@ exports.checkout = asyncHandler(async (req, res) => {
       }
     : null;
 
-  // --- siapkan orderPriceSnapshot untuk audit (simpan uiTotals + engine data) ---
   const orderPriceSnapshot = {
     ui_totals: uiTotals || {},
     engineTotals: priced.totals || {},
@@ -2302,28 +2338,23 @@ exports.checkout = asyncHandler(async (req, res) => {
   const ownerVerified = !paymentRequiresOwnerVerify(method);
   let order;
   function sumPointsAwardedFromPromoActions(actions = []) {
-    // standar: actions array mungkin berisi { type: 'award_points', points: 123 } atau reward details
     if (!Array.isArray(actions)) return 0;
     let sum = 0;
     for (const a of actions) {
       if (!a) continue;
       if (String(a.type || '').toLowerCase() === 'award_points') {
-        // support both a.points or a.amount
         sum += Number(a.points ?? a.amount ?? 0);
       } else if (a?.reward && typeof a.reward === 'object') {
-        // legacy shaped action
         sum += Number(a.reward.points ?? 0);
       }
     }
     return Math.max(0, Math.round(sum));
   }
 
-  // uiTotals dan priced sudah tersedia lebih atas di fungsi checkout (per kode asli)
   const session = await mongoose.startSession();
   let createdOrder = null;
   try {
     await session.withTransaction(async () => {
-      // prepare payload for order creation (mirror existing payload)
       const payload = {
         member: MemberDoc ? MemberDoc._id : null,
         customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
@@ -2331,7 +2362,7 @@ exports.checkout = asyncHandler(async (req, res) => {
         table_number: ft === 'dine_in' ? cart.table_number ?? null : null,
         source: iden.source || 'online',
         fulfillment_type: ft,
-        transaction_code: await nextDailyTxCode('ARCH'), // keep original helper
+        transaction_code: await nextDailyTxCode('ARCH'),
         guestToken: guestToken || null,
         items: orderItems,
         items_subtotal: int(uiTotals.items_subtotal || 0),
@@ -2343,7 +2374,7 @@ exports.checkout = asyncHandler(async (req, res) => {
           voucherId: id,
           voucherSnapshot: {}
         })),
-        appliedVouchersIds: appliedVoucherIds || [], // optional, keep older field if used elsewhere
+        appliedVouchersIds: appliedVoucherIds || [],
         appliedPromo: priced.promoApplied
           ? {
               promoId:
@@ -2357,8 +2388,7 @@ exports.checkout = asyncHandler(async (req, res) => {
           actions: []
         },
         engineSnapshot: priced.engineSnapshot || {},
-
-        ownerVerified, // existing logic
+        ownerVerified,
         ownerVerifiedBy: ownerVerified ? req.user?.id || null : null,
         ownerVerifiedAt: ownerVerified ? new Date() : null,
         orderPriceSnapshot,
@@ -2383,7 +2413,6 @@ exports.checkout = asyncHandler(async (req, res) => {
         }
       };
 
-      // --- Prepare loyalty/points snapshot values BEFORE any DB change ---
       const member_level_before = MemberDoc
         ? String(MemberDoc.level || 'bronze')
         : null;
@@ -2399,107 +2428,77 @@ exports.checkout = asyncHandler(async (req, res) => {
         freshMember = null;
       }
 
-      // pastikan integer points (floor)
       const memberPointsInt = freshMember
         ? Math.floor(Number(freshMember.points || 0))
         : 0;
 
-      // engine grand BEFORE points (sudah rounded by engine earlier)
-      const engineGrandBefore = Number(uiTotals.grand_total || 0);
-
-      // compute candidate points to use
-      let pointsUsedReq = 0;
-      if (usePoints) {
-        if (!freshMember && !MemberDoc) {
-          throwError('Poin hanya dapat digunakan oleh member terdaftar', 400);
+      // fallback safety jika pointsUsedReq belum terisi (seharusnya sudah)
+      if (!pointsUsedReq) {
+        if (usePoints) {
+          const memberForPoints = freshMember || MemberDoc;
+          const memberBalance = Math.max(
+            0,
+            Math.floor(Number(memberForPoints?.points || 0))
+          );
+          pointsUsedReq = Math.min(
+            memberBalance,
+            Math.max(
+              0,
+              Math.round(
+                Number(
+                  (orderPriceSnapshot.engineTotals?.grandTotal ??
+                    uiTotals.grand_total) ||
+                    0
+                )
+              )
+            )
+          );
+        } else {
+          pointsUsedReq = Math.floor(
+            Number(req.body?.points_used ?? priced?.totals?.points_used ?? 0) ||
+              0
+          );
         }
-        const memberForPoints = freshMember || MemberDoc;
-        const memberBalance = Math.max(
-          0,
-          Math.floor(Number(memberForPoints?.points || 0))
-        );
-        pointsUsedReq = Math.min(
-          memberBalance,
-          Math.max(0, Math.round(engineGrandBefore))
-        );
-      } else {
-        // legacy: allow FE to explicitly pass points_used (floor it)
-        pointsUsedReq = Math.floor(
-          Number(req.body?.points_used ?? priced?.totals?.points_used ?? 0) || 0
-        );
       }
 
-      // raw after deduction (integer math)
-      const raw_after_points = Math.max(0, engineGrandBefore - pointsUsedReq);
+      const engineGrandBeforeForTx = Number(
+        orderPriceSnapshot.engineTotals?.grandTotal ??
+          uiTotals.grand_total_before_points ??
+          uiTotals.grand_total ??
+          0
+      );
+      const raw_after_points = Math.max(
+        0,
+        Math.round(engineGrandBeforeForTx) - pointsUsedReq
+      );
 
-      // perform final rounding AFTER points deduction
       const grand_after_points = roundRupiahCustom(
         Math.round(raw_after_points)
       );
       const rounding_delta_after =
         Number(grand_after_points) - Number(raw_after_points);
 
-      // buat nilai ini tersedia untuk dipakai ketika membangun payload di bawah
-      // (kamu sebelumnya pakai grandBefore/pointsUsedReq; sekarang gunakan grand_after_points)
-
-      // If payment_method = 'points', enforce rules:
       if (String(method) === 'points') {
         if (!MemberDoc) {
           throwError('Pembayaran dengan point hanya untuk member', 400);
         }
 
-        const memberBalanceQuick = Math.max(
-          0,
-          Math.floor(Number(MemberDoc.points || 0))
-        );
-
-        const engineGrandBefore = Number(uiTotals.grand_total || 0);
-
-        let pointsUsedReqCandidate = 0;
-        if (usePoints) {
-          pointsUsedReqCandidate = Math.min(
-            memberBalanceQuick,
-            Math.max(0, Math.round(engineGrandBefore))
-          );
-        } else if (
-          typeof req.body?.points_used !== 'undefined' &&
-          req.body?.points_used !== null
-        ) {
-          const parsed = Math.floor(Number(req.body.points_used) || 0);
-          pointsUsedReqCandidate = Math.max(0, parsed);
-        } else if (
-          typeof priced?.totals?.points_used !== 'undefined' &&
-          priced?.totals?.points_used
-        ) {
-          pointsUsedReqCandidate = Math.floor(
-            Number(priced.totals.points_used || 0)
-          );
-        }
-
-        pointsUsedReqCandidate = Math.min(
-          pointsUsedReqCandidate,
-          memberBalanceQuick
-        );
-
-        const grandAfterPointsCheck = Math.max(
-          0,
-          engineGrandBefore - pointsUsedReqCandidate
-        );
-        if (grandAfterPointsCheck !== 0) {
-          throwError(
-            'Pembayaran dengan point hanya diperbolehkan jika poin yang digunakan menutup seluruh jumlah (grand total setelah poin = 0). Pastikan usePoints=true atau kirim points_used yang cukup.',
-            400
-          );
-        }
-
-        pointsUsedReq = pointsUsedReqCandidate;
-
-        const freshMember = await Member.findById(MemberDoc._id).session(
+        const freshMemberCheck = await Member.findById(MemberDoc._id).session(
           session
         );
-        if (!freshMember) throwError('Member tidak ditemukan', 404);
-        if (Number(freshMember.points || 0) < pointsUsedReq) {
+        if (!freshMemberCheck) throwError('Member tidak ditemukan', 404);
+        if (Number(freshMemberCheck.points || 0) < pointsUsedReq) {
           throwError('Saldo point tidak mencukupi', 400);
+        }
+        const afterCheck = Math.max(
+          0,
+          Math.round(engineGrandBeforeForTx) - pointsUsedReq
+        );
+        if (afterCheck !== 0) {
+          throwError(
+            'Pembayaran dengan point hanya diperbolehkan jika poin yang digunakan menutup seluruh jumlah (grand total setelah poin = 0).',
+            400
+          );
         }
       }
 
@@ -2527,21 +2526,21 @@ exports.checkout = asyncHandler(async (req, res) => {
       payload.member_level_before = member_level_before;
       payload.total_spend_before = total_spend_before;
       payload.total_spend_delta = int(total_spend_delta);
-      payload.member_level_after = null; // set after computing new total
-      payload.points_used = int(pointsUsedReq);
+      payload.member_level_after = null;
+
+      // persist pointsUsedReq
+      payload.points_used = int(pointsUsedReq || 0);
+
       payload.points_awarded = int(points_awarded);
       payload.points_awarded_details = points_awarded_details;
 
-      // --- APPLY POINTS INTO PAYLOAD (if any) ---
       payload.points_used = int(pointsUsedReq || 0);
 
-      // gunakan hasil rounding-after-deduction sebagai grand_total final
       payload.rounding_delta = int(
         (payload.rounding_delta || 0) + rounding_delta_after
       );
       payload.grand_total = int(grand_after_points);
 
-      // push discount entry for points (so receipts & reports show it)
       const pointsDiscountEntry = {
         id: null,
         source: 'manual',
@@ -2557,29 +2556,23 @@ exports.checkout = asyncHandler(async (req, res) => {
         : [];
       if (pointsUsedReq > 0) payload.discounts.push(pointsDiscountEntry);
 
-      // if grand_after_points == 0 => mark paid by points (override payment fields)
       if (Number(grand_after_points) === 0) {
         payload.payment_method = 'points';
         payload.payment_status = 'paid';
         payload.paid_at = new Date();
       } else {
-        // biarkan payment_method = method (request)
         payload.payment_method = method;
         payload.payment_status =
           payload.payment_status || (initialIsPaid ? 'paid' : 'unpaid');
       }
 
-      // Create order document inside session
       const [doc] = await Order.create([payload], { session });
-      // ==============================
-      // FORCE SET order totals dari uiTotals (agar konsisten dengan orderPriceSnapshot)
-      // ==============================
+
       try {
         await Order.updateOne(
           { _id: doc._id },
           {
             $set: {
-              // utama — ambil dari uiTotals yang sudah dihitung sebelumnya
               items_subtotal: int(uiTotals.items_subtotal || 0),
               items_discount: int(uiTotals.items_discount || 0),
               items_subtotal_after_discount: int(
@@ -2596,19 +2589,21 @@ exports.checkout = asyncHandler(async (req, res) => {
               rounding_delta: int(uiTotals.rounding_delta || 0),
               grand_total: int(uiTotals.grand_total || 0),
 
-              // simpan snapshot lengkap juga (opsional, sudah Anda persiapkan sebelumnya)
-              orderPriceSnapshot: orderPriceSnapshot
+              orderPriceSnapshot: orderPriceSnapshot,
+
+              // persist points_used explicitly
+              points_used: int(pointsUsedReq || 0)
             }
           },
           { session }
         );
 
-        // debug: verifikasi singkat (opsional)
         const check = await Order.findById(doc._id).session(session).lean();
         console.log('[checkout][debug] order totals forced from uiTotals:', {
           orderId: doc._id,
           saved_items_subtotal: check.items_subtotal,
-          saved_grand_total: check.grand_total
+          saved_grand_total: check.grand_total,
+          saved_points_used: check.points_used
         });
       } catch (e) {
         console.warn(
@@ -2618,14 +2613,11 @@ exports.checkout = asyncHandler(async (req, res) => {
         throwError('Gagal menyimpan order totals', 500);
       }
 
-      // Update member (if exists): apply point deduction, award points, update total_spend, evaluate level after
       if (MemberDoc) {
         const memberId = MemberDoc._id;
-        // Re-fetch inside session to be safe
         const memberLive = await Member.findById(memberId).session(session);
         if (!memberLive) throwError('Member tidak ditemukan saat commit', 404);
 
-        // compute new points balance
         const currentPoints = Number(memberLive.points || 0);
         const newPointsAfterUsage = Math.max(
           0,
@@ -2633,14 +2625,11 @@ exports.checkout = asyncHandler(async (req, res) => {
         );
         const newPointsAfterAward = newPointsAfterUsage + int(points_awarded);
 
-        // compute new total spend
         const newTotalSpend =
           Number(memberLive.total_spend || 0) + Number(total_spend_delta || 0);
 
-        // evaluate new level
         const newLevel = evaluateMemberLevel(newTotalSpend);
 
-        // update member fields atomically inside session
         await Member.updateOne(
           { _id: memberId },
           {
@@ -2656,7 +2645,6 @@ exports.checkout = asyncHandler(async (req, res) => {
           { session }
         );
 
-        // set member_level_after into order doc (update)
         await Order.updateOne(
           { _id: doc._id },
           {
@@ -2667,7 +2655,6 @@ exports.checkout = asyncHandler(async (req, res) => {
           { session }
         );
 
-        // also persist level on member (if changed)
         if (String(memberLive.level || '') !== String(newLevel)) {
           await Member.updateOne(
             { _id: memberId },
@@ -2675,9 +2662,6 @@ exports.checkout = asyncHandler(async (req, res) => {
             { session }
           );
         }
-
-        // Optionally push history entry (if you have pointsHistory array)
-        // await Member.updateOne({ _id: memberId }, { $push: { pointsHistory: { ... } } }, { session });
       }
 
       createdOrder = doc;
@@ -2690,10 +2674,8 @@ exports.checkout = asyncHandler(async (req, res) => {
     throwError('Gagal create order (unknown)', 500);
   }
 
-  // assign to order variable used further down
   order = createdOrder;
 
-  // --- handle upload bukti jika perlu (sama seperti sebelumnya) ---
   try {
     if (needProof(method)) {
       if (!req.file) {
@@ -2737,7 +2719,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     );
   }
 
-  // --- konsumsi voucher claims (non-fatal) berdasarkan priced.chosenClaimIds ---
   if (MemberDoc) {
     console.log('[checkout] start consuming voucher claims', {
       chosenClaimIds: priced.chosenClaimIds || []
@@ -2766,7 +2747,6 @@ exports.checkout = asyncHandler(async (req, res) => {
             status: c.status
           });
 
-          // jika voucher pakai global_stock dan stok = 0 -> revoke klaim lain
           try {
             const v = await Voucher.findById(c.voucher).lean();
             if (v && v.visibility && v.visibility.mode === 'global_stock') {
@@ -2812,7 +2792,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     console.log('[checkout] no MemberDoc -> skip consuming vouchers');
   }
 
-  // --- update cart status checked_out ---
   try {
     await Cart.findByIdAndUpdate(cart._id, {
       $set: {
@@ -2888,7 +2867,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     console.error('[emit][checkout]', e?.message || e);
   }
 
-  // --- response ---
   console.log('[checkout] finished success', {
     orderId: order._id,
     grand_total: order.grand_total
@@ -2901,23 +2879,36 @@ exports.checkout = asyncHandler(async (req, res) => {
         (await Order.findById(order._id).lean());
       if (!full) return;
 
-      // hanya kirim WA jika payment method membutuhkan owner verify
+      console.log('[checkout][verify] post-persist order', {
+        id: full._id,
+        grand_total: full.grand_total,
+        points_used: full.points_used ?? null,
+        orderPriceSnapshot: !!full.orderPriceSnapshot
+      });
+
+      if (MemberDoc) {
+        const postMember = await Member.findById(MemberDoc._id)
+          .lean()
+          .catch(() => null);
+        console.log('[checkout][verify] post-persist member', {
+          memberId: MemberDoc._id,
+          points_after: postMember?.points ?? null
+        });
+      }
+
       if (!paymentRequiresOwnerVerify(full.payment_method)) return;
 
-      // generate token & hash, expiry (hours from env)
       const EXPIRE_HOURS = Number(process.env.OWNER_VERIFY_EXPIRE_HOURS || 6);
-      const tokenRaw = genTokenRaw(); // raw token -> dikirim via WA
+      const tokenRaw = genTokenRaw();
       const tokenHash = hashTokenVerification(tokenRaw);
       const expiresAt = new Date(Date.now() + EXPIRE_HOURS * 60 * 60 * 1000);
 
-      // simpan tokenHash & expiresAt di order (non-blocking update)
       await Order.updateOne(
         { _id: full._id },
         {
           $set: {
             'verification.tokenHash': tokenHash,
             'verification.expiresAt': expiresAt,
-            // clear previous used meta if any
             'verification.usedAt': null,
             'verification.usedFromIp': '',
             'verification.usedUserAgent': ''
@@ -2930,7 +2921,6 @@ exports.checkout = asyncHandler(async (req, res) => {
         )
       );
 
-      // build verify link with raw token
       const DASHBOARD_URL =
         process.env.DASHBOARD_URL || 'https://dashboard.example.com';
       const verifyLink = `${DASHBOARD_URL}/public/owner-verify?orderId=${
@@ -3686,7 +3676,6 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
             }))
           : [];
 
-      // build rewards array (mirip previewPrice)
       const rewards = [];
 
       // dari actions
@@ -3924,31 +3913,16 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     applyPromos = true
   } = req.body || {};
 
-  console.log(
-    '[previewPrice] START - body snapshot:',
-    JSON.stringify({
-      cartSummary: { items: (cart?.items || []).length },
-      fulfillmentType,
-      voucherClaimIds,
-      deliveryModeFromBody,
-      selectedPromoId,
-      usePoints,
-      applyPromos
-    })
-  );
-
   if (!cart?.items?.length) throwError('Cart kosong', 400);
 
   // resolve identity (support guest)
   const memberId = req.member?.id || null;
   const now = new Date();
-  console.log('[previewPrice] identity:', { memberId, now: now.toISOString() });
 
   // ===== filter vouchers (guest cannot use vouchers) =====
   let eligible = [];
   if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
     if (!memberId) {
-      console.warn('[previewPrice] guest attempted voucherClaimIds - ignored');
       eligible = [];
     } else {
       const rawClaims = await VoucherClaim.find({
@@ -3961,7 +3935,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         .map((c) => String(c._id));
     }
   }
-  console.log('[previewPrice] eligible voucher IDs after filter:', eligible);
 
   // ===== delivery mode & fee =====
   const deliveryMode =
@@ -3974,65 +3947,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     fulfillmentType === 'delivery' && deliveryMode === 'delivery'
       ? envDeliveryFee
       : 0;
-  console.log('[previewPrice] delivery:', {
-    deliveryMode,
-    effectiveDeliveryFee
-  });
-
-  // ===== VALIDASI: voucher ongkir hanya untuk delivery =====
-  if (Array.isArray(eligible) && eligible.length > 0) {
-    try {
-      const vcDocs = await VoucherClaim.find({ _id: { $in: eligible } })
-        .populate('voucher')
-        .lean();
-
-      const isShippingVoucherDoc = (vc) => {
-        const v = vc.voucher || vc.voucherDoc || vc;
-        const meta = (v && v.meta) || vc.meta || {};
-        const typeStr = String(
-          v?.type || v?.category || v?.applies_to || v?.discount_for || ''
-        ).toLowerCase();
-
-        const flag =
-          Boolean(v?.isShipping) ||
-          Boolean(meta?.isShipping) ||
-          typeStr === 'shipping' ||
-          typeStr === 'delivery' ||
-          typeStr.includes('ship') ||
-          typeStr.includes('ongkir') ||
-          String(v?.category || '')
-            .toLowerCase()
-            .includes('ship') ||
-          String(v?.applies_to || '')
-            .toLowerCase()
-            .includes('delivery') ||
-          String(v?.discount_for || '')
-            .toLowerCase()
-            .includes('shipping');
-
-        return flag;
-      };
-
-      const foundShipping = vcDocs.some(isShippingVoucherDoc);
-
-      if (foundShipping && deliveryMode !== 'delivery') {
-        console.warn(
-          '[previewPrice] voucher shipping found but mode not delivery'
-        );
-        throwError(
-          'Voucher ongkir hanya dapat dipakai untuk mode pengantaran (delivery). Hapus voucher atau ubah mode pengantaran.',
-          400
-        );
-      }
-    } catch (e) {
-      if (e && e.statusCode) throw e;
-      console.warn(
-        '[previewPrice] voucher shipping validation failed',
-        e?.message || e
-      );
-      // non-fatal: lanjutkan
-    }
-  }
 
   // ===== normalize cart for engine =====
   const normalizedCart = {
@@ -4054,10 +3968,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       };
     })
   };
-  console.log(
-    '[previewPrice] normalizedCart:',
-    JSON.stringify(normalizedCart, null, 2)
-  );
 
   // ===== optional MemberDoc for fetchers =====
   let MemberDoc = null;
@@ -4066,7 +3976,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       .lean()
       .catch(() => null);
   }
-  console.log('[previewPrice] MemberDoc present?:', !!MemberDoc);
 
   // ===== promo usage fetchers =====
   const promoUsageFetchers = {
@@ -4087,10 +3996,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         };
         return await Order.countDocuments(q);
       } catch (e) {
-        console.warn(
-          '[previewPrice] getMemberUsageCount failed',
-          e?.message || e
-        );
         return 0;
       }
     },
@@ -4102,10 +4007,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         };
         return await Order.countDocuments(q);
       } catch (e) {
-        console.warn(
-          '[previewPrice] getGlobalUsageCount failed',
-          e?.message || e
-        );
         return 0;
       }
     }
@@ -4122,29 +4023,11 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         { fetchers: promoUsageFetchers }
       );
     } catch (e) {
-      console.warn(
-        '[previewPrice] findApplicablePromos failed',
-        e?.message || e
-      );
       eligiblePromosList = [];
     }
   } else {
-    // promos disabled by toggle -> treat as none
     eligiblePromosList = [];
   }
-  const eligiblePromosCount = Array.isArray(eligiblePromosList)
-    ? eligiblePromosList.length
-    : 0;
-  console.log('[previewPrice] eligiblePromosList count & ids:', {
-    count: eligiblePromosCount,
-    promos: (eligiblePromosList || []).map((p) => ({
-      id: String(p._id),
-      name: p.name,
-      type: p.type,
-      autoApply: p.autoApply,
-      priority: p.priority
-    }))
-  });
 
   // ===== autoApplied suggestion (pick highest priority autoApply) =====
   let autoAppliedPromo = null;
@@ -4167,70 +4050,11 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         };
       }
     } catch (e) {
-      console.warn('[previewPrice] autoApply preview failed', e?.message || e);
       autoAppliedPromo = null;
     }
   }
-  console.log(
-    '[previewPrice] autoAppliedPromo preview:',
-    autoAppliedPromo
-      ? {
-          promoId: autoAppliedPromo.promoId,
-          name: autoAppliedPromo.name,
-          impactKeys: Object.keys(autoAppliedPromo.impact || {}),
-          actionsLen: (autoAppliedPromo.actions || []).length
-        }
-      : null
-  );
 
-  // ===== validasi: promo yang memblokir voucher jika user mengirim voucherClaimIds =====
-  (function () {
-    const attemptedVoucherUse =
-      Array.isArray(voucherClaimIds) && voucherClaimIds.length > 0;
-    if (!applyPromos) return; // promos disabled -> skip this validation
-
-    if (selectedPromoId) {
-      const sel = (eligiblePromosList || []).find(
-        (p) => String(p._id) === String(selectedPromoId)
-      );
-      console.log('[previewPrice] selectedPromoId check:', {
-        selectedPromoId,
-        selExists: !!sel,
-        selBlocksVoucher: sel?.blocksVoucher || false
-      });
-      if (sel && sel.blocksVoucher && attemptedVoucherUse) {
-        throwError(
-          'Promo yang dipilih memblokir penggunaan voucher. Hapus voucher atau pilih promo lain.',
-          400
-        );
-      }
-    } else if (attemptedVoucherUse) {
-      const highestAuto = (eligiblePromosList || [])
-        .filter((p) => !!p.autoApply)
-        .sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0))[0];
-      console.log(
-        '[previewPrice] highestAuto (for voucher validation):',
-        highestAuto
-          ? {
-              id: String(highestAuto._id),
-              name: highestAuto.name,
-              blocksVoucher: highestAuto.blocksVoucher
-            }
-          : null
-      );
-      if (highestAuto && highestAuto.blocksVoucher) {
-        throwError(
-          `Promo "${
-            highestAuto.name || highestAuto._id
-          }" otomatis akan dipakai dan memblokir voucher. Hapus voucher atau non-aktifkan auto-apply pada promo.`,
-          400
-        );
-      }
-    }
-  })();
-
-  // ---- NEW: pilih selectedPromo yang akan dikirim ke engine
-  // prefer selectedPromoId dari body; kalau gak ada tapi autoAppliedPromo ada, gunakan itu
+  // ---- select promo for engine
   const selectedForEngine = applyPromos
     ? selectedPromoId ||
       (autoAppliedPromo ? String(autoAppliedPromo.promoId) : null)
@@ -4242,27 +4066,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     : false;
 
   // ===== call engine =====
-  console.log('[previewPrice] calling price engine with params:', {
-    memberId,
-    selectedForEngine,
-    autoApplyForEngine,
-    fulfillmentType,
-    deliveryFee:
-      fulfillmentType === 'delivery' ? Number(effectiveDeliveryFee || 0) : 0,
-    voucherClaimIds: eligible
-  });
-  console.log(
-    '[previewPrice] calling price engine with params (full):',
-    JSON.stringify({
-      memberId,
-      selectedForEngine,
-      autoApplyForEngine,
-      cart: normalizedCart,
-      fulfillmentType,
-      deliveryFee: fulfillmentType === 'delivery' ? effectiveDeliveryFee : 0,
-      voucherClaimIds: eligible
-    })
-  );
   let result;
   try {
     result = await applyPromoThenVoucher({
@@ -4273,16 +4076,11 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       deliveryFee:
         fulfillmentType === 'delivery' ? Number(effectiveDeliveryFee || 0) : 0,
       voucherClaimIds: eligible,
-      // gunakan selectedForEngine dan autoApplyForEngine (sinkron dengan preview)
       selectedPromoId: selectedForEngine,
       autoApplyPromo: autoApplyForEngine,
       promoUsageFetchers
     });
   } catch (err) {
-    console.error(
-      '[previewPrice] price engine error (FULL):',
-      err && err.stack ? err.stack : err
-    );
     throwError(
       err?.message
         ? `Gagal menghitung preview harga: ${String(err.message)}`
@@ -4291,32 +4089,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     );
   }
 
-  console.log(
-    '[previewPrice] price engine returned result (top-level keys):',
-    Object.keys(result || {}).sort()
-  );
-  console.log('[previewPrice] price engine result snapshot:', {
-    ok: result?.ok,
-    reasonsLen: (result?.reasons || []).length,
-    promoApplied: result?.promoApplied
-      ? { promoId: result.promoApplied.promoId, name: result.promoApplied.name }
-      : null,
-    promoImpactKeys: result?.promoApplied?.impact
-      ? Object.keys(result.promoApplied.impact || {})
-      : [],
-    promoActionsLen: Array.isArray(result?.promoApplied?.actions)
-      ? result.promoApplied.actions.length
-      : Array.isArray(result?.promoActions)
-      ? result.promoActions.length
-      : 0,
-    voucherResKeys: result?.voucherRes
-      ? Object.keys(result.voucherRes)
-      : result?.voucherResult
-      ? Object.keys(result.voucherResult)
-      : []
-  });
   if (!result || !result.ok) {
-    console.error('[previewPrice] price engine returned failure', result);
     throwError(
       (result && result.reasons && result.reasons.join?.(', ')) ||
         'Gagal menghitung harga (engine)',
@@ -4324,11 +4097,8 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     );
   }
 
-  // ===== build ui_totals (simplified single-source grand_total + rounding) =====
-  const t =
-    (result && result.totals) ||
-    (result.voucherResult && result.voucherResult.totals) ||
-    {};
+  // ===== build ui_totals (single-source grand_total + rounding) =====
+  const t = result.totals || result.voucherResult?.totals || {};
 
   const baseSubtotal = Number(t.baseSubtotal ?? t.base_subtotal ?? 0);
   const itemsDiscount = Number(t.itemsDiscount ?? t.items_discount ?? 0);
@@ -4354,24 +4124,31 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   const service_fee = Math.round(taxableItems * SERVICE_FEE_RATE);
   const tax_amount = Math.round(taxableItems * parsePpnRate());
 
-  // raw before rounding & before points
+  // raw before rounding & before points (this is pre-rounding value)
   const raw_before_points = Math.round(
     taxableItems + service_fee + deliveryFee - shippingDiscount + tax_amount
   );
 
-  // points simulation (floor + cap)
+  // === IMPORTANT CHANGE: do rounding BEFORE applying points ===
+  // first round the total (engine uses roundRupiahCustom in order flow)
+  const grand_before_points = roundRupiahCustom(Math.round(raw_before_points));
+
+  // points simulation: now use grand_before_points as the cap
   const memberPoints = Math.floor(Number(MemberDoc?.points || 0));
   const points_used = usePoints
-    ? Math.min(memberPoints, Math.max(0, Math.round(raw_before_points)))
+    ? Math.min(memberPoints, Math.max(0, Math.round(grand_before_points)))
     : 0;
 
-  // raw after points before final rounding
-  const raw_after_points = Math.max(0, raw_before_points - points_used);
+  // raw after points (use rounded-before-points minus points_used)
+  const raw_after_points = Math.max(
+    0,
+    Math.round(grand_before_points) - points_used
+  );
 
-  // final rounding -> single grand_total
+  // final rounding -> single grand_total (round result after points)
   const grand_total = roundRupiahCustom(Math.round(raw_after_points));
 
-  // single rounding delta
+  // rounding delta — difference between grand_total and the raw_after_points
   const rounding_delta = Number(grand_total) - Math.round(raw_after_points);
 
   const ui_totals = {
@@ -4382,21 +4159,15 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     tax_amount: int(tax_amount),
     delivery_fee: int(deliveryFee),
     shipping_discount: int(shippingDiscount),
+    // gunakan nama points_used (sesuai expectation)
     points_used: int(points_used),
+    // cantumkan grand total (setelah points & rounding)
     grand_total: int(grand_total),
+    // juga simpan raw_before_points & grand_before_points & raw_after_points untuk debug/FE jika perlu
+    raw_total_before_rounding: int(raw_before_points),
+    grand_total_before_points: int(grand_before_points),
+    raw_total_after_points_before_rounding: int(raw_after_points),
     rounding_delta: int(rounding_delta)
-  };
-
-  console.log('[previewPrice] computed ui_totals:', ui_totals);
-
-  // ===== normalize voucher info =====
-  const voucherInfo = (result.voucherResult && {
-    chosenClaimIds:
-      result.chosenClaimIds || result.voucherResult.chosenClaimIds || [],
-    breakdown: result.voucherResult.breakdown || result.breakdown || []
-  }) || {
-    chosenClaimIds: result.chosenClaimIds || [],
-    breakdown: result.breakdown || []
   };
 
   // ===== promo / rewards normalization =====
@@ -4457,7 +4228,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     }
   }
 
-  // eligible promos summary
   const eligiblePromosSummary = (eligiblePromosList || []).map((p) => ({
     id: String(p._id),
     name: p.name,
@@ -4472,35 +4242,16 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     description: appliedPromo ? appliedPromo.description || null : null,
     rewards: normalizedRewards,
     points_total: Number(pointsTotalFromEngine || 0),
-    chosenClaimIds: voucherInfo.chosenClaimIds || []
+    chosenClaimIds: result.chosenClaimIds || []
   };
-
-  // LOG final response payload (not too big)
-  try {
-    console.log('[previewPrice] FINAL RESPONSE PREPARED:', {
-      reasons: result.reasons || result.voucherResult?.reasons || [],
-      eligiblePromosCount,
-      eligiblePromos: eligiblePromosSummary,
-      promo: {
-        appliedPromoId: promoCompact.appliedPromoId,
-        appliedPromoName: promoCompact.appliedPromoName,
-        rewardsLen: promoCompact.rewards.length,
-        points_total: promoCompact.points_total
-      },
-      voucherChosen: promoCompact.chosenClaimIds,
-      ui_totals
-    });
-  } catch (e) {
-    /* ignore logging error */
-  }
 
   return res.status(200).json({
     ok: true,
     reasons: result.reasons || result.voucherResult?.reasons || [],
-    eligiblePromosCount,
+    eligiblePromosCount: eligiblePromosList.length,
     eligiblePromos: eligiblePromosSummary,
     promo: promoCompact,
-    voucher: { chosenClaimIds: voucherInfo.chosenClaimIds || [] },
+    voucher: { chosenClaimIds: result.chosenClaimIds || [] },
     ui_totals,
     member_points: Number(MemberDoc?.points || 0),
     guest: !memberId,
@@ -5193,19 +4944,15 @@ const buildOrderReceipt = (order) => {
   });
 
   // ------- applied promos & vouchers summary -------
-  // order.appliedPromo / order.applied_promo shapes
   const appliedPromo = order.appliedPromo || order.applied_promo || null;
   const appliedPromos = [];
   if (appliedPromo) {
-    // normalize promo snapshot
     const ap =
       appliedPromo.promoSnapshot || appliedPromo.promoSnapshot || appliedPromo;
 
     if (ap) {
-      // build rewards array mirip previewPrice normalization
       const normalizedRewards = [];
 
-      // from actions (award_points, grant_membership, etc)
       if (ap.actions && Array.isArray(ap.actions)) {
         for (const a of ap.actions) {
           const t = String(a.type || '').toLowerCase();
@@ -5234,7 +4981,6 @@ const buildOrderReceipt = (order) => {
         }
       }
 
-      // from impact: free items
       if (ap.impact && Array.isArray(ap.impact.addedFreeItems)) {
         for (const f of ap.impact.addedFreeItems) {
           normalizedRewards.push({
@@ -5246,7 +4992,6 @@ const buildOrderReceipt = (order) => {
         }
       }
 
-      // from impact: discount
       const promoDiscountValue =
         (ap.impact && (ap.impact.itemsDiscount || ap.impact.cartDiscount)) || 0;
       if (promoDiscountValue && Number(promoDiscountValue) > 0) {
@@ -5263,7 +5008,6 @@ const buildOrderReceipt = (order) => {
           ap.promoId || ap.promo_id || (ap.id ? String(ap.id) : null) || null,
         name: ap.name || ap.promoName || null,
         description: ap.description || ap.notes || null,
-        // pastikan type terisi (prioritas: ap.type -> promoSnapshot.type -> ap.promoType)
         type: ap.type || ap.promoSnapshot?.type || ap.promoType || null,
         rewards: normalizedRewards,
         impact: ap.impact || {},
@@ -5272,7 +5016,7 @@ const buildOrderReceipt = (order) => {
     }
   }
 
-  // vouchers summary (applied_voucher_ids and order.appliedVouchers)
+  // vouchers summary
   const appliedVoucherEntries = [];
   if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
     for (const av of order.appliedVouchers) {
@@ -5294,7 +5038,7 @@ const buildOrderReceipt = (order) => {
     }
   }
 
-  // free items summary (populate name & qty) — bantu FE render free item section
+  // free items summary
   const free_items = (order.items || [])
     .filter(
       (it) => Number(it.price || it.unit_price || it.base_price || 0) === 0
@@ -5306,15 +5050,13 @@ const buildOrderReceipt = (order) => {
       imageUrl: it.imageUrl || null
     }));
 
-  // ----------------- LOCAL ENRICHMENT (pakai data order.items, tanpa DB) -------------
-  // build menu map dari order.items (best-effort)
+  // (local enrichment unchanged) build menuMap and enrich rewards...
   const menuMap = {};
   for (const it of items) {
     const mid = it.menu || it.menuId || (it.menu && it.menu._id) || null;
     if (!mid) continue;
     const key = String(mid);
     if (!menuMap[key]) {
-      // prefer item.menu object fields if populated, else use item.name/image
       const mObj = it.menu && typeof it.menu === 'object' ? it.menu : null;
       menuMap[key] = {
         name: it.name || (mObj && mObj.name) || null,
@@ -5324,7 +5066,6 @@ const buildOrderReceipt = (order) => {
     }
   }
 
-  // enrich appliedPromos rewards free_item using menuMap
   for (const ap of appliedPromos) {
     if (!Array.isArray(ap.rewards)) continue;
     for (const r of ap.rewards) {
@@ -5337,7 +5078,6 @@ const buildOrderReceipt = (order) => {
         const mid = String(r.meta.menuId);
         const mdoc = menuMap[mid];
         if (mdoc) {
-          // jangan ubah meta.menuId
           r.label =
             r.label && r.label !== `Free item ${mid}`
               ? r.label
@@ -5347,7 +5087,6 @@ const buildOrderReceipt = (order) => {
           if (!r.meta.menuName && mdoc.name) r.meta.menuName = mdoc.name;
           if (!r.meta.menuCode && mdoc.code) r.meta.menuCode = mdoc.code;
         } else {
-          // fallback: kalau free_items diorder, cek free_items array
           const found = free_items.find((f) => String(f.menuId) === mid);
           if (found) {
             r.label =
@@ -5365,7 +5104,6 @@ const buildOrderReceipt = (order) => {
     }
   }
 
-  // enrich free_items names from menuMap where possible
   for (const f of free_items) {
     if (f.menuId) {
       const mdoc = menuMap[String(f.menuId)];
@@ -5376,7 +5114,7 @@ const buildOrderReceipt = (order) => {
     }
   }
 
-  // ------- final receipt object (tanpa discounts attribute) -------
+  // ------- final receipt object (tambahkan points_used) -------
   const receipt = {
     id: String(order._id),
     transaction_code: order.transaction_code || '',
@@ -5393,6 +5131,13 @@ const buildOrderReceipt = (order) => {
       shipping_discount: int(shipping_discount),
       tax_amount: int(tax_amount),
       tax_rate_percent: Number(tax_rate_percent || 0),
+      // points_used: prefer snapshot.ui_totals.points_used -> fallback order.points_used -> 0
+      points_used: int(
+        snapshotUi?.points_used ??
+          snapshotUi?.points_candidate_use ??
+          order.points_used ??
+          0
+      ),
       rounding_delta: int(rounding_delta),
       grand_total: int(grand_total),
       raw_total_before_rounding: int(raw_total_before_rounding)
@@ -5426,13 +5171,11 @@ const buildOrderReceipt = (order) => {
       placed_at: order.placed_at,
       paid_at: order.paid_at || null
     },
-    // applied promos & vouchers (summary) — promo sudah berisi rewards dan type terisi jika ada
     applied_promos: appliedPromos,
     applied_vouchers: appliedVoucherEntries,
     applied_voucher_ids: Array.isArray(order.applied_voucher_ids)
       ? order.applied_voucher_ids
       : appliedVoucherEntries.map((v) => v.voucherId),
-    // free items summary for FE convenience
     free_items,
     meta: {
       note: order.notes || order.note || ''
