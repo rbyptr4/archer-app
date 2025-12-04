@@ -12,7 +12,12 @@ const {
   updateBirthday,
   updateAddress
 } = require('../../controllers/member/authMemberController');
+const {
+  listMyOrders,
+  getMyOrder
+} = require('../../controllers/orderController');
 const authMember = require('../../middlewares/authMember');
+const authMemberOptional = require('../../middlewares/authMemberOptional');
 const {
   requestChangeName,
   requestChangePhone,
@@ -40,5 +45,8 @@ router.patch('/me/address', authMember, updateAddress);
 
 router.post('/logout', logoutMember);
 router.post('/resend-otp', resendOtp);
+
+router.get('/my-order', authMemberOptional, listMyOrders);
+router.get('/my-order/:id', authMember, getMyOrder);
 
 module.exports = router;
