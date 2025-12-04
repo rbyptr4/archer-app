@@ -102,6 +102,7 @@ router.get(
 );
 
 router.get('/my-order', authMemberRequired, order.listMyOrders);
+router.get('/member/my-order/:id', authMemberRequired, order.getMyOrder);
 router.post('/price-preview', authMemberOptional, order.previewPrice);
 
 router.post(
@@ -236,8 +237,6 @@ router.delete(
   requirePageAccess('orders'),
   order.cancelOrder
 );
-
-router.get('/member/my-order/:id', authMemberRequired, order.getMyOrder);
 
 router.patch('/update/:itemId', order.updateItem);
 router.delete('/remove/:itemId', order.removeItem);

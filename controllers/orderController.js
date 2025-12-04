@@ -3601,9 +3601,14 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
   const id = req.params.id;
   if (!mongoose.Types.ObjectId.isValid(id)) throwError('ID tidak valid', 400);
 
-  // ambil order + populate member minimal + verified_by name
+  // ambil order + populate member minimal + items.menu + verified_by
   const order = await Order.findById(id)
-    .populate({ path: 'member', select: 'name phone' })
+    .populate({ path: 'member', select: 'name phone email membershipTier' })
+    .populate({
+      path: 'items.menu',
+      select: 'name imageUrl code price category',
+      justOne: false
+    })
     .populate({ path: 'verified_by', select: 'name' })
     .lean();
   if (!order) throwError('Order tidak ditemukan', 404);
@@ -3615,6 +3620,7 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
 
   const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
   const intVal = (v) => Math.round(Number(v || 0));
+  const int = (v) => intVal(v); // helper local mirip int()
 
   // --- normalisasi discounts internal (TETAP hitung, tapi TIDAK dikirim ke client) ---
   const rawDiscounts = Array.isArray(order.discounts)
@@ -3817,113 +3823,149 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
     }
   }
 
-  // --- susun items simple (sesuai permintaan) ---
-  const itemsSimple = (order.items || []).map((it) => {
+  // --- susun itemsDetailed (mirip getDetailOrder) ---
+  const itemsDetailed = (order.items || []).map((it, idx) => {
     const qty = safeNumber(it.quantity || it.qty || 0);
-    const basePrice = safeNumber(it.base_price || 0);
+    const basePrice = safeNumber(
+      it.base_price || it.price || it.unit_price || 0
+    );
     const addons_unit = (it.addons || []).reduce(
       (s, a) => s + (Number.isFinite(+a.price) ? +a.price : 0) * (a.qty || 1),
       0
     );
     const unit_before_tax = basePrice + addons_unit;
     const line_subtotal = Number(it.line_subtotal ?? unit_before_tax * qty);
+    const tax = safeNumber(it.tax_amount || it.tax || 0);
+    const itemMenu = it.menu && typeof it.menu === 'object' ? it.menu : null;
 
     return {
-      name: it.name,
-      menu: it.menu ? String(it.menu) : null,
-      menu_code: it.menu_code || '',
-      imageUrl: it.imageUrl || '',
+      idx,
+      id: it._id ? String(it._id) : null,
+      name: it.name || (itemMenu && itemMenu.name) || null,
+      menu: it.menu
+        ? typeof it.menu === 'string'
+          ? String(it.menu)
+          : String(it.menu._id || it.menu)
+        : null,
+      menu_snapshot: itemMenu
+        ? {
+            name: itemMenu.name,
+            imageUrl: itemMenu.imageUrl,
+            code: itemMenu.code
+          }
+        : it.menuSnapshot || it.menu,
+      menu_code: it.menu_code || (itemMenu && itemMenu.code) || '',
+      imageUrl: it.imageUrl || (itemMenu && itemMenu.imageUrl) || null,
       qty,
       base_price: basePrice,
+      unit_before_tax,
       addons: (it.addons || []).map((a) => ({
+        id: a._id ? String(a._id) : null,
         name: a.name,
         price: safeNumber(a.price),
-        qty: a.qty || 1
+        qty: a.qty || 1,
+        total: safeNumber(a.price) * (a.qty || 1)
       })),
       notes: it.notes || '',
+      adjustments: Array.isArray(it.adjustments) ? it.adjustments : [],
       line_subtotal,
-      adjustments: Array.isArray(it.adjustments) ? it.adjustments : []
+      tax,
+      tax_rate_percent: safeNumber(it.tax_rate_percent || null),
+      discount: safeNumber(it.line_discount || it.discount || 0),
+      final_price: safeNumber(
+        it.final_price ?? line_subtotal - (it.line_discount || 0) + tax
+      )
     };
   });
 
-  // --- final slim response (TANPA attribute discounts verbose) ---
-  const slim = {
-    id: String(order._id),
-    transaction_code: order.transaction_code || null,
-    customer: {
-      name: order.member?.name || order.customer_name || null,
-      phone: order.member?.phone || order.customer_phone || null
-    },
-    ownerVerified: order.ownerVerified,
-    fulfillment_type: order.fulfillment_type || null,
-    table_number: order.table_number ?? null,
-    payment_status: order.payment_status ?? null,
-    items: itemsSimple,
-    totals: {
-      items_subtotal: safeNumber(order.items_subtotal || 0),
-      service_fee: safeNumber(order.service_fee || 0),
-      delivery_fee: safeNumber(order.delivery_fee || 0),
-      items_discount: safeNumber(order.items_discount || 0),
-      shipping_discount: safeNumber(order.shipping_discount || 0),
-      tax_rate_percent: safeNumber(
-        order.tax_rate_percent || Math.round((parsePpnRate() || 0.11) * 100)
-      ),
-      tax_amount: safeNumber(order.tax_amount || 0),
-      rounding_delta: safeNumber(order.rounding_delta || 0),
-      grand_total: safeNumber(order.grand_total || 0)
-    },
+  // --- build totals object (sama seperti detail) ---
+  const totals = {
+    items_subtotal: safeNumber(order.items_subtotal || 0),
+    items_discount: safeNumber(order.items_discount || 0),
+    service_fee: safeNumber(order.service_fee || 0),
+    delivery_fee: safeNumber(order.delivery_fee || 0),
+    shipping_discount: safeNumber(order.shipping_discount || 0),
+    tax_rate_percent: safeNumber(
+      order.tax_rate_percent || Math.round(0.11 * 100)
+    ),
+    tax_amount: safeNumber(order.tax_amount || 0),
+    rounding_delta: safeNumber(order.rounding_delta || 0),
+    grand_total: safeNumber(order.grand_total || 0),
+    paid_total: safeNumber(order.paid_total || order.grand_total || 0),
+
+    // tambahan points info agar client bisa lihat breakdown
+    points_used: safeNumber(order.points_used || 0),
+    points_awarded: safeNumber(order.points_awarded || 0)
+  };
+
+  // --- Local enrichment for free_item labels using order.items (no DB calls) ---
+  try {
+    const menuMap = {};
+    (order.items || []).forEach((it) => {
+      const mid = it.menu || it.menuId || (it.menu && it.menu._id) || null;
+      if (!mid) return;
+      const key = String(mid);
+      if (!menuMap[key]) {
+        const mObj = it.menu && typeof it.menu === 'object' ? it.menu : null;
+        menuMap[key] = {
+          name: it.name || (mObj && mObj.name) || null,
+          imageUrl: it.imageUrl || (mObj && mObj.imageUrl) || null,
+          code: it.menu_code || (mObj && mObj.code) || null
+        };
+      }
+    });
+
+    // enrich appliedPromos rewards free_item
+    for (const ap of appliedPromos) {
+      if (!Array.isArray(ap.rewards)) continue;
+      for (const r of ap.rewards) {
+        if (
+          r &&
+          String(r.type || '').toLowerCase() === 'free_item' &&
+          r.meta &&
+          r.meta.menuId
+        ) {
+          const mid = String(r.meta.menuId);
+          const mdoc = menuMap[mid];
+          if (mdoc) {
+            r.label =
+              r.label && r.label !== `Free item ${mid}`
+                ? r.label
+                : mdoc.name || r.label || `Free item ${mid}`;
+            if (!r.meta.imageUrl && mdoc.imageUrl)
+              r.meta.imageUrl = mdoc.imageUrl;
+            if (!r.meta.menuName && mdoc.name) r.meta.menuName = mdoc.name;
+            if (!r.meta.menuCode && mdoc.code) r.meta.menuCode = mdoc.code;
+          } else {
+            r.label = r.label || `Free item ${mid}`;
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[getMyOrder] local enrichment failed', e?.message || e);
+  }
+
+  // --- susun full response (sama structure dengan getDetailOrder) ---
+  const full = Object.assign({}, order, {
+    _id: order._id ? String(order._id) : null,
+    id: order._id ? String(order._id) : null,
+    member: order.member || null,
+    applied_promos: appliedPromos,
+    applied_vouchers: appliedVouchers,
+    items: itemsDetailed,
+    totals,
     payment: {
       method: order.payment_method || null,
       provider: order.payment_provider || null,
       status: order.payment_status || null,
       proof_url: order.payment_proof_url || null,
-      paid_at: order.paid_at || null
-    },
-    status: order.status || null,
-    placed_at: order.placed_at || null,
-    created_at: order.createdAt || null,
-    updated_at: order.updatedAt || null,
-    delivery: order.delivery
-      ? {
-          mode: order.delivery.mode || null,
-          address_text: order.delivery.address_text || null,
-          location:
-            order.delivery.location &&
-            typeof order.delivery.location.lat === 'number'
-              ? {
-                  lat: order.delivery.location.lat,
-                  lng: order.delivery.location.lng
-                }
-              : null,
-          distance_km: order.delivery.distance_km ?? null,
-          delivery_fee: order.delivery.delivery_fee ?? null,
-          slot_label: order.delivery.slot_label || null,
-          scheduled_at: order.delivery.scheduled_at || null,
-          status: order.delivery.status || null,
-          pickup_window: order.delivery.pickup_window
-            ? {
-                from: order.delivery.pickup_window.from || null,
-                to: order.delivery.pickup_window.to || null
-              }
-            : null
-        }
-      : null,
+      paid_at: order.paid_at || null,
+      raw: order.payment || null
+    }
+  });
 
-    // verifikasi oleh kasir (jika ada)
-    verified_by: order.verified_by
-      ? {
-          id: String(order.verified_by._id),
-          name: order.verified_by.name || ''
-        }
-      : null,
-    verified_at: order.verified_at || null,
-
-    // ringkasan promo & voucher (tanpa array discounts yang verbose)
-    applied_promos: appliedPromos,
-    applied_vouchers: appliedVouchers
-  };
-
-  return res.status(200).json({ success: true, order: slim });
+  return res.status(200).json({ success: true, order: full });
 });
 
 exports.previewPrice = asyncHandler(async (req, res) => {
@@ -6480,7 +6522,7 @@ exports.completeOrder = asyncHandler(async (req, res) => {
 exports.acceptAndVerify = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
-  // ambil lean untuk validasi awal
+  // ambil lean untuk validasi awal (snapshot sebelum update)
   const order = await Order.findById(req.params.id).lean();
   if (!order) throwError('Order tidak ditemukan', 404);
 
@@ -6513,9 +6555,55 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
   doc.verified_at = new Date();
   if (!doc.placed_at) doc.placed_at = new Date();
 
+  // =========================
+  // FIX: pastikan points masuk ke top-level discount supaya pre-validate menghitung grand_total after points
+  // Ambil points dari doc (jika ada) atau dari lean order (payload awal)
+  const pointsFromDoc = Number(doc.points_used || 0);
+  const pointsFromLean = Number(order.points_used || 0);
+  const pointsUsed = pointsFromDoc || pointsFromLean || 0;
+
+  // Jika items_discount belum memasukkan points, tambahkan.
+  // (Catatan: asumsi flow create belum menambahkan points ke items_discount; jika sudah, nilai akan double-add.
+  //  Harusnya flow create sudah diubah seperti instruksi sebelumnya. Jika ragu, cek kondisi dan hanya tambahkan jika belum ada.)
+  // Kita lakukan check ringan: jika items_discount < (ui_totals.items_discount + pointsUsed) maka set ke value tersebut.
+  const uiItemsDiscount =
+    Number(order?.orderPriceSnapshot?.ui_totals?.items_discount || 0) || 0;
+  const desiredItemsDiscount = uiItemsDiscount + Number(pointsUsed || 0);
+  const currentItemsDiscount = Number(doc.items_discount || 0);
+
+  if (currentItemsDiscount < desiredItemsDiscount) {
+    doc.items_discount = desiredItemsDiscount;
+  } else {
+    // tetap pakai currentItemsDiscount (mencegah double-add bila sudah ter-apply)
+    doc.items_discount = currentItemsDiscount;
+  }
+
+  // simpan explicit points_used (audit)
+  doc.points_used = Number(pointsUsed || 0);
+
+  // sinkronkan grand_total dengan snapshot UI after-points bila tersedia
+  const uiTotals = order?.orderPriceSnapshot?.ui_totals;
+  if (uiTotals) {
+    const uiAfter = uiTotals.grand_total_after_points ?? uiTotals.grand_total;
+    if (typeof uiAfter !== 'undefined' && uiAfter !== null) {
+      doc.grand_total = Number(uiAfter);
+    }
+  } else if (order?.orderPriceSnapshot?.engineTotals?.grandTotal != null) {
+    // fallback: engine grandTotal minus points (jika engineTotals adalah before-points)
+    doc.grand_total =
+      Number(order.orderPriceSnapshot.engineTotals.grandTotal || 0) -
+      Number(pointsUsed || 0);
+  }
+
+  // ===== simpan perubahan (pre-validate akan jalan, tapi karena items_discount sudah include points, perhitungan ulang menghasilkan nilai yang konsisten) ====
   await doc.save();
 
-  // prepare payload untuk emits
+  // ambil order final yang sudah tersimpan untuk emit & response (populate minimal jika perlu)
+  const finalOrder = await Order.findById(doc._id)
+    .populate('verified_by', 'name email')
+    .lean();
+
+  // prepare payload untuk emits (pakai doc/user)
   const payload = {
     id: String(doc._id),
     transaction_code: doc.transaction_code,
@@ -6541,33 +6629,37 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     };
 
     const summary = {
-      id: String(order._id),
-      transaction_code: order.transaction_code || '',
+      id: String(finalOrder._id),
+      transaction_code: finalOrder.transaction_code || '',
       delivery_mode:
-        order.delivery?.mode ||
-        (order.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
-      grand_total: Number(order.grand_total || 0),
-      fulfillment_type: order.fulfillment_type || null,
+        finalOrder.delivery?.mode ||
+        (finalOrder.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
+      grand_total: Number(finalOrder.grand_total || 0),
+      fulfillment_type: finalOrder.fulfillment_type || null,
       customer_name:
-        (order.member && order.member.name) || order.customer_name || '',
+        (finalOrder.member && finalOrder.member.name) ||
+        finalOrder.customer_name ||
+        '',
       customer_phone:
-        (order.member && order.member.phone) || order.customer_phone || '',
-      placed_at: order.placed_at || order.createdAt || null,
+        (finalOrder.member && finalOrder.member.phone) ||
+        finalOrder.customer_phone ||
+        '',
+      placed_at: finalOrder.placed_at || finalOrder.createdAt || null,
       table_number:
-        order.fulfillment_type === 'dine_in'
-          ? order.table_number || null
+        finalOrder.fulfillment_type === 'dine_in'
+          ? finalOrder.table_number || null
           : null,
-      payment_status: order.payment_status || null,
-      status: order.status || null,
-      total_quantity: Number(order.total_quantity || 0),
-      pickup_window: order.delivery?.pickup_window
+      payment_status: finalOrder.payment_status || null,
+      status: finalOrder.status || null,
+      total_quantity: Number(finalOrder.total_quantity || 0),
+      pickup_window: finalOrder.delivery?.pickup_window
         ? {
-            from: order.delivery.pickup_window.from || null,
-            to: order.delivery.pickup_window.to || null
+            from: finalOrder.delivery.pickup_window.from || null,
+            to: finalOrder.delivery.pickup_window.to || null
           }
         : null,
-      delivery_slot_label: order.delivery?.slot_label || null,
-      member_id: order.member ? String(order.member) : null
+      delivery_slot_label: finalOrder.delivery?.slot_label || null,
+      member_id: finalOrder.member ? String(finalOrder.member) : null
     };
 
     emitOrdersStream({
@@ -6604,14 +6696,10 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     }
   })();
 
-  // ambil order final (opsional populate minimal) untuk response
-  const orderForResp = await Order.findById(doc._id)
-    .populate('verified_by', 'name email')
-    .lean();
-
+  // balikan response dengan order final (sudah populated verified_by)
   res
     .status(200)
-    .json({ message: 'Pesanan diterima & diverifikasi', order: orderForResp });
+    .json({ message: 'Pesanan diterima & diverifikasi', order: finalOrder });
 });
 
 exports.assignDelivery = asyncHandler(async (req, res) => {

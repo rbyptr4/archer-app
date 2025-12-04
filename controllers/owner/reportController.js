@@ -721,7 +721,6 @@ exports.listMemberSummary = asyncHandler(async (req, res) => {
   const pipeline = [
     { $match: combinedMatch },
 
-    // ⚡ Stable infinite-scroll: newest first
     { $sort: { createdAt: -1, _id: -1 } },
 
     { $limit: limit + 1 },
@@ -815,9 +814,6 @@ exports.getMemberFullDetail = asyncHandler(async (req, res) => {
   const member = await Member.findById(id).lean();
   if (!member) throwError('Member tidak ditemukan', 404);
 
-  // ===========================
-  //   AGGREGATE ORDER MEMBER
-  // ===========================
   const orders = await Order.aggregate([
     {
       $match: {
@@ -856,16 +852,14 @@ exports.getMemberFullDetail = asyncHandler(async (req, res) => {
     0
   );
 
-  // rincian fulfillment
   const summaryFulfillment = {
     dine_in: 0,
     delivery: 0,
-    pickup: 0,
-    none: 0
+    pickup: 0
   };
 
   orders.forEach((o) => {
-    const mode =
+    let mode =
       o.delivery?.mode ||
       (o.fulfillment_type === 'dine_in'
         ? 'dine_in'
@@ -873,16 +867,16 @@ exports.getMemberFullDetail = asyncHandler(async (req, res) => {
         ? 'delivery'
         : 'none');
 
-    if (summaryFulfillment[mode] !== undefined) {
-      summaryFulfillment[mode]++;
-    } else {
-      summaryFulfillment.none++;
+    if (!mode || mode === 'none') mode = 'dine_in';
+
+    if (mode === 'dine_in') summaryFulfillment.dine_in++;
+    else if (mode === 'delivery') summaryFulfillment.delivery++;
+    else if (mode === 'pickup') summaryFulfillment.pickup++;
+    else {
+      summaryFulfillment.dine_in++;
     }
   });
 
-  // ===========================
-  //   RECENT 50 ORDERS
-  // ===========================
   const recentOrders = await Order.find({ member: id })
     .sort({ placed_at: -1 })
     .limit(50)
@@ -891,13 +885,28 @@ exports.getMemberFullDetail = asyncHandler(async (req, res) => {
       placed_at: 1,
       status: 1,
       payment_status: 1,
-      'delivery.mode': 1
+      'delivery.mode': 1,
+      grand_total: 1,
+      verified_by: 1
     })
+    .populate({ path: 'verified_by', select: 'name' })
     .lean();
 
-  // ===========================
-  //   FINAL RESPONSE (CLEAN)
-  // ===========================
+  const recentOrdersClean = (recentOrders || []).map((r) => ({
+    id: String(r._id),
+    transaction_code: r.transaction_code || '',
+    placed_at: r.placed_at || null,
+    status: r.status || null,
+    payment_status: r.payment_status || null,
+    delivery_mode:
+      r.delivery?.mode ||
+      (r.fulfillment_type === 'dine_in' ? 'dine_in' : 'delivery'),
+    grand_total: Number(r.grand_total || 0),
+    verified_by: r.verified_by
+      ? { id: String(r.verified_by._id), name: r.verified_by.name || '' }
+      : null
+  }));
+
   res.json({
     member_profile: {
       id: member._id,
@@ -925,7 +934,7 @@ exports.getMemberFullDetail = asyncHandler(async (req, res) => {
       fulfillment_breakdown: summaryFulfillment
     },
 
-    recent_orders: recentOrders
+    recent_orders: recentOrdersClean
   });
 });
 
