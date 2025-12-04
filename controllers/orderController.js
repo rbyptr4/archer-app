@@ -2403,8 +2403,11 @@ exports.checkout = asyncHandler(async (req, res) => {
         ? Math.floor(Number(freshMember.points || 0))
         : 0;
 
-      // engine grand BEFORE points (sudah rounded by engine earlier)
-      const engineGrandBefore = Number(uiTotals.grand_total || 0);
+      const engineGrandBefore = Number(
+        uiTotals.grand_total_before_points ??
+          grandBeforePoints ??
+          uiTotals.grand_total
+      );
 
       // compute candidate points to use
       let pointsUsedReq = 0;
@@ -2417,10 +2420,20 @@ exports.checkout = asyncHandler(async (req, res) => {
           0,
           Math.floor(Number(memberForPoints?.points || 0))
         );
+
+        // gunakan engineGrandBefore (sebelum points) untuk hitung berapa poin yg mungkin dipakai
         pointsUsedReq = Math.min(
           memberBalance,
           Math.max(0, Math.round(engineGrandBefore))
         );
+
+        // debug log (sementara)
+        console.log('[checkout][debug] compute pointsUsedReq', {
+          memberBalance,
+          engineGrandBefore,
+          pointsUsedReq,
+          usePoints
+        });
       } else {
         // legacy: allow FE to explicitly pass points_used (floor it)
         pointsUsedReq = Math.floor(
@@ -2452,7 +2465,11 @@ exports.checkout = asyncHandler(async (req, res) => {
           Math.floor(Number(MemberDoc.points || 0))
         );
 
-        const engineGrandBefore = Number(uiTotals.grand_total || 0);
+        const engineGrandBefore = Number(
+          uiTotals.grand_total_before_points ??
+            grandBeforePoints ??
+            uiTotals.grand_total
+        );
 
         let pointsUsedReqCandidate = 0;
         if (usePoints) {
