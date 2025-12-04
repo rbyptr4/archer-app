@@ -2444,34 +2444,55 @@ exports.checkout = asyncHandler(async (req, res) => {
 
       // If payment_method = 'points', enforce rules:
       if (String(method) === 'points') {
-        if (!MemberDoc)
+        if (!MemberDoc) {
           throwError('Pembayaran dengan point hanya untuk member', 400);
+        }
 
-        // Jika FE memilih payment_method='points', pastikan final amount after points adalah 0.
-        // Namun karena kita support toggle, final grand after points dihitung sebagai:
-        const engineGrandBefore = Number(uiTotals.grand_total || 0);
-        const candidatePointsUse = usePoints
-          ? Math.min(
-              Number(MemberDoc?.points || 0),
-              Math.max(0, Math.round(engineGrandBefore))
-            )
-          : Number(req.body?.points_used ?? 0);
-
-        const grandAfterPoints = Math.max(
+        const memberBalanceQuick = Math.max(
           0,
-          engineGrandBefore - candidatePointsUse
+          Math.floor(Number(MemberDoc.points || 0))
         );
-        if (grandAfterPoints !== 0) {
+
+        const engineGrandBefore = Number(uiTotals.grand_total || 0);
+
+        let pointsUsedReqCandidate = 0;
+        if (usePoints) {
+          pointsUsedReqCandidate = Math.min(
+            memberBalanceQuick,
+            Math.max(0, Math.round(engineGrandBefore))
+          );
+        } else if (
+          typeof req.body?.points_used !== 'undefined' &&
+          req.body?.points_used !== null
+        ) {
+          const parsed = Math.floor(Number(req.body.points_used) || 0);
+          pointsUsedReqCandidate = Math.max(0, parsed);
+        } else if (
+          typeof priced?.totals?.points_used !== 'undefined' &&
+          priced?.totals?.points_used
+        ) {
+          pointsUsedReqCandidate = Math.floor(
+            Number(priced.totals.points_used || 0)
+          );
+        }
+
+        pointsUsedReqCandidate = Math.min(
+          pointsUsedReqCandidate,
+          memberBalanceQuick
+        );
+
+        const grandAfterPointsCheck = Math.max(
+          0,
+          engineGrandBefore - pointsUsedReqCandidate
+        );
+        if (grandAfterPointsCheck !== 0) {
           throwError(
-            'Pembayaran dengan point hanya bisa jika grand total setelah menggunakan poin = 0',
+            'Pembayaran dengan point hanya diperbolehkan jika poin yang digunakan menutup seluruh jumlah (grand total setelah poin = 0). Pastikan usePoints=true atau kirim points_used yang cukup.',
             400
           );
         }
 
-        // ensure pointsUsedReq (computed previously) is positive and member has sufficient balance
-        if (pointsUsedReq <= 0) {
-          throwError('points_used wajib untuk payment_method=points', 400);
-        }
+        pointsUsedReq = pointsUsedReqCandidate;
 
         const freshMember = await Member.findById(MemberDoc._id).session(
           session
