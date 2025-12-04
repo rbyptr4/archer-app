@@ -6492,99 +6492,70 @@ exports.completeOrder = asyncHandler(async (req, res) => {
 exports.acceptAndVerify = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
-  // ambil lean untuk validasi awal (snapshot sebelum update)
-  const order = await Order.findById(req.params.id).lean();
-  if (!order) throwError('Order tidak ditemukan', 404);
+  const id = req.params.id;
+  if (!id) throwError('Order ID wajib', 400);
 
-  if (order.status !== 'created') {
+  // ambil lean snapshot awal (untuk validasi)
+  const orderLean = await Order.findById(id).lean();
+  if (!orderLean) throwError('Order tidak ditemukan', 404);
+
+  // hanya pesanan 'created' yang boleh diterima
+  if (orderLean.status !== 'created') {
     throwError('Hanya pesanan berstatus created yang bisa diterima', 409);
   }
 
-  // prevent accept if owner verification required but not yet done
-  const requiresOwner = paymentRequiresOwnerVerify(order.payment_method);
-  if (requiresOwner && !order.ownerVerified) {
+  // jika payment memerlukan owner verify, pastikan sudah verified by owner
+  const requiresOwner = paymentRequiresOwnerVerify(orderLean.payment_method);
+  if (requiresOwner && !orderLean.ownerVerified) {
     throwError(
       'Pembayaran belum diverifikasi oleh Owner. Tidak bisa menerima pesanan.',
       409
     );
   }
 
-  // existing payment status guard (sesuaikan policy)
-  if (order.payment_status !== 'paid') {
+  // hanya boleh verifikasi jika sudah 'paid' (policy proyekmu)
+  if (orderLean.payment_status !== 'paid') {
     throwError('Pembayaran belum paid. Tidak bisa verifikasi.', 409);
   }
 
-  // ambil doc non-lean untuk update
-  const doc = await Order.findById(req.params.id);
+  // ambil document non-lean untuk update & simpan
+  const doc = await Order.findById(id);
   if (!doc) throwError('Order tidak ditemukan (second fetch)', 404);
 
-  // set status & verification
+  // set verification fields (tidak melakukan perhitungan harga di sini)
   doc.status = 'accepted';
   doc.payment_status = 'verified';
   doc.verified_by = req.user._id;
   doc.verified_at = new Date();
   if (!doc.placed_at) doc.placed_at = new Date();
 
-  // =========================
-  // FIX: pastikan points masuk ke top-level discount supaya pre-validate menghitung grand_total after points
-  // Ambil points dari doc (jika ada) atau dari lean order (payload awal)
-  const pointsFromDoc = Number(doc.points_used || 0);
-  const pointsFromLean = Number(order.points_used || 0);
-  const pointsUsed = pointsFromDoc || pointsFromLean || 0;
+  // kecilkan resiko: guard supaya points/discount/top-level totals tidak diubah di sini
+  // (acceptAndVerify tidak melakukan harga/recompute — itu berarti kita tidak memodifikasi fields pricing)
 
-  // Jika items_discount belum memasukkan points, tambahkan.
-  // (Catatan: asumsi flow create belum menambahkan points ke items_discount; jika sudah, nilai akan double-add.
-  //  Harusnya flow create sudah diubah seperti instruksi sebelumnya. Jika ragu, cek kondisi dan hanya tambahkan jika belum ada.)
-  // Kita lakukan check ringan: jika items_discount < (ui_totals.items_discount + pointsUsed) maka set ke value tersebut.
-  const uiItemsDiscount =
-    Number(order?.orderPriceSnapshot?.ui_totals?.items_discount || 0) || 0;
-  const desiredItemsDiscount = uiItemsDiscount + Number(pointsUsed || 0);
-  const currentItemsDiscount = Number(doc.items_discount || 0);
-
-  if (currentItemsDiscount < desiredItemsDiscount) {
-    doc.items_discount = desiredItemsDiscount;
-  } else {
-    // tetap pakai currentItemsDiscount (mencegah double-add bila sudah ter-apply)
-    doc.items_discount = currentItemsDiscount;
-  }
-
-  // simpan explicit points_used (audit)
-  doc.points_used = Number(pointsUsed || 0);
-
-  // sinkronkan grand_total dengan snapshot UI after-points bila tersedia
-  const uiTotals = order?.orderPriceSnapshot?.ui_totals;
-  if (uiTotals) {
-    const uiAfter = uiTotals.grand_total_after_points ?? uiTotals.grand_total;
-    if (typeof uiAfter !== 'undefined' && uiAfter !== null) {
-      doc.grand_total = Number(uiAfter);
-    }
-  } else if (order?.orderPriceSnapshot?.engineTotals?.grandTotal != null) {
-    // fallback: engine grandTotal minus points (jika engineTotals adalah before-points)
-    doc.grand_total =
-      Number(order.orderPriceSnapshot.engineTotals.grandTotal || 0) -
-      Number(pointsUsed || 0);
-  }
-
-  // ===== simpan perubahan (pre-validate akan jalan, tapi karena items_discount sudah include points, perhitungan ulang menghasilkan nilai yang konsisten) ====
+  // simpan perubahan
   await doc.save();
 
-  // ambil order final yang sudah tersimpan untuk emit & response (populate minimal jika perlu)
+  // ambil versi final yang lebih lengkap untuk response/emit (populate minimal)
   const finalOrder = await Order.findById(doc._id)
     .populate('verified_by', 'name email')
+    .populate({ path: 'member', select: 'name phone' })
     .lean();
 
-  // prepare payload untuk emits (pakai doc/user)
+  // siapkan payload untuk emits
   const payload = {
     id: String(doc._id),
-    transaction_code: doc.transaction_code,
+    transaction_code:
+      doc.transaction_code ||
+      (finalOrder && finalOrder.transaction_code) ||
+      String(doc._id),
     status: doc.status,
     payment_status: doc.payment_status,
     verified_by: { id: String(req.user._id), name: req.user.name },
     at: doc.verified_at
   };
 
+  // emits dan notifikasi — defensive try/catch supaya kegagalan emit tidak memblokir response
   try {
-    // notifikasi / stream
     emitToCashier('staff:notify', {
       message: 'Pesanan telah diterima & diverifikasi.'
     });
@@ -6599,37 +6570,52 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     };
 
     const summary = {
-      id: String(finalOrder._id),
-      transaction_code: finalOrder.transaction_code || '',
+      id: String(finalOrder?._id || doc._id),
+      transaction_code:
+        finalOrder?.transaction_code || doc.transaction_code || '',
       delivery_mode:
-        finalOrder.delivery?.mode ||
-        (finalOrder.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
-      grand_total: Number(finalOrder.grand_total || 0),
-      fulfillment_type: finalOrder.fulfillment_type || null,
+        finalOrder?.delivery?.mode ||
+        (finalOrder?.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
+      grand_total: Number(finalOrder?.grand_total || doc.grand_total || 0),
+      fulfillment_type:
+        finalOrder?.fulfillment_type || doc.fulfillment_type || null,
       customer_name:
-        (finalOrder.member && finalOrder.member.name) ||
-        finalOrder.customer_name ||
+        (finalOrder?.member && finalOrder.member.name) ||
+        finalOrder?.customer_name ||
+        doc.customer_name ||
         '',
       customer_phone:
-        (finalOrder.member && finalOrder.member.phone) ||
-        finalOrder.customer_phone ||
+        (finalOrder?.member && finalOrder.member.phone) ||
+        finalOrder?.customer_phone ||
+        doc.customer_phone ||
         '',
-      placed_at: finalOrder.placed_at || finalOrder.createdAt || null,
+      placed_at:
+        finalOrder?.placed_at ||
+        finalOrder?.createdAt ||
+        doc.placed_at ||
+        doc.createdAt ||
+        null,
       table_number:
-        finalOrder.fulfillment_type === 'dine_in'
-          ? finalOrder.table_number || null
+        (finalOrder?.fulfillment_type || doc.fulfillment_type) === 'dine_in'
+          ? finalOrder?.table_number ?? doc.table_number ?? null
           : null,
-      payment_status: finalOrder.payment_status || null,
-      status: finalOrder.status || null,
-      total_quantity: Number(finalOrder.total_quantity || 0),
-      pickup_window: finalOrder.delivery?.pickup_window
+      payment_status: finalOrder?.payment_status || doc.payment_status || null,
+      status: finalOrder?.status || doc.status || null,
+      total_quantity: Number(
+        finalOrder?.total_quantity ?? doc.total_quantity ?? 0
+      ),
+      pickup_window: finalOrder?.delivery?.pickup_window
         ? {
             from: finalOrder.delivery.pickup_window.from || null,
             to: finalOrder.delivery.pickup_window.to || null
           }
         : null,
-      delivery_slot_label: finalOrder.delivery?.slot_label || null,
-      member_id: finalOrder.member ? String(finalOrder.member) : null
+      delivery_slot_label: finalOrder?.delivery?.slot_label || null,
+      member_id: finalOrder?.member
+        ? String(finalOrder.member._id)
+        : doc.member
+        ? String(doc.member)
+        : null
     };
 
     emitOrdersStream({
@@ -6652,9 +6638,14 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     console.error('[emit][acceptAndVerify]', err?.message || err);
   }
 
+  // kirim WA receipt non-blocking — gunakan finalOrder (sudah populated) dan defensive guards
   (async () => {
     try {
-      const full = await Order.findById(doc._id).lean();
+      const full =
+        finalOrder ||
+        (await Order.findById(doc._id)
+          .populate({ path: 'member', select: 'name phone' })
+          .lean());
       if (!full) {
         console.warn(
           '[WA receipt] order not found when trying to send WA receipt',
@@ -6663,6 +6654,13 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
           }
         );
         return;
+      }
+
+      // fallback fields supaya builder tidak crash
+      full.transaction_code =
+        full.transaction_code || doc.transaction_code || String(doc._id);
+      if (!full.customer_phone && full.member && full.member.phone) {
+        full.customer_phone = full.member.phone;
       }
 
       const phone = (full.customer_phone || '').trim();
@@ -6688,14 +6686,15 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
       } catch (e) {
         console.error('[WA receipt] buildOrderReceiptMessage failed', {
           orderId: String(full._id),
-          err: e?.message || e
+          err: e?.message || e,
+          full_keys: full ? Object.keys(full) : null
         });
         return;
       }
 
       if (!message) {
         console.warn('[WA receipt] empty message returned, skip send', {
-          orderId: String(full._1 || full._id)
+          orderId: String(full._id)
         });
         return;
       }
@@ -6707,10 +6706,15 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     }
   })();
 
-  // balikan response dengan order final (sudah populated verified_by)
-  res
-    .status(200)
-    .json({ message: 'Pesanan diterima & diverifikasi', order: finalOrder });
+  // kirim response ke caller
+  return res.status(200).json({
+    message: 'Pesanan diterima & diverifikasi',
+    order: finalOrder || {
+      id: String(doc._id),
+      status: doc.status,
+      payment_status: doc.payment_status
+    }
+  });
 });
 
 exports.assignDelivery = asyncHandler(async (req, res) => {
