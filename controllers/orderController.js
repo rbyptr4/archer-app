@@ -6495,16 +6495,15 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
   const id = req.params.id;
   if (!id) throwError('Order ID wajib', 400);
 
-  // ambil lean snapshot awal (untuk validasi)
+  // ambil lean snapshot awal (validasi)
   const orderLean = await Order.findById(id).lean();
   if (!orderLean) throwError('Order tidak ditemukan', 404);
 
-  // hanya pesanan 'created' yang boleh diterima
   if (orderLean.status !== 'created') {
     throwError('Hanya pesanan berstatus created yang bisa diterima', 409);
   }
 
-  // jika payment memerlukan owner verify, pastikan sudah verified by owner
+  // owner verify guard (jika perlu)
   const requiresOwner = paymentRequiresOwnerVerify(orderLean.payment_method);
   if (requiresOwner && !orderLean.ownerVerified) {
     throwError(
@@ -6513,35 +6512,48 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     );
   }
 
-  // hanya boleh verifikasi jika sudah 'paid' (policy proyekmu)
+  // payment status guard
   if (orderLean.payment_status !== 'paid') {
     throwError('Pembayaran belum paid. Tidak bisa verifikasi.', 409);
   }
 
-  // ambil document non-lean untuk update & simpan
+  // ambil document non-lean untuk update
   const doc = await Order.findById(id);
   if (!doc) throwError('Order tidak ditemukan (second fetch)', 404);
 
-  // set verification fields (tidak melakukan perhitungan harga di sini)
+  // set status & verification (tidak mengutak-atik harga)
   doc.status = 'accepted';
   doc.payment_status = 'verified';
   doc.verified_by = req.user._id;
   doc.verified_at = new Date();
   if (!doc.placed_at) doc.placed_at = new Date();
 
-  // kecilkan resiko: guard supaya points/discount/top-level totals tidak diubah di sini
-  // (acceptAndVerify tidak melakukan harga/recompute — itu berarti kita tidak memodifikasi fields pricing)
-
-  // simpan perubahan
   await doc.save();
 
-  // ambil versi final yang lebih lengkap untuk response/emit (populate minimal)
+  // ambil final order lengkap untuk emit + WA (populate fields yang biasanya dipakai)
   const finalOrder = await Order.findById(doc._id)
     .populate('verified_by', 'name email')
     .populate({ path: 'member', select: 'name phone' })
+    .populate({
+      path: 'items.menu',
+      select: 'name imageUrl code price',
+      justOne: false
+    })
     .lean();
 
-  // siapkan payload untuk emits
+  // ensure finalOrder fallback fields so builder tidak break
+  if (finalOrder) {
+    finalOrder.transaction_code =
+      finalOrder.transaction_code || doc.transaction_code || String(doc._id);
+    if (
+      !finalOrder.customer_phone &&
+      finalOrder.member &&
+      finalOrder.member.phone
+    ) {
+      finalOrder.customer_phone = finalOrder.member.phone;
+    }
+  }
+
   const payload = {
     id: String(doc._id),
     transaction_code:
@@ -6554,7 +6566,7 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     at: doc.verified_at
   };
 
-  // emits dan notifikasi — defensive try/catch supaya kegagalan emit tidak memblokir response
+  // emits (non-blocking)
   try {
     emitToCashier('staff:notify', {
       message: 'Pesanan telah diterima & diverifikasi.'
@@ -6638,9 +6650,10 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     console.error('[emit][acceptAndVerify]', err?.message || err);
   }
 
-  // kirim WA receipt non-blocking — gunakan finalOrder (sudah populated) dan defensive guards
+  // kirim WA receipt non-blocking — sekarang panggil builder dengan { order, uiTotals }
   (async () => {
     try {
+      // gunakan finalOrder (lebih stabil karena sudah populated)
       const full =
         finalOrder ||
         (await Order.findById(doc._id)
@@ -6649,19 +6662,20 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
       if (!full) {
         console.warn(
           '[WA receipt] order not found when trying to send WA receipt',
-          {
-            orderId: String(doc._id)
-          }
+          { orderId: String(doc._id) }
         );
         return;
       }
 
-      // fallback fields supaya builder tidak crash
+      // prepare uiTotals (ambil dari snapshot bila ada)
+      const uiTotals =
+        full.orderPriceSnapshot?.ui_totals || full.ui_totals || null;
+
+      // fallbacks supaya builder aman
       full.transaction_code =
         full.transaction_code || doc.transaction_code || String(doc._id);
-      if (!full.customer_phone && full.member && full.member.phone) {
+      if (!full.customer_phone && full.member && full.member.phone)
         full.customer_phone = full.member.phone;
-      }
 
       const phone = (full.customer_phone || '').trim();
       if (!phone) {
@@ -6680,33 +6694,66 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
 
       const wa = toWa62(phone);
 
-      let message;
+      // panggil builder sesuai signature lama: buildOrderReceiptMessage({ order, uiTotals })
+      let message = null;
       try {
-        message = buildOrderReceiptMessage(full);
+        message = buildOrderReceiptMessage({ order: full, uiTotals });
       } catch (e) {
         console.error('[WA receipt] buildOrderReceiptMessage failed', {
           orderId: String(full._id),
           err: e?.message || e,
+          stack: e?.stack,
           full_keys: full ? Object.keys(full) : null
         });
-        return;
+
+        // fallback simple text (so user still gets receipt)
+        try {
+          const tcode = full.transaction_code || String(full._id);
+          const gt =
+            typeof full.grand_total !== 'undefined'
+              ? Number(full.grand_total)
+              : null;
+          const itemsSummary = (Array.isArray(full.items) ? full.items : [])
+            .map((it) => {
+              const name =
+                it?.name || it?.menu?.name || it?.menu_code || 'item';
+              const qty = it?.quantity ?? it?.qty ?? 1;
+              return `${name} x${qty}`;
+            })
+            .slice(0, 5)
+            .join('\n');
+          message = `Terima kasih! Pesanan diterima.\nKode: ${tcode}\n${
+            gt !== null ? `Total: ${gt}\n` : ''
+          }${itemsSummary ? `Items:\n${itemsSummary}` : ''}\nArchers Cafe`;
+        } catch (fallbackErr) {
+          console.error(
+            '[WA receipt] failed to build fallback message',
+            fallbackErr?.message || fallbackErr
+          );
+          return;
+        }
       }
 
       if (!message) {
-        console.warn('[WA receipt] empty message returned, skip send', {
-          orderId: String(full._id)
-        });
+        console.warn(
+          '[WA receipt] message empty after builder + fallback, skip send',
+          { orderId: String(full._id) }
+        );
         return;
       }
 
       await sendText(wa, message);
       console.log('[WA receipt] sent', { orderId: String(full._id), phone });
     } catch (e) {
-      console.error('[WA receipt] failed:', e?.message || e);
+      console.error(
+        '[WA receipt] unexpected failed:',
+        e?.message || e,
+        e?.stack
+      );
     }
   })();
 
-  // kirim response ke caller
+  // response ke caller
   return res.status(200).json({
     message: 'Pesanan diterima & diverifikasi',
     order: finalOrder || {
