@@ -3562,14 +3562,14 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
   const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
   const intVal = (v) => Math.round(Number(v || 0));
 
-  // normalisasi discounts dari order (bisa berasal dari order.discounts / order.breakdown)
+  // --- normalisasi discounts internal (TETAP hitung, tapi TIDAK dikirim ke client) ---
   const rawDiscounts = Array.isArray(order.discounts)
     ? order.discounts
     : Array.isArray(order.breakdown)
     ? order.breakdown
     : [];
 
-  const discounts = (rawDiscounts || []).map((d) => {
+  const discountsInternal = (rawDiscounts || []).map((d) => {
     const id = d.id || d.claimId || d.claim_id || null;
     const source = d.source || (d.voucherId || d.voucher ? 'voucher' : 'promo');
     const label =
@@ -3606,48 +3606,125 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
     };
   });
 
-  // applied promos normalization
+  // --- applied promos normalization (non-redundant, addedFreeItems single source) ---
   const appliedPromos = [];
   const apSource =
     order.appliedPromos ||
-    (order.appliedPromo ? [order.appliedPromo] : null) ||
-    (order.applied_promo ? [order.applied_promo] : null) ||
+    (order.appliedPromo
+      ? Array.isArray(order.appliedPromo)
+        ? order.appliedPromo
+        : [order.appliedPromo]
+      : null) ||
+    (order.applied_promo
+      ? Array.isArray(order.applied_promo)
+        ? order.applied_promo
+        : [order.applied_promo]
+      : null) ||
     null;
 
   if (Array.isArray(apSource) && apSource.length) {
     for (const ap of apSource) {
       let snap = ap;
       if (ap.promoSnapshot) snap = ap.promoSnapshot;
-      if (ap.promo) snap = ap.promo;
+      if (ap.promo) snap = ap.promo; // legacy
+
+      // ensure single source addedFreeItems
+      const addedFreeItems =
+        snap.impact &&
+        Array.isArray(snap.impact.addedFreeItems) &&
+        snap.impact.addedFreeItems.length
+          ? snap.impact.addedFreeItems
+          : snap.freeItemsSnapshot &&
+            Array.isArray(snap.freeItemsSnapshot) &&
+            snap.freeItemsSnapshot.length
+          ? snap.freeItemsSnapshot.map((f) => ({
+              menuId: f.menuId || f._id || null,
+              qty: Number(f.qty || 1),
+              name: f.name || null,
+              imageUrl: f.imageUrl || null,
+              category: f.category || null
+            }))
+          : [];
+
+      // build rewards array (mirip previewPrice)
+      const rewards = [];
+
+      // dari actions
+      const actions = snap.actions || snap.promoSnapshot?.actions || [];
+      if (Array.isArray(actions) && actions.length) {
+        for (const a of actions) {
+          const t = String(a.type || '').toLowerCase();
+          if (t === 'award_points') {
+            rewards.push({
+              type: 'points',
+              amount: Number(a.points ?? a.amount ?? 0),
+              label: a.label || 'Poin',
+              meta: a.meta || {}
+            });
+          } else if (t === 'grant_membership') {
+            rewards.push({
+              type: 'membership',
+              amount: null,
+              label: a.label || 'Grant membership',
+              meta: a.meta || {}
+            });
+          } else {
+            rewards.push({
+              type: a.type || 'action',
+              amount: a.amount ?? null,
+              label: a.label || a.type || 'Reward',
+              meta: a.meta || {}
+            });
+          }
+        }
+      }
+
+      // dari addedFreeItems
+      if (Array.isArray(addedFreeItems) && addedFreeItems.length) {
+        for (const f of addedFreeItems) {
+          rewards.push({
+            type: 'free_item',
+            amount: 0,
+            label: f.name || `Free item ${f.menuId || ''}`,
+            meta: {
+              menuId: f.menuId,
+              qty: Number(f.qty || 1),
+              imageUrl: f.imageUrl || null
+            }
+          });
+        }
+      }
+
+      // dari impact discount
+      const promoDiscountValue =
+        (snap.impact &&
+          (snap.impact.itemsDiscount || snap.impact.cartDiscount)) ||
+        0;
+      if (promoDiscountValue && Number(promoDiscountValue) > 0) {
+        rewards.push({
+          type: 'discount',
+          amount: intVal(promoDiscountValue),
+          label: 'Diskon promo',
+          meta: { promoId: snap.promoId || snap.id || null }
+        });
+      }
+
       appliedPromos.push({
-        promoId: snap.promoId || snap.promoId || snap.id || null,
+        promoId:
+          snap.promoId || snap.promo_id || (snap.id ? String(snap.id) : null),
         name: snap.name || snap.promoName || null,
         description: snap.description || snap.notes || null,
-        impact: snap.impact || snap.promoSnapshot?.impact || {},
-        actions: snap.actions || snap.promoSnapshot?.actions || [],
-        freeItemsSnapshot:
-          snap.freeItemsSnapshot && Array.isArray(snap.freeItemsSnapshot)
-            ? snap.freeItemsSnapshot
-            : (snap.impact && snap.impact.addedFreeItems) || []
+        type: snap.type || null,
+        impact: Object.assign({}, snap.impact || {}, {
+          addedFreeItems: addedFreeItems
+        }),
+        actions: actions || [],
+        rewards
       });
     }
-  } else if (order.appliedPromo) {
-    const ap = order.appliedPromo;
-    const snap = ap.promoSnapshot || ap;
-    appliedPromos.push({
-      promoId: snap.promoId || snap.promoId || snap.id || null,
-      name: snap.name || snap.promoName || null,
-      description: snap.description || snap.notes || null,
-      impact: snap.impact || snap.promoSnapshot?.impact || {},
-      actions: snap.actions || snap.promoSnapshot?.actions || [],
-      freeItemsSnapshot:
-        snap.freeItemsSnapshot && Array.isArray(snap.freeItemsSnapshot)
-          ? snap.freeItemsSnapshot
-          : (snap.impact && snap.impact.addedFreeItems) || []
-    });
   }
 
-  // applied vouchers normalization
+  // --- applied vouchers normalization (ringkas) ---
   const appliedVouchers = [];
   if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
     for (const av of order.appliedVouchers) {
@@ -3687,10 +3764,39 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
     }
   }
 
-  // Susun response yang bersih / minimal (mirror getDetailOrder)
+  // --- susun items simple (sesuai permintaan) ---
+  const itemsSimple = (order.items || []).map((it) => {
+    const qty = safeNumber(it.quantity || it.qty || 0);
+    const basePrice = safeNumber(it.base_price || 0);
+    const addons_unit = (it.addons || []).reduce(
+      (s, a) => s + (Number.isFinite(+a.price) ? +a.price : 0) * (a.qty || 1),
+      0
+    );
+    const unit_before_tax = basePrice + addons_unit;
+    const line_subtotal = Number(it.line_subtotal ?? unit_before_tax * qty);
+
+    return {
+      name: it.name,
+      menu: it.menu ? String(it.menu) : null,
+      menu_code: it.menu_code || '',
+      imageUrl: it.imageUrl || '',
+      qty,
+      base_price: basePrice,
+      addons: (it.addons || []).map((a) => ({
+        name: a.name,
+        price: safeNumber(a.price),
+        qty: a.qty || 1
+      })),
+      notes: it.notes || '',
+      line_subtotal,
+      adjustments: Array.isArray(it.adjustments) ? it.adjustments : []
+    };
+  });
+
+  // --- final slim response (TANPA attribute discounts verbose) ---
   const slim = {
     id: String(order._id),
-    transaction_code: order.transaction_code,
+    transaction_code: order.transaction_code || null,
     customer: {
       name: order.member?.name || order.customer_name || null,
       phone: order.member?.phone || order.customer_phone || null
@@ -3699,35 +3805,7 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
     fulfillment_type: order.fulfillment_type || null,
     table_number: order.table_number ?? null,
     payment_status: order.payment_status ?? null,
-    items: (order.items || []).map((it) => {
-      const qty = safeNumber(it.quantity || 0);
-      const basePrice = safeNumber(it.base_price || 0);
-
-      const addons_unit = (it.addons || []).reduce(
-        (s, a) => s + (Number.isFinite(+a.price) ? +a.price : 0) * (a.qty || 1),
-        0
-      );
-
-      const unit_before_tax = basePrice + addons_unit;
-      const line_subtotal = Number(it.line_subtotal ?? unit_before_tax * qty);
-
-      return {
-        name: it.name,
-        menu: String(it.menu || ''),
-        menu_code: it.menu_code || '',
-        imageUrl: it.imageUrl || '',
-        qty,
-        base_price: basePrice,
-        addons: (it.addons || []).map((a) => ({
-          name: a.name,
-          price: safeNumber(a.price),
-          qty: a.qty || 1
-        })),
-        notes: it.notes || '',
-        line_subtotal,
-        adjustments: Array.isArray(it.adjustments) ? it.adjustments : []
-      };
-    }),
+    items: itemsSimple,
     totals: {
       items_subtotal: safeNumber(order.items_subtotal || 0),
       service_fee: safeNumber(order.service_fee || 0),
@@ -3786,6 +3864,8 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
         }
       : null,
     verified_at: order.verified_at || null,
+
+    // ringkasan promo & voucher (tanpa array discounts yang verbose)
     applied_promos: appliedPromos,
     applied_vouchers: appliedVouchers
   };
@@ -4602,16 +4682,19 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
   if (!mongoose.Types.ObjectId.isValid(id)) throwError('ID tidak valid', 400);
 
-  // populate member (ambil hanya name & phone)
   const order = await Order.findById(id)
-    .populate({ path: 'member', select: 'name phone' })
+    .populate({ path: 'member', select: 'name phone email membershipTier' })
+    .populate({
+      path: 'items.menu',
+      select: 'name imageUrl code price category',
+      justOne: false
+    })
     .lean();
   if (!order) throwError('Order tidak ditemukan', 404);
 
   const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
   const intVal = (v) => Math.round(Number(v || 0));
 
-  // --- normalisasi discounts internal (TETAP hitung, tapi TIDAK dikirim ke client) ---
   const rawDiscounts = Array.isArray(order.discounts)
     ? order.discounts
     : Array.isArray(order.breakdown)
@@ -4655,9 +4738,7 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
     };
   });
 
-  // --- applied promos normalization (kita ubah agar non-redundant) ---
   const appliedPromos = [];
-  // dukung beberapa bentuk: array atau single
   const apSource =
     order.appliedPromos ||
     (order.appliedPromo
@@ -4674,12 +4755,10 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
 
   if (Array.isArray(apSource) && apSource.length) {
     for (const ap of apSource) {
-      // ap dapat berbentuk snapshot atau wrapper { promoId, promoSnapshot }
       let snap = ap;
       if (ap.promoSnapshot) snap = ap.promoSnapshot;
-      if (ap.promo) snap = ap.promo; // legacy
+      if (ap.promo) snap = ap.promo;
 
-      // pastikan impact.addedFreeItems ada (gunakan freeItemsSnapshot bila ada)
       const addedFreeItems =
         snap.impact &&
         Array.isArray(snap.impact.addedFreeItems) &&
@@ -4697,10 +4776,9 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
             }))
           : [];
 
-      // build rewards array (mirip previewPrice)
       const rewards = [];
 
-      // dari actions
+      // actions
       const actions = snap.actions || snap.promoSnapshot?.actions || [];
       if (Array.isArray(actions) && actions.length) {
         for (const a of actions) {
@@ -4716,7 +4794,7 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
             rewards.push({
               type: 'membership',
               amount: null,
-              label: a.label || 'Grant membership',
+              label: a.label || 'Membership',
               meta: a.meta || {}
             });
           } else {
@@ -4730,7 +4808,7 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
         }
       }
 
-      // dari addedFreeItems
+      // addedFreeItems -> free_item rewards
       if (Array.isArray(addedFreeItems) && addedFreeItems.length) {
         for (const f of addedFreeItems) {
           rewards.push({
@@ -4740,13 +4818,14 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
             meta: {
               menuId: f.menuId,
               qty: Number(f.qty || 1),
-              imageUrl: f.imageUrl || null
+              imageUrl: f.imageUrl || null,
+              category: f.category || null
             }
           });
         }
       }
 
-      // dari impact discount
+      // impact discount
       const promoDiscountValue =
         (snap.impact &&
           (snap.impact.itemsDiscount || snap.impact.cartDiscount)) ||
@@ -4766,7 +4845,6 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
         name: snap.name || snap.promoName || null,
         description: snap.description || snap.notes || null,
         type: snap.type || null,
-        // pastikan impact selalu punya addedFreeItems sebagai sumber tunggal free items
         impact: Object.assign({}, snap.impact || {}, { addedFreeItems }),
         actions: actions || [],
         rewards
@@ -4774,7 +4852,76 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
     }
   }
 
-  // --- applied vouchers normalization (ringkas) ---
+  // -------------------------
+  // 3) ENRICH FREE_ITEM rewards dengan data Menu (nama + image) TANPA mengubah menuId
+  // -------------------------
+  try {
+    const menuIds = new Set();
+    (appliedPromos || []).forEach((ap) => {
+      if (!Array.isArray(ap.rewards)) return;
+      for (const r of ap.rewards) {
+        if (
+          r &&
+          String(r.type || '').toLowerCase() === 'free_item' &&
+          r.meta &&
+          r.meta.menuId
+        ) {
+          try {
+            menuIds.add(String(r.meta.menuId));
+          } catch (e) {}
+        }
+      }
+    });
+
+    if (menuIds.size > 0) {
+      const ids = Array.from(menuIds);
+      const menus = await Menu.find({ _id: { $in: ids } })
+        .select('_id name imageUrl code category')
+        .lean()
+        .catch(() => []);
+      const mmap = (menus || []).reduce((acc, m) => {
+        acc[String(m._id)] = m;
+        return acc;
+      }, {});
+
+      for (const ap of appliedPromos) {
+        if (!Array.isArray(ap.rewards)) continue;
+        for (const r of ap.rewards) {
+          if (
+            r &&
+            String(r.type || '').toLowerCase() === 'free_item' &&
+            r.meta &&
+            r.meta.menuId
+          ) {
+            const mid = String(r.meta.menuId);
+            const mdoc = mmap[mid];
+            if (mdoc) {
+              // only enrich label & imageUrl, keep meta.menuId untouched
+              r.label =
+                r.label && r.label !== `Free item ${mid}`
+                  ? r.label
+                  : mdoc.name || r.label || `Free item ${mid}`;
+              if (!r.meta.imageUrl) r.meta.imageUrl = mdoc.imageUrl || null;
+              if (!r.meta.menuName) r.meta.menuName = mdoc.name || null;
+              if (!r.meta.menuCode) r.meta.menuCode = mdoc.code || null;
+              if (!r.meta.category) r.meta.category = mdoc.category || null;
+            } else {
+              r.label = r.label || `Free item ${mid}`;
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn(
+      '[getDetailOrder] enrichment free_item failed',
+      e?.message || e
+    );
+  }
+
+  // -------------------------
+  // 4) NORMALIZE APPLIED VOUCHERS (enrichment snapshot jika memungkinkan)
+  // -------------------------
   const appliedVouchers = [];
   if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
     for (const av of order.appliedVouchers) {
@@ -4791,10 +4938,8 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
     Array.isArray(order.applied_voucher_ids) &&
     order.applied_voucher_ids.length
   ) {
-    // best-effort enrich
     try {
       const vids = order.applied_voucher_ids.map((v) => String(v));
-      const Voucher = require('../models/voucherModel');
       const vdocs = await Voucher.find({ _id: { $in: vids } })
         .lean()
         .catch(() => []);
@@ -4815,104 +4960,99 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
     }
   }
 
-  // --- susun items simple (sesuai permintaan) ---
-  const itemsSimple = (order.items || []).map((it) => {
+  // -------------------------
+  // 5) SIAPKAN ITEMS DETAIL (lengkap)
+  // -------------------------
+  const itemsDetailed = (order.items || []).map((it, idx) => {
     const qty = safeNumber(it.quantity || it.qty || 0);
-    const basePrice = safeNumber(it.base_price || 0);
+    const basePrice = safeNumber(
+      it.base_price || it.price || it.unit_price || 0
+    );
     const addons_unit = (it.addons || []).reduce(
       (s, a) => s + (Number.isFinite(+a.price) ? +a.price : 0) * (a.qty || 1),
       0
     );
     const unit_before_tax = basePrice + addons_unit;
     const line_subtotal = Number(it.line_subtotal ?? unit_before_tax * qty);
+    const tax = safeNumber(it.tax_amount || it.tax || 0);
+    const itemMenu = it.menu && typeof it.menu === 'object' ? it.menu : null; // populated earlier maybe
 
     return {
-      name: it.name,
-      menu: it.menu ? String(it.menu) : null,
-      menu_code: it.menu_code || '',
-      imageUrl: it.imageUrl || '',
+      idx,
+      id: it._id ? String(it._id) : null,
+      name: it.name || (itemMenu && itemMenu.name) || null,
+      menu: it.menu
+        ? typeof it.menu === 'string'
+          ? String(it.menu)
+          : String(it.menu._id || it.menu)
+        : null,
+      menu_snapshot: itemMenu
+        ? {
+            name: itemMenu.name,
+            imageUrl: itemMenu.imageUrl,
+            code: itemMenu.code
+          }
+        : it.menuSnapshot || it.menu,
+      menu_code: it.menu_code || (itemMenu && itemMenu.code) || '',
+      imageUrl: it.imageUrl || (itemMenu && itemMenu.imageUrl) || null,
       qty,
       base_price: basePrice,
+      unit_before_tax,
       addons: (it.addons || []).map((a) => ({
+        id: a._id ? String(a._id) : null,
         name: a.name,
         price: safeNumber(a.price),
-        qty: a.qty || 1
+        qty: a.qty || 1,
+        total: safeNumber(a.price) * (a.qty || 1)
       })),
       notes: it.notes || '',
+      adjustments: Array.isArray(it.adjustments) ? it.adjustments : [],
       line_subtotal,
-      adjustments: Array.isArray(it.adjustments) ? it.adjustments : []
+      tax,
+      tax_rate_percent: safeNumber(it.tax_rate_percent || null),
+      discount: safeNumber(it.line_discount || it.discount || 0),
+      final_price: safeNumber(
+        it.final_price ?? line_subtotal - (it.line_discount || 0) + tax
+      )
     };
   });
 
-  // --- final slim response (TANPA attribute discounts) ---
-  const slim = {
-    id: String(order._id),
-    transaction_code: order.transaction_code || null,
-    customer: {
-      name: order.member?.name || order.customer_name || null,
-      phone: order.member?.phone || order.customer_phone || null
-    },
-    ownerVerified: order.ownerVerified,
-    fulfillment_type: order.fulfillment_type || null,
-    table_number: order.table_number ?? null,
-    payment_status: order.payment_status ?? null,
-    items: itemsSimple,
+  // -------------------------
+  // 6) BUILD FULL RESPONSE OBJECT (tidak merubah internal discounts unless intended)
+  // -------------------------
+  const full = Object.assign({}, order, {
+    _id: order._id ? String(order._id) : null,
+    id: order._id ? String(order._id) : null,
+    member: order.member || null,
+    discounts_internal: discountsInternal,
+    applied_promos: appliedPromos,
+    applied_vouchers: appliedVouchers,
+    items: itemsDetailed,
     totals: {
       items_subtotal: safeNumber(order.items_subtotal || 0),
+      items_discount: safeNumber(order.items_discount || 0),
       service_fee: safeNumber(order.service_fee || 0),
       delivery_fee: safeNumber(order.delivery_fee || 0),
-      items_discount: safeNumber(order.items_discount || 0),
       shipping_discount: safeNumber(order.shipping_discount || 0),
       tax_rate_percent: safeNumber(
-        order.tax_rate_percent || Math.round((parsePpnRate() || 0.11) * 100)
+        order.tax_rate_percent || Math.round(0.11 * 100)
       ),
       tax_amount: safeNumber(order.tax_amount || 0),
       rounding_delta: safeNumber(order.rounding_delta || 0),
-      grand_total: safeNumber(order.grand_total || 0)
+      grand_total: safeNumber(order.grand_total || 0),
+      paid_total: safeNumber(order.paid_total || order.grand_total || 0)
     },
     payment: {
       method: order.payment_method || null,
       provider: order.payment_provider || null,
       status: order.payment_status || null,
       proof_url: order.payment_proof_url || null,
-      paid_at: order.paid_at || null
-    },
-    status: order.status || null,
-    placed_at: order.placed_at || null,
-    created_at: order.createdAt || null,
-    updated_at: order.updatedAt || null,
-    delivery: order.delivery
-      ? {
-          mode: order.delivery.mode || null,
-          address_text: order.delivery.address_text || null,
-          location:
-            order.delivery.location &&
-            typeof order.delivery.location.lat === 'number'
-              ? {
-                  lat: order.delivery.location.lat,
-                  lng: order.delivery.location.lng
-                }
-              : null,
-          distance_km: order.delivery.distance_km ?? null,
-          delivery_fee: order.delivery.delivery_fee ?? null,
-          slot_label: order.delivery.slot_label || null,
-          scheduled_at: order.delivery.scheduled_at || null,
-          status: order.delivery.status || null,
-          pickup_window: order.delivery.pickup_window
-            ? {
-                from: order.delivery.pickup_window.from || null,
-                to: order.delivery.pickup_window.to || null
-              }
-            : null
-        }
-      : null,
+      paid_at: order.paid_at || null,
+      raw: order.payment || null
+    }
+  });
 
-    // ringkasan promo & voucher (tanpa array discounts yang verbose)
-    applied_promos: appliedPromos,
-    applied_vouchers: appliedVouchers
-  };
-
-  return res.status(200).json({ success: true, order: slim });
+  return res.status(200).json({ success: true, order: full });
 });
 
 const buildOrderReceipt = (order) => {
@@ -5100,72 +5240,75 @@ const buildOrderReceipt = (order) => {
     const ap =
       appliedPromo.promoSnapshot || appliedPromo.promoSnapshot || appliedPromo;
 
-    // build rewards array mirip previewPrice normalization
-    const normalizedRewards = [];
+    if (ap) {
+      // build rewards array mirip previewPrice normalization
+      const normalizedRewards = [];
 
-    // from actions (award_points, grant_membership, etc)
-    if (ap.actions && Array.isArray(ap.actions)) {
-      for (const a of ap.actions) {
-        const t = String(a.type || '').toLowerCase();
-        if (t === 'award_points') {
+      // from actions (award_points, grant_membership, etc)
+      if (ap.actions && Array.isArray(ap.actions)) {
+        for (const a of ap.actions) {
+          const t = String(a.type || '').toLowerCase();
+          if (t === 'award_points') {
+            normalizedRewards.push({
+              type: 'points',
+              amount: Number(a.points ?? a.amount ?? 0),
+              label: a.label || 'Poin',
+              meta: a.meta || {}
+            });
+          } else if (t === 'grant_membership') {
+            normalizedRewards.push({
+              type: 'membership',
+              amount: null,
+              label: a.label || 'Grant membership',
+              meta: a.meta || {}
+            });
+          } else {
+            normalizedRewards.push({
+              type: a.type || 'action',
+              amount: a.amount ?? null,
+              label: a.label || a.type || 'Reward',
+              meta: a.meta || {}
+            });
+          }
+        }
+      }
+
+      // from impact: free items
+      if (ap.impact && Array.isArray(ap.impact.addedFreeItems)) {
+        for (const f of ap.impact.addedFreeItems) {
           normalizedRewards.push({
-            type: 'points',
-            amount: Number(a.points ?? a.amount ?? 0),
-            label: a.label || 'Poin',
-            meta: a.meta || {}
-          });
-        } else if (t === 'grant_membership') {
-          normalizedRewards.push({
-            type: 'membership',
-            amount: null,
-            label: a.label || 'Grant membership',
-            meta: a.meta || {}
-          });
-        } else {
-          normalizedRewards.push({
-            type: a.type || 'action',
-            amount: a.amount ?? null,
-            label: a.label || a.type || 'Reward',
-            meta: a.meta || {}
+            type: 'free_item',
+            amount: 0,
+            label: f.name || `Free item ${f.menuId || ''}`,
+            meta: { menuId: f.menuId, qty: Number(f.qty || 1) }
           });
         }
       }
-    }
 
-    // from impact: free items
-    if (ap.impact && Array.isArray(ap.impact.addedFreeItems)) {
-      for (const f of ap.impact.addedFreeItems) {
+      // from impact: discount
+      const promoDiscountValue =
+        (ap.impact && (ap.impact.itemsDiscount || ap.impact.cartDiscount)) || 0;
+      if (promoDiscountValue && Number(promoDiscountValue) > 0) {
         normalizedRewards.push({
-          type: 'free_item',
-          amount: 0,
-          label: f.name || `Free item ${f.menuId || ''}`,
-          meta: { menuId: f.menuId, qty: Number(f.qty || 1) }
+          type: 'discount',
+          amount: int(promoDiscountValue),
+          label: 'Diskon promo',
+          meta: { promoId: ap.promoId || ap.id || null }
         });
       }
-    }
 
-    // from impact: discount
-    const promoDiscountValue =
-      (ap.impact && (ap.impact.itemsDiscount || ap.impact.cartDiscount)) || 0;
-    if (promoDiscountValue && Number(promoDiscountValue) > 0) {
-      normalizedRewards.push({
-        type: 'discount',
-        amount: int(promoDiscountValue),
-        label: 'Diskon promo',
-        meta: { promoId: ap.promoId || ap.id || null }
+      appliedPromos.push({
+        promoId:
+          ap.promoId || ap.promo_id || (ap.id ? String(ap.id) : null) || null,
+        name: ap.name || ap.promoName || null,
+        description: ap.description || ap.notes || null,
+        // pastikan type terisi (prioritas: ap.type -> promoSnapshot.type -> ap.promoType)
+        type: ap.type || ap.promoSnapshot?.type || ap.promoType || null,
+        rewards: normalizedRewards,
+        impact: ap.impact || {},
+        actions: ap.actions || []
       });
     }
-
-    appliedPromos.push({
-      promoId:
-        ap.promoId || ap.promo_id || (ap.id ? String(ap.id) : null) || null,
-      name: ap.name || ap.promoName || null,
-      description: ap.description || ap.notes || null,
-      type: ap.type || ap.promoSnapshot?.type || null,
-      rewards: normalizedRewards,
-      impact: ap.impact || {},
-      actions: ap.actions || []
-    });
   }
 
   // vouchers summary (applied_voucher_ids and order.appliedVouchers)
@@ -5198,8 +5341,79 @@ const buildOrderReceipt = (order) => {
     .map((it) => ({
       menuId: it.menu || it.menuId || null,
       name: it.name || it.title || 'Free item',
-      qty: Number(it.quantity || it.qty || 1)
+      qty: Number(it.quantity || it.qty || 1),
+      imageUrl: it.imageUrl || null
     }));
+
+  // ----------------- LOCAL ENRICHMENT (pakai data order.items, tanpa DB) -------------
+  // build menu map dari order.items (best-effort)
+  const menuMap = {};
+  for (const it of items) {
+    const mid = it.menu || it.menuId || (it.menu && it.menu._id) || null;
+    if (!mid) continue;
+    const key = String(mid);
+    if (!menuMap[key]) {
+      // prefer item.menu object fields if populated, else use item.name/image
+      const mObj = it.menu && typeof it.menu === 'object' ? it.menu : null;
+      menuMap[key] = {
+        name: it.name || (mObj && mObj.name) || null,
+        imageUrl: it.imageUrl || (mObj && mObj.imageUrl) || null,
+        code: it.menu_code || (mObj && mObj.code) || null
+      };
+    }
+  }
+
+  // enrich appliedPromos rewards free_item using menuMap
+  for (const ap of appliedPromos) {
+    if (!Array.isArray(ap.rewards)) continue;
+    for (const r of ap.rewards) {
+      if (
+        r &&
+        String(r.type || '').toLowerCase() === 'free_item' &&
+        r.meta &&
+        r.meta.menuId
+      ) {
+        const mid = String(r.meta.menuId);
+        const mdoc = menuMap[mid];
+        if (mdoc) {
+          // jangan ubah meta.menuId
+          r.label =
+            r.label && r.label !== `Free item ${mid}`
+              ? r.label
+              : mdoc.name || r.label || `Free item ${mid}`;
+          if (!r.meta.imageUrl && mdoc.imageUrl)
+            r.meta.imageUrl = mdoc.imageUrl;
+          if (!r.meta.menuName && mdoc.name) r.meta.menuName = mdoc.name;
+          if (!r.meta.menuCode && mdoc.code) r.meta.menuCode = mdoc.code;
+        } else {
+          // fallback: kalau free_items diorder, cek free_items array
+          const found = free_items.find((f) => String(f.menuId) === mid);
+          if (found) {
+            r.label =
+              r.label && r.label !== `Free item ${mid}`
+                ? r.label
+                : found.name || r.label || `Free item ${mid}`;
+            if (!r.meta.imageUrl && found.imageUrl)
+              r.meta.imageUrl = found.imageUrl;
+            if (!r.meta.menuName && found.name) r.meta.menuName = found.name;
+          } else {
+            r.label = r.label || `Free item ${mid}`;
+          }
+        }
+      }
+    }
+  }
+
+  // enrich free_items names from menuMap where possible
+  for (const f of free_items) {
+    if (f.menuId) {
+      const mdoc = menuMap[String(f.menuId)];
+      if (mdoc && (!f.name || f.name === 'Free item')) {
+        f.name = mdoc.name || f.name;
+        if (!f.imageUrl && mdoc.imageUrl) f.imageUrl = mdoc.imageUrl;
+      }
+    }
+  }
 
   // ------- final receipt object (tanpa discounts attribute) -------
   const receipt = {
@@ -5251,7 +5465,7 @@ const buildOrderReceipt = (order) => {
       placed_at: order.placed_at,
       paid_at: order.paid_at || null
     },
-    // applied promos & vouchers (summary) — promo sudah berisi rewards
+    // applied promos & vouchers (summary) — promo sudah berisi rewards dan type terisi jika ada
     applied_promos: appliedPromos,
     applied_vouchers: appliedVoucherEntries,
     applied_voucher_ids: Array.isArray(order.applied_voucher_ids)
