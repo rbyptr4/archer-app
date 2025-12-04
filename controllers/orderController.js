@@ -2536,9 +2536,6 @@ exports.checkout = asyncHandler(async (req, res) => {
       payload.points_awarded = int(points_awarded);
       payload.points_awarded_details = points_awarded_details;
 
-      // --- APPLY POINTS INTO PAYLOAD (if any) ---
-      payload.points_used = int(pointsUsedReq || 0);
-
       // gunakan hasil rounding-after-deduction sebagai grand_total final
       payload.rounding_delta = int(
         (payload.rounding_delta || 0) + rounding_delta_after
@@ -2578,13 +2575,17 @@ exports.checkout = asyncHandler(async (req, res) => {
       // FORCE SET order totals dari uiTotals (agar konsisten dengan orderPriceSnapshot)
       // ==============================
       try {
+        const pointsUsedInt = int(pointsUsedReq || 0);
+        const itemsDiscountFinal =
+          int(uiTotals.items_discount || 0) + pointsUsedInt;
+
         await Order.updateOne(
           { _id: doc._id },
           {
             $set: {
-              // utama — ambil dari payload final jika tersedia (payload sudah di-set sebelumnya)
               items_subtotal: int(uiTotals.items_subtotal || 0),
-              items_discount: int(uiTotals.items_discount || 0),
+              // pastikan saved items_discount sudah include points
+              items_discount: itemsDiscountFinal,
               items_subtotal_after_discount: int(
                 uiTotals.items_subtotal_after_discount || 0
               ),
@@ -2596,7 +2597,6 @@ exports.checkout = asyncHandler(async (req, res) => {
               tax_rate_percent: Number(uiTotals.tax_rate_percent || 0),
               tax_amount: int(uiTotals.tax_amount || 0),
 
-              // gunakan rounding/grand dari payload (final after points). fallback ke uiTotals.after_points atau uiTotals
               rounding_delta: int(
                 payload.rounding_delta ??
                   uiTotals.rounding_delta_after_points ??
@@ -2610,13 +2610,11 @@ exports.checkout = asyncHandler(async (req, res) => {
                   0
               ),
 
-              // simpan snapshot lengkap juga (opsional, sudah Anda persiapkan sebelumnya)
               orderPriceSnapshot: orderPriceSnapshot
             }
           },
           { session }
         );
-
         // debug: verifikasi singkat (opsional)
         const check = await Order.findById(doc._id).session(session).lean();
         console.log('[checkout][debug] order totals forced from uiTotals:', {
@@ -3628,43 +3626,6 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
     : Array.isArray(order.breakdown)
     ? order.breakdown
     : [];
-
-  const discountsInternal = (rawDiscounts || []).map((d) => {
-    const id = d.id || d.claimId || d.claim_id || null;
-    const source = d.source || (d.voucherId || d.voucher ? 'voucher' : 'promo');
-    const label =
-      d.label ||
-      d.name ||
-      d.title ||
-      (source === 'promo' ? 'Promo' : 'Voucher');
-    const amount = intVal(d.amount ?? d.amountTotal ?? d.itemsDiscount ?? 0);
-    const items = Array.isArray(d.items)
-      ? d.items.map((it) => ({
-          menuId: it.menuId || it.menu || it.menu_id || null,
-          qty: Number(it.qty || it.quantity || 0),
-          amount: intVal(it.amount || it.line_discount || 0),
-          claimId: it.claimId || it.claim_id || null
-        }))
-      : [];
-    return {
-      claimId: source === 'voucher' ? (id ? String(id) : null) : null,
-      voucherId:
-        source === 'voucher' && (d.voucherId || d.voucher)
-          ? String(d.voucherId || d.voucher)
-          : null,
-      id: id ? String(id) : null,
-      source,
-      orderIdx: d.orderIdx ?? d.order_index ?? null,
-      type: d.type ?? 'amount',
-      label,
-      amount,
-      items,
-      meta: d.meta || d.raw?.meta || {},
-      note: d.note || d.meta?.note || '',
-      appliedAt: d.appliedAt || d.applied_at || null,
-      raw: d.raw || d
-    };
-  });
 
   // --- applied promos normalization (non-redundant, addedFreeItems single source) ---
   const appliedPromos = [];
