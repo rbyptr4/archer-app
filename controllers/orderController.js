@@ -177,7 +177,7 @@ function isSlotAvailable(label, dateDay = null) {
   return !!(slot && slot.available);
 }
 
-function buildPromoCompactFromApplied({ applied }) {
+async function buildPromoCompactFromApplied({ applied }) {
   if (!applied) return null;
   const impact = applied.impact || {};
   const actions = applied.actions || [];
@@ -187,15 +187,28 @@ function buildPromoCompactFromApplied({ applied }) {
   // free items dari impact.addedFreeItems
   if (Array.isArray(impact.addedFreeItems) && impact.addedFreeItems.length) {
     for (const f of impact.addedFreeItems) {
+      // jika name / imageUrl masih null → ambil dari DB
+      let menuData = null;
+
+      if (!f.name || !f.imageUrl) {
+        menuData = await Menu.findById(f.menuId)
+          .select('name imageUrl')
+          .lean()
+          .catch(() => null);
+      }
+
+      const resolvedName = f.name || menuData?.name || 'Free Item';
+      const resolvedImage = f.imageUrl || menuData?.imageUrl || null;
+
       rewards.push({
         type: 'free_item',
-        label: `Gratis: ${f.name || ''}`,
+        label: `Gratis: ${resolvedName}`,
         amount: 0,
         meta: {
           menuId: f.menuId || null,
           qty: Number(f.qty || 1),
-          name: f.name || null,
-          imageUrl: f.imageUrl || null
+          name: resolvedName,
+          imageUrl: resolvedImage
         }
       });
     }
