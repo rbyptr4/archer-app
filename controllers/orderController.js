@@ -6528,7 +6528,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     const roundingDelta = int(grandTotal - beforeRound);
 
     // build standardized promo object
-    const promoCompact = buildPromoCompactFromApplied({
+    const promoCompact = await buildPromoCompactFromApplied({
       applied: {
         promoId: String(chosen._id),
         name: chosen.name,
@@ -6612,7 +6612,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     const roundingDelta = int(grandTotal - beforeRound);
 
     // build standardized promo object
-    const promoCompact = buildPromoCompactFromApplied({
+    const promoCompact = await buildPromoCompactFromApplied({
       applied: appliedPromoSnapshot
     });
 
