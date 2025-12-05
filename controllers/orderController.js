@@ -5628,12 +5628,28 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   }
 
   const cartForEngine = {
-    items: orderItems.map((it) => ({
-      menuId: it.menu,
-      qty: Number(it.quantity || 0),
-      price: Number(it.base_price || 0),
-      category: it.category?.subId || it.category?.big || null
-    }))
+    items: orderItems.map((it) => {
+      // hitung addons per unit (jika addons disimpan per-line sebelumnya)
+      const addonsPerUnit = Array.isArray(it.addons)
+        ? it.addons.reduce(
+            (s, a) =>
+              s +
+              Number(a.price || 0) *
+                (Number(a.qty || 1) / Number(it.quantity || 1)),
+            0
+          )
+        : 0;
+
+      // per-unit price = base_price + addonsPerUnit
+      const unitPrice = Math.round(Number(it.base_price || 0) + addonsPerUnit);
+
+      return {
+        menuId: it.menu,
+        qty: Number(it.quantity || 0),
+        price: unitPrice,
+        category: it.category?.subId || it.category?.big || null
+      };
+    })
   };
 
   // promos (kasir mode: voucher NOT allowed)
@@ -6075,14 +6091,27 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     itemsSubtotal += line_subtotal;
   }
 
-  // prepare cart for promoEngine (structure expected)
   const cartForEngine = {
-    items: orderItems.map((it) => ({
-      menuId: it.menu,
-      qty: Number(it.quantity || 0),
-      price: Number(it.base_price || 0),
-      category: it.category?.subId || it.category?.big || null
-    }))
+    items: orderItems.map((it) => {
+      const addonsPerUnit = Array.isArray(it.addons)
+        ? it.addons.reduce(
+            (s, a) =>
+              s +
+              Number(a.price || 0) *
+                (Number(a.qty || 1) / Number(it.quantity || 1)),
+            0
+          )
+        : 0;
+
+      const unitPrice = Math.round(Number(it.base_price || 0) + addonsPerUnit);
+
+      return {
+        menuId: it.menu,
+        qty: Number(it.quantity || 0),
+        price: unitPrice,
+        category: it.category?.subId || it.category?.big || null
+      };
+    })
   };
 
   // determine member (optional) — gunakan member_id dari body bila disediakan (kasir)
@@ -7577,25 +7606,55 @@ exports.deliverySlots = asyncHandler(async (req, res) => {
 });
 
 exports.listMembers = asyncHandler(async (req, res) => {
-  const keyword = String(req.query.q || '').trim();
+  function escapeRegex(str) {
+    if (!str) return '';
+    return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  const rawKeyword = String(req.query.q || '').trim();
+  const keyword = rawKeyword.replace(/\s+/g, ' ').trim(); // normalize whitespace
   const limit = Math.min(Number(req.query.limit) || 20, 100); // batas aman max 100
 
-  // base filter
   const filter = { is_active: true };
 
   if (keyword) {
-    // cari nama atau phone yang mengandung keyword (case-insensitive)
-    filter.$or = [
-      { name: { $regex: keyword, $options: 'i' } },
-      { phone: { $regex: keyword.replace(/\D+/g, ''), $options: 'i' } } // hilangkan non-digit
-    ];
+    const onlyDigits = /^\d+$/.test(keyword.replace(/\D+/g, ''));
+
+    if (onlyDigits) {
+      const clean = keyword.replace(/\D+/g, '');
+      filter.$or = [
+        { phone: { $regex: clean, $options: 'i' } },
+        { name: { $regex: escapeRegex(keyword), $options: 'i' } }
+      ];
+    } else {
+      // general case: escape keyword before using as regex to avoid special-char issues
+      const safe = escapeRegex(keyword);
+
+      // opsi: split tokens dan cari semua token (AND) — lebih relevan untuk multi-word searches
+      const tokens = safe.split(/\s+/).filter(Boolean);
+      if (tokens.length > 1) {
+        // cari semua token ada di name (urutannya tidak harus berurutan)
+        filter.$and = tokens.map((t) => ({
+          name: { $regex: t, $options: 'i' }
+        }));
+      } else {
+        // single token: cari di name atau phone
+        filter.$or = [
+          { name: { $regex: safe, $options: 'i' } },
+          { phone: { $regex: keyword.replace(/\D+/g, ''), $options: 'i' } }
+        ];
+      }
+    }
   }
+
+  // kamu bisa tambahkan collation bila butuh accent-insensitive search (Mongo 3.4+)
+  // const collation = { locale: 'en', strength: 1 }; // strength 1 = base characters only (ignore accents & case)
 
   const members = await Member.find(filter)
     .select('_id name phone')
     .sort({ name: 1 })
     .limit(limit)
     .lean();
+
   res.status(200).json({
     ok: true,
     count: members.length,
