@@ -117,6 +117,7 @@ router.post(
   requirePageAccess('orders'),
   order.previewPosOrder
 );
+
 router.post(
   '/evaluate-pos',
   validateToken,

@@ -6084,7 +6084,6 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
   if (!Array.isArray(items) || items.length === 0)
     throwError('items wajib', 400);
 
-  // build items (same logic as create)
   const orderItems = [];
   let totalQty = 0;
   let itemsSubtotal = 0;
@@ -6119,7 +6118,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       quantity: qty,
       addons: normAddons,
       notes: String(it.notes || '').trim(),
-      line_subtotal,
+      line_subtotal: int(line_subtotal),
       category: {
         big: menu.bigCategory || null,
         subId: menu.subcategory || null
@@ -6130,7 +6129,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     itemsSubtotal += line_subtotal;
   }
 
-  // cart for engine: per-unit include addons per unit
+  // --- prepare cart for promo engine (per-unit includes addons) ---
   const cartForEngine = {
     items: orderItems.map((it) => {
       const addonsPerUnit = Array.isArray(it.addons)
@@ -6152,29 +6151,40 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     })
   };
 
-  // resolve memberDoc if provided (req.member > member_id)
+  // --- resolve MemberDoc (prioritas req.member, lalu member_id/memberId jika as_member true) ---
   let MemberDoc = null;
   if (req.member && req.member.id) {
     MemberDoc = await Member.findById(req.member.id)
       .lean()
       .catch(() => null);
-  } else {
-    const mid = member_id || memberId;
-    if (mid)
-      MemberDoc = await Member.findById(mid)
-        .lean()
-        .catch(() => null);
+  } else if (as_member) {
+    const mid = String(member_id || memberId || '').trim() || null;
+    if (!mid)
+      throwError(
+        'Saat as_member = true, kirimkan member_id (kasir harus pilih member)',
+        400
+      );
+    MemberDoc = await Member.findById(mid)
+      .lean()
+      .catch(() => null);
+    if (!MemberDoc) throwError('Member tidak ditemukan', 404);
   }
 
   const now = new Date();
+
+  // --- cari eligible promos (pastikan engine tahu MemberDoc bila ada) ---
   let eligible = [];
   try {
     eligible = await findApplicablePromos(cartForEngine, MemberDoc, now);
   } catch (e) {
+    console.warn(
+      '[previewPosOrder] findApplicablePromos failed',
+      e?.message || e
+    );
     eligible = [];
   }
 
-  // choose autoApply (only those with autoApply true)
+  // --- pilih autoApply promo (await applyPromo untuk impact preview) ---
   let appliedPromoSnapshot = null;
   try {
     const autos = (eligible || []).filter((p) => !!p.autoApply);
@@ -6192,19 +6202,37 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       };
     }
   } catch (e) {
+    console.warn(
+      '[previewPosOrder] autoApply applyPromo failed',
+      e?.message || e
+    );
     appliedPromoSnapshot = null;
   }
 
-  // if client requested preview for a specific promo -> use that
+  // --- helper: build preview totals (shared) ---
+  function buildTotalsFromSubtotal(subtotalAfterDiscount) {
+    const sfRate = Number(SERVICE_FEE_RATE || 0);
+    const serviceFee = int(Math.round(subtotalAfterDiscount * sfRate));
+    const rate = parsePpnRate();
+    const taxAmount = int(Math.round(subtotalAfterDiscount * rate));
+    const beforeRound = int(subtotalAfterDiscount + serviceFee + taxAmount);
+    const grandTotal = int(roundRupiahCustom(beforeRound));
+    const roundingDelta = int(grandTotal - beforeRound);
+    return { serviceFee, rate, taxAmount, grandTotal, roundingDelta };
+  }
+
+  // --- jika FE meminta preview untuk promo tertentu ---
   if (selectedPromoId) {
     const chosen = eligible.find(
       (p) => String(p._id) === String(selectedPromoId)
     );
     if (!chosen)
-      return res.status(400).json({
-        success: false,
-        message: 'Promo tidak berlaku untuk cart ini'
-      });
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: 'Promo tidak berlaku untuk cart ini'
+        });
 
     const { impact, actions } = await applyPromo(chosen, cartForEngine);
     const itemsDiscount = Number(
@@ -6215,15 +6243,36 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       itemsSubtotal - itemsDiscount
     );
 
-    const sfRate = Number(SERVICE_FEE_RATE || 0);
-    const serviceFee = int(Math.round(items_subtotal_after_discount * sfRate));
-    const rate = parsePpnRate();
-    const taxAmount = int(Math.round(items_subtotal_after_discount * rate));
-    const beforeRound = int(
-      items_subtotal_after_discount + serviceFee + taxAmount
+    const totals = buildTotalsFromSubtotal(items_subtotal_after_discount);
+
+    // enrich free items (await) -> memastikan name & imageUrl tersedia
+    const enrichedAdded = await enrichFreeItemsForImpact(
+      impact.addedFreeItems || []
     );
-    const grandTotal = int(roundRupiahCustom(beforeRound));
-    const roundingDelta = int(grandTotal - beforeRound);
+
+    const addedPreviewItems = enrichedAdded.map((f) => {
+      return {
+        menu: f.menuId ? String(f.menuId) : null,
+        menu_snapshot: f.menuId
+          ? {
+              id: String(f.menuId),
+              menu_code: f.menuCode || null,
+              name: f.name || 'Free item',
+              imageUrl: f.imageUrl || null,
+              price: Number(f.price || 0)
+            }
+          : null,
+        menu_code: f.menuCode || null,
+        name: f.name || 'Free item',
+        imageUrl: f.imageUrl || null,
+        base_price: 0,
+        quantity: Number(f.qty || 1),
+        addons: [],
+        notes: 'Free item (promo)',
+        line_subtotal: 0,
+        category: { big: f.category || null, subId: null }
+      };
+    });
 
     const promoCompact = await buildPromoCompactFromApplied({
       applied: {
@@ -6235,21 +6284,6 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
         actions
       }
     });
-    const enrichedAdded = await enrichFreeItemsForImpact(
-      impact.addedFreeItems || []
-    );
-    const addedPreviewItems = enrichedAdded.map((f) => ({
-      menu: f.menuId,
-      menu_code: null,
-      name: f.name || 'Free item',
-      imageUrl: f.imageUrl || null,
-      base_price: 0,
-      quantity: f.qty,
-      addons: [],
-      notes: 'Free item (promo)',
-      line_subtotal: 0,
-      category: { big: f.category || null, subId: null }
-    }));
 
     return res.json({
       success: true,
@@ -6258,14 +6292,14 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
         total_quantity:
           totalQty +
           addedPreviewItems.reduce((s, it) => s + Number(it.quantity || 0), 0),
-        items_subtotal: itemsSubtotal,
-        items_discount: itemsDiscount,
-        items_subtotal_after_discount,
-        service_fee: serviceFee,
-        tax_rate_percent: Math.round(rate * 100 * 100) / 100,
-        tax_amount: taxAmount,
-        grand_total: grandTotal,
-        rounding_delta: roundingDelta,
+        items_subtotal: int(itemsSubtotal),
+        items_discount: int(itemsDiscount),
+        items_subtotal_after_discount: int(items_subtotal_after_discount),
+        service_fee: totals.serviceFee,
+        tax_rate_percent: Math.round(totals.rate * 100 * 100) / 100,
+        tax_amount: totals.taxAmount,
+        grand_total: totals.grandTotal,
+        rounding_delta: totals.roundingDelta,
         addedFreeItems: enrichedAdded
       },
       eligiblePromos: (eligible || []).map((p) => ({
@@ -6282,7 +6316,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     });
   }
 
-  // if auto-applied exists -> build preview with its impact
+  // --- jika ada auto-applied promo -> bangun preview berdasarkan impact ---
   if (appliedPromoSnapshot && appliedPromoSnapshot.impact) {
     const impact = appliedPromoSnapshot.impact;
     const itemsDiscount = Number(
@@ -6293,18 +6327,28 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       itemsSubtotal - itemsDiscount
     );
 
+    // enrich free items (await)
     const enrichedAdded = await enrichFreeItemsForImpact(
       impact.addedFreeItems || []
     );
     const itemsPreviewWithFree = orderItems.slice();
     for (const f of enrichedAdded) {
       itemsPreviewWithFree.push({
-        menu: f.menuId,
-        menu_code: null,
+        menu: f.menuId ? String(f.menuId) : null,
+        menu_snapshot: f.menuId
+          ? {
+              id: String(f.menuId),
+              menu_code: f.menuCode || null,
+              name: f.name || 'Free item',
+              imageUrl: f.imageUrl || null,
+              price: Number(f.price || 0)
+            }
+          : null,
+        menu_code: f.menuCode || null,
         name: f.name || 'Free item',
         imageUrl: f.imageUrl || null,
         base_price: 0,
-        quantity: f.qty,
+        quantity: Number(f.qty || 1),
         addons: [],
         notes: 'Free item (promo)',
         line_subtotal: 0,
@@ -6312,15 +6356,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       });
     }
 
-    const sfRate = Number(SERVICE_FEE_RATE || 0);
-    const serviceFee = int(Math.round(items_subtotal_after_discount * sfRate));
-    const rate = parsePpnRate();
-    const taxAmount = int(Math.round(items_subtotal_after_discount * rate));
-    const beforeRound = int(
-      items_subtotal_after_discount + serviceFee + taxAmount
-    );
-    const grandTotal = int(roundRupiahCustom(beforeRound));
-    const roundingDelta = int(grandTotal - beforeRound);
+    const totals = buildTotalsFromSubtotal(items_subtotal_after_discount);
 
     const promoCompact = await buildPromoCompactFromApplied({
       applied: appliedPromoSnapshot
@@ -6332,14 +6368,14 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
         items: itemsPreviewWithFree,
         total_quantity:
           totalQty + enrichedAdded.reduce((s, f) => s + Number(f.qty || 0), 0),
-        items_subtotal: itemsSubtotal,
-        items_discount: itemsDiscount,
-        items_subtotal_after_discount,
-        service_fee: serviceFee,
-        tax_rate_percent: Math.round(rate * 100 * 100) / 100,
-        tax_amount: taxAmount,
-        grand_total: grandTotal,
-        rounding_delta: roundingDelta,
+        items_subtotal: int(itemsSubtotal),
+        items_discount: int(itemsDiscount),
+        items_subtotal_after_discount: int(items_subtotal_after_discount),
+        service_fee: totals.serviceFee,
+        tax_rate_percent: Math.round(totals.rate * 100 * 100) / 100,
+        tax_amount: totals.taxAmount,
+        grand_total: totals.grandTotal,
+        rounding_delta: totals.roundingDelta,
         addedFreeItems: enrichedAdded
       },
       eligiblePromos: (eligible || []).map((p) => ({
@@ -6356,7 +6392,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     });
   }
 
-  // no promo
+  // --- no promo ---
   const sfRate = Number(SERVICE_FEE_RATE || 0);
   const serviceFee = int(Math.round(itemsSubtotal * sfRate));
   const rate = parsePpnRate();
@@ -6370,9 +6406,9 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     preview: {
       items: orderItems,
       total_quantity: totalQty,
-      items_subtotal: itemsSubtotal,
+      items_subtotal: int(itemsSubtotal),
       items_discount: 0,
-      items_subtotal_after_discount: itemsSubtotal,
+      items_subtotal_after_discount: int(itemsSubtotal),
       service_fee: serviceFee,
       tax_rate_percent: Math.round(rate * 100 * 100) / 100,
       tax_amount: taxAmount,
@@ -6393,334 +6429,6 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
   });
 });
 
-// exports.previewPosOrder = asyncHandler(async (req, res) => {
-//   if (!req.user) throwError('Unauthorized', 401);
-
-//   const {
-//     items,
-//     as_member = false,
-//     member_id = null,
-//     selectedPromoId = null
-//   } = req.body || {};
-//   if (!Array.isArray(items) || items.length === 0)
-//     throwError('items wajib', 400);
-
-//   // build normalized cart items (like createPosDineIn)
-//   const orderItems = [];
-//   let totalQty = 0;
-//   let itemsSubtotal = 0;
-//   for (const it of items) {
-//     const menu = await Menu.findById(it.menu_id).lean();
-//     if (!menu || !menu.isActive)
-//       throwError('Menu tidak ditemukan / tidak aktif', 404);
-
-//     const qty = clamp(asInt(it.quantity, 1), 1, 999);
-//     const normAddons = normalizeAddons(it.addons);
-//     const addonsTotal = normAddons.reduce(
-//       (s, a) => s + (a.price || 0) * (a.qty || 1),
-//       0
-//     );
-//     const unit = priceFinal(menu.price);
-//     // line_subtotal already includes addons: (unit + addonsTotal) * qty
-//     const line_subtotal = (unit + addonsTotal) * qty;
-
-//     orderItems.push({
-//       menu: menu._id,
-//       menu_code: menu.menu_code || '',
-//       name: menu.name,
-//       base_price: unit,
-//       quantity: qty,
-//       addons: normAddons,
-//       notes: String(it.notes || '').trim(),
-//       line_subtotal,
-//       category: {
-//         big: menu.bigCategory || null,
-//         subId: menu.subcategory || null
-//       }
-//     });
-
-//     totalQty += qty;
-//     itemsSubtotal += line_subtotal;
-//   }
-
-//   const cartForEngine = {
-//     items: orderItems.map((it) => {
-//       const addonsPerUnit = Array.isArray(it.addons)
-//         ? it.addons.reduce(
-//             (s, a) =>
-//               s +
-//               Number(a.price || 0) *
-//                 (Number(a.qty || 1) / Number(it.quantity || 1)),
-//             0
-//           )
-//         : 0;
-
-//       const unitPrice = Math.round(Number(it.base_price || 0) + addonsPerUnit);
-
-//       return {
-//         menuId: it.menu,
-//         qty: Number(it.quantity || 0),
-//         price: unitPrice,
-//         category: it.category?.subId || it.category?.big || null
-//       };
-//     })
-//   };
-
-//   // determine member (optional) — gunakan member_id dari body bila disediakan (kasir)
-//   let member = null;
-//   if (as_member && member_id) {
-//     member = await Member.findById(member_id).lean();
-//     if (!member) throwError('Member tidak ditemukan', 400);
-//   }
-
-//   const now = new Date();
-//   const eligible = await findApplicablePromos(cartForEngine, member, now);
-//   console.log('[previewPosOrder] eligible promos count:', eligible.length);
-
-//   // pilih auto-applied promo (jika ada)
-//   let appliedPromoSnapshot = null;
-//   const autoPromo = chooseAutoPromo(eligible);
-//   if (autoPromo) {
-//     try {
-//       const { impact, actions } = await applyPromo(autoPromo, cartForEngine);
-//       appliedPromoSnapshot = {
-//         promoId: String(autoPromo._id),
-//         name: autoPromo.name || null,
-//         type: autoPromo.type || null,
-//         description: autoPromo.description || null,
-//         impact,
-//         actions: actions || []
-//       };
-//     } catch (e) {
-//       console.warn('[previewPosOrder] auto promo apply fail', e?.message);
-//       appliedPromoSnapshot = null;
-//     }
-//   }
-
-//   // jika FE request preview apply a particular promo => compute that preview (sama seperti sebelumnya)
-//   if (selectedPromoId) {
-//     const chosen = eligible.find(
-//       (p) => String(p._id) === String(selectedPromoId)
-//     );
-//     if (!chosen) {
-//       return res.status(400).json({
-//         success: false,
-//         message: 'Promo tidak berlaku untuk cart ini'
-//       });
-//     }
-//     const { impact, actions } = await applyPromo(chosen, cartForEngine);
-//     const itemsDiscount =
-//       Number(impact.itemsDiscount || 0) + Number(impact.cartDiscount || 0);
-//     const items_subtotal_after_discount = Math.max(
-//       0,
-//       itemsSubtotal - itemsDiscount
-//     );
-
-//     // build preview totals using itemsSubtotal (yang sudah termasuk addons)
-//     const sfRate = Number(SERVICE_FEE_RATE || 0);
-//     const serviceFee = int(Math.round(items_subtotal_after_discount * sfRate));
-//     const rate = parsePpnRate();
-//     const taxAmount = int(Math.round(items_subtotal_after_discount * rate));
-//     const beforeRound = int(
-//       items_subtotal_after_discount + serviceFee + taxAmount
-//     );
-//     const grandTotal = int(roundRupiahCustom(beforeRound));
-//     const roundingDelta = int(grandTotal - beforeRound);
-
-//     // build standardized promo object
-//     const promoCompact = await buildPromoCompactFromApplied({
-//       applied: {
-//         promoId: String(chosen._id),
-//         name: chosen.name,
-//         type: chosen.type,
-//         description: chosen.description,
-//         impact,
-//         actions
-//       }
-//     });
-
-//     return res.json({
-//       success: true,
-//       preview: {
-//         items: orderItems,
-//         total_quantity: totalQty,
-//         items_subtotal: itemsSubtotal,
-//         items_discount: itemsDiscount,
-//         items_subtotal_after_discount,
-//         service_fee: serviceFee,
-//         tax_rate_percent: Math.round(rate * 100 * 100) / 100,
-//         tax_amount: taxAmount,
-//         grand_total: grandTotal,
-//         rounding_delta: roundingDelta
-//       },
-//       eligiblePromos: eligible.map((p) => ({
-//         id: String(p._id),
-//         name: p.name,
-//         type: p.type,
-//         blocksVoucher: !!p.blocksVoucher,
-//         autoApply: !!p.autoApply,
-//         priority: Number(p.priority || 0)
-//       })),
-//       promo: promoCompact,
-//       eligiblePromosCount: eligible.length,
-//       // POS specific: kasir tidak boleh pakai poin
-//       can_use_points: false
-//     });
-//   }
-
-//   // jika auto-applied ada: gunakan impact nya untuk menghitung preview (diskon dari itemsSubtotal)
-//   if (appliedPromoSnapshot && appliedPromoSnapshot.impact) {
-//     const impact = appliedPromoSnapshot.impact;
-//     const itemsDiscount = Number(
-//       impact.itemsDiscount || impact.cartDiscount || 0
-//     );
-//     const items_subtotal_after_discount = Math.max(
-//       0,
-//       itemsSubtotal - itemsDiscount
-//     );
-
-//     // tambahkan free items ke preview list tanpa side-effect
-//     // --- resolve free items (batch) ---
-//     const addedFreeItems = Array.isArray(impact.addedFreeItems)
-//       ? impact.addedFreeItems.slice()
-//       : [];
-
-//     let freeMenuMap = {};
-//     if (addedFreeItems.length) {
-//       const freeMenuIds = addedFreeItems
-//         .map((f) => (f.menuId ? String(f.menuId) : null))
-//         .filter(Boolean);
-
-//       if (freeMenuIds.length) {
-//         const freeMenus = await Menu.find({ _id: { $in: freeMenuIds } })
-//           .select('name imageUrl menu_code price bigCategory subcategory')
-//           .lean()
-//           .catch(() => []);
-//         freeMenuMap = Object.fromEntries(
-//           freeMenus.map((m) => [String(m._id), m])
-//         );
-//       }
-//     }
-
-//     // build preview items with enriched free items
-//     const itemsPreviewWithFree = orderItems.slice();
-//     if (addedFreeItems.length) {
-//       for (const f of addedFreeItems) {
-//         const menuIdStr = f.menuId ? String(f.menuId) : null;
-//         const menuData = menuIdStr ? freeMenuMap[menuIdStr] : null;
-
-//         const resolvedName = f.name || menuData?.name || 'Free item';
-//         const resolvedImage = f.imageUrl || menuData?.imageUrl || null;
-//         const resolvedMenuCode = menuData?.menu_code || f.menu_code || null;
-
-//         itemsPreviewWithFree.push({
-//           menu: menuData ? String(menuData._id) : menuIdStr || null,
-//           menu_code: resolvedMenuCode,
-//           name: resolvedName,
-//           imageUrl: resolvedImage,
-//           base_price: 0,
-//           quantity: Number(f.qty || 1),
-//           addons: [],
-//           notes: 'Free item (promo)',
-//           line_subtotal: 0,
-//           category: {
-//             big: menuData?.bigCategory || f.category || null,
-//             subId: menuData?.subcategory || null
-//           }
-//         });
-//       }
-//     }
-
-//     const sfRate = Number(SERVICE_FEE_RATE || 0);
-//     const serviceFee = int(Math.round(items_subtotal_after_discount * sfRate));
-//     const rate = parsePpnRate();
-//     const taxAmount = int(Math.round(items_subtotal_after_discount * rate));
-//     const beforeRound = int(
-//       items_subtotal_after_discount + serviceFee + taxAmount
-//     );
-//     const grandTotal = int(roundRupiahCustom(beforeRound));
-//     const roundingDelta = int(grandTotal - beforeRound);
-
-//     // build standardized promo object
-//     const promoCompact = await buildPromoCompactFromApplied({
-//       applied: appliedPromoSnapshot
-//     });
-
-//     return res.json({
-//       success: true,
-//       preview: {
-//         items: itemsPreviewWithFree,
-//         total_quantity:
-//           totalQty + addedFreeItems.reduce((s, f) => s + Number(f.qty || 0), 0),
-//         items_subtotal: itemsSubtotal,
-//         items_discount: itemsDiscount,
-//         items_subtotal_after_discount,
-//         service_fee: serviceFee,
-//         tax_rate_percent: Math.round(rate * 100 * 100) / 100,
-//         tax_amount: taxAmount,
-//         grand_total: grandTotal,
-//         rounding_delta: roundingDelta,
-//         addedFreeItems
-//       },
-//       eligiblePromos: eligible.map((p) => ({
-//         id: String(p._id),
-//         name: p.name,
-//         type: p.type,
-//         blocksVoucher: !!p.blocksVoucher,
-//         autoApply: !!p.autoApply,
-//         priority: Number(p.priority || 0)
-//       })),
-//       eligiblePromosCount: eligible.length,
-//       // PROMO object standardized for FE (single source of truth)
-//       promo: promoCompact,
-//       // remove redundant autoAppliedPromo from response (FE cukup memeriksa promo)
-//       // POS specific: kasir tidak boleh pakai poin
-//       can_use_points: false
-//     });
-//   }
-
-//   // no promo applied: standard preview
-//   const sfRate = Number(SERVICE_FEE_RATE || 0);
-//   const serviceFee = int(Math.round(itemsSubtotal * sfRate));
-//   const rate = parsePpnRate();
-//   const taxAmount = int(Math.round(itemsSubtotal * rate));
-//   const beforeRound = int(itemsSubtotal + serviceFee + taxAmount);
-//   const grandTotal = int(roundRupiahCustom(beforeRound));
-//   const roundingDelta = int(grandTotal - beforeRound);
-
-//   return res.json({
-//     success: true,
-//     preview: {
-//       items: orderItems,
-//       total_quantity: totalQty,
-//       items_subtotal: itemsSubtotal,
-//       items_discount: 0,
-//       items_subtotal_after_discount: itemsSubtotal,
-//       service_fee: serviceFee,
-//       tax_rate_percent: Math.round(rate * 100 * 100) / 100,
-//       tax_amount: taxAmount,
-//       grand_total: grandTotal,
-//       rounding_delta: roundingDelta
-//     },
-//     eligiblePromos: eligible.map((p) => ({
-//       id: String(p._id),
-//       name: p.name,
-//       type: p.type,
-//       blocksVoucher: !!p.blocksVoucher,
-//       autoApply: !!p.autoApply,
-//       priority: Number(p.priority || 0),
-//       rewardSummary:
-//         Array.isArray(p.rewards) && p.rewards.length
-//           ? p.rewards
-//           : p.reward
-//           ? [p.reward]
-//           : []
-//     })),
-//     eligiblePromosCount: eligible.length,
-//     promo: null,
-//     can_use_points: false
-//   });
-// });
 
 exports.evaluatePos = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
