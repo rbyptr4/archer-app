@@ -6580,23 +6580,53 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     );
 
     // tambahkan free items ke preview list tanpa side-effect
+    // --- resolve free items (batch) ---
     const addedFreeItems = Array.isArray(impact.addedFreeItems)
       ? impact.addedFreeItems.slice()
       : [];
+
+    let freeMenuMap = {};
+    if (addedFreeItems.length) {
+      const freeMenuIds = addedFreeItems
+        .map((f) => (f.menuId ? String(f.menuId) : null))
+        .filter(Boolean);
+
+      if (freeMenuIds.length) {
+        const freeMenus = await Menu.find({ _id: { $in: freeMenuIds } })
+          .select('name imageUrl menu_code price bigCategory subcategory')
+          .lean()
+          .catch(() => []);
+        freeMenuMap = Object.fromEntries(
+          freeMenus.map((m) => [String(m._id), m])
+        );
+      }
+    }
+
+    // build preview items with enriched free items
     const itemsPreviewWithFree = orderItems.slice();
     if (addedFreeItems.length) {
       for (const f of addedFreeItems) {
+        const menuIdStr = f.menuId ? String(f.menuId) : null;
+        const menuData = menuIdStr ? freeMenuMap[menuIdStr] : null;
+
+        const resolvedName = f.name || menuData?.name || 'Free item';
+        const resolvedImage = f.imageUrl || menuData?.imageUrl || null;
+        const resolvedMenuCode = menuData?.menu_code || f.menu_code || null;
+
         itemsPreviewWithFree.push({
-          menu: f.menuId || null,
-          menu_code: null,
-          name: f.name || 'Free item',
-          imageUrl: f.imageUrl || null,
+          menu: menuData ? String(menuData._id) : menuIdStr || null,
+          menu_code: resolvedMenuCode,
+          name: resolvedName,
+          imageUrl: resolvedImage,
           base_price: 0,
           quantity: Number(f.qty || 1),
           addons: [],
           notes: 'Free item (promo)',
           line_subtotal: 0,
-          category: { big: f.category || null, subId: null }
+          category: {
+            big: menuData?.bigCategory || f.category || null,
+            subId: menuData?.subcategory || null
+          }
         });
       }
     }
