@@ -5954,7 +5954,6 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
   if (!Array.isArray(items) || items.length === 0)
     throwError('items wajib', 400);
 
-  // build normalized cart items (like createPosDineIn)
   const orderItems = [];
   let totalQty = 0;
   let itemsSubtotal = 0;
@@ -5991,7 +5990,6 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     itemsSubtotal += line_subtotal;
   }
 
-  // prepare cart for promoEngine (structure expected)
   const cartForEngine = {
     items: orderItems.map((it) => ({
       menuId: it.menu,
@@ -6001,7 +5999,6 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     }))
   };
 
-  // determine member (optional)
   let member = null;
   if (as_member && member_id) {
     member = await Member.findById(member_id).lean();
@@ -6011,8 +6008,6 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
   const eligible = await findApplicablePromos(cartForEngine, member, now);
   console.log('[previewPosOrder] eligible promos count:', eligible.length);
 
-  // pilih auto-applied promo untuk preview: pilih yang autoApply true dengan priority tertinggi,
-  // jika tidak ada autoApply, tetap null (FE akan menampilkan daftar eligible)
   let autoAppliedPromo = null;
   const autoPromo = chooseAutoPromo(eligible);
   if (autoPromo) {
@@ -6029,16 +6024,13 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     }
   }
 
-  // expose counts to FE (later response uses eligible + autoAppliedPromo)
-
-  // if FE requests to preview applying a particular promo, calculate impact
+  // --- Jika FE minta preview apply promo tertentu, kembalikan preview itu (spt sebelum) ---
   let promoAppliedPreview = null;
   if (selectedPromoId) {
     const chosen = eligible.find(
       (p) => String(p._id) === String(selectedPromoId)
     );
     if (!chosen) {
-      // tidak eligible
       return res.status(400).json({
         success: false,
         message: 'Promo tidak berlaku untuk cart ini'
@@ -6052,7 +6044,6 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       actions
     };
 
-    // buat preview totals setelah promo (tanpa side-effect)
     const itemsDiscount =
       Number(impact.itemsDiscount || 0) + Number(impact.cartDiscount || 0);
     const items_subtotal_after_discount = Math.max(
@@ -6099,11 +6090,91 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       })),
       promoAppliedPreview,
       eligiblePromosCount: eligible.length,
+      autoAppliedPromo,
+      // POS specific: kasir tidak boleh pakai poin
+      can_use_points: false
+    });
+  }
+
+  // --- Jika tidak ada selectedPromoId: apply autoAppliedPromo ke preview jika ada ---
+  if (autoAppliedPromo && autoAppliedPromo.impact) {
+    const impact = autoAppliedPromo.impact;
+    const itemsDiscount = Number(
+      impact.itemsDiscount || impact.cartDiscount || 0
+    );
+    const items_subtotal_after_discount = Math.max(
+      0,
+      itemsSubtotal - itemsDiscount
+    );
+
+    // tambahkan free items ke preview list (tanpa side-effect)
+    const addedFreeItems = Array.isArray(impact.addedFreeItems)
+      ? impact.addedFreeItems.slice()
+      : [];
+    const itemsPreviewWithFree = orderItems.slice();
+    if (addedFreeItems.length) {
+      for (const f of addedFreeItems) {
+        itemsPreviewWithFree.push({
+          menu: f.menuId || null,
+          menu_code: null,
+          name: f.name || 'Free item',
+          imageUrl: f.imageUrl || null,
+          base_price: 0,
+          quantity: Number(f.qty || 1),
+          addons: [],
+          notes: 'Free item (promo)',
+          line_subtotal: 0,
+          category: { big: f.category || null, subId: null }
+        });
+      }
+    }
+
+    const sfRate = Number(SERVICE_FEE_RATE || 0);
+    const serviceFee = int(Math.round(items_subtotal_after_discount * sfRate));
+    const rate = parsePpnRate();
+    const taxAmount = int(Math.round(items_subtotal_after_discount * rate));
+    const beforeRound = int(
+      items_subtotal_after_discount + serviceFee + taxAmount
+    );
+    const grandTotal = int(roundRupiahCustom(beforeRound));
+    const roundingDelta = int(grandTotal - beforeRound);
+
+    return res.json({
+      success: true,
+      preview: {
+        items: itemsPreviewWithFree,
+        total_quantity:
+          totalQty + addedFreeItems.reduce((s, f) => s + Number(f.qty || 0), 0),
+        items_subtotal: itemsSubtotal,
+        items_discount: itemsDiscount,
+        items_subtotal_after_discount,
+        service_fee: serviceFee,
+        tax_rate_percent: Math.round(rate * 100 * 100) / 100,
+        tax_amount: taxAmount,
+        grand_total: grandTotal,
+        rounding_delta: roundingDelta,
+        addedFreeItems
+      },
+      eligiblePromos: eligible.map((p) => ({
+        id: String(p._id),
+        name: p.name,
+        type: p.type,
+        blocksVoucher: !!p.blocksVoucher,
+        autoApply: !!p.autoApply,
+        priority: Number(p.priority || 0)
+      })),
+      eligiblePromosCount: eligible.length,
+      // kembalikan applied promo compact untuk FE agar langsung tahu promo mana yang auto applied
+      appliedPromo: {
+        promoId: autoAppliedPromo.promoId,
+        name: autoAppliedPromo.name,
+        impact: autoAppliedPromo.impact,
+        actions: autoAppliedPromo.actions || []
+      },
       autoAppliedPromo
     });
   }
 
-  // jika tidak preview apply, kembalikan list promo saja + normal preview (tanpa promo)
   const sfRate = Number(SERVICE_FEE_RATE || 0);
   const serviceFee = int(Math.round(itemsSubtotal * sfRate));
   const rate = parsePpnRate();
@@ -6127,7 +6198,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       rounding_delta: roundingDelta
     },
     eligiblePromos: eligible.map((p) => ({
-      id: String(p._1 || p._id || p.id),
+      id: String(p._id),
       name: p.name,
       type: p.type,
       blocksVoucher: !!p.blocksVoucher,
@@ -6139,7 +6210,9 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
           : p.reward
           ? [p.reward]
           : []
-    }))
+    })),
+    eligiblePromosCount: eligible.length,
+    autoAppliedPromo: autoAppliedPromo || null
   });
 });
 
