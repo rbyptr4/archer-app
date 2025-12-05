@@ -5,7 +5,21 @@ const BASE = process.env.WABLAS_BASE || 'https://tegal.wablas.com/api';
 const BASE_V2 = process.env.WABLAS_BASE_V2 || 'https://tegal.wablas.com/api/v2';
 const AUTH = `${process.env.WABLAS_TOKEN}.${process.env.WABLAS_SECRET}`;
 
-/** Kirim text sederhana */
+/* ===== Formatter kecil yang bisa dipakai ulang ===== */
+const rp = (n) => `Rp${Number(n || 0).toLocaleString('id-ID')}`;
+const fmtDT = (iso) => {
+  const d = iso ? new Date(iso) : new Date();
+  return d.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
+};
+
+function fmtRp(n) {
+  try {
+    return `Rp ${Number(n || 0).toLocaleString('id-ID')}`;
+  } catch {
+    return `Rp ${n || 0}`;
+  }
+}
+
 async function sendText(phone, message) {
   if (!phone || !message) return { ok: false, reason: 'empty phone/message' };
   try {
@@ -33,21 +47,6 @@ _
     timeout: 10000
   });
   return res.data;
-}
-
-/* ===== Formatter kecil yang bisa dipakai ulang ===== */
-const rp = (n) => `Rp${Number(n || 0).toLocaleString('id-ID')}`;
-const fmtDT = (iso) => {
-  const d = iso ? new Date(iso) : new Date();
-  return d.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
-};
-
-function fmtRp(n) {
-  try {
-    return `Rp ${Number(n || 0).toLocaleString('id-ID')}`;
-  } catch {
-    return `Rp ${n || 0}`;
-  }
 }
 
 function buildOrderReceiptMessage({ order, uiTotals }) {
