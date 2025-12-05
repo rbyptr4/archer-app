@@ -23,6 +23,9 @@ const {
   requestChangePhone,
   verifyChangeName,
   verifyChangePhone,
+  requestForgotUsername,
+  verifyForgotUsername,
+  setNewUsername,
   resendOtp
 } = require('../../controllers/member/waOtpController');
 const router = express.Router();
@@ -33,6 +36,9 @@ router.post('/request-change-phone', requestChangePhone);
 router.post('/verify-change-phone', verifyChangePhone);
 router.post('/request-change-name', requestChangeName);
 router.post('/verify-change-name', verifyChangeName);
+router.post('/forgot-username', requestForgotUsername);
+router.post('/forgot-username/verify', verifyForgotUsername);
+router.post('/forgot-username/set', setNewUsername);
 router.post('/login', loginMember);
 router.post('/login/verify', verifyLoginOtp);
 router.post('/register', registerMember);

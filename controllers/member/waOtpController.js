@@ -3,8 +3,16 @@ const crypto = require('crypto');
 const Member = require('../../models/memberModel');
 const MemberOtp = require('../../models/memberOtpModel');
 const throwError = require('../../utils/throwError');
-
-const { REFRESH_TTL_MS } = require('../../utils/memberToken');
+const MemberSession = require('../../models/memberSessionModel'); // add if belum ada
+const {
+  signAccessToken,
+  generateOpaqueToken,
+  hashToken,
+  ACCESS_COOKIE,
+  REFRESH_COOKIE,
+  DEVICE_COOKIE,
+  REFRESH_TTL_MS
+} = require('../../utils/memberToken');
 
 const { sendOtpText } = require('../../utils/wablas');
 const { generateOtp, hashOtp, expiresAtFromNow } = require('../../utils/otp');
@@ -232,6 +240,207 @@ exports.verifyChangeName = asyncHandler(async (req, res) => {
   });
 });
 
+// ------------------- Forgot username: request OTP -------------------
+exports.requestForgotUsername = asyncHandler(async (req, res) => {
+  // body: { phone }
+  const { phone } = req.body || {};
+  if (!phone) throwError('Nomor telepon wajib diisi', 400);
+
+  const normalized = normalizePhoneLocal(phone);
+  if (!normalized) throwError('Nomor tidak valid', 400);
+
+  // find member by phone (must exist)
+  const member = await Member.findOne({ phone: normalized });
+  if (!member) throwError('Member dengan nomor ini tidak ditemukan', 404);
+
+  // check cooldown for existing forgot_username OTP
+  const last = await MemberOtp.findOne({
+    phone: normalized,
+    purpose: 'forgot_username'
+  }).sort('-createdAt');
+
+  if (
+    last &&
+    last.last_sent_at &&
+    Date.now() - last.last_sent_at.getTime() < RESEND_COOLDOWN_SEC * 1000
+  ) {
+    const wait = Math.ceil(
+      (RESEND_COOLDOWN_SEC * 1000 -
+        (Date.now() - last.last_sent_at.getTime())) /
+        1000
+    );
+    throwError(`Tunggu ${wait} detik untuk kirim ulang OTP`, 429);
+  }
+
+  const code = generateOtp();
+  const doc = await MemberOtp.create({
+    phone: normalized,
+    code_hash: hashOtp(code),
+    expires_at: expiresAtFromNow(),
+    last_sent_at: new Date(),
+    purpose: 'forgot_username',
+    meta: { memberId: member._id.toString() }
+  });
+
+  // kirim WA/SMS
+  await sendOtpText(toWa62Local(normalized), code);
+
+  res.json({
+    success: true,
+    message: 'OTP dikirim ke nomor terdaftar. Masukkan OTP untuk melanjutkan.',
+    otp_id: doc._id,
+    phone: normalized
+  });
+});
+
+// ------------------- Forgot username: verify OTP -------------------
+exports.verifyForgotUsername = asyncHandler(async (req, res) => {
+  // body: { phone, otp }
+  const { phone, otp } = req.body || {};
+  if (!phone || !otp) throwError('Phone & OTP wajib diisi', 400);
+
+  const normalized = normalizePhoneLocal(phone);
+  const rec = await MemberOtp.findOne({
+    phone: normalized,
+    purpose: 'forgot_username'
+  }).sort('-createdAt');
+
+  if (!rec) throwError('OTP tidak ditemukan', 400);
+  if (rec.used_at) throwError('OTP sudah digunakan', 400);
+  if (new Date(rec.expires_at).getTime() < Date.now())
+    throwError('OTP kedaluwarsa', 400);
+  if (rec.attempt_count >= 5) throwError('Percobaan OTP melebihi batas', 429);
+
+  // timingSafeEqual compare hashes
+  const ok = crypto.timingSafeEqual(
+    Buffer.from(rec.code_hash),
+    Buffer.from(hashOtp(otp))
+  );
+  if (!ok) {
+    await MemberOtp.updateOne({ _id: rec._id }, { $inc: { attempt_count: 1 } });
+    throwError('OTP salah', 400);
+  }
+
+  // mark used (we keep meta.memberId)
+  rec.used_at = new Date();
+  await rec.save();
+
+  // Return success + otp_id so FE can continue to set new username
+  res.json({
+    success: true,
+    message: 'OTP terverifikasi. Silakan kirim username baru.',
+    otp_id: rec._id
+  });
+});
+
+// ------------------- Forgot username: set new username + auto-login -------------------
+exports.setNewUsername = asyncHandler(async (req, res) => {
+  // body: { phone, otp_id, newName }
+  const { phone, otp_id, newName } = req.body || {};
+  if (!phone || !otp_id || !newName)
+    throwError('phone, otp_id, dan newName wajib diisi', 400);
+
+  const normalized = normalizePhoneLocal(phone);
+
+  // ambil record OTP
+  const rec = await MemberOtp.findOne({
+    _id: otp_id,
+    phone: normalized,
+    purpose: 'forgot_username'
+  });
+  if (!rec) throwError('OTP tidak ditemukan', 400);
+
+  // require that OTP sudah diverifikasi (used_at set) dan masih "fresh" (misalnya 15 menit)
+  if (!rec.used_at) throwError('OTP belum diverifikasi', 400);
+  const MAX_AFTER_VERIFY_MS = Number(
+    process.env.FORGOT_USERNAME_VERIFY_WINDOW_MS || 15 * 60 * 1000
+  ); // default 15 menit
+  if (Date.now() - rec.used_at.getTime() > MAX_AFTER_VERIFY_MS)
+    throwError(
+      'Token verifikasi sudah kedaluwarsa. Mohon request ulang OTP.',
+      400
+    );
+
+  const { memberId } = rec.meta || {};
+  if (!memberId) throwError('Metadata OTP tidak lengkap', 500);
+
+  const member = await Member.findById(memberId);
+  if (!member) throwError('Member tidak ditemukan', 404);
+
+  // update name (username)
+  member.name = String(newName).trim();
+  await member.save();
+
+  // create member session & cookies (auto-login) — mirror logic di utils/memberToken / orderController.ensureMemberForCheckout
+  const sessionDevice =
+    req.cookies?.[DEVICE_COOKIE] ||
+    req.get('x-online-session') ||
+    req.get('x-device-id') ||
+    crypto.randomUUID();
+
+  const accessToken = signAccessToken(member);
+  const refreshToken = generateOpaqueToken();
+  const refreshHash = hashToken(refreshToken);
+
+  // upsert MemberSession
+  const now = Date.now();
+  const existing = await MemberSession.findOne({
+    member: member._id,
+    device_id: sessionDevice,
+    revoked_at: null,
+    expires_at: { $gt: new Date(now) }
+  });
+
+  if (existing) {
+    existing.refresh_hash = refreshHash;
+    existing.expires_at = new Date(now + REFRESH_TTL_MS);
+    existing.user_agent = req.get('user-agent') || existing.user_agent || '';
+    existing.ip = req.ip || existing.ip || '';
+    await existing.save();
+  } else {
+    await MemberSession.create({
+      member: member._id,
+      device_id: sessionDevice,
+      refresh_hash: refreshHash,
+      user_agent: req.get('user-agent') || '',
+      ip: req.ip,
+      expires_at: new Date(now + REFRESH_TTL_MS)
+    });
+  }
+
+  // set cookies (sesuaikan flags sesuai env kamu)
+  const cookieAccess = {
+    httpOnly: true,
+    maxAge: 15 * 60 * 1000,
+    sameSite: 'Lax'
+  };
+  const cookieRefresh = {
+    httpOnly: true,
+    maxAge: REFRESH_TTL_MS,
+    sameSite: 'Lax'
+  };
+  const cookieDevice = {
+    httpOnly: false,
+    maxAge: REFRESH_TTL_MS,
+    sameSite: 'Lax'
+  };
+
+  res.cookie(ACCESS_COOKIE, accessToken, cookieAccess);
+  res.cookie(REFRESH_COOKIE, refreshToken, cookieRefresh);
+  res.cookie(DEVICE_COOKIE, sessionDevice, cookieDevice);
+
+  // mark OTP record final (optional: add meta note)
+  rec.meta = rec.meta || {};
+  rec.meta.username_set_at = new Date();
+  await rec.save();
+
+  res.json({
+    success: true,
+    message: 'Username diperbarui dan Anda telah login.',
+    member: { id: member._id, name: member.name, phone: member.phone }
+  });
+});
+
 // ------------------- X) Resend OTP (generic) -------------------
 exports.resendOtp = asyncHandler(async (req, res) => {
   // body: { phone, purpose }  purpose in: 'login' | 'register' | 'change_phone' | 'change_name'
@@ -242,7 +451,8 @@ exports.resendOtp = asyncHandler(async (req, res) => {
     'login',
     'register',
     'change_phone',
-    'change_name'
+    'change_name',
+    'forgot_username'
   ]);
   if (!PURPOSES.has(purpose)) throwError('purpose tidak valid', 400);
 
@@ -262,11 +472,12 @@ exports.resendOtp = asyncHandler(async (req, res) => {
         ? 'Silakan request OTP login terlebih dahulu.'
         : purpose === 'change_phone'
         ? 'Silakan mulai dari requestChangePhone terlebih dahulu.'
-        : 'Silakan mulai dari requestChangeName terlebih dahulu.';
+        : purpose === 'change_name'
+        ? 'Silakan mulai dari requestChangeName terlebih dahulu.'
+        : 'Silakan request OTP lupa username terlebih dahulu.';
     throwError(`Belum ada permintaan OTP untuk purpose ini. ${hint}`, 404);
   }
 
-  // Cek cooldown
   if (
     last.last_sent_at &&
     Date.now() - last.last_sent_at.getTime() < RESEND_COOLDOWN_SEC * 1000
@@ -279,9 +490,6 @@ exports.resendOtp = asyncHandler(async (req, res) => {
     throwError(`Tunggu ${wait} detik untuk kirim ulang OTP`, 429);
   }
 
-  // (Opsional) Kalau mau batasi total resend per OTP chain, bisa hitung dari waktu window tertentu.
-
-  // Buat kode baru dan dokumen baru (audit trail), bawa meta yang sama
   const code = generateOtp();
   const newDoc = await MemberOtp.create({
     phone: normalized,
