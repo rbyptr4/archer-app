@@ -177,6 +177,89 @@ function isSlotAvailable(label, dateDay = null) {
   return !!(slot && slot.available);
 }
 
+function buildPromoCompactFromApplied({ applied }) {
+  if (!applied) return null;
+  const impact = applied.impact || {};
+  const actions = applied.actions || [];
+
+  const rewards = [];
+
+  // free items dari impact.addedFreeItems
+  if (Array.isArray(impact.addedFreeItems) && impact.addedFreeItems.length) {
+    for (const f of impact.addedFreeItems) {
+      rewards.push({
+        type: 'free_item',
+        label: `Gratis: ${f.name || ''}`,
+        amount: 0,
+        meta: {
+          menuId: f.menuId || null,
+          qty: Number(f.qty || 1),
+          name: f.name || null,
+          imageUrl: f.imageUrl || null
+        }
+      });
+    }
+  }
+
+  // diskon: itemsDiscount / cartDiscount
+  const discountAmount = Number(
+    impact.itemsDiscount || impact.cartDiscount || 0
+  );
+  if (discountAmount > 0) {
+    rewards.push({
+      type: 'discount',
+      label: applied.name || 'Diskon',
+      amount: discountAmount,
+      meta: {
+        // opsi tambahan
+        note: impact.note || null
+      }
+    });
+  }
+
+  // points dari actions atau impact
+  if (Number(impact.points || 0) > 0) {
+    rewards.push({
+      type: 'points',
+      label: 'Poin',
+      amount: Number(impact.points),
+      meta: {}
+    });
+  } else if (Array.isArray(actions) && actions.length) {
+    for (const a of actions) {
+      if (
+        String(a.type || '').toLowerCase() === 'award_points' ||
+        String(a.type || '').toLowerCase() === 'points'
+      ) {
+        rewards.push({
+          type: 'points',
+          label: a.label || 'Poin',
+          amount: Number(a.points || a.amount || 0),
+          meta: a.meta || {}
+        });
+      }
+    }
+  }
+
+  // membership / tag: jika promo target member-only, set reward type membership (informational)
+  if (applied.target && String(applied.target).toLowerCase() === 'member') {
+    rewards.push({
+      type: 'membership',
+      label: 'Member only',
+      amount: null,
+      meta: {}
+    });
+  }
+
+  return {
+    appliedPromoId: applied.promoId || null,
+    appliedPromoName: applied.name || null,
+    type: applied.type || null,
+    description: applied.description || impact.note || null,
+    rewards
+  };
+}
+
 function genTokenRaw(lenBytes = 32) {
   return crypto.randomBytes(lenBytes).toString('hex'); // 64 chars hex for 32 bytes
 }
@@ -5954,6 +6037,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
   if (!Array.isArray(items) || items.length === 0)
     throwError('items wajib', 400);
 
+  // build normalized cart items (like createPosDineIn)
   const orderItems = [];
   let totalQty = 0;
   let itemsSubtotal = 0;
@@ -5969,6 +6053,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       0
     );
     const unit = priceFinal(menu.price);
+    // line_subtotal already includes addons: (unit + addonsTotal) * qty
     const line_subtotal = (unit + addonsTotal) * qty;
 
     orderItems.push({
@@ -5990,6 +6075,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     itemsSubtotal += line_subtotal;
   }
 
+  // prepare cart for promoEngine (structure expected)
   const cartForEngine = {
     items: orderItems.map((it) => ({
       menuId: it.menu,
@@ -5999,33 +6085,38 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     }))
   };
 
+  // determine member (optional) — gunakan member_id dari body bila disediakan (kasir)
   let member = null;
   if (as_member && member_id) {
     member = await Member.findById(member_id).lean();
+    if (!member) throwError('Member tidak ditemukan', 400);
   }
 
   const now = new Date();
   const eligible = await findApplicablePromos(cartForEngine, member, now);
   console.log('[previewPosOrder] eligible promos count:', eligible.length);
 
-  let autoAppliedPromo = null;
+  // pilih auto-applied promo (jika ada)
+  let appliedPromoSnapshot = null;
   const autoPromo = chooseAutoPromo(eligible);
   if (autoPromo) {
     try {
       const { impact, actions } = await applyPromo(autoPromo, cartForEngine);
-      autoAppliedPromo = {
+      appliedPromoSnapshot = {
         promoId: String(autoPromo._id),
         name: autoPromo.name || null,
+        type: autoPromo.type || null,
+        description: autoPromo.description || null,
         impact,
         actions: actions || []
       };
     } catch (e) {
       console.warn('[previewPosOrder] auto promo apply fail', e?.message);
+      appliedPromoSnapshot = null;
     }
   }
 
-  // --- Jika FE minta preview apply promo tertentu, kembalikan preview itu (spt sebelum) ---
-  let promoAppliedPreview = null;
+  // jika FE request preview apply a particular promo => compute that preview (sama seperti sebelumnya)
   if (selectedPromoId) {
     const chosen = eligible.find(
       (p) => String(p._id) === String(selectedPromoId)
@@ -6037,19 +6128,14 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       });
     }
     const { impact, actions } = await applyPromo(chosen, cartForEngine);
-    promoAppliedPreview = {
-      promoId: String(chosen._id),
-      name: chosen.name || null,
-      impact,
-      actions
-    };
-
     const itemsDiscount =
       Number(impact.itemsDiscount || 0) + Number(impact.cartDiscount || 0);
     const items_subtotal_after_discount = Math.max(
       0,
       itemsSubtotal - itemsDiscount
     );
+
+    // build preview totals using itemsSubtotal (yang sudah termasuk addons)
     const sfRate = Number(SERVICE_FEE_RATE || 0);
     const serviceFee = int(Math.round(items_subtotal_after_discount * sfRate));
     const rate = parsePpnRate();
@@ -6059,6 +6145,18 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     );
     const grandTotal = int(roundRupiahCustom(beforeRound));
     const roundingDelta = int(grandTotal - beforeRound);
+
+    // build standardized promo object
+    const promoCompact = buildPromoCompactFromApplied({
+      applied: {
+        promoId: String(chosen._id),
+        name: chosen.name,
+        type: chosen.type,
+        description: chosen.description,
+        impact,
+        actions
+      }
+    });
 
     return res.json({
       success: true,
@@ -6080,25 +6178,18 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
         type: p.type,
         blocksVoucher: !!p.blocksVoucher,
         autoApply: !!p.autoApply,
-        priority: Number(p.priority || 0),
-        rewardSummary:
-          Array.isArray(p.rewards) && p.rewards.length
-            ? p.rewards
-            : p.reward
-            ? [p.reward]
-            : []
+        priority: Number(p.priority || 0)
       })),
-      promoAppliedPreview,
+      promo: promoCompact,
       eligiblePromosCount: eligible.length,
-      autoAppliedPromo,
       // POS specific: kasir tidak boleh pakai poin
       can_use_points: false
     });
   }
 
-  // --- Jika tidak ada selectedPromoId: apply autoAppliedPromo ke preview jika ada ---
-  if (autoAppliedPromo && autoAppliedPromo.impact) {
-    const impact = autoAppliedPromo.impact;
+  // jika auto-applied ada: gunakan impact nya untuk menghitung preview (diskon dari itemsSubtotal)
+  if (appliedPromoSnapshot && appliedPromoSnapshot.impact) {
+    const impact = appliedPromoSnapshot.impact;
     const itemsDiscount = Number(
       impact.itemsDiscount || impact.cartDiscount || 0
     );
@@ -6107,7 +6198,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       itemsSubtotal - itemsDiscount
     );
 
-    // tambahkan free items ke preview list (tanpa side-effect)
+    // tambahkan free items ke preview list tanpa side-effect
     const addedFreeItems = Array.isArray(impact.addedFreeItems)
       ? impact.addedFreeItems.slice()
       : [];
@@ -6139,6 +6230,11 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     const grandTotal = int(roundRupiahCustom(beforeRound));
     const roundingDelta = int(grandTotal - beforeRound);
 
+    // build standardized promo object
+    const promoCompact = buildPromoCompactFromApplied({
+      applied: appliedPromoSnapshot
+    });
+
     return res.json({
       success: true,
       preview: {
@@ -6164,17 +6260,15 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
         priority: Number(p.priority || 0)
       })),
       eligiblePromosCount: eligible.length,
-      // kembalikan applied promo compact untuk FE agar langsung tahu promo mana yang auto applied
-      appliedPromo: {
-        promoId: autoAppliedPromo.promoId,
-        name: autoAppliedPromo.name,
-        impact: autoAppliedPromo.impact,
-        actions: autoAppliedPromo.actions || []
-      },
-      autoAppliedPromo
+      // PROMO object standardized for FE (single source of truth)
+      promo: promoCompact,
+      // remove redundant autoAppliedPromo from response (FE cukup memeriksa promo)
+      // POS specific: kasir tidak boleh pakai poin
+      can_use_points: false
     });
   }
 
+  // no promo applied: standard preview
   const sfRate = Number(SERVICE_FEE_RATE || 0);
   const serviceFee = int(Math.round(itemsSubtotal * sfRate));
   const rate = parsePpnRate();
@@ -6183,7 +6277,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
   const grandTotal = int(roundRupiahCustom(beforeRound));
   const roundingDelta = int(grandTotal - beforeRound);
 
-  res.json({
+  return res.json({
     success: true,
     preview: {
       items: orderItems,
@@ -6212,7 +6306,8 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
           : []
     })),
     eligiblePromosCount: eligible.length,
-    autoAppliedPromo: autoAppliedPromo || null
+    promo: null,
+    can_use_points: false
   });
 });
 
