@@ -177,28 +177,30 @@ function isSlotAvailable(label, dateDay = null) {
   return !!(slot && slot.available);
 }
 
-async function enrichFreeItemsForImpact(addedFreeItems = []) {
-  if (!Array.isArray(addedFreeItems) || addedFreeItems.length === 0) return [];
-
-  const ids = addedFreeItems
+async function enrichFreeItemsForImpact(items = []) {
+  if (!Array.isArray(items) || !items.length) return [];
+  const ids = items
     .map((f) => (f.menuId ? String(f.menuId) : null))
     .filter(Boolean);
-  const menus = ids.length
-    ? await Menu.find({ _id: { $in: ids } })
-        .select('name imageUrl menu_code price bigCategory subcategory')
-        .lean()
-    : [];
-  const menuMap = Object.fromEntries(menus.map((m) => [String(m._id), m]));
+  let map = {};
+  if (ids.length) {
+    const docs = await Menu.find({ _id: { $in: ids } })
+      .select('name imageUrl menu_code price bigCategory subcategory')
+      .lean()
+      .catch(() => []);
+    map = Object.fromEntries(docs.map((d) => [String(d._id), d]));
+  }
 
-  return addedFreeItems.map((f) => {
+  return items.map((f) => {
     const mid = f.menuId ? String(f.menuId) : null;
-    const menuData = mid ? menuMap[mid] : null;
+    const md = mid ? map[mid] : null;
     return {
       menuId: mid,
       qty: Number(f.qty || 1),
-      category: f.category || null,
-      name: f.name || menuData?.name || 'Free item',
-      imageUrl: f.imageUrl || menuData?.imageUrl || null
+      category: f.category || (md ? md.bigCategory || null : null),
+      name: f.name || (md ? md.name || null : null),
+      imageUrl: f.imageUrl || (md ? md.imageUrl || null : null),
+      note: f.note || null
     };
   });
 }
@@ -208,25 +210,24 @@ async function buildPromoCompactFromApplied({ applied }) {
   const impact = applied.impact || {};
   const actions = applied.actions || [];
 
-  const enrichedAdded = await enrichFreeItemsForImpact(
-    Array.isArray(impact.addedFreeItems) ? impact.addedFreeItems : []
-  );
-
   const rewards = [];
 
   // free items
-  for (const ef of enrichedAdded) {
-    rewards.push({
-      type: 'free_item',
-      label: `Gratis: ${ef.name}`,
-      amount: 0,
-      meta: {
-        menuId: ef.menuId,
-        qty: ef.qty,
-        name: ef.name,
-        imageUrl: ef.imageUrl
-      }
-    });
+  if (Array.isArray(impact.addedFreeItems) && impact.addedFreeItems.length) {
+    const enriched = await enrichFreeItemsForImpact(impact.addedFreeItems);
+    for (const f of enriched) {
+      rewards.push({
+        type: 'free_item',
+        label: `Gratis: ${f.name || 'Item'}`,
+        amount: 0,
+        meta: {
+          menuId: f.menuId || null,
+          qty: Number(f.qty || 1),
+          name: f.name || null,
+          imageUrl: f.imageUrl || null
+        }
+      });
+    }
   }
 
   // discount
@@ -242,7 +243,7 @@ async function buildPromoCompactFromApplied({ applied }) {
     });
   }
 
-  // points (impact or actions)
+  // points from impact or actions
   const pointsFromImpact = Number(impact.points || 0);
   if (pointsFromImpact > 0) {
     rewards.push({
@@ -253,19 +254,27 @@ async function buildPromoCompactFromApplied({ applied }) {
     });
   } else if (Array.isArray(actions) && actions.length) {
     for (const a of actions) {
-      const ta = String(a.type || '').toLowerCase();
-      if (ta === 'award_points' || ta === 'points') {
+      const typ = String(a.type || '').toLowerCase();
+      if (typ === 'award_points' || typ === 'points') {
         rewards.push({
           type: 'points',
           label: a.label || 'Poin',
-          amount: Number(a.points || a.amount || 0),
+          amount: Number(a.points ?? a.amount ?? 0),
+          meta: a.meta || {}
+        });
+      } else {
+        // generic action
+        rewards.push({
+          type: a.type || 'action',
+          label: a.label || a.name || null,
+          amount: a.amount ?? null,
           meta: a.meta || {}
         });
       }
     }
   }
 
-  // membership informational
+  // membership flag if promo target member-only
   if (applied.target && String(applied.target).toLowerCase() === 'member') {
     rewards.push({
       type: 'membership',
@@ -5583,10 +5592,9 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
 
   const ownerVerified = !paymentRequiresOwnerVerify(method);
 
-  // member resolve
   let member = null;
-  let customer_name = '';
-  let customer_phone = '';
+  let customer_name = '',
+    customer_phone = '';
   if (as_member) {
     if (!member_id)
       throwError(
@@ -5605,7 +5613,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
       throwError('Tanpa member: isi minimal nama atau no. telp', 400);
   }
 
-  // build orderItems (snapshot + menu as string id)
+  // build items
   const orderItems = [];
   let totalQty = 0;
   let itemsSubtotal = 0;
@@ -5624,12 +5632,10 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     const unit = priceFinal(menu.price);
     const line_subtotal = (unit + addonsTotal) * qty;
 
-    const menuIdStr = String(menu._id);
-
     orderItems.push({
-      menu: menuIdStr, // simpan sebagai string id untuk menghindari "[object Object]"
+      menu: menu._id, // simpan sebagai ObjectId (atau string)
       menu_snapshot: {
-        id: menuIdStr,
+        id: menu._id,
         menu_code: menu.menu_code || '',
         name: menu.name || '',
         imageUrl: menu.imageUrl || '',
@@ -5653,7 +5659,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     itemsSubtotal += line_subtotal;
   }
 
-  // cart for engine: per-unit price include addons per unit
+  // prepare cartForEngine per-unit prices
   const cartForEngine = {
     items: orderItems.map((it) => {
       const addonsPerUnit = Array.isArray(it.addons)
@@ -5675,7 +5681,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     })
   };
 
-  // promos
+  // promos (kasir mode: voucher NOT allowed)
   const memberForPromo = member ? member : null;
   const promos = await findApplicablePromos(
     cartForEngine,
@@ -5683,7 +5689,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     new Date()
   );
 
-  // pick promo
+  // pick promo (selected or auto)
   let appliedPromoSnapshot = null;
   let promoRewards = [];
   let promoImpact = null;
@@ -5726,45 +5732,50 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     }
   }
 
-  // apply promoImpact: enrich free items and add to orderItems & promoRewards
+  // apply promoImpact: enrich free items then modify orderItems/itemsSubtotal
   if (promoImpact) {
+    // enrich free items
     if (
       Array.isArray(promoImpact.addedFreeItems) &&
       promoImpact.addedFreeItems.length
     ) {
       const enriched = await enrichFreeItemsForImpact(
-        promoImpact.addedFreeItems
+        promoImpact.addedFreeItems || []
       );
-      for (const ef of enriched) {
+      for (const f of enriched) {
+        const freeQty = Number(f.qty || 1);
+        // if menuId exists, convert to ObjectId when pushing (Menu._id already object)
         orderItems.push({
-          menu: ef.menuId || null,
+          menu: f.menuId || null,
           menu_snapshot: {
-            id: ef.menuId || null,
+            id: f.menuId || null,
             menu_code: null,
-            name: ef.name,
-            imageUrl: ef.imageUrl,
+            name: f.name || 'Free item',
+            imageUrl: f.imageUrl || null,
             price: 0
           },
           menu_code: null,
-          name: ef.name,
-          imageUrl: ef.imageUrl,
+          name: f.name || 'Free item',
+          imageUrl: f.imageUrl || null,
           base_price: 0,
-          quantity: ef.qty,
+          quantity: freeQty,
           addons: [],
           notes: 'Free item (promo)',
           line_subtotal: 0,
-          category: { big: ef.category || null, subId: null }
+          category: { big: f.category || null, subId: null }
         });
+
         promoRewards.push({
           type: 'free_item',
-          menuId: ef.menuId || null,
-          name: ef.name,
-          qty: ef.qty
+          menuId: f.menuId || null,
+          name: f.name || null,
+          qty: freeQty
         });
-        totalQty += ef.qty;
+        totalQty += freeQty;
       }
     }
 
+    // discount
     const discountAmount = Number(
       promoImpact.itemsDiscount || promoImpact.cartDiscount || 0
     );
@@ -5772,6 +5783,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
       itemsSubtotal = Math.max(0, itemsSubtotal - discountAmount);
     }
 
+    // actions -> promoRewards
     if (
       Array.isArray(appliedPromoSnapshot?.actions) &&
       appliedPromoSnapshot.actions.length
@@ -5788,7 +5800,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     appliedPromoSnapshot.impact = promoImpact;
   }
 
-  // compute totals
+  // totals (service/tax/rounding)
   const sfRate = Number(SERVICE_FEE_RATE || 0);
   const serviceFee = int(Math.round(itemsSubtotal * sfRate));
   const rate =
@@ -5804,15 +5816,9 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
   const rawBeforeRound = itemsSubtotal + serviceFee + taxAmount;
   const grandTotal = int(roundRupiahCustom(rawBeforeRound));
   const roundingDelta = int(grandTotal - rawBeforeRound);
-
   const now = new Date();
-  const initialPaymentStatus = ownerVerified ? 'verified' : 'paid';
-  const initialOrderStatus = ownerVerified ? 'accepted' : 'created';
-  const paidAtValue = now;
-  const verifiedByValue = ownerVerified ? req.user?.id || null : null;
-  const verifiedAtValue = ownerVerified ? now : null;
 
-  // create order (retry txcode)
+  // create order (retry loop)
   const order = await (async () => {
     for (let i = 0; i < 5; i++) {
       try {
@@ -5875,11 +5881,11 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           rounding_delta: roundingDelta,
           grand_total: grandTotal,
           payment_method: method,
-          payment_status: initialPaymentStatus,
-          paid_at: paidAtValue,
-          verified_by: verifiedByValue,
-          verified_at: verifiedAtValue,
-          status: initialOrderStatus,
+          payment_status: ownerVerified ? 'verified' : 'paid',
+          paid_at: now,
+          verified_by: ownerVerified ? req.user?.id || null : null,
+          verified_at: ownerVerified ? now : null,
+          status: ownerVerified ? 'accepted' : 'created',
           placed_at: now
         });
       } catch (e) {
@@ -5891,16 +5897,15 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     throw new Error('Gagal generate transaction_code unik');
   })();
 
-  // promo side-effects (execute actions, decrement stock, member history)
+  // promo side-effects (unchanged)
   try {
     if (
       appliedPromoSnapshot &&
-      Array.isArray(appliedPromoSnapshot.actions) &&
+      appliedPromoSnapshot.actions &&
       appliedPromoSnapshot.actions.length
     ) {
       try {
         await executePromoActions(order, Member, { session: null });
-
         if (appliedPromoSnapshot && appliedPromoSnapshot.promoId) {
           try {
             await Promo.updateOne(
@@ -5917,7 +5922,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
             );
           }
         }
-
         if (
           order.member &&
           appliedPromoSnapshot &&
@@ -5954,18 +5958,16 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     );
   }
 
-  // async notify owner if needed (unchanged)
+  // async notify owner...
   (async () => {
     try {
       const full = await Order.findById(order._id).lean();
       if (!full) return;
       if (!paymentRequiresOwnerVerify(full.payment_method)) return;
-
       const EXPIRE_HOURS = Number(process.env.OWNER_VERIFY_EXPIRE_HOURS || 6);
       const tokenRaw = genTokenRaw();
       const tokenHash = hashTokenVerification(tokenRaw);
       const expiresAt = new Date(Date.now() + EXPIRE_HOURS * 60 * 60 * 1000);
-
       await Order.updateOne(
         { _id: full._id },
         {
@@ -5983,16 +5985,13 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           e?.message || e
         )
       );
-
       const DASHBOARD_URL = process.env.DASHBOARD_URL;
       const verifyLink = `${DASHBOARD_URL}/public/owner-verify?orderId=${
         full._id
       }&token=${encodeURIComponent(tokenRaw)}`;
-
       const msg = buildOwnerVerifyMessage(full, verifyLink, EXPIRE_HOURS);
       const owners = getOwnerPhone();
       if (!owners.length) return;
-
       const sendPromises = owners.map((rawPhone) => {
         const phone =
           typeof toWa62 === 'function' ? toWa62(rawPhone) : rawPhone;
@@ -6001,7 +6000,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
           (e) => ({ ok: false, phone: rawPhone, err: e?.message || e })
         );
       });
-
       const results = await Promise.allSettled(sendPromises);
       results.forEach((r) => {
         if (r.status === 'fulfilled') {
@@ -6025,7 +6023,7 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     }
   })();
 
-  // emit to cashier / kitchen
+  // emit to cashier and kitchen if ownerVerified
   try {
     const summary = {
       id: String(order._id),
@@ -6047,13 +6045,6 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
       payment_status: order.payment_status || null,
       status: order.status || null,
       total_quantity: Number(order.total_quantity || 0),
-      pickup_window: order.delivery?.pickup_window
-        ? {
-            from: order.delivery.pickup_window.from || null,
-            to: order.delivery.pickup_window.to || null
-          }
-        : null,
-      delivery_slot_label: order.delivery?.slot_label || null,
       member_id: order.member ? String(order.member) : null
     };
 
@@ -6074,16 +6065,12 @@ exports.createPosDineIn = asyncHandler(async (req, res) => {
     ? 'Order POS dine-in dibuat & langsung verified'
     : 'Order POS dine-in dibuat. Menunggu verifikasi owner sebelum diteruskan ke kitchen';
 
-  // return order (toObject) — menu fields are string ids and menu_snapshot filled
   res.status(201).json({
     order: { ...order.toObject(), transaction_code: order.transaction_code },
     message: responseMessage
   });
 });
 
-//
-// previewPosOrder - versi fixed & konsisten dengan create
-//
 exports.previewPosOrder = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
 
@@ -6091,12 +6078,13 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     items,
     as_member = false,
     member_id = null,
+    memberId = null,
     selectedPromoId = null
   } = req.body || {};
   if (!Array.isArray(items) || items.length === 0)
     throwError('items wajib', 400);
 
-  // build normalized cart items (like createPosDineIn)
+  // build items (same logic as create)
   const orderItems = [];
   let totalQty = 0;
   let itemsSubtotal = 0;
@@ -6109,7 +6097,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     const qty = clamp(asInt(it.quantity, 1), 1, 999);
     const normAddons = normalizeAddons(it.addons);
     const addonsTotal = normAddons.reduce(
-      (s, a) => s + (a.price || 0) * (a.qty || 1),
+      (s, a) => s + Number(a.price || 0) * Number(a.qty || 1),
       0
     );
     const unit = priceFinal(menu.price);
@@ -6117,6 +6105,13 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
 
     orderItems.push({
       menu: String(menu._id),
+      menu_snapshot: {
+        id: String(menu._id),
+        menu_code: menu.menu_code || '',
+        name: menu.name || '',
+        imageUrl: menu.imageUrl || '',
+        price: Number(menu.price || 0)
+      },
       menu_code: menu.menu_code || '',
       name: menu.name,
       imageUrl: menu.imageUrl || '',
@@ -6135,7 +6130,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     itemsSubtotal += line_subtotal;
   }
 
-  // cart for engine (per-unit include addons)
+  // cart for engine: per-unit include addons per unit
   const cartForEngine = {
     items: orderItems.map((it) => {
       const addonsPerUnit = Array.isArray(it.addons)
@@ -6157,37 +6152,50 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     })
   };
 
-  // member resolve (kasir can pass member_id)
-  let member = null;
-  if (as_member && member_id) {
-    member = await Member.findById(member_id).lean();
-    if (!member) throwError('Member tidak ditemukan', 400);
+  // resolve memberDoc if provided (req.member > member_id)
+  let MemberDoc = null;
+  if (req.member && req.member.id) {
+    MemberDoc = await Member.findById(req.member.id)
+      .lean()
+      .catch(() => null);
+  } else {
+    const mid = member_id || memberId;
+    if (mid)
+      MemberDoc = await Member.findById(mid)
+        .lean()
+        .catch(() => null);
   }
 
   const now = new Date();
-  const eligible = await findApplicablePromos(cartForEngine, member, now);
+  let eligible = [];
+  try {
+    eligible = await findApplicablePromos(cartForEngine, MemberDoc, now);
+  } catch (e) {
+    eligible = [];
+  }
 
-  // auto apply
+  // choose autoApply (only those with autoApply true)
   let appliedPromoSnapshot = null;
-  const autoPromo = chooseAutoPromo(eligible);
-  if (autoPromo) {
-    try {
-      const { impact, actions } = await applyPromo(autoPromo, cartForEngine);
+  try {
+    const autos = (eligible || []).filter((p) => !!p.autoApply);
+    if (autos.length) {
+      autos.sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0));
+      const chosen = autos[0];
+      const { impact, actions } = await applyPromo(chosen, cartForEngine);
       appliedPromoSnapshot = {
-        promoId: String(autoPromo._id),
-        name: autoPromo.name || null,
-        type: autoPromo.type || null,
-        description: autoPromo.description || null,
+        promoId: String(chosen._id),
+        name: chosen.name || null,
+        type: chosen.type || null,
+        description: chosen.description || null,
         impact,
         actions: actions || []
       };
-    } catch (e) {
-      console.warn('[previewPosOrder] auto promo apply fail', e?.message);
-      appliedPromoSnapshot = null;
     }
+  } catch (e) {
+    appliedPromoSnapshot = null;
   }
 
-  // branch: selectedPromoId preview
+  // if client requested preview for a specific promo -> use that
   if (selectedPromoId) {
     const chosen = eligible.find(
       (p) => String(p._id) === String(selectedPromoId)
@@ -6199,8 +6207,9 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       });
 
     const { impact, actions } = await applyPromo(chosen, cartForEngine);
-    const itemsDiscount =
-      Number(impact.itemsDiscount || 0) + Number(impact.cartDiscount || 0);
+    const itemsDiscount = Number(
+      impact.itemsDiscount || impact.cartDiscount || 0
+    );
     const items_subtotal_after_discount = Math.max(
       0,
       itemsSubtotal - itemsDiscount
@@ -6216,26 +6225,24 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     const grandTotal = int(roundRupiahCustom(beforeRound));
     const roundingDelta = int(grandTotal - beforeRound);
 
-    // enrich promoCompact
     const promoCompact = await buildPromoCompactFromApplied({
       applied: {
         promoId: String(chosen._id),
-        name: chosen.name || null,
-        type: chosen.type || null,
-        description: chosen.description || null,
+        name: chosen.name,
+        type: chosen.type,
+        description: chosen.description,
         impact,
         actions
       }
     });
-
-    // enrich added free items for preview list
-    const enrichedAdded = (
-      await enrichFreeItemsForImpact(impact.addedFreeItems || [])
-    ).map((f) => ({
+    const enrichedAdded = await enrichFreeItemsForImpact(
+      impact.addedFreeItems || []
+    );
+    const addedPreviewItems = enrichedAdded.map((f) => ({
       menu: f.menuId,
       menu_code: null,
-      name: f.name,
-      imageUrl: f.imageUrl,
+      name: f.name || 'Free item',
+      imageUrl: f.imageUrl || null,
       base_price: 0,
       quantity: f.qty,
       addons: [],
@@ -6247,10 +6254,10 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     return res.json({
       success: true,
       preview: {
-        items: orderItems.concat(enrichedAdded),
+        items: orderItems.concat(addedPreviewItems),
         total_quantity:
           totalQty +
-          enrichedAdded.reduce((s, it) => s + Number(it.quantity || 0), 0),
+          addedPreviewItems.reduce((s, it) => s + Number(it.quantity || 0), 0),
         items_subtotal: itemsSubtotal,
         items_discount: itemsDiscount,
         items_subtotal_after_discount,
@@ -6259,11 +6266,9 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
         tax_amount: taxAmount,
         grand_total: grandTotal,
         rounding_delta: roundingDelta,
-        addedFreeItems: await enrichFreeItemsForImpact(
-          impact.addedFreeItems || []
-        )
+        addedFreeItems: enrichedAdded
       },
-      eligiblePromos: eligible.map((p) => ({
+      eligiblePromos: (eligible || []).map((p) => ({
         id: String(p._id),
         name: p.name,
         type: p.type,
@@ -6272,12 +6277,12 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
         priority: Number(p.priority || 0)
       })),
       promo: promoCompact,
-      eligiblePromosCount: eligible.length,
+      eligiblePromosCount: (eligible || []).length,
       can_use_points: false
     });
   }
 
-  // branch: auto-applied preview
+  // if auto-applied exists -> build preview with its impact
   if (appliedPromoSnapshot && appliedPromoSnapshot.impact) {
     const impact = appliedPromoSnapshot.impact;
     const itemsDiscount = Number(
@@ -6296,8 +6301,8 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       itemsPreviewWithFree.push({
         menu: f.menuId,
         menu_code: null,
-        name: f.name,
-        imageUrl: f.imageUrl,
+        name: f.name || 'Free item',
+        imageUrl: f.imageUrl || null,
         base_price: 0,
         quantity: f.qty,
         addons: [],
@@ -6337,7 +6342,7 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
         rounding_delta: roundingDelta,
         addedFreeItems: enrichedAdded
       },
-      eligiblePromos: eligible.map((p) => ({
+      eligiblePromos: (eligible || []).map((p) => ({
         id: String(p._id),
         name: p.name,
         type: p.type,
@@ -6345,20 +6350,20 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
         autoApply: !!p.autoApply,
         priority: Number(p.priority || 0)
       })),
-      eligiblePromosCount: eligible.length,
       promo: promoCompact,
+      eligiblePromosCount: (eligible || []).length,
       can_use_points: false
     });
   }
 
-  // branch: no promo
-  const sfRate2 = Number(SERVICE_FEE_RATE || 0);
-  const serviceFee2 = int(Math.round(itemsSubtotal * sfRate2));
-  const rate2 = parsePpnRate();
-  const taxAmount2 = int(Math.round(itemsSubtotal * rate2));
-  const beforeRound2 = int(itemsSubtotal + serviceFee2 + taxAmount2);
-  const grandTotal2 = int(roundRupiahCustom(beforeRound2));
-  const roundingDelta2 = int(grandTotal2 - beforeRound2);
+  // no promo
+  const sfRate = Number(SERVICE_FEE_RATE || 0);
+  const serviceFee = int(Math.round(itemsSubtotal * sfRate));
+  const rate = parsePpnRate();
+  const taxAmount = int(Math.round(itemsSubtotal * rate));
+  const beforeRound = int(itemsSubtotal + serviceFee + taxAmount);
+  const grandTotal = int(roundRupiahCustom(beforeRound));
+  const roundingDelta = int(grandTotal - beforeRound);
 
   return res.json({
     success: true,
@@ -6368,27 +6373,21 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       items_subtotal: itemsSubtotal,
       items_discount: 0,
       items_subtotal_after_discount: itemsSubtotal,
-      service_fee: serviceFee2,
-      tax_rate_percent: Math.round(rate2 * 100 * 100) / 100,
-      tax_amount: taxAmount2,
-      grand_total: grandTotal2,
-      rounding_delta: roundingDelta2
+      service_fee: serviceFee,
+      tax_rate_percent: Math.round(rate * 100 * 100) / 100,
+      tax_amount: taxAmount,
+      grand_total: grandTotal,
+      rounding_delta: roundingDelta
     },
-    eligiblePromos: eligible.map((p) => ({
+    eligiblePromos: (eligible || []).map((p) => ({
       id: String(p._id),
       name: p.name,
       type: p.type,
       blocksVoucher: !!p.blocksVoucher,
       autoApply: !!p.autoApply,
-      priority: Number(p.priority || 0),
-      rewardSummary:
-        Array.isArray(p.rewards) && p.rewards.length
-          ? p.rewards
-          : p.reward
-          ? [p.reward]
-          : []
+      priority: Number(p.priority || 0)
     })),
-    eligiblePromosCount: eligible.length,
+    eligiblePromosCount: (eligible || []).length,
     promo: null,
     can_use_points: false
   });
