@@ -6393,334 +6393,334 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
   });
 });
 
-exports.previewPosOrder = asyncHandler(async (req, res) => {
-  if (!req.user) throwError('Unauthorized', 401);
+// exports.previewPosOrder = asyncHandler(async (req, res) => {
+//   if (!req.user) throwError('Unauthorized', 401);
 
-  const {
-    items,
-    as_member = false,
-    member_id = null,
-    selectedPromoId = null
-  } = req.body || {};
-  if (!Array.isArray(items) || items.length === 0)
-    throwError('items wajib', 400);
+//   const {
+//     items,
+//     as_member = false,
+//     member_id = null,
+//     selectedPromoId = null
+//   } = req.body || {};
+//   if (!Array.isArray(items) || items.length === 0)
+//     throwError('items wajib', 400);
 
-  // build normalized cart items (like createPosDineIn)
-  const orderItems = [];
-  let totalQty = 0;
-  let itemsSubtotal = 0;
-  for (const it of items) {
-    const menu = await Menu.findById(it.menu_id).lean();
-    if (!menu || !menu.isActive)
-      throwError('Menu tidak ditemukan / tidak aktif', 404);
+//   // build normalized cart items (like createPosDineIn)
+//   const orderItems = [];
+//   let totalQty = 0;
+//   let itemsSubtotal = 0;
+//   for (const it of items) {
+//     const menu = await Menu.findById(it.menu_id).lean();
+//     if (!menu || !menu.isActive)
+//       throwError('Menu tidak ditemukan / tidak aktif', 404);
 
-    const qty = clamp(asInt(it.quantity, 1), 1, 999);
-    const normAddons = normalizeAddons(it.addons);
-    const addonsTotal = normAddons.reduce(
-      (s, a) => s + (a.price || 0) * (a.qty || 1),
-      0
-    );
-    const unit = priceFinal(menu.price);
-    // line_subtotal already includes addons: (unit + addonsTotal) * qty
-    const line_subtotal = (unit + addonsTotal) * qty;
+//     const qty = clamp(asInt(it.quantity, 1), 1, 999);
+//     const normAddons = normalizeAddons(it.addons);
+//     const addonsTotal = normAddons.reduce(
+//       (s, a) => s + (a.price || 0) * (a.qty || 1),
+//       0
+//     );
+//     const unit = priceFinal(menu.price);
+//     // line_subtotal already includes addons: (unit + addonsTotal) * qty
+//     const line_subtotal = (unit + addonsTotal) * qty;
 
-    orderItems.push({
-      menu: menu._id,
-      menu_code: menu.menu_code || '',
-      name: menu.name,
-      base_price: unit,
-      quantity: qty,
-      addons: normAddons,
-      notes: String(it.notes || '').trim(),
-      line_subtotal,
-      category: {
-        big: menu.bigCategory || null,
-        subId: menu.subcategory || null
-      }
-    });
+//     orderItems.push({
+//       menu: menu._id,
+//       menu_code: menu.menu_code || '',
+//       name: menu.name,
+//       base_price: unit,
+//       quantity: qty,
+//       addons: normAddons,
+//       notes: String(it.notes || '').trim(),
+//       line_subtotal,
+//       category: {
+//         big: menu.bigCategory || null,
+//         subId: menu.subcategory || null
+//       }
+//     });
 
-    totalQty += qty;
-    itemsSubtotal += line_subtotal;
-  }
+//     totalQty += qty;
+//     itemsSubtotal += line_subtotal;
+//   }
 
-  const cartForEngine = {
-    items: orderItems.map((it) => {
-      const addonsPerUnit = Array.isArray(it.addons)
-        ? it.addons.reduce(
-            (s, a) =>
-              s +
-              Number(a.price || 0) *
-                (Number(a.qty || 1) / Number(it.quantity || 1)),
-            0
-          )
-        : 0;
+//   const cartForEngine = {
+//     items: orderItems.map((it) => {
+//       const addonsPerUnit = Array.isArray(it.addons)
+//         ? it.addons.reduce(
+//             (s, a) =>
+//               s +
+//               Number(a.price || 0) *
+//                 (Number(a.qty || 1) / Number(it.quantity || 1)),
+//             0
+//           )
+//         : 0;
 
-      const unitPrice = Math.round(Number(it.base_price || 0) + addonsPerUnit);
+//       const unitPrice = Math.round(Number(it.base_price || 0) + addonsPerUnit);
 
-      return {
-        menuId: it.menu,
-        qty: Number(it.quantity || 0),
-        price: unitPrice,
-        category: it.category?.subId || it.category?.big || null
-      };
-    })
-  };
+//       return {
+//         menuId: it.menu,
+//         qty: Number(it.quantity || 0),
+//         price: unitPrice,
+//         category: it.category?.subId || it.category?.big || null
+//       };
+//     })
+//   };
 
-  // determine member (optional) — gunakan member_id dari body bila disediakan (kasir)
-  let member = null;
-  if (as_member && member_id) {
-    member = await Member.findById(member_id).lean();
-    if (!member) throwError('Member tidak ditemukan', 400);
-  }
+//   // determine member (optional) — gunakan member_id dari body bila disediakan (kasir)
+//   let member = null;
+//   if (as_member && member_id) {
+//     member = await Member.findById(member_id).lean();
+//     if (!member) throwError('Member tidak ditemukan', 400);
+//   }
 
-  const now = new Date();
-  const eligible = await findApplicablePromos(cartForEngine, member, now);
-  console.log('[previewPosOrder] eligible promos count:', eligible.length);
+//   const now = new Date();
+//   const eligible = await findApplicablePromos(cartForEngine, member, now);
+//   console.log('[previewPosOrder] eligible promos count:', eligible.length);
 
-  // pilih auto-applied promo (jika ada)
-  let appliedPromoSnapshot = null;
-  const autoPromo = chooseAutoPromo(eligible);
-  if (autoPromo) {
-    try {
-      const { impact, actions } = await applyPromo(autoPromo, cartForEngine);
-      appliedPromoSnapshot = {
-        promoId: String(autoPromo._id),
-        name: autoPromo.name || null,
-        type: autoPromo.type || null,
-        description: autoPromo.description || null,
-        impact,
-        actions: actions || []
-      };
-    } catch (e) {
-      console.warn('[previewPosOrder] auto promo apply fail', e?.message);
-      appliedPromoSnapshot = null;
-    }
-  }
+//   // pilih auto-applied promo (jika ada)
+//   let appliedPromoSnapshot = null;
+//   const autoPromo = chooseAutoPromo(eligible);
+//   if (autoPromo) {
+//     try {
+//       const { impact, actions } = await applyPromo(autoPromo, cartForEngine);
+//       appliedPromoSnapshot = {
+//         promoId: String(autoPromo._id),
+//         name: autoPromo.name || null,
+//         type: autoPromo.type || null,
+//         description: autoPromo.description || null,
+//         impact,
+//         actions: actions || []
+//       };
+//     } catch (e) {
+//       console.warn('[previewPosOrder] auto promo apply fail', e?.message);
+//       appliedPromoSnapshot = null;
+//     }
+//   }
 
-  // jika FE request preview apply a particular promo => compute that preview (sama seperti sebelumnya)
-  if (selectedPromoId) {
-    const chosen = eligible.find(
-      (p) => String(p._id) === String(selectedPromoId)
-    );
-    if (!chosen) {
-      return res.status(400).json({
-        success: false,
-        message: 'Promo tidak berlaku untuk cart ini'
-      });
-    }
-    const { impact, actions } = await applyPromo(chosen, cartForEngine);
-    const itemsDiscount =
-      Number(impact.itemsDiscount || 0) + Number(impact.cartDiscount || 0);
-    const items_subtotal_after_discount = Math.max(
-      0,
-      itemsSubtotal - itemsDiscount
-    );
+//   // jika FE request preview apply a particular promo => compute that preview (sama seperti sebelumnya)
+//   if (selectedPromoId) {
+//     const chosen = eligible.find(
+//       (p) => String(p._id) === String(selectedPromoId)
+//     );
+//     if (!chosen) {
+//       return res.status(400).json({
+//         success: false,
+//         message: 'Promo tidak berlaku untuk cart ini'
+//       });
+//     }
+//     const { impact, actions } = await applyPromo(chosen, cartForEngine);
+//     const itemsDiscount =
+//       Number(impact.itemsDiscount || 0) + Number(impact.cartDiscount || 0);
+//     const items_subtotal_after_discount = Math.max(
+//       0,
+//       itemsSubtotal - itemsDiscount
+//     );
 
-    // build preview totals using itemsSubtotal (yang sudah termasuk addons)
-    const sfRate = Number(SERVICE_FEE_RATE || 0);
-    const serviceFee = int(Math.round(items_subtotal_after_discount * sfRate));
-    const rate = parsePpnRate();
-    const taxAmount = int(Math.round(items_subtotal_after_discount * rate));
-    const beforeRound = int(
-      items_subtotal_after_discount + serviceFee + taxAmount
-    );
-    const grandTotal = int(roundRupiahCustom(beforeRound));
-    const roundingDelta = int(grandTotal - beforeRound);
+//     // build preview totals using itemsSubtotal (yang sudah termasuk addons)
+//     const sfRate = Number(SERVICE_FEE_RATE || 0);
+//     const serviceFee = int(Math.round(items_subtotal_after_discount * sfRate));
+//     const rate = parsePpnRate();
+//     const taxAmount = int(Math.round(items_subtotal_after_discount * rate));
+//     const beforeRound = int(
+//       items_subtotal_after_discount + serviceFee + taxAmount
+//     );
+//     const grandTotal = int(roundRupiahCustom(beforeRound));
+//     const roundingDelta = int(grandTotal - beforeRound);
 
-    // build standardized promo object
-    const promoCompact = await buildPromoCompactFromApplied({
-      applied: {
-        promoId: String(chosen._id),
-        name: chosen.name,
-        type: chosen.type,
-        description: chosen.description,
-        impact,
-        actions
-      }
-    });
+//     // build standardized promo object
+//     const promoCompact = await buildPromoCompactFromApplied({
+//       applied: {
+//         promoId: String(chosen._id),
+//         name: chosen.name,
+//         type: chosen.type,
+//         description: chosen.description,
+//         impact,
+//         actions
+//       }
+//     });
 
-    return res.json({
-      success: true,
-      preview: {
-        items: orderItems,
-        total_quantity: totalQty,
-        items_subtotal: itemsSubtotal,
-        items_discount: itemsDiscount,
-        items_subtotal_after_discount,
-        service_fee: serviceFee,
-        tax_rate_percent: Math.round(rate * 100 * 100) / 100,
-        tax_amount: taxAmount,
-        grand_total: grandTotal,
-        rounding_delta: roundingDelta
-      },
-      eligiblePromos: eligible.map((p) => ({
-        id: String(p._id),
-        name: p.name,
-        type: p.type,
-        blocksVoucher: !!p.blocksVoucher,
-        autoApply: !!p.autoApply,
-        priority: Number(p.priority || 0)
-      })),
-      promo: promoCompact,
-      eligiblePromosCount: eligible.length,
-      // POS specific: kasir tidak boleh pakai poin
-      can_use_points: false
-    });
-  }
+//     return res.json({
+//       success: true,
+//       preview: {
+//         items: orderItems,
+//         total_quantity: totalQty,
+//         items_subtotal: itemsSubtotal,
+//         items_discount: itemsDiscount,
+//         items_subtotal_after_discount,
+//         service_fee: serviceFee,
+//         tax_rate_percent: Math.round(rate * 100 * 100) / 100,
+//         tax_amount: taxAmount,
+//         grand_total: grandTotal,
+//         rounding_delta: roundingDelta
+//       },
+//       eligiblePromos: eligible.map((p) => ({
+//         id: String(p._id),
+//         name: p.name,
+//         type: p.type,
+//         blocksVoucher: !!p.blocksVoucher,
+//         autoApply: !!p.autoApply,
+//         priority: Number(p.priority || 0)
+//       })),
+//       promo: promoCompact,
+//       eligiblePromosCount: eligible.length,
+//       // POS specific: kasir tidak boleh pakai poin
+//       can_use_points: false
+//     });
+//   }
 
-  // jika auto-applied ada: gunakan impact nya untuk menghitung preview (diskon dari itemsSubtotal)
-  if (appliedPromoSnapshot && appliedPromoSnapshot.impact) {
-    const impact = appliedPromoSnapshot.impact;
-    const itemsDiscount = Number(
-      impact.itemsDiscount || impact.cartDiscount || 0
-    );
-    const items_subtotal_after_discount = Math.max(
-      0,
-      itemsSubtotal - itemsDiscount
-    );
+//   // jika auto-applied ada: gunakan impact nya untuk menghitung preview (diskon dari itemsSubtotal)
+//   if (appliedPromoSnapshot && appliedPromoSnapshot.impact) {
+//     const impact = appliedPromoSnapshot.impact;
+//     const itemsDiscount = Number(
+//       impact.itemsDiscount || impact.cartDiscount || 0
+//     );
+//     const items_subtotal_after_discount = Math.max(
+//       0,
+//       itemsSubtotal - itemsDiscount
+//     );
 
-    // tambahkan free items ke preview list tanpa side-effect
-    // --- resolve free items (batch) ---
-    const addedFreeItems = Array.isArray(impact.addedFreeItems)
-      ? impact.addedFreeItems.slice()
-      : [];
+//     // tambahkan free items ke preview list tanpa side-effect
+//     // --- resolve free items (batch) ---
+//     const addedFreeItems = Array.isArray(impact.addedFreeItems)
+//       ? impact.addedFreeItems.slice()
+//       : [];
 
-    let freeMenuMap = {};
-    if (addedFreeItems.length) {
-      const freeMenuIds = addedFreeItems
-        .map((f) => (f.menuId ? String(f.menuId) : null))
-        .filter(Boolean);
+//     let freeMenuMap = {};
+//     if (addedFreeItems.length) {
+//       const freeMenuIds = addedFreeItems
+//         .map((f) => (f.menuId ? String(f.menuId) : null))
+//         .filter(Boolean);
 
-      if (freeMenuIds.length) {
-        const freeMenus = await Menu.find({ _id: { $in: freeMenuIds } })
-          .select('name imageUrl menu_code price bigCategory subcategory')
-          .lean()
-          .catch(() => []);
-        freeMenuMap = Object.fromEntries(
-          freeMenus.map((m) => [String(m._id), m])
-        );
-      }
-    }
+//       if (freeMenuIds.length) {
+//         const freeMenus = await Menu.find({ _id: { $in: freeMenuIds } })
+//           .select('name imageUrl menu_code price bigCategory subcategory')
+//           .lean()
+//           .catch(() => []);
+//         freeMenuMap = Object.fromEntries(
+//           freeMenus.map((m) => [String(m._id), m])
+//         );
+//       }
+//     }
 
-    // build preview items with enriched free items
-    const itemsPreviewWithFree = orderItems.slice();
-    if (addedFreeItems.length) {
-      for (const f of addedFreeItems) {
-        const menuIdStr = f.menuId ? String(f.menuId) : null;
-        const menuData = menuIdStr ? freeMenuMap[menuIdStr] : null;
+//     // build preview items with enriched free items
+//     const itemsPreviewWithFree = orderItems.slice();
+//     if (addedFreeItems.length) {
+//       for (const f of addedFreeItems) {
+//         const menuIdStr = f.menuId ? String(f.menuId) : null;
+//         const menuData = menuIdStr ? freeMenuMap[menuIdStr] : null;
 
-        const resolvedName = f.name || menuData?.name || 'Free item';
-        const resolvedImage = f.imageUrl || menuData?.imageUrl || null;
-        const resolvedMenuCode = menuData?.menu_code || f.menu_code || null;
+//         const resolvedName = f.name || menuData?.name || 'Free item';
+//         const resolvedImage = f.imageUrl || menuData?.imageUrl || null;
+//         const resolvedMenuCode = menuData?.menu_code || f.menu_code || null;
 
-        itemsPreviewWithFree.push({
-          menu: menuData ? String(menuData._id) : menuIdStr || null,
-          menu_code: resolvedMenuCode,
-          name: resolvedName,
-          imageUrl: resolvedImage,
-          base_price: 0,
-          quantity: Number(f.qty || 1),
-          addons: [],
-          notes: 'Free item (promo)',
-          line_subtotal: 0,
-          category: {
-            big: menuData?.bigCategory || f.category || null,
-            subId: menuData?.subcategory || null
-          }
-        });
-      }
-    }
+//         itemsPreviewWithFree.push({
+//           menu: menuData ? String(menuData._id) : menuIdStr || null,
+//           menu_code: resolvedMenuCode,
+//           name: resolvedName,
+//           imageUrl: resolvedImage,
+//           base_price: 0,
+//           quantity: Number(f.qty || 1),
+//           addons: [],
+//           notes: 'Free item (promo)',
+//           line_subtotal: 0,
+//           category: {
+//             big: menuData?.bigCategory || f.category || null,
+//             subId: menuData?.subcategory || null
+//           }
+//         });
+//       }
+//     }
 
-    const sfRate = Number(SERVICE_FEE_RATE || 0);
-    const serviceFee = int(Math.round(items_subtotal_after_discount * sfRate));
-    const rate = parsePpnRate();
-    const taxAmount = int(Math.round(items_subtotal_after_discount * rate));
-    const beforeRound = int(
-      items_subtotal_after_discount + serviceFee + taxAmount
-    );
-    const grandTotal = int(roundRupiahCustom(beforeRound));
-    const roundingDelta = int(grandTotal - beforeRound);
+//     const sfRate = Number(SERVICE_FEE_RATE || 0);
+//     const serviceFee = int(Math.round(items_subtotal_after_discount * sfRate));
+//     const rate = parsePpnRate();
+//     const taxAmount = int(Math.round(items_subtotal_after_discount * rate));
+//     const beforeRound = int(
+//       items_subtotal_after_discount + serviceFee + taxAmount
+//     );
+//     const grandTotal = int(roundRupiahCustom(beforeRound));
+//     const roundingDelta = int(grandTotal - beforeRound);
 
-    // build standardized promo object
-    const promoCompact = await buildPromoCompactFromApplied({
-      applied: appliedPromoSnapshot
-    });
+//     // build standardized promo object
+//     const promoCompact = await buildPromoCompactFromApplied({
+//       applied: appliedPromoSnapshot
+//     });
 
-    return res.json({
-      success: true,
-      preview: {
-        items: itemsPreviewWithFree,
-        total_quantity:
-          totalQty + addedFreeItems.reduce((s, f) => s + Number(f.qty || 0), 0),
-        items_subtotal: itemsSubtotal,
-        items_discount: itemsDiscount,
-        items_subtotal_after_discount,
-        service_fee: serviceFee,
-        tax_rate_percent: Math.round(rate * 100 * 100) / 100,
-        tax_amount: taxAmount,
-        grand_total: grandTotal,
-        rounding_delta: roundingDelta,
-        addedFreeItems
-      },
-      eligiblePromos: eligible.map((p) => ({
-        id: String(p._id),
-        name: p.name,
-        type: p.type,
-        blocksVoucher: !!p.blocksVoucher,
-        autoApply: !!p.autoApply,
-        priority: Number(p.priority || 0)
-      })),
-      eligiblePromosCount: eligible.length,
-      // PROMO object standardized for FE (single source of truth)
-      promo: promoCompact,
-      // remove redundant autoAppliedPromo from response (FE cukup memeriksa promo)
-      // POS specific: kasir tidak boleh pakai poin
-      can_use_points: false
-    });
-  }
+//     return res.json({
+//       success: true,
+//       preview: {
+//         items: itemsPreviewWithFree,
+//         total_quantity:
+//           totalQty + addedFreeItems.reduce((s, f) => s + Number(f.qty || 0), 0),
+//         items_subtotal: itemsSubtotal,
+//         items_discount: itemsDiscount,
+//         items_subtotal_after_discount,
+//         service_fee: serviceFee,
+//         tax_rate_percent: Math.round(rate * 100 * 100) / 100,
+//         tax_amount: taxAmount,
+//         grand_total: grandTotal,
+//         rounding_delta: roundingDelta,
+//         addedFreeItems
+//       },
+//       eligiblePromos: eligible.map((p) => ({
+//         id: String(p._id),
+//         name: p.name,
+//         type: p.type,
+//         blocksVoucher: !!p.blocksVoucher,
+//         autoApply: !!p.autoApply,
+//         priority: Number(p.priority || 0)
+//       })),
+//       eligiblePromosCount: eligible.length,
+//       // PROMO object standardized for FE (single source of truth)
+//       promo: promoCompact,
+//       // remove redundant autoAppliedPromo from response (FE cukup memeriksa promo)
+//       // POS specific: kasir tidak boleh pakai poin
+//       can_use_points: false
+//     });
+//   }
 
-  // no promo applied: standard preview
-  const sfRate = Number(SERVICE_FEE_RATE || 0);
-  const serviceFee = int(Math.round(itemsSubtotal * sfRate));
-  const rate = parsePpnRate();
-  const taxAmount = int(Math.round(itemsSubtotal * rate));
-  const beforeRound = int(itemsSubtotal + serviceFee + taxAmount);
-  const grandTotal = int(roundRupiahCustom(beforeRound));
-  const roundingDelta = int(grandTotal - beforeRound);
+//   // no promo applied: standard preview
+//   const sfRate = Number(SERVICE_FEE_RATE || 0);
+//   const serviceFee = int(Math.round(itemsSubtotal * sfRate));
+//   const rate = parsePpnRate();
+//   const taxAmount = int(Math.round(itemsSubtotal * rate));
+//   const beforeRound = int(itemsSubtotal + serviceFee + taxAmount);
+//   const grandTotal = int(roundRupiahCustom(beforeRound));
+//   const roundingDelta = int(grandTotal - beforeRound);
 
-  return res.json({
-    success: true,
-    preview: {
-      items: orderItems,
-      total_quantity: totalQty,
-      items_subtotal: itemsSubtotal,
-      items_discount: 0,
-      items_subtotal_after_discount: itemsSubtotal,
-      service_fee: serviceFee,
-      tax_rate_percent: Math.round(rate * 100 * 100) / 100,
-      tax_amount: taxAmount,
-      grand_total: grandTotal,
-      rounding_delta: roundingDelta
-    },
-    eligiblePromos: eligible.map((p) => ({
-      id: String(p._id),
-      name: p.name,
-      type: p.type,
-      blocksVoucher: !!p.blocksVoucher,
-      autoApply: !!p.autoApply,
-      priority: Number(p.priority || 0),
-      rewardSummary:
-        Array.isArray(p.rewards) && p.rewards.length
-          ? p.rewards
-          : p.reward
-          ? [p.reward]
-          : []
-    })),
-    eligiblePromosCount: eligible.length,
-    promo: null,
-    can_use_points: false
-  });
-});
+//   return res.json({
+//     success: true,
+//     preview: {
+//       items: orderItems,
+//       total_quantity: totalQty,
+//       items_subtotal: itemsSubtotal,
+//       items_discount: 0,
+//       items_subtotal_after_discount: itemsSubtotal,
+//       service_fee: serviceFee,
+//       tax_rate_percent: Math.round(rate * 100 * 100) / 100,
+//       tax_amount: taxAmount,
+//       grand_total: grandTotal,
+//       rounding_delta: roundingDelta
+//     },
+//     eligiblePromos: eligible.map((p) => ({
+//       id: String(p._id),
+//       name: p.name,
+//       type: p.type,
+//       blocksVoucher: !!p.blocksVoucher,
+//       autoApply: !!p.autoApply,
+//       priority: Number(p.priority || 0),
+//       rewardSummary:
+//         Array.isArray(p.rewards) && p.rewards.length
+//           ? p.rewards
+//           : p.reward
+//           ? [p.reward]
+//           : []
+//     })),
+//     eligiblePromosCount: eligible.length,
+//     promo: null,
+//     can_use_points: false
+//   });
+// });
 
 exports.evaluatePos = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
