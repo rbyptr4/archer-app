@@ -4,6 +4,7 @@ const {
   findApplicablePromos
 } = require('./promoEngine');
 const { validateAndPrice } = require('./voucherEngine');
+const Member = require('../models/memberModel');
 const throwError = require('./throwError');
 
 const int = (v) => Math.round(Number(v || 0));
@@ -113,7 +114,19 @@ async function applyPromoThenVoucher({
     items_len: Array.isArray(cart.items) ? cart.items.length : 0
   });
 
-  const effectiveMember = memberDoc || (memberId ? { _id: memberId } : null);
+  // build effectiveMember: prefer memberDoc, otherwise fetch minimal member from DB if memberId provided
+  let effectiveMember = memberDoc || null;
+  if (!effectiveMember && memberId) {
+    try {
+      // ambil hanya field yang diperlukan promoEngine: _id, level, promoUsageHistory
+      effectiveMember = await Member.findById(memberId)
+        .select('_id level promoUsageHistory')
+        .lean()
+        .catch(() => null);
+    } catch (e) {
+      effectiveMember = null;
+    }
+  }
 
   const originalCart = {
     items: (Array.isArray(cart.items) ? cart.items : []).map((it) => ({

@@ -4,7 +4,8 @@ const DRIVE_FOLDERS = {
   menu: process.env.MENU,
   invoice: process.env.INVOICE,
   banner: process.env.BANNER,
-  expense: process.env.EXPENSE
+  expense: process.env.EXPENSE,
+  delivery: process.env.DELIVERY
 };
 
 function getDriveFolder(type) {

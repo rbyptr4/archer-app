@@ -202,6 +202,8 @@ router.patch(
   validateToken,
   requireRole('owner', 'courier'),
   requirePageAccess('courier'),
+  fileUploader.single('delivery_proof'),
+  parseFormData,
   order.markAssignedToDelivered
 );
 

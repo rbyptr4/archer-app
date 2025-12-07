@@ -42,6 +42,10 @@ const {
 const { buildUiTotalsFromCart } = require('../utils/cartUiCache');
 const { applyPromoThenVoucher } = require('../utils/priceEngine');
 const { getOwnerPhone } = require('../utils/ownerPhone');
+const {
+  consumePromoForOrder,
+  releasePromoForOrder
+} = require('../utils/promoConsume');
 
 const {
   findApplicablePromos,
@@ -2820,9 +2824,49 @@ exports.checkout = asyncHandler(async (req, res) => {
             { session }
           );
         }
+      }
 
-        // Optionally push history entry (if you have pointsHistory array)
-        // await Member.updateOne({ _id: memberId }, { $push: { pointsHistory: { ... } } }, { session });
+      try {
+        if (
+          payload.appliedPromo &&
+          payload.appliedPromo.promoSnapshot &&
+          payload.appliedPromo.promoSnapshot.promoId
+        ) {
+          const promoId = String(
+            payload.appliedPromo.promoSnapshot.promoId ||
+              payload.appliedPromo.promoId ||
+              ''
+          );
+          if (promoId) {
+            await consumePromoForOrder({
+              promoId,
+              memberId: payload.member || null,
+              orderId: doc._id,
+              session
+            });
+            console.log('[checkout] promo consumed for order', {
+              promoId,
+              orderId: String(doc._id)
+            });
+          }
+        } else if (payload.appliedPromo && payload.appliedPromo.promoId) {
+          const promoId = String(payload.appliedPromo.promoId);
+          await consumePromoForOrder({
+            promoId,
+            memberId: payload.member || null,
+            orderId: doc._id,
+            session
+          });
+        }
+      } catch (e) {
+        console.error(
+          '[checkout] consumePromoForOrder failed',
+          e?.message || e
+        );
+        throwError(
+          e?.message || 'Gagal mengamankan penggunaan promo',
+          e?.status || 500
+        );
       }
 
       createdOrder = doc;
@@ -3909,7 +3953,6 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
     }
   }
 
-  // --- susun itemsDetailed (mirip getDetailOrder) ---
   const itemsDetailed = (order.items || []).map((it, idx) => {
     const qty = safeNumber(it.quantity || it.qty || 0);
     const basePrice = safeNumber(
@@ -4032,7 +4075,6 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
     console.warn('[getMyOrder] local enrichment failed', e?.message || e);
   }
 
-  // --- susun full response (sama structure dengan getDetailOrder) ---
   const full = Object.assign({}, order, {
     _id: order._id ? String(order._id) : null,
     id: order._id ? String(order._id) : null,
@@ -4911,6 +4953,9 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
       raw: order.payment || null
     }
   });
+
+  full.delivery = full.delivery || {};
+  full.delivery.proof_url = order.delivery?.delivery_proof_url || null;
 
   return res.status(200).json({ success: true, order: full });
 });
@@ -6227,12 +6272,10 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
       (p) => String(p._id) === String(selectedPromoId)
     );
     if (!chosen)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: 'Promo tidak berlaku untuk cart ini'
-        });
+      return res.status(400).json({
+        success: false,
+        message: 'Promo tidak berlaku untuk cart ini'
+      });
 
     const { impact, actions } = await applyPromo(chosen, cartForEngine);
     const itemsDiscount = Number(
@@ -6428,7 +6471,6 @@ exports.previewPosOrder = asyncHandler(async (req, res) => {
     can_use_points: false
   });
 });
-
 
 exports.evaluatePos = asyncHandler(async (req, res) => {
   if (!req.user) throwError('Unauthorized', 401);
@@ -7357,7 +7399,6 @@ exports.assignBatch = asyncHandler(async (req, res) => {
 });
 
 exports.updateDeliveryStatus = asyncHandler(async (req, res) => {
-  // boleh diakses oleh staff/kasir/kurir tergantung policy; cek user dulu
   if (!req.user) throwError('Unauthorized', 401);
 
   const { status, note } = req.body || {};
@@ -7448,108 +7489,113 @@ exports.markAssignedToDelivered = asyncHandler(async (req, res) => {
   const order = await Order.findById(id);
   if (!order) throwError('Order tidak ditemukan', 404);
 
-  // hanya untuk delivery orders
-  if (order.fulfillment_type !== 'delivery') {
+  if (order.fulfillment_type !== 'delivery')
     throwError('Order ini bukan delivery', 400);
-  }
 
-  // validasi requirement: order sudah accepted & payment verified
-  if (order.status !== 'accepted') {
-    throwError(
-      'Order harus berstatus "accepted" sebelum menandai delivered',
-      409
-    );
-  }
-  if (order.payment_status !== 'verified') {
-    throwError(
-      'Order harus berstatus payment "verified" sebelum menandai delivered',
-      409
-    );
-  }
+  if (order.status !== 'accepted')
+    throwError('Order harus berstatus accepted', 409);
 
-  if (!order.delivery)
-    throwError('Order ini tidak memiliki informasi delivery', 409);
+  if (order.payment_status !== 'verified')
+    throwError('Payment harus verified', 409);
 
-  // pastikan delivery saat ini assigned
-  const currentDeliveryStatus = order.delivery.status || 'pending';
-  if (currentDeliveryStatus !== 'assigned') {
-    throwError(
-      'Hanya order dengan delivery status "assigned" yang bisa ditandai "delivered"',
-      409
-    );
-  }
+  if (!order.delivery) throwError('Order tidak memiliki info delivery', 409);
 
+  if ((order.delivery.status || 'pending') !== 'assigned')
+    throwError('Delivery status harus assigned', 409);
+
+  // validasi kurir
   if (req.user.role !== 'owner') {
-    if (
-      order.delivery.courier?.user &&
-      String(order.delivery.courier.user) !== String(req.user._id)
-    ) {
-      throwError('Tidak berhak: order ini bukan ditugaskan ke Anda', 403);
-    }
+    const assigned = order.delivery?.courier?.user;
+    if (assigned && String(assigned) !== String(req.user._id))
+      throwError('Tidak berhak: order bukan milik Anda', 403);
   }
 
-  const now = new Date();
+  // === WAJIB ADA FILE ===
+  if (!req.file) throwError('Bukti pengiriman wajib diunggah', 400);
 
-  // update delivery status & timestamps (jaga compatibility legacy fields jika ada)
+  // === Penamaan file: <transactionCode>_<YYYYMMDD>.<ext> ===
+  const trx = order.transaction_code || `ORDER_${order._id}`;
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+
+  const ext =
+    (req.file.originalname || '').split('.').pop() ||
+    req.file.mimetype?.split('/').pop() ||
+    'jpg';
+
+  const desiredName = `${trx}_${yyyy}${mm}${dd}.${ext}`;
+
+  // === Upload ke Google Drive ===
+  let fileId;
+  try {
+    const folderId = getDriveFolder('delivery');
+
+    const uploaded = await uploadBuffer(
+      req.file.buffer,
+      desiredName,
+      req.file.mimetype || 'image/jpeg',
+      folderId
+    );
+
+    fileId = uploaded?.id || uploaded?.fileId || uploaded?._id;
+    if (!fileId) throwError('Gagal upload bukti', 500);
+  } catch (err) {
+    console.error('[upload delivery proof]', err);
+    throwError('Gagal mengunggah bukti pengiriman', 500);
+  }
+
+  const proofUrl = `https://drive.google.com/uc?export=view&id=${fileId}`;
+
+  // === Set bukti + status ===
+  order.delivery.delivery_proof_url = proofUrl;
   order.delivery.status = 'delivered';
   order.delivery.timestamps = order.delivery.timestamps || {};
   order.delivery.timestamps.delivered_at = now;
-  if ('delivered_at' in (order.delivery || {})) {
-    order.delivery.delivered_at = now;
-  }
+  order.delivery.delivered_at = now; // legacy kompatibel
 
-  const updatedOrder = await order.save();
+  const saved = await order.save();
 
+  // emit ke cashier, member, dll (tetap sama)
   try {
     const payload = {
-      id: String(updatedOrder._id),
-      transaction_code: updatedOrder.transaction_code,
+      id: String(saved._id),
+      transaction_code: saved.transaction_code,
       delivery: {
-        status: updatedOrder.delivery?.status,
-        courier: updatedOrder.delivery?.courier,
-        delivered_at:
-          (updatedOrder.delivery?.timestamps &&
-            updatedOrder.delivery.timestamps.delivered_at) ||
-          updatedOrder.delivery?.delivered_at ||
-          now
+        status: saved.delivery.status,
+        delivered_at: saved.delivery.timestamps.delivered_at,
+        delivery_proof_url: proofUrl
       }
     };
 
-    if (typeof emitToCashier === 'function') {
-      emitToCashier('staff:notify', {
-        message:
-          'Kurir menandai pesanan sudah diantar. Silakan cek untuk konfirmasi.'
+    emitToCashier?.('staff:notify', {
+      message: 'Kurir mengunggah bukti pengiriman. Silakan cek dan konfirmasi.'
+    });
+
+    emitOrdersStream?.({
+      target: 'cashier',
+      action: 'update',
+      item: payload
+    });
+
+    if (saved.member)
+      emitToMember?.(String(saved.member), 'order:delivered', payload);
+
+    if (saved.guestToken)
+      emitToGuest?.(saved.guestToken, 'order:delivered', payload);
+
+    if (saved.delivery?.courier?.user)
+      emitToCourier?.(String(saved.delivery.courier.user), 'courier:notify', {
+        message: 'Pesanan ditandai delivered. Terima kasih!'
       });
-    }
-
-    if (typeof emitOrdersStream === 'function') {
-      emitOrdersStream({ target: 'cashier', action: 'update', item: payload });
-    }
-
-    // beri tahu member/guest
-    if (updatedOrder.member && typeof emitToMember === 'function') {
-      emitToMember(String(updatedOrder.member), 'order:delivered', payload);
-    }
-    if (updatedOrder.guestToken && typeof emitToGuest === 'function') {
-      emitToGuest(updatedOrder.guestToken, 'order:delivered', payload);
-    }
-
-    // beri tahu courier personal (konfirmasi)
-    const courierUserId = updatedOrder.delivery?.courier?.user;
-    if (courierUserId && typeof emitToCourier === 'function') {
-      emitToCourier(String(courierUserId), 'courier:notify', {
-        message:
-          'Status pengantaran: delivered. Silakan klik Complete pada aplikasi kasir jika perlu.'
-      });
-    }
-  } catch (e) {
-    console.error('[emit][markAssignedToDelivered]', e?.message || e);
+  } catch (err) {
+    console.error('[emit error markAssignedToDelivered]', err);
   }
 
-  // response
   return res.status(200).json({
-    message: 'Delivery berhasil ditandai delivered',
-    order: updatedOrder.toObject()
+    message: 'Pesanan ditandai delivered & bukti tersimpan',
+    order: saved.toObject()
   });
 });
 
@@ -7626,7 +7672,7 @@ exports.deliveryBoard = asyncHandler(async (req, res) => {
 });
 
 exports.listEmployeesDropdown = asyncHandler(async (req, res) => {
-  const employees = await User.find({ role: 'employee' })
+  const employees = await User.find({ role: 'courier' })
     .select('_id name email')
     .sort({ name: 1 })
     .lean();
@@ -8235,10 +8281,45 @@ exports.cancelOrder = asyncHandler(async (req, res) => {
         }
       }
 
-      // Delete order (sesuai permintaan: tidak disimpan di DB)
+      try {
+        if (
+          order.appliedPromo &&
+          (order.appliedPromo.promoId ||
+            (order.appliedPromo.promoSnapshot &&
+              order.appliedPromo.promoSnapshot.promoId))
+        ) {
+          const promoId = String(
+            order.appliedPromo.promoId ||
+              order.appliedPromo.promoSnapshot?.promoId ||
+              ''
+          );
+          if (promoId) {
+            await releasePromoForOrder({
+              promoId,
+              memberId: order.member || null,
+              orderId: order._id,
+              session // penting: ikut dalam transaction
+            });
+            console.log('[cancelOrder] promo released for order', {
+              promoId,
+              orderId: String(order._id)
+            });
+          }
+        }
+      } catch (e) {
+        console.error(
+          '[cancelOrder] releasePromoForOrder failed',
+          e?.message || e
+        );
+
+        throwError(
+          e?.message || 'Gagal me-release promo saat cancel order',
+          e?.status || 500
+        );
+      }
+
       const delRes = await Order.deleteOne({ _id: order._id }).session(session);
       if (delRes.deletedCount === 0) throwError('Gagal menghapus order', 500);
-
       deleted = { id: String(order._id), message: 'Order dihapus' };
     }); // end transaction
 

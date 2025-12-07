@@ -3,6 +3,7 @@ const asyncHandler = require('express-async-handler');
 const Promo = require('../../models/promoModel');
 const { findApplicablePromos } = require('../../utils/promoEngine');
 const Member = require('../../models/memberModel');
+const Menu = require('../../models/menuModel');
 const throwError = require('../../utils/throwError');
 
 const asInt = (v, d = 0) => {
@@ -24,13 +25,6 @@ const asDate = (v) => {
   return !isNaN(d.getTime()) ? d : null;
 };
 
-/* ---------------- normalize & cleanse ---------------- */
-/**
- * normalizeCommon(payload, { isUpdate })
- * - menormalisasi tipe dasar & fields umum
- * - menormalisasi reward: accept payload.reward (object) OR payload.rewards (array/object)
- *   -> normalize to single payload.reward object
- */
 function normalizeCommon(payload = {}, { isUpdate = false } = {}) {
   const p = JSON.parse(JSON.stringify(payload || {})); // shallow clone
 
@@ -115,11 +109,6 @@ function normalizeCommon(payload = {}, { isUpdate = false } = {}) {
   return p;
 }
 
-/**
- * cleanseIrrelevantFieldsByType(payload, type)
- * - hapus / set null field reward yang tidak relevan utk tiap tipe
- * - payload.reward adalah object tunggal
- */
 function cleanseIrrelevantFieldsByType(payload = {}, type) {
   const p = { ...(payload || {}) };
   p.reward = p.reward || {};
@@ -526,7 +515,65 @@ exports.remove = asyncHandler(async (req, res) => {
 exports.getPromo = asyncHandler(async (req, res) => {
   const p = await Promo.findById(req.params.id).lean();
   if (!p || p.isDeleted) throwError('Promo tidak ditemukan', 404);
-  res.json({ promo: p });
+
+  try {
+    // kumpulkan semua menuId yang relevan untuk di-populate
+    const menuIdSet = new Set();
+
+    // kondisi.items
+    if (Array.isArray(p.conditions?.items)) {
+      for (const it of p.conditions.items) {
+        if (it && it.menuId) menuIdSet.add(String(it.menuId));
+      }
+    }
+
+    if (p.reward && p.reward.freeMenuId)
+      menuIdSet.add(String(p.reward.freeMenuId));
+    if (p.reward && p.reward.appliesToMenuId)
+      menuIdSet.add(String(p.reward.appliesToMenuId));
+    if (p.reward && p.reward.applies_to_menu_id)
+      menuIdSet.add(String(p.reward.applies_to_menu_id));
+    if (p.reward && p.reward.menuId) menuIdSet.add(String(p.reward.menuId));
+
+    if (menuIdSet.size === 0) {
+      return res.json({ promo: p });
+    }
+
+    const menuIds = Array.from(menuIdSet);
+    const menus = await Menu.find({ _id: { $in: menuIds } })
+      .select('name code ')
+      .lean()
+      .catch(() => []);
+
+    const menuMap = menus.reduce((acc, m) => {
+      acc[String(m._id)] = m;
+      return acc;
+    }, {});
+
+    if (Array.isArray(p.conditions?.items)) {
+      p.conditions.items = p.conditions.items.map((it) => {
+        const menuId = it?.menuId || it?.menu || null;
+        const menuDoc = menuId ? menuMap[String(menuId)] || null : null;
+        return { ...it, menu: menuDoc };
+      });
+    }
+
+    if (p.reward) {
+      const freeId =
+        p.reward.freeMenuId || p.reward.free_menu_id || p.reward.menuId || null;
+      if (freeId) p.reward.freeMenu = menuMap[String(freeId)] || null;
+
+      const appliesId =
+        p.reward.appliesToMenuId || p.reward.applies_to_menu_id || null;
+      if (appliesId)
+        p.reward.appliesToMenu = menuMap[String(appliesId)] || null;
+    }
+
+    return res.json({ promo: p });
+  } catch (e) {
+    console.error('[getPromo] populate menu failed', e?.message || e);
+    return res.json({ promo: p });
+  }
 });
 
 exports.evaluate = asyncHandler(async (req, res) => {

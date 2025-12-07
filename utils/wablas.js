@@ -314,6 +314,12 @@ function buildOwnerVerifyMessage(order, verifyLink, expireHours = 6) {
   const pm = order.payment_method ? order.payment_method.toUpperCase() : '-';
   lines.push(`Metode: *${pm}*`);
 
+  if (order.payment_proof_url) {
+    lines.push('');
+    lines.push('*Bukti Pembayaran:*');
+    lines.push(order.payment_proof_url);
+  }
+
   /* ===== Mini ringkasan items ===== */
   if (Array.isArray(order.items) && order.items.length) {
     lines.push('');

@@ -67,6 +67,7 @@ const deliverySchema = new mongoose.Schema(
     distance_km: { type: Number, min: 0 },
     delivery_fee: { type: Number, min: 0, default: 0, set: int, get: int },
     note_to_rider: { type: String, trim: true, default: '' },
+    delivery_proof_url: { type: String, trim: true, default: '' },
     mode: {
       type: String,
       enum: ['delivery', 'pickup', 'none'],
