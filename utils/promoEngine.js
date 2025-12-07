@@ -26,33 +26,10 @@ async function findApplicablePromos(
 ) {
   const { items_subtotal, totalQty, items } = snapshotTotals(cart);
 
-  // debug top-level cart
-  try {
-    console.log('[promoEngine.debug] findApplicablePromos called');
-    console.log('[promoEngine.debug] cart snapshot:', {
-      items_subtotal,
-      totalQty,
-      items_sample: (items || []).slice(0, 10)
-    });
-    console.log(
-      '[promoEngine.debug] member snapshot:',
-      member
-        ? { id: String(member._id || member.id), level: member.level }
-        : null
-    );
-  } catch (e) {
-    /* ignore logging errors */
-  }
-
   // ambil semua promo aktif
   const promos = await Promo.find({ isActive: true })
     .sort({ priority: -1 })
     .lean();
-
-  console.log(
-    '[promoEngine.debug] promos fetched count:',
-    Array.isArray(promos) ? promos.length : 0
-  );
 
   const eligible = [];
   const memberId = member ? String(member._id || member.id) : null;
@@ -73,7 +50,6 @@ async function findApplicablePromos(
     if (p.conditions?.startAt && new Date(p.conditions.startAt) > now) {
       debug.reasonSkipped = 'startAt_future';
       debug.checks.startAt = { ok: false, startAt: p.conditions.startAt };
-      console.log('[promoEngine.debug][SKIP]', debug);
       continue;
     } else {
       debug.checks.startAt = {
@@ -84,7 +60,6 @@ async function findApplicablePromos(
     if (p.conditions?.endAt && new Date(p.conditions.endAt) < now) {
       debug.reasonSkipped = 'endAt_passed';
       debug.checks.endAt = { ok: false, endAt: p.conditions.endAt };
-      console.log('[promoEngine.debug][SKIP]', debug);
       continue;
     } else {
       debug.checks.endAt = { ok: true, endAt: p.conditions?.endAt || null };
@@ -94,7 +69,6 @@ async function findApplicablePromos(
     if (p.conditions?.audience === 'members' && !member) {
       debug.reasonSkipped = 'audience_members_only_but_no_member';
       debug.checks.audience = { ok: false, audience: p.conditions?.audience };
-      console.log('[promoEngine.debug][SKIP]', debug);
       continue;
     }
     debug.checks.audience = {
@@ -114,7 +88,6 @@ async function findApplicablePromos(
           required: p.conditions.memberLevels,
           memberLevel: member?.level || null
         };
-        console.log('[promoEngine.debug][SKIP]', debug);
         continue;
       }
       const allowed = new Set(
@@ -127,7 +100,6 @@ async function findApplicablePromos(
           required: p.conditions.memberLevels,
           memberLevel: member.level
         };
-        console.log('[promoEngine.debug][SKIP]', debug);
         continue;
       }
       debug.checks.memberLevels = {
@@ -154,7 +126,6 @@ async function findApplicablePromos(
         items_subtotal,
         required: Number(p.conditions.minTotal)
       };
-      console.log('[promoEngine.debug][SKIP]', debug);
       continue;
     } else {
       debug.checks.minTotal = {
@@ -175,7 +146,6 @@ async function findApplicablePromos(
         totalQty,
         required: Number(p.conditions.minQty)
       };
-      console.log('[promoEngine.debug][SKIP]', debug);
       continue;
     } else {
       debug.checks.minQty = {
@@ -231,7 +201,6 @@ async function findApplicablePromos(
       if (!ok) {
         debug.reasonSkipped = 'item_conditions_not_met';
         debug.checks.itemConditions = { ok: false, details: itemChecks };
-        console.log('[promoEngine.debug][SKIP]', debug);
         continue;
       } else {
         debug.checks.itemConditions = { ok: true, details: itemChecks };
@@ -254,7 +223,6 @@ async function findApplicablePromos(
           used,
           limit: Number(p.perMemberLimit)
         };
-        console.log('[promoEngine.debug][SKIP]', debug);
         continue;
       }
       debug.checks.perMemberLimit = {
@@ -294,7 +262,6 @@ async function findApplicablePromos(
           if (cnt >= Number(p.conditions.usageLimitPerMember)) {
             debug.reasonSkipped = 'usageLimitPerMember_exceeded';
             debug.checks.usageWindow.memberOk = false;
-            console.log('[promoEngine.debug][SKIP]', debug);
             continue;
           } else {
             debug.checks.usageWindow.memberOk = true;
@@ -305,7 +272,6 @@ async function findApplicablePromos(
             e?.message || e
           );
           debug.reasonSkipped = 'fetcher_member_failed';
-          console.log('[promoEngine.debug][SKIP]', debug);
           continue;
         }
       }
@@ -323,7 +289,6 @@ async function findApplicablePromos(
           if (gcnt >= Number(p.conditions.usageLimitGlobal)) {
             debug.reasonSkipped = 'usageLimitGlobal_exceeded';
             debug.checks.usageWindow.globalOk = false;
-            console.log('[promoEngine.debug][SKIP]', debug);
             continue;
           } else {
             debug.checks.usageWindow.globalOk = true;
@@ -334,7 +299,6 @@ async function findApplicablePromos(
             e?.message || e
           );
           debug.reasonSkipped = 'fetcher_global_failed';
-          console.log('[promoEngine.debug][SKIP]', debug);
           continue;
         }
       }
@@ -347,7 +311,6 @@ async function findApplicablePromos(
         if (stockNum <= 0) {
           debug.reasonSkipped = 'globalStock_empty';
           debug.checks.globalStock = { ok: false, stock: stockNum };
-          console.log('[promoEngine.debug][SKIP]', debug);
           continue;
         } else {
           debug.checks.globalStock = { ok: true, stock: stockNum };
@@ -362,14 +325,9 @@ async function findApplicablePromos(
     // lulus semua check -> eligible
     debug.reasonSkipped = null;
     debug.checks.eligible = true;
-    console.log('[promoEngine.debug][PASS]', debug);
     eligible.push(p);
   } // end for promos
 
-  console.log(
-    '[promoEngine.debug] findApplicablePromos finished. eligible count:',
-    eligible.length
-  );
   return eligible;
 }
 
@@ -399,24 +357,6 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
       ? promo.reward_summary
       : [];
 
-  // LOG promo header
-  try {
-    console.log(
-      '[promoEngine.applyPromo] promoId:',
-      String(promo._id),
-      'name:',
-      promo.name,
-      'type:',
-      promo.type,
-      'subtotal:',
-      subtotal,
-      'rewardsLen:',
-      rewards.length
-    );
-  } catch (e) {
-    /* ignore */
-  }
-
   // helper parse angka
   const parseNumber = (v) => {
     if (v == null) return NaN;
@@ -431,12 +371,6 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
     if (!raw || typeof raw !== 'object') continue;
 
     const r = { ...raw };
-
-    // LOG raw reward
-    console.log(
-      '[promoEngine.applyPromo] processing reward:',
-      JSON.stringify(r)
-    );
 
     // ======================================
     // 1) FREE ITEM
@@ -462,12 +396,6 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
       });
 
       impact.note += (impact.note ? '; ' : '') + `Gratis ${freeQty} item`;
-      console.log(
-        '[promoEngine.applyPromo] addedFreeItem ->',
-        freeMenuId,
-        'qty',
-        freeQty
-      );
     }
 
     // ======================================
@@ -520,12 +448,6 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
 
       impact.note +=
         (impact.note ? '; ' : '') + `Diskon ${percentVal}% (${amt})`;
-
-      console.log('[promoEngine.applyPromo] percent discount applied:', {
-        percentVal,
-        scopeSub,
-        amt
-      });
     }
 
     // flat amount
@@ -570,7 +492,6 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
       impact.cartDiscount += amt;
 
       impact.note += (impact.note ? '; ' : '') + `Potongan Rp ${amt}`;
-      console.log('[promoEngine.applyPromo] flat discount applied:', { amt });
     }
 
     // ======================================
@@ -585,7 +506,6 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
         meta: { promoId: promo._id }
       });
       impact.note += (impact.note ? '; ' : '') + `Poin +${pts}`;
-      console.log('[promoEngine.applyPromo] pointsFixed applied:', pts);
     }
 
     const ptsPercent = parseNumber(r.pointsPercent || r.points_percent);
@@ -599,16 +519,8 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
         });
         impact.note +=
           (impact.note ? '; ' : '') + `Poin ${ptsPercent}% (~${pts})`;
-        console.log('[promoEngine.applyPromo] pointsPercent applied:', {
-          ptsPercent,
-          pts
-        });
       } else {
         impact.note += (impact.note ? '; ' : '') + `Poin ${ptsPercent}% (0)`;
-        console.log(
-          '[promoEngine.applyPromo] pointsPercent zero result:',
-          ptsPercent
-        );
       }
     }
 
@@ -621,20 +533,11 @@ async function applyPromo(promo, cartSnapshot = {}, pricing = {}) {
         meta: { promoId: promo._id }
       });
       impact.note += (impact.note ? '; ' : '') + `Grant membership`;
-      console.log('[promoEngine.applyPromo] grantMembership added');
     }
   }
 
   // safety: cap diskon max subtotal
   impact.itemsDiscount = Math.max(0, Math.min(impact.itemsDiscount, subtotal));
-
-  // LOG final impact/actions
-  console.log(
-    '[promoEngine.applyPromo] final impact:',
-    JSON.stringify(impact),
-    'actions:',
-    JSON.stringify(actions)
-  );
 
   return { impact, actions };
 }
