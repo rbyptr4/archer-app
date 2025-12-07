@@ -1513,7 +1513,6 @@ exports.estimateDelivery = asyncHandler(async (req, res) => {
   });
 });
 
-/* ===================== CHECKOUT ===================== */
 exports.checkout = asyncHandler(async (req, res) => {
   const {
     name,
@@ -1521,7 +1520,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     fulfillment_type,
     payment_method,
     idempotency_key,
-    voucherClaimIds = [],
     register_decision = 'register',
     usePoints = false
   } = req.body || {};
@@ -1533,9 +1531,45 @@ exports.checkout = asyncHandler(async (req, res) => {
     null;
 
   if (guestToken === '') guestToken = null;
-  console.log('[checkout] guestToken resolved', {
-    guestToken: guestToken ? 'present' : 'none'
-  });
+
+  // --- normalize voucherClaimIds (support multiple FE shapes) ---
+  // taruh di sini: setelah guestToken resolved & sebelum log incoming body snippet
+  let voucherClaimIds = [];
+
+  // prefer explicit camelCase array
+  if (
+    Array.isArray(req.body?.voucherClaimIds) &&
+    req.body.voucherClaimIds.length
+  ) {
+    voucherClaimIds = req.body.voucherClaimIds;
+  } else if (
+    Array.isArray(req.body?.voucher?.chosenClaimIds) &&
+    req.body?.voucher?.chosenClaimIds.length
+  ) {
+    voucherClaimIds = req.body.voucher.chosenClaimIds;
+  } else if (
+    Array.isArray(req.body?.voucher?.chosen_claim_ids) &&
+    req.body?.voucher?.chosen_claim_ids.length
+  ) {
+    voucherClaimIds = req.body.voucher.chosen_claim_ids;
+  } else if (
+    Array.isArray(req.body?.voucher_claim_ids) &&
+    req.body?.voucher_claim_ids.length
+  ) {
+    voucherClaimIds = req.body.voucher_claim_ids;
+  } else if (
+    typeof req.body?.voucher_claim_id !== 'undefined' &&
+    req.body.voucher_claim_id
+  ) {
+    voucherClaimIds = [req.body.voucher_claim_id];
+  }
+
+  // coerce to string, remove falsy
+  voucherClaimIds = (Array.isArray(voucherClaimIds) ? voucherClaimIds : [])
+    .filter(Boolean)
+    .map((v) => String(v));
+
+  console.log('[checkout] NORMALIZED voucherClaimIds ->', voucherClaimIds);
 
   console.log('[checkout] incoming body snippet', {
     fulfillment_type,
@@ -1567,9 +1601,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     if (originallyLoggedIn || wantRegister) {
       const joinChannel = iden0.mode === 'self_order' ? 'self_order' : 'online';
       MemberDoc = await ensureMemberForCheckout(req, res, joinChannel);
-      console.log('[checkout] Member found/ensured', {
-        memberId: MemberDoc ? MemberDoc._id : null
-      });
     } else {
       customer_name = String(name || '').trim();
       const rawPhone = String(phone || '').trim();
@@ -1587,10 +1618,6 @@ exports.checkout = asyncHandler(async (req, res) => {
       } else {
         customer_phone = '';
       }
-      console.log('[checkout] guest customer', {
-        customer_name,
-        customer_phone
-      });
     }
   } catch (e) {
     console.error('[checkout] ensureMemberForCheckout failed', e?.message || e);
@@ -1645,10 +1672,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     console.error('[checkout] cart empty', { cartId: cart._id });
     throwError('Cart kosong', 400);
   }
-  console.log('[checkout] cart loaded', {
-    cartId: cart._id,
-    items: cart.items.length
-  });
 
   // --- delivery / slot / pickup handling ---
   const delivery_mode =
@@ -1773,9 +1796,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   try {
     recomputeTotals(cart);
     await cart.save();
-    console.log('[checkout] cart recompute & saved', { cartId: cart._id });
   } catch (err) {
-    console.error('[checkout] gagal simpan cart', err?.message || err);
     throwError(
       err?.message
         ? `Gagal menyimpan cart: ${String(err.message)}`
@@ -1973,16 +1994,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     console.warn('[checkout] findApplicablePromos failed', e?.message || e);
     eligiblePromosList = [];
   }
-  console.log('[checkout] eligiblePromosList count & ids:', {
-    count: eligiblePromosList.length,
-    promos: (eligiblePromosList || []).map((p) => ({
-      id: String(p._id),
-      name: p.name,
-      type: p.type,
-      autoApply: p.autoApply,
-      priority: p.priority
-    }))
-  });
 
   let autoAppliedPromo = null;
   try {
@@ -2007,17 +2018,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     console.warn('[checkout] autoApply preview failed', e?.message || e);
     autoAppliedPromo = null;
   }
-  console.log(
-    '[checkout] autoAppliedPromo preview:',
-    autoAppliedPromo
-      ? {
-          promoId: autoAppliedPromo.promoId,
-          name: autoAppliedPromo.name
-        }
-      : null
-  );
 
-  // Prioritas: FE selectedPromoId > autoAppliedPromo > null
   const selectedForEngine = req.body?.selectedPromoId
     ? req.body?.selectedPromoId
     : autoAppliedPromo
@@ -2030,18 +2031,20 @@ exports.checkout = asyncHandler(async (req, res) => {
     ? false
     : true;
 
-  console.log('[checkout] selectedForEngine, autoApplyForEngine', {
-    selectedForEngine,
-    autoApplyForEngine
-  });
+  const engineDeliveryFee = Number(
+    deliveryObj.delivery_fee_raw ??
+      deliveryObj.delivery_fee ??
+      Number(process.env.DELIVERY_FLAT_FEE || 0)
+  );
 
-  // panggil engine dengan param sinkron
+  console.log('[checkout] engineDeliveryFee ->', engineDeliveryFee);
+
   priced = await applyPromoThenVoucher({
     memberId: MemberDoc ? MemberDoc._id : null,
     memberDoc: MemberDoc || null,
     cart: normalizedForEngine,
     fulfillmentType: ft,
-    deliveryFee: deliveryObj.delivery_fee || 0,
+    deliveryFee: engineDeliveryFee,
     voucherClaimIds: eligibleClaimIds,
     selectedPromoId: selectedForEngine,
     autoApplyPromo: autoApplyForEngine,
@@ -2069,6 +2072,51 @@ exports.checkout = asyncHandler(async (req, res) => {
       (priced && priced.reasons && priced.reasons.join?.(', ')) ||
         'Gagal menghitung harga (engine)',
       400
+    );
+  }
+
+  console.log('[checkout][engine-debug]', {
+    engineDeliveryFee,
+    priced_totals: priced?.totals || {},
+    priced_breakdown: priced?.breakdown || [],
+    priced_chosenClaimIds: priced?.chosenClaimIds || []
+  });
+
+  if (
+    (!eligibleClaimIds || eligibleClaimIds.length === 0) &&
+    Array.isArray(priced?.chosenClaimIds) &&
+    priced.chosenClaimIds.length
+  ) {
+    console.warn(
+      '[checkout][fallback] eligibleClaimIds empty; using priced.chosenClaimIds from engine'
+    );
+    eligibleClaimIds = priced.chosenClaimIds.map(String);
+    console.log(
+      '[checkout][fallback] eligibleClaimIds replaced ->',
+      eligibleClaimIds
+    );
+  }
+
+  // jika FE minta voucher tapi eligibleClaimIds kosong -> log detail (sudah ada log, ini tambahan)
+  if (
+    Array.isArray(voucherClaimIds) &&
+    voucherClaimIds.length &&
+    eligibleClaimIds.length === 0
+  ) {
+    console.error(
+      '[checkout][voucher-debug][NO_ELIGIBLE] requested but none eligible',
+      {
+        requested: voucherClaimIds,
+        memberId: MemberDoc ? String(MemberDoc._id) : null,
+        rawByIdSummary: rawById.map((d) => ({
+          id: String(d._id),
+          member: String(d.member || null),
+          status: d.status,
+          remainingUse: d.remainingUse ?? null,
+          validUntil: d.validUntil || null,
+          voucherId: d.voucher ? String(d.voucher) : null
+        }))
+      }
     );
   }
 
@@ -2550,14 +2598,6 @@ exports.checkout = asyncHandler(async (req, res) => {
           memberBalance,
           Math.max(0, Math.round(engineGrandBefore))
         );
-
-        // debug log (sementara)
-        console.log('[checkout][debug] compute pointsUsedReq', {
-          memberBalance,
-          engineGrandBefore,
-          pointsUsedReq,
-          usePoints
-        });
       } else {
         // legacy: allow FE to explicitly pass points_used (floor it)
         pointsUsedReq = Math.floor(
@@ -2758,11 +2798,6 @@ exports.checkout = asyncHandler(async (req, res) => {
         );
         // debug: verifikasi singkat (opsional)
         const check = await Order.findById(doc._id).session(session).lean();
-        console.log('[checkout][debug] order totals forced from uiTotals:', {
-          orderId: doc._id,
-          saved_items_subtotal: check.items_subtotal,
-          saved_grand_total: check.grand_total
-        });
       } catch (e) {
         console.warn(
           '[checkout] failed to force-set order totals from uiTotals',
@@ -2848,10 +2883,6 @@ exports.checkout = asyncHandler(async (req, res) => {
               orderId: doc._id,
               session
             });
-            console.log('[checkout] promo consumed for order', {
-              promoId,
-              orderId: String(doc._id)
-            });
           }
         } else if (payload.appliedPromo && payload.appliedPromo.promoId) {
           const promoId = String(payload.appliedPromo.promoId);
@@ -2906,9 +2937,6 @@ exports.checkout = asyncHandler(async (req, res) => {
         order.payment_status = 'paid';
         order.paid_at = new Date();
         await order.save();
-        console.log('[checkout] proof uploaded, order marked paid', {
-          orderId: order._id
-        });
       } else {
         await Order.deleteOne({ _id: order._id }).catch(() => {});
         console.error('[checkout] proof upload returned empty url');
@@ -3080,12 +3108,6 @@ exports.checkout = asyncHandler(async (req, res) => {
   } catch (e) {
     console.error('[emit][checkout]', e?.message || e);
   }
-
-  // --- response ---
-  console.log('[checkout] finished success', {
-    orderId: order._id,
-    grand_total: order.grand_total
-  });
 
   (async () => {
     try {

@@ -421,9 +421,6 @@ exports.myVoucher = asyncHandler(async (req, res) => {
 
   const now = new Date();
 
-  // Ambil hanya claim yang masih bisa dipakai:
-  // - status: claimed
-  // - remainingUse > 0
   const claims = await VoucherClaim.find({
     member: meId,
     status: 'claimed',
@@ -460,12 +457,6 @@ exports.myVoucher = asyncHandler(async (req, res) => {
         claimStatus: c.status || 'claimed',
         voucherActive: true,
         isExpired: false,
-        stock:
-          v.visibility?.mode === 'global_stock'
-            ? typeof v.visibility.globalStock === 'number'
-              ? v.visibility.globalStock
-              : null
-            : null,
         state: {
           canUse: true,
           isDisabledStyle: false
