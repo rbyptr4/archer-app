@@ -243,13 +243,28 @@ function validateRewardByType(reward = {}, type) {
   }
 }
 
+function normalizeConditionItemsIncoming(cond = {}) {
+  if (!cond || typeof cond !== 'object') return cond || {};
+  if (!('items' in cond)) return cond; // kalau FE nggak kirim items => jangan ubah apa-apa
+  if (!Array.isArray(cond.items)) cond.items = [];
+  cond.items = cond.items
+    .filter((it) => it && typeof it === 'object')
+    .map((it) => {
+      const out = {};
+      out.qty = Number.isFinite(Number(it.qty)) ? Number(it.qty) : 1;
+      const rawMid = it.menuId ?? it.menu_id ?? it.menu ?? null;
+      if (rawMid && mongoose.Types.ObjectId.isValid(String(rawMid))) {
+        out.menuId = mongoose.Types.ObjectId(String(rawMid));
+      } else {
+        out.menuId = null;
+      }
+      if ('category' in it) out.category = it.category ?? null;
+      return out;
+    });
+  return cond;
+}
+
 exports.create = asyncHandler(async (req, res) => {
-  console.log(
-    '[promo.create] raw req.body.conditions type:',
-    typeof req.body.conditions,
-    'value:',
-    req.body.conditions
-  );
   let payload = normalizeCommon(req.body || {}, { isUpdate: false });
 
   if (!payload.name || !String(payload.name).trim())
@@ -332,10 +347,11 @@ exports.update = asyncHandler(async (req, res) => {
 
   incoming = cleanseIrrelevantFieldsByType(incoming, finalType);
 
-  // Normalisasi conditions pada update: jika dikirim -> terapkan normalisasi startAt/endAt
+  // --- Normalisasi partial conditions (merge, jangan timpa keseluruhan) ---
   if (incoming.conditions && typeof incoming.conditions === 'object') {
     const ic = incoming.conditions;
 
+    // normalisasi startAt/endAt hanya jika dikirim
     if ('startAt' in ic) {
       if (ic.startAt) {
         const d = new Date(ic.startAt);
@@ -354,28 +370,39 @@ exports.update = asyncHandler(async (req, res) => {
       }
     }
 
-    // jika user tidak mengirim startAt/endAt mereka akan tetap pada nilai lama di p.conditions
+    // normalisasi items hanya jika dikirim; jangan hilangkan items lama jika tidak dikirim
+    incoming.conditions = normalizeConditionItemsIncoming(ic);
+
+    // MERGE incoming.conditions ke p.conditions (preserve fields yang tidak dikirim)
+    p.conditions = Object.assign({}, p.conditions || {}, incoming.conditions);
+  } else {
+    // jika incoming.conditions tidak dikirim, biarkan p.conditions apa adanya
+    if (!p.conditions) p.conditions = {};
   }
 
-  // validate using either incoming.conditions (if provided) or existing p.conditions
-  validateConditions(incoming.conditions || p.conditions);
+  // validate menggunakan kondisi hasil merge (p.conditions) dan reward final
+  validateConditions(p.conditions);
   validateRewardByType(incoming.reward || p.reward || {}, finalType);
 
-  // apply incoming fields
+  // apply incoming fields kecuali conditions (karena sudah kita tangani merge)
   Object.keys(incoming).forEach((k) => {
+    if (k === 'conditions') return; // skip karena sudah merge
     p[k] = incoming[k];
   });
 
-  // After applying, ensure condition dates are normalized on the saved doc too
+  // After applying, ensure condition dates dan items tetap ada
   if (!p.conditions) p.conditions = {};
-  if (!p.conditions.startAt) p.conditions.startAt = null;
-  if (!p.conditions.endAt) p.conditions.endAt = null;
+  if (!('startAt' in p.conditions) || p.conditions.startAt == null)
+    p.conditions.startAt = p.conditions.startAt ?? null;
+  if (!('endAt' in p.conditions) || p.conditions.endAt == null)
+    p.conditions.endAt = p.conditions.endAt ?? null;
+  if (!Array.isArray(p.conditions.items))
+    p.conditions.items = p.conditions.items || [];
 
-  // special: globalStock normalization on update
+  // globalStock normalization jika dikirim
   if ('globalStock' in incoming) {
     const gsRaw = incoming.globalStock;
     const gsNum = Number.isFinite(Number(gsRaw)) ? Number(gsRaw) : null;
-    // if user explicitly sets 0 -> store null; else set numeric or null
     p.globalStock = gsNum === 0 ? null : gsNum;
   }
 
@@ -384,8 +411,9 @@ exports.update = asyncHandler(async (req, res) => {
     p.conditions.startAt &&
     p.conditions.endAt &&
     new Date(p.conditions.startAt) > new Date(p.conditions.endAt)
-  )
+  ) {
     throwError('conditions.startAt tidak boleh setelah conditions.endAt', 400);
+  }
 
   await p.save();
   res.json({ promo: p.toObject() });
