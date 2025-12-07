@@ -68,6 +68,57 @@ const toBool = (v, def = true) => {
   return def;
 };
 
+function attachDisplayPrices(items = []) {
+  const rate =
+    typeof ppnRate !== 'undefined' && Number.isFinite(Number(ppnRate))
+      ? Number(ppnRate)
+      : 0.11;
+
+  const localCalcFinal = (priceObj) => {
+    try {
+      if (typeof calcFinalPrice === 'function') return calcFinalPrice(priceObj);
+    } catch (e) {}
+
+    const orig = Number(priceObj?.original || 0);
+    const mode = String(
+      priceObj?.discountMode || priceObj?.discount_mode || 'none'
+    );
+
+    if (mode === 'percent') {
+      const pct = Math.min(
+        100,
+        Math.max(
+          0,
+          Number(priceObj?.discountPercent || priceObj?.discount_percent || 0)
+        )
+      );
+      return Math.max(0, Math.round(orig * (1 - pct / 100)));
+    }
+
+    if (mode === 'manual') {
+      return Math.max(
+        0,
+        Number(priceObj?.manualPromoPrice || priceObj?.manual_promo_price || 0)
+      );
+    }
+
+    return orig;
+  };
+
+  return (items || []).map((m) => {
+    // jika aggregation sudah memberi price_final, pakai itu; kalau tidak, hitung dari price field
+    const baseFinal =
+      typeof m.price_final === 'number'
+        ? m.price_final
+        : localCalcFinal(m.price || m.priceObj || {});
+
+    const taxAmount = Math.round(Math.max(0, baseFinal * rate));
+    const priceWithTax = baseFinal + taxAmount;
+
+    return { ...m, price_final: baseFinal, price_with_tax: priceWithTax };
+  });
+}
+
 /* ========== Helper addons ========== */
 const sanitizeNewAddon = (a = {}) => ({
   name: String(a?.name || '').trim(),
@@ -384,14 +435,11 @@ exports.listMenuForMember = asyncHandler(async (req, res) => {
   const filter = {};
   const attachDisplayPrices = (items) =>
     items.map((m) => {
-      // gunakan price_final jika sudah tersedia (dari aggregation),
-      // kalau nggak ada, hitung pakai calcFinalPrice(m.price)
       const baseFinal =
         typeof m.price_final === 'number'
           ? m.price_final
           : calcFinalPrice(m.price);
 
-      // ppnRate diasumsikan sudah tersedia di file (sama seperti di kode asli)
       const taxAmount = Math.round(Math.max(0, baseFinal * ppnRate));
       const priceWithTax = baseFinal + taxAmount;
 
