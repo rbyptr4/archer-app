@@ -4,13 +4,14 @@ const authMember = require('../../middlewares/authMember');
 const ctrl = require('../../controllers/member/voucherMemberController');
 const router = express.Router();
 
-router.get('/me/wallet', authMember, ctrl.myWallet);
-router.get('/me/my-voucher', authMember, ctrl.myVoucher);
-router.get('/explore', authMember, ctrl.explore);
+router.use(authMember);
+router.get('/me/wallet', ctrl.myWallet);
+router.get('/me/my-voucher', ctrl.myVoucher);
+router.get('/explore', ctrl.explore);
 
-router.get('/me/my-voucher/:id', authMember, ctrl.myVoucher);
-router.get('/explore/:id', authMember, ctrl.getVoucherById);
+router.get('/me/my-voucher/:id', ctrl.myVoucher);
+router.get('/explore/:id', ctrl.getVoucherById);
 
-router.post('/:voucherId/claim', authMember, ctrl.claim);
+router.post('/:voucherId/claim', ctrl.claim);
 
 module.exports = router;

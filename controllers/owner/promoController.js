@@ -244,6 +244,12 @@ function validateRewardByType(reward = {}, type) {
 }
 
 exports.create = asyncHandler(async (req, res) => {
+  console.log(
+    '[promo.create] raw req.body.conditions type:',
+    typeof req.body.conditions,
+    'value:',
+    req.body.conditions
+  );
   let payload = normalizeCommon(req.body || {}, { isUpdate: false });
 
   if (!payload.name || !String(payload.name).trim())
