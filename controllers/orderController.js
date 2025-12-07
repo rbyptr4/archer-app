@@ -1569,7 +1569,8 @@ exports.checkout = asyncHandler(async (req, res) => {
     .filter(Boolean)
     .map((v) => String(v));
 
-  console.log('[checkout] NORMALIZED voucherClaimIds ->', voucherClaimIds);
+    console.log('[voucher] normalizedClaimIds:', voucherClaimIds);
+
 
   console.log('[checkout] incoming body snippet', {
     fulfillment_type,
@@ -1845,6 +1846,7 @@ exports.checkout = asyncHandler(async (req, res) => {
             createdAt: d.createdAt || null
           });
         });
+        console.log('[voucher] rawById:', rawById.length);
 
         // Build eligibleClaimIds dari rawById (manual checks)
         const now = new Date();
@@ -1868,10 +1870,8 @@ exports.checkout = asyncHandler(async (req, res) => {
           })
           .map((d) => String(d._id));
 
-        console.log(
-          '[checkout][voucher-check] eligibleClaimIds after rawById processing:',
-          eligibleClaimIds
-        );
+          console.log('[voucher] eligibleClaimIds:', eligibleClaimIds);
+
 
         // Optional: compare with query-by-filter (for diagnosis)
         try {
@@ -2050,19 +2050,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     autoApplyPromo: autoApplyForEngine,
     promoUsageFetchers
   });
-
-  console.log('[checkout] priceEngine returned', {
-    ok: priced?.ok,
-    reasons: priced?.reasons,
-    totals_keys: Object.keys(priced?.totals || {}),
-    breakdown_length: Array.isArray(priced?.breakdown)
-      ? priced.breakdown.length
-      : 0,
-    chosenClaimIds: Array.isArray(priced?.chosenClaimIds)
-      ? priced.chosenClaimIds.length
-      : 0,
-    promoApplied: priced.promoApplied ? priced.promoApplied.promoId : null
-  });
+  console.log('[voucher] engineChosenClaimIds:', priced?.chosenClaimIds || []);
 
   // --- END PANGGIL price engine ---
 
@@ -2960,9 +2948,8 @@ exports.checkout = asyncHandler(async (req, res) => {
 
   // --- konsumsi voucher claims (non-fatal) berdasarkan priced.chosenClaimIds ---
   if (MemberDoc) {
-    console.log('[checkout] start consuming voucher claims', {
-      chosenClaimIds: priced.chosenClaimIds || []
-    });
+    console.log('[voucher] consuming:', priced.chosenClaimIds || []);
+
     for (const claimId of priced.chosenClaimIds || []) {
       try {
         const c = await VoucherClaim.findById(claimId);
