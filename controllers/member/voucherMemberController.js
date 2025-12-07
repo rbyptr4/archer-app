@@ -30,7 +30,6 @@ exports.explore = asyncHandler(async (req, res) => {
 
   const now = new Date();
 
-  // ambil semua voucher aktif / tidak dihapus
   const list = await Voucher.find({ isDeleted: false, isActive: true })
     .sort('-createdAt')
     .lean();
@@ -39,17 +38,14 @@ exports.explore = asyncHandler(async (req, res) => {
     return res.json({ vouchers: [] });
   }
 
-  // ids untuk query klaim
   const ids = list.map((v) => v._id);
 
-  // hitung berapa kali member ini sudah klaim tiap voucher (exclude revoked)
-  // hasil: [{ _id: voucherId, count: X }, ...]
   const claimCounts = await VoucherClaim.aggregate([
     {
       $match: {
         member: meId,
         voucher: { $in: ids },
-        status: { $ne: 'revoked' } // sesuaikan kalau mau include/exclude status lain
+        status: { $ne: 'revoked' }
       }
     },
     {
@@ -65,18 +61,12 @@ exports.explore = asyncHandler(async (req, res) => {
     return acc;
   }, {});
 
-  // helper: ambil limit per-member dari voucher (coba beberapa field umum)
   function getPerMemberLimit(v) {
-    // sesuaikan urutan / nama field kalau modelmu berbeda
-    if (typeof v.perMemberLimit === 'number') return v.perMemberLimit;
-    if (typeof v.limitPerMember === 'number') return v.limitPerMember;
     if (v.visibility && typeof v.visibility.perMemberLimit === 'number')
-      return v.visibility.perMemberLimit;
-    // kalau nggak ada limit => null (artinya unlimited)
-    return null;
+      return Number(v.visibility.perMemberLimit);
+    return 1;
   }
 
-  // pertama filter awal (inWindow, include/exclude, global stock)
   const prelim = list.filter((v) => {
     if (!inWindow(v, now)) return false;
 
@@ -100,14 +90,10 @@ exports.explore = asyncHandler(async (req, res) => {
     return true;
   });
 
-  // lalu apply per-member limit filter menggunakan countsMap
   const visible = prelim.filter((v) => {
     const id = String(v._id);
-    const limit = getPerMemberLimit(v); // null = unlimited
-    if (limit == null) return true;
-
+    const limit = getPerMemberLimit(v); // >=1
     const claimed = countsMap[id] || 0;
-    // jika sudah klaim >= limit, sembunyikan dari explore
     return claimed < Number(limit);
   });
 
@@ -128,7 +114,8 @@ exports.explore = asyncHandler(async (req, res) => {
       name: v.name,
       description: v.notes || null,
       valid_until,
-      stock
+      stock,
+      perMemberLimit: getPerMemberLimit(v)
     };
   });
 

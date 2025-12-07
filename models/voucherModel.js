@@ -15,10 +15,22 @@ const VoucherSchema = new mongoose.Schema(
     amount: { type: Number, min: 0 }, // untuk type=amount/ongkir flat
     maxDiscount: { type: Number, min: 0, default: null },
 
-    // gratis ongkir: pakai type='shipping'. amount optional (bisa cap). percent optional juga (misal 100% ongkir)
     shipping: {
-      percent: { type: Number, min: 0, max: 100, default: 100 }, // 100% = free ongkir
-      maxAmount: { type: Number, min: 0, default: 0 } // 0 = no cap
+      percent: {
+        type: Number,
+        min: 0,
+        max: 100,
+        required: function () {
+          return this.type === 'shipping';
+        }
+      },
+      maxAmount: {
+        type: Number,
+        min: 0,
+        required: function () {
+          return this.type === 'shipping';
+        }
+      }
     },
 
     // ---- periode & stok ----
@@ -30,8 +42,8 @@ const VoucherSchema = new mongoose.Schema(
       },
       startAt: { type: Date },
       endAt: { type: Date },
-      globalStock: { type: Number, min: 0, default: 0 }, // untuk global_stock
-      perMemberLimit: { type: Number, min: 0, default: 1 } // 0 = unlimited claim per member
+      globalStock: { type: Number, min: 0, default: null }, // untuk global_stock
+      perMemberLimit: { type: Number, min: 1, default: 1 }
     },
 
     usage: {
@@ -42,8 +54,8 @@ const VoucherSchema = new mongoose.Schema(
       // apakah perlu claim dulu atau bisa auto-applied (kita set default: perlu claim)
       claimRequired: { type: Boolean, default: true },
       // stacking rule
-      stackableWithShipping: { type: Boolean, default: true }, // ongkir boleh nempel voucher lain
-      stackableWithOthers: { type: Boolean, default: false } // non-ongkir default: tidak stack
+      stackableWithShipping: { type: Boolean, default: false },
+      stackableWithOthers: { type: Boolean, default: false }
     },
 
     // ---- target & syarat ----
