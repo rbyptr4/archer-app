@@ -271,33 +271,37 @@ exports.createShippingVoucher = asyncHandler(async (req, res) => {
 
 /* ===================== LIST / DETAIL ===================== */
 exports.listVoucher = asyncHandler(async (req, res) => {
-  // Keep your original list logic (supports filtering/paging)
-  // For brevity: simple list with optional type filter
-  const { q, type, limit = 50, page = 1 } = req.query || {};
+  const { q, type } = req.query || {};
+  const limit = Math.min(Math.max(asInt(req.query.limit || 50, 50), 1), 200);
+  const cursor = req.query.cursor;
+
   const filter = { isDeleted: false };
   if (q) filter.name = new RegExp(String(q), 'i');
   if (type) filter.type = String(type);
 
-  const perPage = Math.min(
-    Math.max(asInt(req.query.pageSize || limit, 20), 1),
-    200
-  );
-  const skip = (Math.max(asInt(page, 1), 1) - 1) * perPage;
-  const [total, items] = await Promise.all([
-    Voucher.countDocuments(filter),
-    Voucher.find(filter)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(perPage)
-      .lean()
-  ]);
+  if (cursor) {
+    const d = new Date(cursor);
+    if (!isNaN(d.getTime())) filter.createdAt = { $lt: d };
+  }
+
+  const items = await Voucher.find(filter)
+    .sort({ createdAt: -1 })
+    .limit(limit + 1)
+    .lean();
+
+  const total = await Voucher.countDocuments(filter);
+
+  const rows = items.slice(0, limit);
+  const next_cursor =
+    items.length > limit && items[limit] && items[limit].createdAt
+      ? new Date(items[limit].createdAt).toISOString()
+      : null;
 
   res.json({
-    vouchers: items,
+    limit,
+    next_cursor,
     total,
-    page: Math.max(asInt(page, 1), 1),
-    pageSize: perPage,
-    totalPages: Math.max(1, Math.ceil(total / perPage))
+    data: rows
   });
 });
 

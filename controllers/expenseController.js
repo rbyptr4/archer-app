@@ -41,8 +41,37 @@ exports.createType = asyncHandler(async (req, res) => {
 });
 
 exports.listTypes = asyncHandler(async (req, res) => {
-  const types = await ExpenseType.find({}).sort({ name: 1 }).lean();
-  res.json({ data: types });
+  // limit & cursor
+  const limit = Math.min(Math.max(asInt(req.query.limit || 50, 50), 1), 200);
+  const cursor = req.query.cursor;
+
+  const filter = {}; // tambahkan filter jika perlu
+
+  if (cursor) {
+    const d = new Date(cursor);
+    if (!isNaN(d.getTime())) filter.createdAt = { $lt: d };
+  }
+
+  // ambil limit + 1 untuk tahu apakah ada next cursor
+  const items = await ExpenseType.find(filter)
+    .sort({ createdAt: -1 })
+    .limit(limit + 1)
+    .lean();
+
+  const total = await ExpenseType.countDocuments({}); // optional: kamu bisa refine sesuai filter jika mau
+
+  const rows = items.slice(0, limit);
+  const next_cursor =
+    items.length > limit && items[limit] && items[limit].createdAt
+      ? new Date(items[limit].createdAt).toISOString()
+      : null;
+
+  return res.json({
+    limit,
+    next_cursor,
+    total,
+    data: rows
+  });
 });
 
 exports.getTypeById = asyncHandler(async (req, res) => {

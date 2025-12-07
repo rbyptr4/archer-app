@@ -412,12 +412,13 @@ exports.list = asyncHandler(async (req, res) => {
   const {
     q,
     isActive,
-    page = 1,
-    pageSize = 25,
     type,
     sortBy = 'priority',
     sortDir = 'desc'
   } = req.query || {};
+
+  const limit = Math.min(Math.max(asInt(req.query.limit || 25, 25), 1), 200);
+  const cursor = req.query.cursor;
 
   const filter = {};
   if (q) filter.name = new RegExp(String(q), 'i');
@@ -427,25 +428,33 @@ exports.list = asyncHandler(async (req, res) => {
   }
   if (type) filter.type = String(type);
 
-  const perPage = Math.min(Math.max(asInt(pageSize, 25), 1), 200);
-  const skip = (Math.max(asInt(page, 1), 1) - 1) * perPage;
+  if (cursor) {
+    const d = new Date(cursor);
+    if (!isNaN(d.getTime())) filter.createdAt = { $lt: d };
+  }
 
   const dir = String(sortDir || 'desc').toLowerCase() === 'asc' ? 1 : -1;
   const sort = {};
   sort[String(sortBy || 'priority')] = dir;
   sort.createdAt = -1;
 
-  const [total, items] = await Promise.all([
-    Promo.countDocuments(filter),
-    Promo.find(filter).sort(sort).skip(skip).limit(perPage).lean()
-  ]);
+  const items = await Promo.find(filter)
+    .sort(sort)
+    .limit(limit + 1)
+    .lean();
+  const total = await Promo.countDocuments(filter);
+
+  const rows = items.slice(0, limit);
+  const next_cursor =
+    items.length > limit && items[limit] && items[limit].createdAt
+      ? new Date(items[limit].createdAt).toISOString()
+      : null;
 
   res.json({
-    promos: items,
+    limit,
+    next_cursor,
     total,
-    page: Math.max(asInt(page, 1), 1),
-    pageSize: perPage,
-    totalPages: Math.max(1, Math.ceil(total / perPage))
+    data: rows
   });
 });
 

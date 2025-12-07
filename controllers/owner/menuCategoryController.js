@@ -26,28 +26,45 @@ exports.createSubcategory = asyncHandler(async (req, res) => {
   res.status(201).json({ success: true, subcategory: doc });
 });
 
-/* LIST: GET /menu-categories/list?big=drink&q=kop&active=true */
 exports.listSubcategories = asyncHandler(async (req, res) => {
   const big = (req.query.big || '').trim().toLowerCase();
   const q = (req.query.q || '').trim();
-  const active = (req.query.active || '').toLowerCase();
   const sortDir =
     String(req.query.sortDir || 'asc').toLowerCase() === 'desc' ? -1 : 1;
+  const limit = Math.min(Math.max(asInt(req.query.limit || 100, 100), 1), 500);
+  const cursor = req.query.cursor;
 
   const filter = {};
   if (big) {
     if (!BIG_CATEGORIES.includes(big)) throwError('big tidak valid', 400);
     filter.bigCategory = big;
   }
-  if (q) {
-    filter.$or = [{ name: { $regex: q, $options: 'i' } }];
+  if (q) filter.$or = [{ name: { $regex: q, $options: 'i' } }];
+
+  if (cursor) {
+    const d = new Date(cursor);
+    if (!isNaN(d.getTime())) filter.createdAt = { $lt: d };
   }
 
   const items = await MenuSubcategory.find(filter)
     .sort({ sortOrder: sortDir, name: 1, _id: 1 })
+    .limit(limit + 1)
     .lean();
 
-  res.json({ success: true, data: items });
+  const total = await MenuSubcategory.countDocuments(filter);
+
+  const rows = items.slice(0, limit);
+  const next_cursor =
+    items.length > limit && items[limit] && items[limit].createdAt
+      ? new Date(items[limit].createdAt).toISOString()
+      : null;
+
+  res.json({
+    limit,
+    next_cursor,
+    total,
+    data: rows
+  });
 });
 
 /* UPDATE: PATCH /menu-categories/update/:id */

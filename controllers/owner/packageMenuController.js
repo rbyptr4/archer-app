@@ -452,7 +452,6 @@ exports.listPackageMenus = asyncHandler(async (req, res) => {
     Math.max(parseInt(req.query.limit || '20', 10), 1),
     100
   );
-  const skip = 0;
   const q = String(req.query.q || '').trim();
   const isActiveParam = String(req.query.isActive || '').toLowerCase();
   const sortBy = String(req.query.sortBy || 'name');
@@ -465,13 +464,12 @@ exports.listPackageMenus = asyncHandler(async (req, res) => {
   const filter = { bigCategory: 'package' };
   if (!isBackoffice) filter.isActive = true;
 
-  if (q) {
+  if (q)
     filter.$or = [
       { name: { $regex: q, $options: 'i' } },
       { menu_code: { $regex: q, $options: 'i' } },
       { description: { $regex: q, $options: 'i' } }
     ];
-  }
 
   if (isActiveParam === 'true') filter.isActive = true;
   else if (isActiveParam === 'false') filter.isActive = false;
@@ -496,20 +494,25 @@ exports.listPackageMenus = asyncHandler(async (req, res) => {
     sortObj['name'] = 1;
   }
 
-  const items = await Menu.find(filter)
-    .sort({ createdAt: -1 })
-    .limit(limit + 1)
-    .lean({ virtuals: true });
+  const [items, total] = await Promise.all([
+    Menu.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(limit + 1)
+      .lean({ virtuals: true }),
+    Menu.countDocuments(filter)
+  ]);
 
+  const rows = items.slice(0, limit);
   const next_cursor =
-    items.length > limit
-      ? new Date(items[limit - 1].createdAt).toISOString()
+    items.length > limit && items[limit] && items[limit].createdAt
+      ? new Date(items[limit].createdAt).toISOString()
       : null;
 
   res.json({
-    success: true,
-    data: items.slice(0, limit),
-    paging: { limit, next_cursor }
+    limit,
+    next_cursor,
+    total,
+    data: rows
   });
 });
 
