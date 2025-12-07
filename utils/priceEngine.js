@@ -884,7 +884,7 @@ async function applyPromoThenVoucher({
     voucherRes.breakdown.length
   ) {
     for (const vb of voucherRes.breakdown) {
-      const id = vb.voucherClaimId || vb.id || 'voucher';
+      const id = vb.voucherClaimId || vb.id || null;
       const label = vb.label || 'Voucher';
       const amount = Number(vb.amount || 0);
       const items = Array.isArray(vb.items) ? vb.items : [];

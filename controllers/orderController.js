@@ -2110,11 +2110,15 @@ exports.checkout = asyncHandler(async (req, res) => {
     ? priced.breakdown
     : [];
 
-  // build a map claimId -> voucherClaimDoc for convenience (if any claimIds referenced)
+  const isObjectIdLike = (s) =>
+    typeof s === 'string' && /^[0-9a-fA-F]{24}$/.test(s);
   const claimIdsNeeded = engineDiscounts
-    .flatMap((d) => (d.items || []).map((it) => it.claimId || it.claimId) || [])
+    .flatMap((d) =>
+      (d.items || []).map((it) => it.claimId || it.claim_id || null)
+    )
     .filter(Boolean)
-    .map(String);
+    .map(String)
+    .filter(isObjectIdLike);
 
   let claimDocsMap = {};
   if (claimIdsNeeded.length) {
