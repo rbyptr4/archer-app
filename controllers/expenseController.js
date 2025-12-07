@@ -13,6 +13,11 @@ const { buildExpenseProofFileName } = require('../utils/makeFileName');
 const { parseRange } = require('../utils/periodRange');
 const { getDriveFolder } = require('../utils/driveFolders');
 
+const asInt = (v, d = 0) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.trunc(n) : d;
+};
+
 function getRangeFromQuery(q = {}) {
   const rangeKey = q.range || q.period || 'today';
   const weekStartsOn = Number.isFinite(+q.weekStartsOn) ? +q.weekStartsOn : 1;
