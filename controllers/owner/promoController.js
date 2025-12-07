@@ -1,5 +1,6 @@
 // controllers/promoController.js
 const asyncHandler = require('express-async-handler');
+const mongoose = require('mongoose');
 const Promo = require('../../models/promoModel');
 const { findApplicablePromos } = require('../../utils/promoEngine');
 const Member = require('../../models/memberModel');
