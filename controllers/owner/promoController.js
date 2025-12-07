@@ -7,6 +7,19 @@ const Member = require('../../models/memberModel');
 const Menu = require('../../models/menuModel');
 const throwError = require('../../utils/throwError');
 
+function isValidId(v) {
+  try {
+    return mongoose.Types.ObjectId.isValid(String(v));
+  } catch (e) {
+    return false;
+  }
+}
+
+function asId(v) {
+  if (!isValidId(v)) return null;
+  return new mongoose.Types.ObjectId(String(v));
+}
+
 const asInt = (v, d = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? Math.trunc(n) : d;
@@ -235,22 +248,26 @@ function validateRewardByType(reward = {}, type) {
 
 function normalizeConditionItemsIncoming(cond = {}) {
   if (!cond || typeof cond !== 'object') return cond || {};
-  if (!('items' in cond)) return cond; // kalau FE nggak kirim items => jangan ubah apa-apa
+  if (!('items' in cond)) return cond;
+
   if (!Array.isArray(cond.items)) cond.items = [];
+
   cond.items = cond.items
     .filter((it) => it && typeof it === 'object')
     .map((it) => {
       const out = {};
+
       out.qty = Number.isFinite(Number(it.qty)) ? Number(it.qty) : 1;
+
       const rawMid = it.menuId ?? it.menu_id ?? it.menu ?? null;
-      if (rawMid && mongoose.Types.ObjectId.isValid(String(rawMid))) {
-        out.menuId = mongoose.Types.ObjectId(String(rawMid));
-      } else {
-        out.menuId = null;
-      }
+
+      out.menuId = isValidId(rawMid) ? asId(rawMid) : null;
+
       if ('category' in it) out.category = it.category ?? null;
+
       return out;
     });
+
   return cond;
 }
 
