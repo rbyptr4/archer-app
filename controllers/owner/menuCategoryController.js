@@ -9,6 +9,11 @@ const throwError = require('../../utils/throwError');
 
 const isValidId = (v) => mongoose.Types.ObjectId.isValid(String(v));
 
+const asInt = (v, d = 0) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.trunc(n) : d;
+};
+
 /* CREATE: POST /menu-categories/create */
 exports.createSubcategory = asyncHandler(async (req, res) => {
   const { bigCategory, name, sortOrder = 0 } = req.body || {};
