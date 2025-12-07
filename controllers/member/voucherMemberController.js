@@ -30,11 +30,54 @@ exports.explore = asyncHandler(async (req, res) => {
 
   const now = new Date();
 
+  // ambil semua voucher aktif / tidak dihapus
   const list = await Voucher.find({ isDeleted: false, isActive: true })
     .sort('-createdAt')
     .lean();
 
-  const visible = list.filter((v) => {
+  if (!Array.isArray(list) || list.length === 0) {
+    return res.json({ vouchers: [] });
+  }
+
+  // ids untuk query klaim
+  const ids = list.map((v) => v._id);
+
+  // hitung berapa kali member ini sudah klaim tiap voucher (exclude revoked)
+  // hasil: [{ _id: voucherId, count: X }, ...]
+  const claimCounts = await VoucherClaim.aggregate([
+    {
+      $match: {
+        member: meId,
+        voucher: { $in: ids },
+        status: { $ne: 'revoked' } // sesuaikan kalau mau include/exclude status lain
+      }
+    },
+    {
+      $group: {
+        _id: '$voucher',
+        count: { $sum: 1 }
+      }
+    }
+  ]);
+
+  const countsMap = (claimCounts || []).reduce((acc, it) => {
+    acc[String(it._id)] = Number(it.count) || 0;
+    return acc;
+  }, {});
+
+  // helper: ambil limit per-member dari voucher (coba beberapa field umum)
+  function getPerMemberLimit(v) {
+    // sesuaikan urutan / nama field kalau modelmu berbeda
+    if (typeof v.perMemberLimit === 'number') return v.perMemberLimit;
+    if (typeof v.limitPerMember === 'number') return v.limitPerMember;
+    if (v.visibility && typeof v.visibility.perMemberLimit === 'number')
+      return v.visibility.perMemberLimit;
+    // kalau nggak ada limit => null (artinya unlimited)
+    return null;
+  }
+
+  // pertama filter awal (inWindow, include/exclude, global stock)
+  const prelim = list.filter((v) => {
     if (!inWindow(v, now)) return false;
 
     if (v.target?.excludeMemberIds?.some((id) => String(id) === meId))
@@ -55,6 +98,17 @@ exports.explore = asyncHandler(async (req, res) => {
       return false;
 
     return true;
+  });
+
+  // lalu apply per-member limit filter menggunakan countsMap
+  const visible = prelim.filter((v) => {
+    const id = String(v._id);
+    const limit = getPerMemberLimit(v); // null = unlimited
+    if (limit == null) return true;
+
+    const claimed = countsMap[id] || 0;
+    // jika sudah klaim >= limit, sembunyikan dari explore
+    return claimed < Number(limit);
   });
 
   const out = visible.map((v) => {
@@ -380,63 +434,58 @@ exports.myVoucher = asyncHandler(async (req, res) => {
 
   const now = new Date();
 
-  // ambil semua klaim milik member (termasuk claimed/used/expired/revoked)
+  // Ambil hanya claim yang masih bisa dipakai:
+  // - status: claimed
+  // - remainingUse > 0
   const claims = await VoucherClaim.find({
-    member: meId
+    member: meId,
+    status: 'claimed',
+    remainingUse: { $gt: 0 }
   })
     .populate('voucher')
     .sort('-createdAt')
     .lean();
 
-  // map ke bentuk ringkas: mirip explore tapi untuk klaim
-  const out = (claims || []).map((c) => {
-    const v = c.voucher || null;
-    const voucherId = v ? String(v._id) : null;
+  const out = (claims || [])
+    .map((c) => {
+      const v = c.voucher || null;
+      if (!v || v.isDeleted || !v.isActive) return null; // hide voucher inactive / deleted
 
-    // valid_until: prefer claim.validUntil (klaim bisa punya expiry berbeda), fallback ke voucher.visibility.endAt
-    const validUntil = c.validUntil
-      ? new Date(c.validUntil)
-      : v && v.visibility && v.visibility.endAt
-      ? new Date(v.visibility.endAt)
-      : null;
-
-    // apakah voucher aktif / terhapus menurut voucher master
-    const voucherActive = !!(v && v.isActive && !v.isDeleted);
-
-    // apakah sudah kadaluarsa (berdasarkan claim.validUntil atau voucher visibility)
-    const isExpired = validUntil ? now > validUntil : false;
-
-    // global stock info (jika ada)
-    const stock =
-      v && v.visibility && v.visibility.mode === 'global_stock'
-        ? typeof v.visibility.globalStock === 'number'
-          ? v.visibility.globalStock
-          : null
+      // Tentukan validUntil
+      const validUntil = c.validUntil
+        ? new Date(c.validUntil)
+        : v?.visibility?.endAt
+        ? new Date(v.visibility.endAt)
         : null;
 
-    // ringkasan yang minimal untuk wallet list
-    return {
-      claimId: String(c._id), // id klaim (FE butuh ini untuk action/use)
-      voucherId,
-      name: v ? v.name : '(Voucher hilang)',
-      description: v ? v.notes || null : null,
-      claimedAt: c.claimedAt ? new Date(c.claimedAt).toISOString() : null,
-      valid_until: validUntil ? validUntil.toISOString() : null,
-      remainingUse: typeof c.remainingUse === 'number' ? c.remainingUse : null,
-      claimStatus: c.status || 'claimed', // 'claimed'|'used'|'expired'|'revoked'
-      voucherActive, // apakah voucher master aktif
-      isExpired, // kalkulasi kadaluarsa berdasarkan claim/voucher
-      stock, // global stock (atau null)
-      state: {
-        canUse:
-          !isExpired &&
-          c.status === 'claimed' &&
-          (c.remainingUse ?? 0) > 0 &&
-          voucherActive,
-        isDisabledStyle: isExpired || c.status !== 'claimed' || !voucherActive
-      }
-    };
-  });
+      // Check expired
+      const isExpired = validUntil ? now > validUntil : false;
+      if (isExpired) return null; // jangan tampilkan voucher expired
+
+      return {
+        claimId: String(c._id),
+        voucherId: String(v._id),
+        name: v.name,
+        description: v.notes ?? null,
+        claimedAt: c.claimedAt ? new Date(c.claimedAt).toISOString() : null,
+        valid_until: validUntil ? validUntil.toISOString() : null,
+        remainingUse: c.remainingUse ?? null,
+        claimStatus: c.status || 'claimed',
+        voucherActive: true,
+        isExpired: false,
+        stock:
+          v.visibility?.mode === 'global_stock'
+            ? typeof v.visibility.globalStock === 'number'
+              ? v.visibility.globalStock
+              : null
+            : null,
+        state: {
+          canUse: true,
+          isDisabledStyle: false
+        }
+      };
+    })
+    .filter(Boolean); // bersihkan yg null (inactive / expired)
 
   return res.json({ claims: out });
 });
