@@ -4474,22 +4474,73 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     priority: Number(p.priority || 0)
   }));
 
-  const promoCompact = {
-    appliedPromoId: appliedPromo ? appliedPromo.promoId : null,
-    appliedPromoName: appliedPromo ? appliedPromo.name || null : null,
-    description: appliedPromo ? appliedPromo.description || null : null,
-    rewards: normalizedRewards,
-    points_total: Number(pointsTotalFromEngine || 0),
-    chosenClaimIds: result.chosenClaimIds || []
-  };
+  // ===== promo object: jika tidak ada appliedPromo => null; jika ada => ringkasan tanpa chosenClaimIds/points_total =====
+  let promoOut = null;
+  if (appliedPromo) {
+    promoOut = {
+      appliedPromoId: appliedPromo ? appliedPromo.promoId : null,
+      appliedPromoName: appliedPromo ? appliedPromo.name || null : null,
+      description: appliedPromo ? appliedPromo.description || null : null,
+      rewards: normalizedRewards
+    };
+  } else {
+    promoOut = null;
+  }
+
+  // ===== build voucher object: dapat chosenClaimIds dari beberapa path (robust) + claims detail (tanpa summary name/description) =====
+  let voucherOut = { chosenClaimIds: [] };
+
+  const chosenFromResult =
+    result.chosenClaimIds ||
+    (result.voucherResult && result.voucherResult.chosenClaimIds) ||
+    (result.promoApplied && result.promoApplied.chosenClaimIds) ||
+    (result.promo && result.promo.chosenClaimIds) ||
+    [];
+
+  const chosenSet = Array.from(
+    new Set(
+      (Array.isArray(chosenFromResult) ? chosenFromResult : [])
+        .concat(Array.isArray(eligible) ? eligible : [])
+        .filter(Boolean)
+    )
+  );
+  voucherOut.chosenClaimIds = chosenSet;
+
+  try {
+    if (chosenSet.length) {
+      const claimDocs = await VoucherClaim.find({ _id: { $in: chosenSet } })
+        .populate('voucher')
+        .lean()
+        .catch(() => []);
+
+      voucherOut.claims = claimDocs.map((c) => ({
+        claimId: String(c._id),
+        voucherId: c.voucher ? String(c.voucher._id) : null,
+        voucherName: c.voucher ? c.voucher.name || null : null,
+        voucherDescription:
+          c.voucher && (c.voucher.description || c.voucher.notes)
+            ? c.voucher.description || c.voucher.notes
+            : null
+      }));
+    } else {
+      voucherOut.claims = [];
+    }
+  } catch (e) {
+    // jangan crash preview kalau fetch voucher gagal
+    console.error(
+      '[previewPrice] fetch voucher details failed',
+      e?.message || e
+    );
+    voucherOut.claims = voucherOut.claims ?? [];
+  }
 
   return res.status(200).json({
     ok: true,
     reasons: result.reasons || result.voucherResult?.reasons || [],
     eligiblePromosCount: eligiblePromosList.length,
     eligiblePromos: eligiblePromosSummary,
-    promo: promoCompact,
-    voucher: { chosenClaimIds: result.chosenClaimIds || [] },
+    promo: promoOut,
+    voucher: voucherOut,
     ui_totals,
     member_points: Number(MemberDoc?.points || 0),
     guest: !memberId,
