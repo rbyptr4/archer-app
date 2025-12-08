@@ -395,24 +395,69 @@ exports.myWallet = asyncHandler(async (req, res) => {
   const meId = getMemberId(req);
   if (!meId) throwError('Unauthorized (member)', 401);
 
-  // ambil claims yang status = 'claimed'
+  const now = new Date();
+
   const claims = await VoucherClaim.find({
     member: meId,
-    status: 'claimed'
+    status: 'claimed',
+    remainingUse: { $gt: 0 }
   })
     .populate('voucher')
     .sort('-createdAt')
     .lean();
 
-  // filter: hanya kembalikan klaim yang voucher-nya aktif & belum dihapus
-  const visible = (claims || []).filter((c) => {
-    if (!c.voucher) return false;
-    if (c.voucher.isDeleted) return false;
-    if (!c.voucher.isActive) return false; // hide sementara kalau voucher dinonaktifkan
-    return true;
-  });
+  // helper: normalisasi single claim sesuai contoh myVoucher
+  const normalizeClaim = (c) => {
+    const v = c.voucher || null;
+    if (!v || v.isDeleted || !v.isActive) return null;
 
-  res.json({ claims: visible });
+    // Tentukan validUntil: prioritas ke claim.validUntil, lalu voucher.visibility.endAt
+    const validUntil = c.validUntil
+      ? new Date(c.validUntil)
+      : v?.visibility?.endAt
+      ? new Date(v.visibility.endAt)
+      : null;
+
+    // Check expired
+    const isExpired = validUntil ? now > validUntil : false;
+    if (isExpired) return null; // jangan tampilkan voucher expired
+
+    // apakah masih bisa dipakai (sederhana): remainingUse > 0 dan tidak expired
+    const canUse = (c.remainingUse ?? 0) > 0 && !isExpired;
+
+    return {
+      claimId: String(c._id),
+      voucherId: v ? String(v._id) : null,
+      type: v ? v.type || null : null, // 'percent' | 'amount' | 'shipping' | ...
+      name: v ? v.name || null : null,
+      description: v ? v.notes || v.description || null : null,
+      claimedAt: c.claimedAt
+        ? new Date(c.claimedAt).toISOString()
+        : c.createdAt
+        ? new Date(c.createdAt).toISOString()
+        : null,
+      valid_until: validUntil ? validUntil.toISOString() : null,
+      remainingUse: typeof c.remainingUse === 'number' ? c.remainingUse : null,
+      claimStatus: c.status || 'claimed',
+      voucherActive: true,
+      isExpired: false,
+      state: {
+        canUse,
+        isDisabledStyle: !canUse
+      }
+    };
+  };
+
+  const normalized = (claims || []).map(normalizeClaim).filter(Boolean); // remove nulls (inactive/expired)
+
+  // pisahkan berdasarkan tipe voucher
+  const discounts = normalized.filter((x) => x.type !== 'shipping');
+  const shipping = normalized.filter((x) => x.type === 'shipping');
+
+  return res.json({
+    discounts,
+    shipping
+  });
 });
 
 exports.myVoucher = asyncHandler(async (req, res) => {
