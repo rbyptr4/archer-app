@@ -1531,18 +1531,18 @@ exports.checkout = asyncHandler(async (req, res) => {
     null;
 
   if (guestToken === '') guestToken = null;
-console.log('[checkout.debug] incoming raw body snippet (top):', {
-  bodyKeys: Object.keys(req.body || {}).slice(0, 20),
-  voucherClaimIds_raw:
-    req.body?.voucherClaimIds ??
-    req.body?.voucher?.chosenClaimIds ??
-    req.body?.voucher?.chosen_claim_ids ??
-    req.body?.voucher_claim_ids ??
-    req.body?.voucher_claim_id ??
-    null,
-  xGuestToken: req.headers?.['x-guest-token'] || null,
-  cookieGuestToken: req.cookies?.guestToken || null
-});
+  console.log('[checkout.debug] incoming raw body snippet (top):', {
+    bodyKeys: Object.keys(req.body || {}).slice(0, 20),
+    voucherClaimIds_raw:
+      req.body?.voucherClaimIds ??
+      req.body?.voucher?.chosenClaimIds ??
+      req.body?.voucher?.chosen_claim_ids ??
+      req.body?.voucher_claim_ids ??
+      req.body?.voucher_claim_id ??
+      null,
+    xGuestToken: req.headers?.['x-guest-token'] || null,
+    cookieGuestToken: req.cookies?.guestToken || null
+  });
   // --- normalize voucherClaimIds (support multiple FE shapes) ---
   // taruh di sini: setelah guestToken resolved & sebelum log incoming body snippet
   let voucherClaimIds = [];
@@ -1575,13 +1575,60 @@ console.log('[checkout.debug] incoming raw body snippet (top):', {
     voucherClaimIds = [req.body.voucher_claim_id];
   }
 
+  // --- defensive: accept stringified JSON or comma-separated strings from FE ---
+  // contoh FE bad-shape: voucherClaimIds: '["6935b582b10efc0ff7bd1d84"]' atau '6935b582b10efc0ff7bd1d84'
+  if (!Array.isArray(voucherClaimIds)) {
+    // collect candidate raw values FE might have sent (prefer the top-level one first)
+    const rawCandidates = [
+      req.body?.voucherClaimIds,
+      req.body?.voucher_claim_ids,
+      req.body?.voucher?.chosenClaimIds,
+      req.body?.voucher?.chosen_claim_ids,
+      req.body?.voucher_claim_id
+    ].filter(Boolean);
+
+    if (rawCandidates.length === 1 && typeof rawCandidates[0] === 'string') {
+      const raw = String(rawCandidates[0]).trim();
+      try {
+        // try parse JSON (e.g. '["id1","id2"]')
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.length) {
+          voucherClaimIds = parsed;
+          console.log(
+            '[checkout.debug] parsed voucherClaimIds from JSON-string:',
+            voucherClaimIds
+          );
+        } else if (typeof parsed === 'string' && parsed) {
+          voucherClaimIds = [parsed];
+          console.log(
+            '[checkout.debug] parsed single voucherClaimId from JSON-string:',
+            voucherClaimIds
+          );
+        }
+      } catch (e) {
+        // fallback: accept comma-separated string or single id string
+        const maybe = raw
+          .replace(/^\[|\]$/g, '') // strip surrounding brackets if any
+          .split(',')
+          .map((s) => String(s || '').trim())
+          .filter(Boolean);
+        if (maybe.length) {
+          voucherClaimIds = maybe;
+          console.log(
+            '[checkout.debug] parsed voucherClaimIds from comma/string:',
+            voucherClaimIds
+          );
+        }
+      }
+    }
+  }
+
   // coerce to string, remove falsy
   voucherClaimIds = (Array.isArray(voucherClaimIds) ? voucherClaimIds : [])
     .filter(Boolean)
     .map((v) => String(v));
 
-    console.log('[voucher] normalizedClaimIds:', voucherClaimIds);
-
+  console.log('[voucher] normalizedClaimIds:', voucherClaimIds);
 
   console.log('[checkout] incoming body snippet', {
     fulfillment_type,
@@ -1881,12 +1928,12 @@ console.log('[checkout.debug] incoming raw body snippet (top):', {
           })
           .map((d) => String(d._id));
 
-          console.log('[voucher] eligibleClaimIds:', eligibleClaimIds);
+        console.log('[voucher] eligibleClaimIds:', eligibleClaimIds);
 
-console.log(
-  '[checkout.debug] normalized voucherClaimIds (to-server):',
-  voucherClaimIds
-);
+        console.log(
+          '[checkout.debug] normalized voucherClaimIds (to-server):',
+          voucherClaimIds
+        );
 
         // Optional: compare with query-by-filter (for diagnosis)
         try {
@@ -2053,6 +2100,23 @@ console.log(
   );
 
   console.log('[checkout] engineDeliveryFee ->', engineDeliveryFee);
+  console.log('[checkout.debug] calling applyPromoThenVoucher with:', {
+    memberId: MemberDoc?._id || null,
+    fulfillmentType: ft,
+    engineDeliveryFee,
+    voucherClaimIds_forEngine: eligibleClaimIds,
+    normalizedForEngine_summary: {
+      items_len: (normalizedForEngine.items || []).length,
+      first:
+        normalizedForEngine.items && normalizedForEngine.items[0]
+          ? {
+              menuId: String(normalizedForEngine.items[0].menuId || ''),
+              qty: normalizedForEngine.items[0].qty,
+              price: normalizedForEngine.items[0].price
+            }
+          : null
+    }
+  });
 
   priced = await applyPromoThenVoucher({
     memberId: MemberDoc ? MemberDoc._id : null,
