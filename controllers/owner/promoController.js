@@ -431,47 +431,78 @@ exports.list = asyncHandler(async (req, res) => {
     q,
     isActive,
     type,
+    page = 1,
+    pageSize = 25,
     sortBy = 'priority',
     sortDir = 'desc'
   } = req.query || {};
-
-  const limit = Math.min(Math.max(asInt(req.query.limit || 25, 25), 1), 200);
-  const cursor = req.query.cursor;
+  const limit = Math.min(Math.max(Number(pageSize) || 25, 1), 200);
+  const skip = (Math.max(Number(page) || 1, 1) - 1) * limit;
 
   const filter = {};
-  if (q) filter.name = new RegExp(String(q), 'i');
-  if (isActive !== undefined) {
-    const b = asBool(isActive);
-    if (typeof b === 'boolean') filter.isActive = b;
+  if (q) filter.name = { $regex: String(q), $options: 'i' };
+  if (typeof isActive !== 'undefined') {
+    const s = String(isActive).toLowerCase();
+    if (['1', 'true', 'yes', 'y'].includes(s)) filter.isActive = true;
+    else if (['0', 'false', 'no', 'n'].includes(s)) filter.isActive = false;
   }
   if (type) filter.type = String(type);
-
-  if (cursor) {
-    const d = new Date(cursor);
-    if (!isNaN(d.getTime())) filter.createdAt = { $lt: d };
-  }
 
   const dir = String(sortDir || 'desc').toLowerCase() === 'asc' ? 1 : -1;
   const sort = {};
   sort[String(sortBy || 'priority')] = dir;
   sort.createdAt = -1;
 
-  const items = await Promo.find(filter)
-    .sort(sort)
-    .limit(limit + 1)
-    .lean();
-  const total = await Promo.countDocuments(filter);
+  const [total, items] = await Promise.all([
+    Promo.countDocuments(filter),
+    Promo.find(filter).sort(sort).skip(skip).limit(limit).lean()
+  ]);
 
-  const rows = items.slice(0, limit);
-  const next_cursor =
-    items.length > limit && items[limit] && items[limit].createdAt
-      ? new Date(items[limit].createdAt).toISOString()
-      : null;
+  const promoTypeLabel = {
+    free_item: 'Gratis item',
+    buy_x_get_y: 'Beli X gratis Y',
+    percent: 'Diskon persentase',
+    amount: 'Potongan nominal',
+    points: 'Beri poin',
+    membership: 'Free membership'
+  };
+
+  const now = Date.now();
+
+  const rows = (items || []).map((p) => {
+    // asumsi endAt di dalam p.conditions.endAt (kalau berbeda, sesuaikan)
+    const endAtRaw =
+      p.conditions && p.conditions.endAt ? new Date(p.conditions.endAt) : null;
+    const endAtTs =
+      endAtRaw && !isNaN(endAtRaw.getTime()) ? endAtRaw.getTime() : null;
+
+    // globalStock kemungkinan ada di root p.globalStock atau di p.visibility/globalStock
+    let globalStock = null;
+    if (typeof p.globalStock !== 'undefined') globalStock = p.globalStock;
+    else if (p.visibility && typeof p.visibility.globalStock !== 'undefined')
+      globalStock = p.visibility.globalStock;
+
+    const expired = endAtTs !== null ? now > endAtTs : false;
+    const soldOut = typeof globalStock === 'number' ? globalStock === 0 : false;
+
+    return {
+      id: String(p._id),
+      name: p.name || '',
+      type: p.type || '',
+      typeLabel: promoTypeLabel[String(p.type || '')] || String(p.type || ''),
+      endAt: endAtTs ? new Date(endAtTs).toISOString() : null,
+      priority: typeof p.priority === 'number' ? p.priority : 0,
+      globalStock: typeof globalStock !== 'undefined' ? globalStock : null,
+      isActive: !!p.isActive,
+      // ATTRIBUTE YANG DITAMBAHKAN: true kalau expired atau stock = 0
+      isUnavailable: expired || soldOut
+    };
+  });
 
   res.json({
-    limit,
-    next_cursor,
     total,
+    page: Math.max(Number(page) || 1, 1),
+    pageSize: limit,
     data: rows
   });
 });

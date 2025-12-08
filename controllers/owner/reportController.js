@@ -1112,3 +1112,219 @@ exports.customerGrowth = asyncHandler(async (req, res) => {
     }
   });
 });
+
+/**
+ * GET /reports/top-selling-menus-summary
+ * Query:
+ *  - from,to,range
+ *  - bigCategory (optional)  -> contoh: ?bigCategory=drinks
+ *  - limit (optional, default 10)
+ *
+ * Response (JSON) contoh:
+ * {
+ *   period: { start, end },
+ *   bigCategory: 'drinks'|'all',
+ *   total_menus: 12,
+ *   items: [
+ *     { menu_id, name, menu_code, total_qty, total_purchases } // total_purchases = total sales (Rp)
+ *   ],
+ *   graph: {
+ *     labels: ['Es Kopi', 'Nasi Goreng', ...],
+ *     qtyData: [120, 80, ...],
+ *     salesData: [2400000, 1600000, ...]
+ *   }
+ * }
+ */
+exports.topSellingMenusSummary = asyncHandler(async (req, res) => {
+  const { start, end } = getRangeFromQuery(req.query);
+  if (!start || !end) throwError('Range tanggal tidak valid', 400);
+
+  const bigCategory = req.query.bigCategory
+    ? String(req.query.bigCategory).trim()
+    : null;
+  const limit = Math.min(
+    Math.max(parseInt(String(req.query.limit || '10'), 10) || 10, 1),
+    200
+  );
+
+  // prefetch menu ids if filtering by category for efficiency
+  let menuIds = null;
+  if (bigCategory) {
+    const docs = await Menu.find({ bigCategory }).select('_id').lean();
+    if (!docs || docs.length === 0) {
+      return res.json({
+        period: { start, end },
+        bigCategory,
+        total_menus: 0,
+        items: [],
+        graph: { labels: [], qtyData: [], salesData: [] }
+      });
+    }
+    menuIds = docs.map((d) => d._id);
+  }
+
+  const pipeline = [
+    {
+      $match: {
+        payment_status: { $in: ['paid', 'verified'] },
+        status: { $ne: 'cancelled' },
+        verified_at: { $gte: start, $lte: end }
+      }
+    },
+    // unwind items
+    { $unwind: '$items' },
+
+    // early filter by items.menu if category filter is applied (efisien)
+    ...(menuIds ? [{ $match: { 'items.menu': { $in: menuIds } } }] : []),
+
+    // normalize and bring order-level fields needed for prorating
+    {
+      $addFields: {
+        _itemMenu: { $ifNull: ['$items.menu', '$items.menuId'] },
+        _itemQty: { $toInt: { $ifNull: ['$items.quantity', '$items.qty', 0] } },
+        _line_subtotal: { $toDouble: { $ifNull: ['$items.line_subtotal', 0] } },
+        // If items.line_total_after_adjustments not present, keep null (so we can detect)
+        _line_after_adj: {
+          $cond: [
+            {
+              $or: [
+                { $eq: ['$items.line_total_after_adjustments', null] },
+                { $eq: ['$items.line_total_after_adjustments', undefined] }
+              ]
+            },
+            null,
+            { $toDouble: '$items.line_total_after_adjustments' }
+          ]
+        },
+        _itemNameFromOrder: { $ifNull: ['$items.name', null] },
+        _itemMenuCodeFromOrder: { $ifNull: ['$items.menu_code', null] },
+
+        // order-level values to be used for prorating
+        _order_items_subtotal: {
+          $toDouble: { $ifNull: ['$items_subtotal', 0] }
+        },
+        _order_items_discount: {
+          $toDouble: { $ifNull: ['$items_discount', 0] }
+        }
+      }
+    },
+
+    // Lookup menu doc (to get name/menu_code/bigCategory snapshot if exists)
+    {
+      $lookup: {
+        from: 'menus',
+        localField: '_itemMenu',
+        foreignField: '_id',
+        as: 'menuDoc'
+      }
+    },
+    { $unwind: { path: '$menuDoc', preserveNullAndEmptyArrays: true } },
+
+    // compute prorated share of order-level items_discount only when:
+    // - order_items_subtotal > 0
+    // - order_items_discount > 0
+    // - and line_after_adj is null (meaning we don't have per-line adjusted value)
+    {
+      $addFields: {
+        _prorated_items_discount: {
+          $cond: [
+            {
+              $and: [
+                { $gt: ['$_order_items_subtotal', 0] },
+                { $gt: ['$_order_items_discount', 0] },
+                { $eq: ['$_line_after_adj', null] }
+              ]
+            },
+            {
+              $multiply: [
+                { $divide: ['$_line_subtotal', '$_order_items_subtotal'] },
+                '$_order_items_discount'
+              ]
+            },
+            0
+          ]
+        }
+      }
+    },
+
+    // final line amount logic:
+    // - if _line_after_adj exists (even if zero): use it
+    // - else: line_subtotal - prorated_items_discount
+    // - clamp to >= 0
+    {
+      $addFields: {
+        _final_line_amount: {
+          $max: [
+            0,
+            {
+              $cond: [
+                { $ne: ['$_line_after_adj', null] },
+                '$_line_after_adj',
+                { $subtract: ['$_line_subtotal', '$_prorated_items_discount'] }
+              ]
+            }
+          ]
+        }
+      }
+    },
+
+    // only include items that actually contribute revenue after adjustments (> 0)
+    { $match: { _final_line_amount: { $gt: 0 } } },
+
+    // group per menu id and sum qty & final amounts
+    {
+      $group: {
+        _id: '$_itemMenu',
+        total_qty: { $sum: '$_itemQty' },
+        total_purchases: { $sum: '$_final_line_amount' },
+        name_first: {
+          $first: { $ifNull: ['$menuDoc.name', '$_itemNameFromOrder'] }
+        },
+        menu_code_first: {
+          $first: { $ifNull: ['$menuDoc.menu_code', '$_itemMenuCodeFromOrder'] }
+        },
+        bigCategory_first: { $first: '$menuDoc.bigCategory' }
+      }
+    },
+
+    // project in neat shape
+    {
+      $project: {
+        menu_id: '$_id',
+        name: '$name_first',
+        menu_code: '$menu_code_first',
+        bigCategory: '$bigCategory_first',
+        total_qty: 1,
+        total_purchases: { $round: ['$total_purchases', 0] }
+      }
+    },
+
+    // sort & limit
+    { $sort: { total_qty: -1, total_purchases: -1 } },
+    { $limit: limit }
+  ];
+
+  const rows = await Order.aggregate(pipeline).allowDiskUse(true).exec();
+
+  const labels = rows.map((r) => r.name || r.menu_code || String(r.menu_id));
+  const qtyData = rows.map((r) => Number(r.total_qty || 0));
+  const salesData = rows.map((r) => Number(r.total_purchases || 0));
+
+  res.json({
+    period: { start, end },
+    bigCategory: bigCategory || 'all',
+    total_menus: rows.length,
+    items: rows.map((r) => ({
+      menu_id: r.menu_id,
+      name: r.name,
+      menu_code: r.menu_code,
+      total_qty: r.total_qty,
+      total_purchases: r.total_purchases
+    })),
+    graph: {
+      labels,
+      qtyData,
+      salesData
+    }
+  });
+});

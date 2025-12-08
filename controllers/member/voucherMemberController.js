@@ -395,6 +395,17 @@ exports.myWallet = asyncHandler(async (req, res) => {
   const meId = getMemberId(req);
   if (!meId) throwError('Unauthorized (member)', 401);
 
+  // mode query: 'delivery' => tunjukkan voucher ongkir; default 'none' (tidak tunjukkan)
+  const mode = (req.query?.mode || 'none').toString().trim().toLowerCase();
+  const wantDelivery = mode === 'delivery';
+
+  // promo query: 'enabled' | 'disabled' (default 'disabled' supaya FE explicit)
+  const promoQ = (req.query?.promo || 'disabled')
+    .toString()
+    .trim()
+    .toLowerCase();
+  const promoEnabled = promoQ === 'enabled';
+
   const now = new Date();
 
   const claims = await VoucherClaim.find({
@@ -448,15 +459,34 @@ exports.myWallet = asyncHandler(async (req, res) => {
     };
   };
 
-  const normalized = (claims || []).map(normalizeClaim).filter(Boolean); // remove nulls (inactive/expired)
+  const normalized = (claims || []).map(normalizeClaim).filter(Boolean);
 
-  // pisahkan berdasarkan tipe voucher
-  const discounts = normalized.filter((x) => x.type !== 'shipping');
-  const shipping = normalized.filter((x) => x.type === 'shipping');
+  // default empty
+  let discounts = [];
+  let shipping = [];
+
+  if (wantDelivery) {
+    // mode=delivery -> hanya tampilkan voucher ongkir saja (shipping), terlepas promo flag
+    shipping = normalized.filter((x) => x.type === 'shipping');
+    discounts = []; // jangan tampilkan diskon
+  } else {
+    // mode != delivery (none)
+    if (promoEnabled) {
+      // promo enable + mode none => jangan tampilin voucher apapun
+      discounts = [];
+      shipping = [];
+    } else {
+      // promo disabled + mode none => hanya tampilin voucher diskon (non-shipping)
+      discounts = normalized.filter((x) => x.type !== 'shipping');
+      shipping = [];
+    }
+  }
 
   return res.json({
     discounts,
-    shipping
+    shipping,
+    mode: wantDelivery ? 'delivery' : 'none',
+    promo: promoEnabled ? 'enabled' : 'disabled'
   });
 });
 

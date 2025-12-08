@@ -48,7 +48,7 @@ const VoucherSchema = new mongoose.Schema(
 
     usage: {
       // penggunaan per claim = biasanya 1x. Bisa dibuat >1 kalau mau.
-      maxUsePerClaim: { type: Number, min: 1, default: 1 },
+      maxUsePerClaim: { type: Number, min: 1, max: 1, default: 1 },
       // masa pakai setelah diklaim (opsional). Kalau null, pakai endAt global saja.
       useValidDaysAfterClaim: { type: Number, min: 0, default: 0 },
       // apakah perlu claim dulu atau bisa auto-applied (kita set default: perlu claim)

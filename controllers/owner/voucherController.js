@@ -269,38 +269,60 @@ exports.createShippingVoucher = asyncHandler(async (req, res) => {
   res.status(201).json({ voucher: v });
 });
 
-/* ===================== LIST / DETAIL ===================== */
 exports.listVoucher = asyncHandler(async (req, res) => {
-  const { q, type } = req.query || {};
-  const limit = Math.min(Math.max(asInt(req.query.limit || 50, 50), 1), 200);
-  const cursor = req.query.cursor;
+  const { q, type, page = 1, pageSize = 50 } = req.query || {};
+  const limit = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+  const skip = (Math.max(Number(page) || 1, 1) - 1) * limit;
 
   const filter = { isDeleted: false };
-  if (q) filter.name = new RegExp(String(q), 'i');
+  if (q) filter.name = { $regex: String(q), $options: 'i' };
   if (type) filter.type = String(type);
 
-  if (cursor) {
-    const d = new Date(cursor);
-    if (!isNaN(d.getTime())) filter.createdAt = { $lt: d };
-  }
+  const [total, items] = await Promise.all([
+    Voucher.countDocuments(filter),
+    Voucher.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean()
+  ]);
 
-  const items = await Voucher.find(filter)
-    .sort({ createdAt: -1 })
-    .limit(limit + 1)
-    .lean();
+  const typeLabelMap = {
+    percent: 'Diskon persentase',
+    amount: 'Potongan nominal',
+    shipping: 'Ongkir',
+    bundling: 'Bundling'
+    // tambahkan mapping lain kalau perlu
+  };
 
-  const total = await Voucher.countDocuments(filter);
+  const now = Date.now();
 
-  const rows = items.slice(0, limit);
-  const next_cursor =
-    items.length > limit && items[limit] && items[limit].createdAt
-      ? new Date(items[limit].createdAt).toISOString()
-      : null;
+  const rows = (items || []).map((v) => {
+    const endAtRaw =
+      v.visibility && v.visibility.endAt ? new Date(v.visibility.endAt) : null;
+    const endAtTs =
+      endAtRaw && !isNaN(endAtRaw.getTime()) ? endAtRaw.getTime() : null;
+
+    const globalStock =
+      v.visibility && typeof v.visibility.globalStock !== 'undefined'
+        ? v.visibility.globalStock
+        : null;
+
+    const expired = endAtTs !== null ? now > endAtTs : false;
+    const soldOut = typeof globalStock === 'number' ? globalStock === 0 : false;
+
+    return {
+      id: String(v._id),
+      name: v.name || '',
+      type: v.type || '',
+      typeLabel: typeLabelMap[String(v.type || '')] || String(v.type || ''),
+      globalStock: globalStock,
+      endAt: endAtTs ? new Date(endAtTs).toISOString() : null,
+      isActive: !!v.isActive,
+      isUnavailable: expired || soldOut
+    };
+  });
 
   res.json({
-    limit,
-    next_cursor,
     total,
+    page: Math.max(Number(page) || 1, 1),
+    pageSize: limit,
     data: rows
   });
 });

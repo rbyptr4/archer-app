@@ -2154,7 +2154,10 @@ exports.checkout = asyncHandler(async (req, res) => {
   const breakdown = Array.isArray(priced.breakdown) ? priced.breakdown : [];
   const claimedInBreakdown = new Set(
     breakdown
-      .map((b) => b.claimId)
+      .map(
+        (b) =>
+          b.claimId || b.voucherClaimId || b.voucher_claim_id || b.id || b._id
+      )
       .filter(Boolean)
       .map(String)
   );
@@ -2240,11 +2243,15 @@ exports.checkout = asyncHandler(async (req, res) => {
 
     // collect voucher ids for appliedVouchers array
     if (source === 'voucher') {
-      // if engine provided voucherId directly
-      if (d.voucherId || d.voucher_id || d.voucher) {
-        appliedVoucherIdSet.add(
-          String(d.voucherId || d.voucher_id || d.voucher)
-        );
+      // Check common keys engine might have emitted
+      const maybeVoucherId =
+        d.voucherId ||
+        d.voucher_id ||
+        d.voucher ||
+        d.voucherId ||
+        d.raw?.voucherId;
+      if (maybeVoucherId) {
+        appliedVoucherIdSet.add(String(maybeVoucherId));
       } else if (
         id &&
         claimDocsMap[String(id)] &&
@@ -2292,8 +2299,7 @@ exports.checkout = asyncHandler(async (req, res) => {
   const beforeRound = int(
     items_subtotal_after_discount +
       service_fee +
-      deliveryObj.delivery_fee -
-      shipping_discount +
+      deliveryObj.delivery_fee +
       taxAmount
   );
 

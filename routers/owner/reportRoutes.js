@@ -27,7 +27,7 @@ router.get('/members/dashboard/top-spender', rpt.topSpendersThisMonth);
 router.get('/members/customer-growth', rpt.customerGrowth);
 
 // ====== Laporan Menu ======
-router.get('/menu/top-menu', rpt.bestSeller);
+router.get('/menu/top-menu', rpt.topSellingMenusSummary);
 
 router.get('/orders/:id', rpt.getDetailOrder);
 router.get('/members/:id', rpt.getMemberFullDetail);
