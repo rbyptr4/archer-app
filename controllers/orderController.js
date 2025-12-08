@@ -1143,8 +1143,8 @@ exports.getCart = asyncHandler(async (req, res) => {
     ...cart,
     fulfillment_type: cart.fulfillment_type || 'dine_in',
     delivery_mode: cartDeliveryMode,
-    items,
-    ui_totals: ui
+    items
+    // ui_totals: ui
   });
 });
 
@@ -1535,15 +1535,30 @@ exports.checkout = asyncHandler(async (req, res) => {
   let voucherClaimIds = [];
 
   // prefer explicit camelCase array if already an array
-  if (Array.isArray(req.body?.voucherClaimIds) && req.body.voucherClaimIds.length) {
+  if (
+    Array.isArray(req.body?.voucherClaimIds) &&
+    req.body.voucherClaimIds.length
+  ) {
     voucherClaimIds = req.body.voucherClaimIds;
-  } else if (Array.isArray(req.body?.voucher?.chosenClaimIds) && req.body.voucher.chosenClaimIds.length) {
+  } else if (
+    Array.isArray(req.body?.voucher?.chosenClaimIds) &&
+    req.body.voucher.chosenClaimIds.length
+  ) {
     voucherClaimIds = req.body.voucher.chosenClaimIds;
-  } else if (Array.isArray(req.body?.voucher?.chosen_claim_ids) && req.body.voucher.chosen_claim_ids.length) {
+  } else if (
+    Array.isArray(req.body?.voucher?.chosen_claim_ids) &&
+    req.body.voucher.chosen_claim_ids.length
+  ) {
     voucherClaimIds = req.body.voucher.chosen_claim_ids;
-  } else if (Array.isArray(req.body?.voucher_claim_ids) && req.body.voucher_claim_ids.length) {
+  } else if (
+    Array.isArray(req.body?.voucher_claim_ids) &&
+    req.body.voucher_claim_ids.length
+  ) {
     voucherClaimIds = req.body.voucher_claim_ids;
-  } else if (typeof req.body?.voucher_claim_id !== 'undefined' && req.body.voucher_claim_id) {
+  } else if (
+    typeof req.body?.voucher_claim_id !== 'undefined' &&
+    req.body.voucher_claim_id
+  ) {
     voucherClaimIds = [req.body.voucher_claim_id];
   } else {
     const tryParse = (val) => {
@@ -1557,13 +1572,19 @@ exports.checkout = asyncHandler(async (req, res) => {
         const p = JSON.parse(s);
         if (Array.isArray(p) && p.length) return p;
         if (typeof p === 'string' && p) return [p];
-      } catch (e) {
-      }
-      const maybe = s.replace(/^\[|\]$/g, '').split(',').map(x => String(x||'').trim()).filter(Boolean);
+      } catch (e) {}
+      const maybe = s
+        .replace(/^\[|\]$/g, '')
+        .split(',')
+        .map((x) => String(x || '').trim())
+        .filter(Boolean);
       return maybe.length ? maybe : [s];
     };
 
-    voucherClaimIds = tryParse(req.body?.voucherClaimIds) || tryParse(req.body?.voucher_claim_ids) || [];
+    voucherClaimIds =
+      tryParse(req.body?.voucherClaimIds) ||
+      tryParse(req.body?.voucher_claim_ids) ||
+      [];
   }
 
   voucherClaimIds = (Array.isArray(voucherClaimIds) ? voucherClaimIds : [])
@@ -1571,7 +1592,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     .map((v) => String(v));
 
   console.log('[voucher] normalizedClaimIds:', voucherClaimIds);
-
 
   console.log('[checkout] incoming body snippet', {
     fulfillment_type,
@@ -4272,6 +4292,8 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         };
       }
     } catch (e) {
+      // log only on error
+      console.error('[previewPrice] auto apply promo failed', e?.message || e);
       autoAppliedPromo = null;
     }
   }
@@ -4303,6 +4325,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       promoUsageFetchers
     });
   } catch (err) {
+    console.error('[previewPrice] engine error', err?.message || err);
     throwError(
       err?.message
         ? `Gagal menghitung preview harga: ${String(err.message)}`
@@ -4322,6 +4345,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   // ===== build ui_totals (single-source grand_total + rounding) =====
   const t = result.totals || result.voucherResult?.totals || {};
 
+  const int = (v) => Math.round(Number(v || 0));
   const baseSubtotal = Number(t.baseSubtotal ?? t.base_subtotal ?? 0);
   const itemsDiscount = Number(t.itemsDiscount ?? t.items_discount ?? 0);
   const items_subtotal_after_discount = Number(
@@ -4342,9 +4366,23 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     : Number(effectiveDeliveryFee || 0);
 
   // taxable items (same logic as order compute)
+  const SERVICE_FEE_RATE = Number(process.env.SERVICE_FEE_RATE || 0.02) || 0.02;
   const taxableItems = Math.max(0, baseSubtotal - itemsDiscount);
   const service_fee = Math.round(taxableItems * SERVICE_FEE_RATE);
+
+  const parsePpnRate = () => {
+    return Number(process.env.PPN_RATE || 0.11) || 0.11;
+  };
   const tax_amount = Math.round(taxableItems * parsePpnRate());
+
+  // helper rounding function from codebase (assumed available)
+  const roundRupiahCustom = (v) => {
+    // jika project punya util, replace dengan utilnya. Default behavior: round to nearest 100
+    const rem = Number(v) % 100;
+    if (rem === 0) return Number(v);
+    if (rem >= 50) return Number(v) + (100 - rem);
+    return Number(v) - rem;
+  };
 
   // raw before rounding & before points (this is pre-rounding value)
   const raw_before_points = Math.round(
@@ -4454,14 +4492,53 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     priority: Number(p.priority || 0)
   }));
 
+  // ===== compact promo: tanpa points_total dan chosenClaimIds =====
   const promoCompact = {
     appliedPromoId: appliedPromo ? appliedPromo.promoId : null,
     appliedPromoName: appliedPromo ? appliedPromo.name || null : null,
     description: appliedPromo ? appliedPromo.description || null : null,
-    rewards: normalizedRewards,
-    points_total: Number(pointsTotalFromEngine || 0),
-    chosenClaimIds: result.chosenClaimIds || []
+    rewards: normalizedRewards
   };
+
+  // ===== build voucher object: chosenClaimIds + name & description (ambil dari Voucher) =====
+  let voucherOut = { chosenClaimIds: result.chosenClaimIds || [] };
+
+  try {
+    const chosen = Array.isArray(result.chosenClaimIds)
+      ? result.chosenClaimIds.filter(Boolean)
+      : [];
+
+    if (chosen.length) {
+      const claimDocs = await VoucherClaim.find({ _id: { $in: chosen } })
+        .populate('voucher')
+        .lean()
+        .catch(() => []);
+
+      const firstClaim = claimDocs && claimDocs.length ? claimDocs[0] : null;
+      const voucherDoc =
+        firstClaim && firstClaim.voucher ? firstClaim.voucher : null;
+
+      if (voucherDoc) {
+        voucherOut.name = voucherDoc.name || null;
+        voucherOut.description =
+          voucherDoc.description || voucherDoc.notes || null;
+      } else {
+        voucherOut.name = null;
+        voucherOut.description = null;
+      }
+    } else {
+      voucherOut.name = null;
+      voucherOut.description = null;
+    }
+  } catch (e) {
+    // hanya log error, jangan crash preview
+    console.error(
+      '[previewPrice] fetch voucher details failed',
+      e?.message || e
+    );
+    voucherOut.name = voucherOut.name ?? null;
+    voucherOut.description = voucherOut.description ?? null;
+  }
 
   return res.status(200).json({
     ok: true,
@@ -4469,7 +4546,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     eligiblePromosCount: eligiblePromosList.length,
     eligiblePromos: eligiblePromosSummary,
     promo: promoCompact,
-    voucher: { chosenClaimIds: result.chosenClaimIds || [] },
+    voucher: voucherOut,
     ui_totals,
     member_points: Number(MemberDoc?.points || 0),
     guest: !memberId,
