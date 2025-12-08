@@ -54,7 +54,7 @@ const VoucherSchema = new mongoose.Schema(
       // apakah perlu claim dulu atau bisa auto-applied (kita set default: perlu claim)
       claimRequired: { type: Boolean, default: true },
       // stacking rule
-      stackableWithShipping: { type: Boolean, default: false },
+      stackableWithShipping: { type: Boolean, default: true },
       stackableWithOthers: { type: Boolean, default: false }
     },
 

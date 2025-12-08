@@ -181,16 +181,10 @@ async function validateAndPrice(
 
   const chosen = [];
 
-  // NON-SHIPPING stacking policy:
-  // - Jika ada minimal satu voucher non-shipping yang TIDAK stackableWithOthers => pilih 1 terbaik.
-  // - Jika semua non-shipping vouchers memiliki stackableWithOthers === true => izinkan semua.
   if (nonShipping.length > 0) {
-    const anyNonStackable = nonShipping.some(
-      (c) => c.voucher.usage && c.voucher.usage.stackableWithOthers === false
-    );
-
-    if (anyNonStackable) {
-      // pilih 1 terbaik
+    if (nonShipping.length === 1) {
+      chosen.push(nonShipping[0]);
+    } else {
       let best = null,
         bestValue = -1;
       for (const c of nonShipping) {
@@ -203,32 +197,31 @@ async function validateAndPrice(
       }
       if (best) {
         chosen.push(best);
-        reasons.push(
-          `Hanya satu voucher non-ongkir yang bisa dipakai (ada yg non-stackable). Dipilih: ${best.voucher.name}`
-        );
       }
-    } else {
-      // semua stackable => pakai semuanya (hormati per-voucher cap di computeVoucherDiscount)
-      for (const c of nonShipping) chosen.push(c);
       reasons.push(
-        `Beberapa voucher non-ongkir diizinkan menumpuk (semua stackable).`
+        `Hanya satu voucher non-ongkir yang bisa dipakai. Dipilih: ${
+          best ? best.voucher.name : 'tidak ada'
+        }`
       );
     }
   }
 
-  // SHIPPING: pilih yang paling menguntungkan (shipping discount)
+  // SHIPPING: boleh digabung dengan satu non-shipping yang dipilih
   if (shippingClaims.length > 0) {
-    let best = null,
-      bestValue = -1;
+    // pilih shipping terbaik (max shippingDiscount)
+    let bestShip = null,
+      bestShipValue = -1;
     for (const c of shippingClaims) {
       const est = computeVoucherDiscount(c.voucher, items, deliveryFee);
       const val = est.shippingDiscount;
-      if (val > bestValue) {
-        bestValue = val;
-        best = c;
+      if (val > bestShipValue) {
+        bestShipValue = val;
+        bestShip = c;
       }
     }
-    if (best) chosen.push(best);
+    if (bestShip) {
+      chosen.push(bestShip);
+    }
   }
 
   // compute chosen voucher effects

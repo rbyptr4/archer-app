@@ -4161,20 +4161,50 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   const memberId = req.member?.id || null;
   const now = new Date();
 
+  // ===== validation object sementara (dipakai untuk membangun pesan) =====
+  const validation = {
+    hasError: false,
+    messages: [],
+    invalidClaimIds: []
+  };
+
   // ===== filter vouchers (guest cannot use vouchers) =====
   let eligible = [];
+  let rawClaims = [];
   if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
+    // jika guest, langsung error
     if (!memberId) {
-      eligible = [];
+      validation.hasError = true;
+      validation.messages.push('Guest tidak bisa menggunakan voucher.');
+      validation.invalidClaimIds = voucherClaimIds.slice();
+      // throw langsung
+      throwError(validation.messages.join(' '), 400);
     } else {
-      const rawClaims = await VoucherClaim.find({
+      rawClaims = await VoucherClaim.find({
         _id: { $in: voucherClaimIds },
         member: memberId,
         status: 'claimed'
-      }).lean();
+      })
+        .lean()
+        .catch(() => []);
+
       eligible = rawClaims
         .filter((c) => !c.validUntil || new Date(c.validUntil) > now)
         .map((c) => String(c._id));
+
+      // jika ada voucherClaimIds input yg tidak termasuk di eligible -> error
+      const invalids = (
+        Array.isArray(voucherClaimIds) ? voucherClaimIds : []
+      ).filter((id) => !eligible.includes(String(id)));
+      if (invalids.length) {
+        validation.hasError = true;
+        validation.invalidClaimIds = invalids;
+        validation.messages.push(
+          'Beberapa voucher yang dipilih tidak valid/kadaluarsa/tidak dimiliki.'
+        );
+        // langsung throw error supaya FE menangkapnya
+        throwError(validation.messages.join(' '), 400);
+      }
     }
   }
 
@@ -4540,7 +4570,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     eligiblePromosCount: eligiblePromosList.length,
     eligiblePromos: eligiblePromosSummary,
     promo: promoOut,
-    voucher: voucherOut,
+    voucher: voucherOut.chosenClaimIds.length ? voucherOut : null,
     ui_totals,
     member_points: Number(MemberDoc?.points || 0),
     guest: !memberId,
