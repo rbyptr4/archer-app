@@ -4157,11 +4157,11 @@ exports.previewPrice = asyncHandler(async (req, res) => {
 
   if (!cart?.items?.length) throwError('Cart kosong', 400);
 
-  // resolve identity (support guest)
+  const int = (v) => Math.round(Number(v || 0));
+
   const memberId = req.member?.id || null;
   const now = new Date();
 
-  // ===== filter vouchers (guest cannot use vouchers) =====
   let eligible = [];
   if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
     if (!memberId) {
@@ -4362,9 +4362,22 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     : Number(effectiveDeliveryFee || 0);
 
   // taxable items (same logic as order compute)
+  const SERVICE_FEE_RATE = Number(process.env.SERVICE_FEE_RATE || 0.02) || 0.02;
   const taxableItems = Math.max(0, baseSubtotal - itemsDiscount);
   const service_fee = Math.round(taxableItems * SERVICE_FEE_RATE);
+
+  const parsePpnRate = () => {
+    return Number(process.env.PPN_RATE || 0.11) || 0.11;
+  };
   const tax_amount = Math.round(taxableItems * parsePpnRate());
+
+  // helper rounding function from codebase (assumed available)
+  const roundRupiahCustom = (v) => {
+    const rem = Number(v) % 100;
+    if (rem === 0) return Number(v);
+    if (rem >= 50) return Number(v) + (100 - rem);
+    return Number(v) - rem;
+  };
 
   // raw before rounding & before points (this is pre-rounding value)
   const raw_before_points = Math.round(
@@ -4474,22 +4487,81 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     priority: Number(p.priority || 0)
   }));
 
-  const promoCompact = {
-    appliedPromoId: appliedPromo ? appliedPromo.promoId : null,
-    appliedPromoName: appliedPromo ? appliedPromo.name || null : null,
-    description: appliedPromo ? appliedPromo.description || null : null,
-    rewards: normalizedRewards,
-    points_total: Number(pointsTotalFromEngine || 0),
-    chosenClaimIds: result.chosenClaimIds || []
-  };
+  // ===== promo object: jika tidak ada appliedPromo => null; jika ada => ringkasan tanpa chosenClaimIds/points_total =====
+  let promoOut = null;
+  if (appliedPromo) {
+    promoOut = {
+      appliedPromoId: appliedPromo ? appliedPromo.promoId : null,
+      appliedPromoName: appliedPromo ? appliedPromo.name || null : null,
+      description: appliedPromo ? appliedPromo.description || null : null,
+      rewards: normalizedRewards
+    };
+  } else {
+    promoOut = null;
+  }
+
+  // ===== build voucher object: dapat chosenClaimIds dari beberapa path (robust) + name/description + claims detail =====
+  let voucherOut = { chosenClaimIds: [] };
+
+  const chosenFromResult =
+    result.chosenClaimIds ||
+    (result.voucherResult && result.voucherResult.chosenClaimIds) ||
+    (result.promoApplied && result.promoApplied.chosenClaimIds) ||
+    (result.promo && result.promo.chosenClaimIds) ||
+    [];
+
+  const chosenSet = Array.from(
+    new Set(
+      (Array.isArray(chosenFromResult) ? chosenFromResult : [])
+        .concat(Array.isArray(eligible) ? eligible : [])
+        .filter(Boolean)
+    )
+  );
+  voucherOut.chosenClaimIds = chosenSet;
+
+  try {
+    if (chosenSet.length) {
+      const claimDocs = await VoucherClaim.find({ _id: { $in: chosenSet } })
+        .populate('voucher')
+        .lean()
+        .catch(() => []);
+
+      voucherOut.claims = claimDocs.map((c) => ({
+        claimId: String(c._id),
+        voucherId: c.voucher ? String(c.voucher._id) : null,
+        voucherName: c.voucher ? c.voucher.name || null : null,
+        voucherDescription:
+          c.voucher && (c.voucher.description || c.voucher.notes)
+            ? c.voucher.description || c.voucher.notes
+            : null
+      }));
+
+      const first = voucherOut.claims.length ? voucherOut.claims[0] : null;
+      voucherOut.name = first ? first.voucherName : null;
+      voucherOut.description = first ? first.voucherDescription : null;
+    } else {
+      voucherOut.name = null;
+      voucherOut.description = null;
+      voucherOut.claims = [];
+    }
+  } catch (e) {
+    // jangan crash preview kalau fetch voucher gagal
+    console.error(
+      '[previewPrice] fetch voucher details failed',
+      e?.message || e
+    );
+    voucherOut.name = voucherOut.name ?? null;
+    voucherOut.description = voucherOut.description ?? null;
+    voucherOut.claims = voucherOut.claims ?? [];
+  }
 
   return res.status(200).json({
     ok: true,
     reasons: result.reasons || result.voucherResult?.reasons || [],
     eligiblePromosCount: eligiblePromosList.length,
     eligiblePromos: eligiblePromosSummary,
-    promo: promoCompact,
-    voucher: { chosenClaimIds: result.chosenClaimIds || [] },
+    promo: promoOut,
+    voucher: voucherOut,
     ui_totals,
     member_points: Number(MemberDoc?.points || 0),
     guest: !memberId,
