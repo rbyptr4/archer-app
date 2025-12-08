@@ -88,15 +88,19 @@ async function applyPromoThenVoucher({
   now = new Date(),
   promoUsageFetchers = {}
 } = {}) {
-  // Ringkas: log hanya awal (konfigurasi) supaya trace masih ada
-  console.info('[PE] START applyPromoThenVoucher', {
+  console.log('[PE] START applyPromoThenVoucher', {
     memberId,
     fulfillmentType,
     deliveryFee,
     voucherClaimIdsLen: Array.isArray(voucherClaimIds)
       ? voucherClaimIds.length
       : 0,
-    items_len: Array.isArray(cart.items) ? cart.items.length : 0
+    voucherClaimIdsSample: Array.isArray(voucherClaimIds)
+      ? voucherClaimIds.slice(0, 5)
+      : voucherClaimIds,
+    cart_items_len: Array.isArray((cart || {}).items) ? cart.items.length : 0,
+    cart_items_sample:
+      cart && cart.items && cart.items[0] ? cart.items[0] : null
   });
 
   // build effectiveMember
@@ -130,7 +134,19 @@ async function applyPromoThenVoucher({
     qty: Number(it.qty || 0),
     price: Number(it.price || 0)
   }));
-
+  console.log('[PE.debug] originalForDist summary:', {
+    count: originalForDist.length,
+    subtotal: originalForDist.reduce(
+      (s, x) => s + Number(x.price || 0) * Number(x.qty || 0),
+      0
+    ),
+    sample: originalForDist.slice(0, 3)
+  });
+  const safeCart = makeSafeCartForPromo(originalForDist);
+  console.log(
+    '[PE.debug] safeCart for promo (first items):',
+    safeCart.items && safeCart.items.slice(0, 3)
+  );
   // find applicable promos (no verbose logging)
   let applicable = [];
   try {
@@ -405,6 +421,17 @@ async function applyPromoThenVoucher({
       }
     }
   }
+  console.log(
+    '[PE.debug] calling validateAndPrice with voucherClaimIds:',
+    voucherClaimIds
+  );
+  console.log('[PE.debug] cartAfterPromo summary:', {
+    items_len: (cartAfterPromo.items || []).length,
+    subtotal: (cartAfterPromo.items || []).reduce(
+      (s, it) => s + Number(it.price || 0) * Number(it.qty || 0),
+      0
+    )
+  });
 
   // ==== Fokus voucher: panggil voucher engine dan log ringkas hasilnya ====
   let voucherRes = null;

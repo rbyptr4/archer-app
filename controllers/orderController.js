@@ -1531,7 +1531,18 @@ exports.checkout = asyncHandler(async (req, res) => {
     null;
 
   if (guestToken === '') guestToken = null;
-
+console.log('[checkout.debug] incoming raw body snippet (top):', {
+  bodyKeys: Object.keys(req.body || {}).slice(0, 20),
+  voucherClaimIds_raw:
+    req.body?.voucherClaimIds ??
+    req.body?.voucher?.chosenClaimIds ??
+    req.body?.voucher?.chosen_claim_ids ??
+    req.body?.voucher_claim_ids ??
+    req.body?.voucher_claim_id ??
+    null,
+  xGuestToken: req.headers?.['x-guest-token'] || null,
+  cookieGuestToken: req.cookies?.guestToken || null
+});
   // --- normalize voucherClaimIds (support multiple FE shapes) ---
   // taruh di sini: setelah guestToken resolved & sebelum log incoming body snippet
   let voucherClaimIds = [];
@@ -1872,6 +1883,10 @@ exports.checkout = asyncHandler(async (req, res) => {
 
           console.log('[voucher] eligibleClaimIds:', eligibleClaimIds);
 
+console.log(
+  '[checkout.debug] normalized voucherClaimIds (to-server):',
+  voucherClaimIds
+);
 
         // Optional: compare with query-by-filter (for diagnosis)
         try {
