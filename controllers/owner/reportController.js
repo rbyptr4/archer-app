@@ -1114,7 +1114,7 @@ exports.customerGrowth = asyncHandler(async (req, res) => {
 });
 
 /**
- * GET /reports/top-selling-menus-summary
+ * GET /report/menu/top-menu
  * Query:
  *  - from,to,range
  *  - bigCategory (optional)  -> contoh: ?bigCategory=drinks
@@ -1219,11 +1219,6 @@ exports.topSellingMenusSummary = asyncHandler(async (req, res) => {
       }
     },
     { $unwind: { path: '$menuDoc', preserveNullAndEmptyArrays: true } },
-
-    // compute prorated share of order-level items_discount only when:
-    // - order_items_subtotal > 0
-    // - order_items_discount > 0
-    // - and line_after_adj is null (meaning we don't have per-line adjusted value)
     {
       $addFields: {
         _prorated_items_discount: {
@@ -1246,11 +1241,6 @@ exports.topSellingMenusSummary = asyncHandler(async (req, res) => {
         }
       }
     },
-
-    // final line amount logic:
-    // - if _line_after_adj exists (even if zero): use it
-    // - else: line_subtotal - prorated_items_discount
-    // - clamp to >= 0
     {
       $addFields: {
         _final_line_amount: {
