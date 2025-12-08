@@ -1531,104 +1531,47 @@ exports.checkout = asyncHandler(async (req, res) => {
     null;
 
   if (guestToken === '') guestToken = null;
-  console.log('[checkout.debug] incoming raw body snippet (top):', {
-    bodyKeys: Object.keys(req.body || {}).slice(0, 20),
-    voucherClaimIds_raw:
-      req.body?.voucherClaimIds ??
-      req.body?.voucher?.chosenClaimIds ??
-      req.body?.voucher?.chosen_claim_ids ??
-      req.body?.voucher_claim_ids ??
-      req.body?.voucher_claim_id ??
-      null,
-    xGuestToken: req.headers?.['x-guest-token'] || null,
-    cookieGuestToken: req.cookies?.guestToken || null
-  });
   // --- normalize voucherClaimIds (support multiple FE shapes) ---
-  // taruh di sini: setelah guestToken resolved & sebelum log incoming body snippet
   let voucherClaimIds = [];
 
-  // prefer explicit camelCase array
-  if (
-    Array.isArray(req.body?.voucherClaimIds) &&
-    req.body.voucherClaimIds.length
-  ) {
+  // prefer explicit camelCase array if already an array
+  if (Array.isArray(req.body?.voucherClaimIds) && req.body.voucherClaimIds.length) {
     voucherClaimIds = req.body.voucherClaimIds;
-  } else if (
-    Array.isArray(req.body?.voucher?.chosenClaimIds) &&
-    req.body?.voucher?.chosenClaimIds.length
-  ) {
+  } else if (Array.isArray(req.body?.voucher?.chosenClaimIds) && req.body.voucher.chosenClaimIds.length) {
     voucherClaimIds = req.body.voucher.chosenClaimIds;
-  } else if (
-    Array.isArray(req.body?.voucher?.chosen_claim_ids) &&
-    req.body?.voucher?.chosen_claim_ids.length
-  ) {
+  } else if (Array.isArray(req.body?.voucher?.chosen_claim_ids) && req.body.voucher.chosen_claim_ids.length) {
     voucherClaimIds = req.body.voucher.chosen_claim_ids;
-  } else if (
-    Array.isArray(req.body?.voucher_claim_ids) &&
-    req.body?.voucher_claim_ids.length
-  ) {
+  } else if (Array.isArray(req.body?.voucher_claim_ids) && req.body.voucher_claim_ids.length) {
     voucherClaimIds = req.body.voucher_claim_ids;
-  } else if (
-    typeof req.body?.voucher_claim_id !== 'undefined' &&
-    req.body.voucher_claim_id
-  ) {
+  } else if (typeof req.body?.voucher_claim_id !== 'undefined' && req.body.voucher_claim_id) {
     voucherClaimIds = [req.body.voucher_claim_id];
-  }
-
-  // --- defensive: accept stringified JSON or comma-separated strings from FE ---
-  // contoh FE bad-shape: voucherClaimIds: '["6935b582b10efc0ff7bd1d84"]' atau '6935b582b10efc0ff7bd1d84'
-  if (!Array.isArray(voucherClaimIds)) {
-    // collect candidate raw values FE might have sent (prefer the top-level one first)
-    const rawCandidates = [
-      req.body?.voucherClaimIds,
-      req.body?.voucher_claim_ids,
-      req.body?.voucher?.chosenClaimIds,
-      req.body?.voucher?.chosen_claim_ids,
-      req.body?.voucher_claim_id
-    ].filter(Boolean);
-
-    if (rawCandidates.length === 1 && typeof rawCandidates[0] === 'string') {
-      const raw = String(rawCandidates[0]).trim();
+  } else {
+    const tryParse = (val) => {
+      if (!val && val !== 0) return null;
+      if (Array.isArray(val) && val.length) return val;
+      if (typeof val === 'number') return [String(val)];
+      if (typeof val !== 'string') return null;
+      const s = val.trim();
+      if (!s) return null;
       try {
-        // try parse JSON (e.g. '["id1","id2"]')
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed) && parsed.length) {
-          voucherClaimIds = parsed;
-          console.log(
-            '[checkout.debug] parsed voucherClaimIds from JSON-string:',
-            voucherClaimIds
-          );
-        } else if (typeof parsed === 'string' && parsed) {
-          voucherClaimIds = [parsed];
-          console.log(
-            '[checkout.debug] parsed single voucherClaimId from JSON-string:',
-            voucherClaimIds
-          );
-        }
+        const p = JSON.parse(s);
+        if (Array.isArray(p) && p.length) return p;
+        if (typeof p === 'string' && p) return [p];
       } catch (e) {
-        // fallback: accept comma-separated string or single id string
-        const maybe = raw
-          .replace(/^\[|\]$/g, '') // strip surrounding brackets if any
-          .split(',')
-          .map((s) => String(s || '').trim())
-          .filter(Boolean);
-        if (maybe.length) {
-          voucherClaimIds = maybe;
-          console.log(
-            '[checkout.debug] parsed voucherClaimIds from comma/string:',
-            voucherClaimIds
-          );
-        }
       }
-    }
+      const maybe = s.replace(/^\[|\]$/g, '').split(',').map(x => String(x||'').trim()).filter(Boolean);
+      return maybe.length ? maybe : [s];
+    };
+
+    voucherClaimIds = tryParse(req.body?.voucherClaimIds) || tryParse(req.body?.voucher_claim_ids) || [];
   }
 
-  // coerce to string, remove falsy
   voucherClaimIds = (Array.isArray(voucherClaimIds) ? voucherClaimIds : [])
     .filter(Boolean)
     .map((v) => String(v));
 
   console.log('[voucher] normalizedClaimIds:', voucherClaimIds);
+
 
   console.log('[checkout] incoming body snippet', {
     fulfillment_type,
@@ -3072,10 +3015,6 @@ exports.checkout = asyncHandler(async (req, res) => {
                     }
                   }
                 );
-                console.log(
-                  '[checkout] global stock empty -> revoked other claims',
-                  { voucher: v._id }
-                );
               }
             }
           } catch (ee) {
@@ -3168,9 +3107,6 @@ exports.checkout = asyncHandler(async (req, res) => {
     emitOrdersStream({ target: 'cashier', action: 'insert', item: summary });
 
     emitToStaff('staff:notify', { message: 'Pesanan baru dibuat.' });
-    console.log('[checkout] emitted order summary to streams', {
-      orderId: order._id
-    });
   } catch (e) {
     console.error('[emit][checkout]', e?.message || e);
   }
