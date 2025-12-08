@@ -1143,8 +1143,8 @@ exports.getCart = asyncHandler(async (req, res) => {
     ...cart,
     fulfillment_type: cart.fulfillment_type || 'dine_in',
     delivery_mode: cartDeliveryMode,
-    items
-    // ui_totals: ui
+    items,
+    ui_totals: ui
   });
 });
 
@@ -4292,7 +4292,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         };
       }
     } catch (e) {
-      // log only on error
       console.error('[previewPrice] auto apply promo failed', e?.message || e);
       autoAppliedPromo = null;
     }
@@ -4500,35 +4499,51 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     rewards: normalizedRewards
   };
 
-  // ===== build voucher object: chosenClaimIds + name & description (ambil dari Voucher) =====
-  let voucherOut = { chosenClaimIds: result.chosenClaimIds || [] };
+  let voucherOut = { chosenClaimIds: [] };
+
+  const chosenFromResult =
+    result.chosenClaimIds ||
+    (result.voucherResult && result.voucherResult.chosenClaimIds) ||
+    (result.promoApplied && result.promoApplied.chosenClaimIds) ||
+    (result.promo && result.promo.chosenClaimIds) ||
+    [];
+
+  // juga gabungkan dengan eligible (input) sebagai fallback
+  const chosenSet = Array.from(
+    new Set(
+      (Array.isArray(chosenFromResult) ? chosenFromResult : [])
+        .concat(Array.isArray(eligible) ? eligible : [])
+        .filter(Boolean)
+    )
+  );
+  voucherOut.chosenClaimIds = chosenSet;
 
   try {
-    const chosen = Array.isArray(result.chosenClaimIds)
-      ? result.chosenClaimIds.filter(Boolean)
-      : [];
-
-    if (chosen.length) {
-      const claimDocs = await VoucherClaim.find({ _id: { $in: chosen } })
+    if (chosenSet.length) {
+      const claimDocs = await VoucherClaim.find({ _id: { $in: chosenSet } })
         .populate('voucher')
         .lean()
         .catch(() => []);
 
-      const firstClaim = claimDocs && claimDocs.length ? claimDocs[0] : null;
-      const voucherDoc =
-        firstClaim && firstClaim.voucher ? firstClaim.voucher : null;
+      // jika FE mau detail per-claim, kita sediakan juga claims array
+      voucherOut.claims = claimDocs.map((c) => ({
+        claimId: String(c._id),
+        voucherId: c.voucher ? String(c.voucher._id) : null,
+        voucherName: c.voucher ? c.voucher.name || null : null,
+        voucherDescription:
+          c.voucher && (c.voucher.description || c.voucher.notes)
+            ? c.voucher.description || c.voucher.notes
+            : null
+      }));
 
-      if (voucherDoc) {
-        voucherOut.name = voucherDoc.name || null;
-        voucherOut.description =
-          voucherDoc.description || voucherDoc.notes || null;
-      } else {
-        voucherOut.name = null;
-        voucherOut.description = null;
-      }
+      // ambil ringkasan (nama & deskripsi) dari voucher pertama jika ada
+      const first = voucherOut.claims.length ? voucherOut.claims[0] : null;
+      voucherOut.name = first ? first.voucherName : null;
+      voucherOut.description = first ? first.voucherDescription : null;
     } else {
       voucherOut.name = null;
       voucherOut.description = null;
+      voucherOut.claims = [];
     }
   } catch (e) {
     // hanya log error, jangan crash preview
@@ -4538,6 +4553,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     );
     voucherOut.name = voucherOut.name ?? null;
     voucherOut.description = voucherOut.description ?? null;
+    voucherOut.claims = voucherOut.claims ?? [];
   }
 
   return res.status(200).json({
