@@ -2056,11 +2056,14 @@ exports.checkout = asyncHandler(async (req, res) => {
     ? false
     : true;
 
-  const engineDeliveryFee = Number(
-    deliveryObj.delivery_fee_raw ??
-      deliveryObj.delivery_fee ??
-      Number(process.env.DELIVERY_FLAT_FEE || 0)
-  );
+  const engineDeliveryFee =
+    ft === 'dine_in'
+      ? 0
+      : Number(
+          deliveryObj.delivery_fee_raw ??
+            deliveryObj.delivery_fee ??
+            Number(process.env.DELIVERY_FLAT_FEE || 0)
+        );
 
   console.log('[checkout] engineDeliveryFee ->', engineDeliveryFee);
   console.log('[checkout.debug] calling applyPromoThenVoucher with:', {
@@ -4150,6 +4153,8 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
   return res.status(200).json({ success: true, order: full });
 });
 
+// Pastikan file ini memiliki akses ke: asyncHandler, throwError, Member, VoucherClaim, Order, Promo (models),
+// applyPromoThenVoucher, findApplicablePromos, applyPromo, SERVICE_FEE_RATE, parsePpnRate, roundRupiahCustom, int
 exports.previewPrice = asyncHandler(async (req, res) => {
   const {
     cart,
@@ -4510,14 +4515,163 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     priority: Number(p.priority || 0)
   }));
 
-  // ===== promo object: jika tidak ada appliedPromo => null; jika ada => ringkasan tanpa chosenClaimIds/points_total =====
+  // ======================
+  // tambahan: enrich applied promo dengan usage/stock info
+  // ======================
+  let promoDetails = null;
+  if (appliedPromo && appliedPromo.promoId) {
+    try {
+      // require di sini supaya modul tetap fleksibel (jika models diimport di file lain)
+      const Promo = require('../models/promoModel');
+      promoDetails =
+        (await Promo.findById(appliedPromo.promoId)
+          .lean()
+          .catch(() => null)) ||
+        (Array.isArray(eligiblePromosList)
+          ? eligiblePromosList.find(
+              (p) => String(p._id) === String(appliedPromo.promoId)
+            )
+          : null);
+    } catch (e) {
+      console.warn(
+        '[previewPrice] fetch promo details failed',
+        e?.message || e
+      );
+      promoDetails = null;
+    }
+  }
+
+  let promoUsageInfo = {
+    memberUsed: 0,
+    globalUsed: 0
+  };
+
+  if (promoDetails && promoDetails._id) {
+    try {
+      // gunakan fields time window jika ada, fallback ke epoch (hitung semua)
+      const sinceDate = promoDetails.conditions?.usageWindowStart
+        ? new Date(promoDetails.conditions.usageWindowStart)
+        : promoDetails.conditions?.startAt
+        ? new Date(promoDetails.conditions.startAt)
+        : new Date(0);
+
+      // member usage (hanya jika ada member)
+      if (typeof promoUsageFetchers.getMemberUsageCount === 'function') {
+        promoUsageInfo.memberUsed = memberId
+          ? await promoUsageFetchers.getMemberUsageCount(
+              String(promoDetails._id),
+              memberId,
+              sinceDate
+            )
+          : 0;
+      }
+
+      // global usage
+      if (typeof promoUsageFetchers.getGlobalUsageCount === 'function') {
+        promoUsageInfo.globalUsed =
+          await promoUsageFetchers.getGlobalUsageCount(
+            String(promoDetails._id),
+            sinceDate
+          );
+      }
+    } catch (e) {
+      console.warn('[previewPrice] promo usage fetch failed', e?.message || e);
+      promoUsageInfo = promoUsageInfo || { memberUsed: 0, globalUsed: 0 };
+    }
+  }
+
+  // compute remaining numbers conservatively
+  let remainingPerMember = null;
+  let remainingGlobal = null;
+  let globalStock =
+    promoDetails && promoDetails.globalStock != null
+      ? Number(promoDetails.globalStock)
+      : null;
+
+  if (promoDetails) {
+    const perMemberLimit = Number(
+      promoDetails.conditions?.usageLimitPerMember || 0
+    );
+    const globalLimit = Number(promoDetails.conditions?.usageLimitGlobal || 0);
+
+    if (perMemberLimit > 0) {
+      remainingPerMember = Math.max(
+        0,
+        perMemberLimit - (promoUsageInfo.memberUsed || 0)
+      );
+    } else {
+      // kalau tidak ada limit per-member, set null (unlimited)
+      remainingPerMember = null;
+    }
+
+    if (globalLimit > 0) {
+      remainingGlobal = Math.max(
+        0,
+        globalLimit - (promoUsageInfo.globalUsed || 0)
+      );
+    } else {
+      remainingGlobal = null;
+    }
+
+    // jika globalStock juga dipakai, laporkan kombinasi yang paling ketat
+    if (Number.isFinite(globalStock)) {
+      if (remainingGlobal == null) {
+        remainingGlobal = Math.max(
+          0,
+          globalStock - (promoUsageInfo.globalUsed || 0)
+        );
+      } else {
+        remainingGlobal = Math.max(
+          0,
+          Math.min(
+            remainingGlobal,
+            globalStock - (promoUsageInfo.globalUsed || 0)
+          )
+        );
+      }
+    }
+  }
+
+  // build extra info object
+  const promoExtra = promoDetails
+    ? {
+        promoId: String(promoDetails._id),
+        validFrom:
+          promoDetails.conditions?.startAt ||
+          promoDetails.startAt ||
+          promoDetails.conditions?.usageWindowStart ||
+          null,
+        validUntil:
+          promoDetails.conditions?.endAt ||
+          promoDetails.endAt ||
+          promoDetails.conditions?.usageWindowEnd ||
+          null,
+        note:
+          promoDetails.note ||
+          promoDetails.notes ||
+          promoDetails.description ||
+          promoDetails.meta?.note ||
+          null,
+        globalStock: globalStock,
+        usageLimitPerMember:
+          promoDetails.conditions?.usageLimitPerMember ?? null,
+        usageLimitGlobal: promoDetails.conditions?.usageLimitGlobal ?? null,
+        usedByMember: promoUsageInfo.memberUsed ?? 0,
+        usedGlobal: promoUsageInfo.globalUsed ?? 0,
+        remainingPerMember,
+        remainingGlobal
+      }
+    : null;
+
+  // ===== promo object: jika tidak ada appliedPromo => null; jika ada => ringkasan + extra =====
   let promoOut = null;
   if (appliedPromo) {
     promoOut = {
       appliedPromoId: appliedPromo ? appliedPromo.promoId : null,
       appliedPromoName: appliedPromo ? appliedPromo.name || null : null,
       description: appliedPromo ? appliedPromo.description || null : null,
-      rewards: normalizedRewards
+      rewards: normalizedRewards,
+      extra: promoExtra // tambahan info tentang sisa klaim / stok / validitas
     };
   } else {
     promoOut = null;
