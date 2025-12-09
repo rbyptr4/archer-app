@@ -1599,7 +1599,8 @@ exports.checkout = asyncHandler(async (req, res) => {
   const iden0 = getIdentity(req);
   const ft =
     iden0.mode === 'self_order' ? 'dine_in' : fulfillment_type || 'dine_in';
-  if (!['dine_in', 'delivery'].includes(ft)) throwError('fulfillment_type tidak valid', 400);
+  if (!['dine_in', 'delivery'].includes(ft))
+    throwError('fulfillment_type tidak valid', 400);
 
   const method = String(payment_method || '').toLowerCase();
   const originallyLoggedIn = !!iden0.memberId;
@@ -1616,7 +1617,8 @@ exports.checkout = asyncHandler(async (req, res) => {
     } else {
       customer_name = String(name || '').trim();
       const rawPhone = String(phone || '').trim();
-      if (!customer_name && !rawPhone) throwError('Tanpa member: isi minimal nama atau no. telp', 400);
+      if (!customer_name && !rawPhone)
+        throwError('Tanpa member: isi minimal nama atau no. telp', 400);
       if (rawPhone) {
         const digits = rawPhone.replace(/\D+/g, '');
         if (!digits) throwError('Nomor telepon harus berupa angka', 400);
@@ -1630,9 +1632,12 @@ exports.checkout = asyncHandler(async (req, res) => {
     throw e;
   }
 
-  if (method === 'points' && !MemberDoc) throwError('Pembayaran dengan poin hanya untuk member terdaftar', 400);
-  if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method)) throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
-  if (usePoints && !MemberDoc) throwError('Poin hanya dapat digunakan oleh member terdaftar', 400);
+  if (method === 'points' && !MemberDoc)
+    throwError('Pembayaran dengan poin hanya untuk member terdaftar', 400);
+  if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method))
+    throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
+  if (usePoints && !MemberDoc)
+    throwError('Poin hanya dapat digunakan oleh member terdaftar', 400);
 
   const iden = {
     ...iden0,
@@ -1645,7 +1650,9 @@ exports.checkout = asyncHandler(async (req, res) => {
   };
 
   // --- ambil cart aktif ---
-  const cartObj = await getActiveCartForIdentity(iden, { allowCreateOnline: false });
+  const cartObj = await getActiveCartForIdentity(iden, {
+    allowCreateOnline: false
+  });
   if (!cartObj) throwError('Cart tidak ditemukan / kosong', 404);
   const cart = await Cart.findById(cartObj._1 || cartObj._id);
   if (!cart) throwError('Cart tidak ditemukan / kosong', 404);
@@ -1658,9 +1665,14 @@ exports.checkout = asyncHandler(async (req, res) => {
         String(cart.last_idempotency_key || '') === String(idempotency_key) &&
         cart.order_id
       ) {
-        const existing = await Order.findById(cart.order_id).lean().catch(() => null);
+        const existing = await Order.findById(cart.order_id)
+          .lean()
+          .catch(() => null);
         if (existing) {
-          console.info('[checkout][idempotency] returning existing order for idempotency_key', idempotency_key);
+          console.info(
+            '[checkout][idempotency] returning existing order for idempotency_key',
+            idempotency_key
+          );
           // small summary if uiTotals not yet computed
           return res.status(200).json({
             order: existing,
@@ -1669,32 +1681,52 @@ exports.checkout = asyncHandler(async (req, res) => {
         }
       }
       // optimistic mark on cart to make quick retries be fast (best-effort; may be overwritten)
-      await Cart.findByIdAndUpdate(cart._id, { $set: { last_idempotency_key: idempotency_key } }).catch(()=>{});
+      await Cart.findByIdAndUpdate(cart._id, {
+        $set: { last_idempotency_key: idempotency_key }
+      }).catch(() => {});
     } catch (e) {
-      console.warn('[checkout][idempotency] early check failed', e?.message || e);
+      console.warn(
+        '[checkout][idempotency] early check failed',
+        e?.message || e
+      );
       // don't block flow if idempotency check broken
     }
   }
 
   // --- delivery / slot / pickup handling (unchanged) ---
-  const delivery_mode = ft === 'dine_in' ? 'none' : String(req.body?.delivery_mode || 'delivery').toLowerCase();
+  const delivery_mode =
+    ft === 'dine_in'
+      ? 'none'
+      : String(req.body?.delivery_mode || 'delivery').toLowerCase();
   const providedSlot = (req.body?.delivery_slot || '').trim();
   const providedScheduledAtRaw = req.body?.scheduled_at || null;
-  const providedScheduledAt = providedScheduledAtRaw ? dayjs(providedScheduledAtRaw).tz(LOCAL_TZ) : null;
+  const providedScheduledAt = providedScheduledAtRaw
+    ? dayjs(providedScheduledAtRaw).tz(LOCAL_TZ)
+    : null;
 
   let slotLabel = null;
   let slotDt = null;
-  if (delivery_mode === 'delivery' && providedScheduledAt && providedScheduledAt.isValid()) {
+  if (
+    delivery_mode === 'delivery' &&
+    providedScheduledAt &&
+    providedScheduledAt.isValid()
+  ) {
     slotDt = providedScheduledAt.startOf('minute');
     slotLabel = slotDt.format('HH:mm');
   } else if (delivery_mode === 'delivery' && providedSlot) {
     const maybeDt = parseSlotLabelToDate(providedSlot);
-    if (!maybeDt || !maybeDt.isValid()) throwError('delivery_slot tidak valid', 400);
+    if (!maybeDt || !maybeDt.isValid())
+      throwError('delivery_slot tidak valid', 400);
     slotDt = maybeDt;
     slotLabel = providedSlot;
   }
 
-  if (slotLabel && ft !== 'dine_in' && delivery_mode === 'delivery' && !isSlotAvailable(slotLabel, null, delivery_mode)) {
+  if (
+    slotLabel &&
+    ft !== 'dine_in' &&
+    delivery_mode === 'delivery' &&
+    !isSlotAvailable(slotLabel, null, delivery_mode)
+  ) {
     throwError('Slot sudah tidak tersedia / sudah lewat', 409);
   }
 
@@ -1706,7 +1738,8 @@ exports.checkout = asyncHandler(async (req, res) => {
   };
 
   // pickup window handling
-  const pickupFromRaw = req.body?.pickup_from || req.body?.pickupWindow?.from || null;
+  const pickupFromRaw =
+    req.body?.pickup_from || req.body?.pickupWindow?.from || null;
   const pickupToRaw = req.body?.pickup_to || req.body?.pickupWindow?.to || null;
   if (delivery_mode === 'pickup') {
     deliveryObj.mode = 'pickup';
@@ -1730,9 +1763,11 @@ exports.checkout = asyncHandler(async (req, res) => {
   if (delivery_mode === 'delivery' && ft !== 'dine_in') {
     const latN = Number(req.body?.lat);
     const lngN = Number(req.body?.lng);
-    if (!Number.isFinite(latN) || !Number.isFinite(lngN)) throwError('Lokasi (lat,lng) wajib untuk delivery', 400);
+    if (!Number.isFinite(latN) || !Number.isFinite(lngN))
+      throwError('Lokasi (lat,lng) wajib untuk delivery', 400);
     const distance_km = haversineKm(CAFE_COORD, { lat: latN, lng: lngN });
-    if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0)) throwError(`Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`);
+    if (distance_km > Number(DELIVERY_MAX_RADIUS_KM || 0))
+      throwError(`Di luar radius ${DELIVERY_MAX_RADIUS_KM} km`);
     deliveryObj.address_text = String(req.body?.address_text || '').trim();
     deliveryObj.location = { lat: latN, lng: lngN };
     deliveryObj.distance_km = Number(distance_km.toFixed(2));
@@ -1773,10 +1808,14 @@ exports.checkout = asyncHandler(async (req, res) => {
   // --- PRE-UPLOAD PROOF if needed (do BEFORE create order) ---
   let preUploadedProofUrl = null;
   if (needProof(method)) {
-    if (!req.file) throwError('Bukti pembayaran wajib diunggah untuk metode ini', 400);
+    if (!req.file)
+      throwError('Bukti pembayaran wajib diunggah untuk metode ini', 400);
     try {
-      preUploadedProofUrl = await handleTransferProofIfAny(req, method, { transactionCode: 'PRECREATE' });
-      if (!preUploadedProofUrl) throwError('Gagal mengunggah bukti pembayaran', 500);
+      preUploadedProofUrl = await handleTransferProofIfAny(req, method, {
+        transactionCode: 'PRECREATE'
+      });
+      if (!preUploadedProofUrl)
+        throwError('Gagal mengunggah bukti pembayaran', 500);
     } catch (e) {
       console.error('[checkout] pre-upload proof failed', e?.message || e);
       throwError('Gagal mengunggah bukti pembayaran', 500);
@@ -1788,13 +1827,27 @@ exports.checkout = asyncHandler(async (req, res) => {
   let rawById = [];
   if (MemberDoc) {
     if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
-      rawById = await VoucherClaim.find({ _id: { $in: voucherClaimIds } }).lean().catch(() => []);
+      rawById = await VoucherClaim.find({ _id: { $in: voucherClaimIds } })
+        .lean()
+        .catch(() => []);
       const now = new Date();
       eligibleClaimIds = (rawById || [])
-        .filter((d) => String(d.member || '') === String(MemberDoc._id || '') && d.status === 'claimed' && (!d.validUntil || new Date(d.validUntil) > now))
+        .filter(
+          (d) =>
+            String(d.member || '') === String(MemberDoc._id || '') &&
+            d.status === 'claimed' &&
+            (!d.validUntil || new Date(d.validUntil) > now)
+        )
         .map((d) => String(d._id));
-      if (Array.isArray(voucherClaimIds) && voucherClaimIds.length && eligibleClaimIds.length === 0) {
-        throwError('Voucher tidak valid/expired/atau bukan milik member ini. Silakan periksa wallet Anda atau refresh halaman.', 400);
+      if (
+        Array.isArray(voucherClaimIds) &&
+        voucherClaimIds.length &&
+        eligibleClaimIds.length === 0
+      ) {
+        throwError(
+          'Voucher tidak valid/expired/atau bukan milik member ini. Silakan periksa wallet Anda atau refresh halaman.',
+          400
+        );
       }
     }
   } else if (voucherClaimIds?.length) {
@@ -1806,7 +1859,10 @@ exports.checkout = asyncHandler(async (req, res) => {
     items: (cart.items || []).map((it) => {
       const menuBase = Number(it.base_price ?? it.unit_price ?? it.price ?? 0);
       const addons = Array.isArray(it.addons) ? it.addons : [];
-      const addonsPerUnit = addons.reduce((s, a) => s + Number(a?.price || 0) * Math.max(1, Number(a?.qty || 1)), 0);
+      const addonsPerUnit = addons.reduce(
+        (s, a) => s + Number(a?.price || 0) * Math.max(1, Number(a?.qty || 1)),
+        0
+      );
       const unit_price = Math.round(menuBase + addonsPerUnit);
       return {
         base_price: menuBase,
@@ -1827,9 +1883,17 @@ exports.checkout = asyncHandler(async (req, res) => {
       try {
         if (!memberId) return 0;
         if (MemberDoc && Array.isArray(MemberDoc.promoUsageHistory)) {
-          return MemberDoc.promoUsageHistory.filter((h) => String(h.promoId) === String(promoId) && new Date(h.usedAt || h.date) >= sinceDate).length;
+          return MemberDoc.promoUsageHistory.filter(
+            (h) =>
+              String(h.promoId) === String(promoId) &&
+              new Date(h.usedAt || h.date) >= sinceDate
+          ).length;
         }
-        const q = { 'appliedPromo.promoId': promoId, member: memberId, createdAt: { $gte: sinceDate } };
+        const q = {
+          'appliedPromo.promoId': promoId,
+          member: memberId,
+          createdAt: { $gte: sinceDate }
+        };
         return await Order.countDocuments(q);
       } catch (e) {
         console.warn('[checkout] getMemberUsageCount failed', e?.message || e);
@@ -1838,7 +1902,10 @@ exports.checkout = asyncHandler(async (req, res) => {
     },
     getGlobalUsageCount: async (promoId, sinceDate) => {
       try {
-        const q = { 'appliedPromo.promoId': promoId, createdAt: { $gte: sinceDate } };
+        const q = {
+          'appliedPromo.promoId': promoId,
+          createdAt: { $gte: sinceDate }
+        };
         return await Order.countDocuments(q);
       } catch (e) {
         console.warn('[checkout] getGlobalUsageCount failed', e?.message || e);
@@ -1849,7 +1916,12 @@ exports.checkout = asyncHandler(async (req, res) => {
 
   let eligiblePromosList = [];
   try {
-    eligiblePromosList = await findApplicablePromos(normalizedForEngine, MemberDoc, new Date(), { fetchers: promoUsageFetchers });
+    eligiblePromosList = await findApplicablePromos(
+      normalizedForEngine,
+      MemberDoc,
+      new Date(),
+      { fetchers: promoUsageFetchers }
+    );
   } catch (e) {
     console.warn('[checkout] findApplicablePromos failed', e?.message || e);
     eligiblePromosList = [];
@@ -1863,8 +1935,15 @@ exports.checkout = asyncHandler(async (req, res) => {
       if (autos.length) {
         autos.sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0));
         const chosen = autos[0];
-        const { impact, actions } = await applyPromo(chosen, { items: normalizedForEngine.items });
-        autoAppliedPromo = { promoId: String(chosen._id), name: chosen.name || null, impact, actions: actions || [] };
+        const { impact, actions } = await applyPromo(chosen, {
+          items: normalizedForEngine.items
+        });
+        autoAppliedPromo = {
+          promoId: String(chosen._id),
+          name: chosen.name || null,
+          impact,
+          actions: actions || []
+        };
       }
     }
   } catch (e) {
@@ -1872,11 +1951,26 @@ exports.checkout = asyncHandler(async (req, res) => {
     autoAppliedPromo = null;
   }
 
-  const selectedForEngine = req.body?.selectedPromoId ? req.body?.selectedPromoId : autoAppliedPromo ? String(autoAppliedPromo.promoId) : null;
-  const autoApplyForEngine = req.body?.selectedPromoId ? false : selectedForEngine ? false : true;
+  const selectedForEngine = req.body?.selectedPromoId
+    ? req.body?.selectedPromoId
+    : autoAppliedPromo
+    ? String(autoAppliedPromo.promoId)
+    : null;
+  const autoApplyForEngine = req.body?.selectedPromoId
+    ? false
+    : selectedForEngine
+    ? false
+    : true;
 
   // engineDeliveryFee logic (dine_in -> 0)
-  const engineDeliveryFee = ft === 'dine_in' ? 0 : Number(deliveryObj.delivery_fee_raw ?? deliveryObj.delivery_fee ?? Number(process.env.DELIVERY_FLAT_FEE || 0));
+  const engineDeliveryFee =
+    ft === 'dine_in'
+      ? 0
+      : Number(
+          deliveryObj.delivery_fee_raw ??
+            deliveryObj.delivery_fee ??
+            Number(process.env.DELIVERY_FLAT_FEE || 0)
+        );
 
   // call price engine
   let priced;
@@ -1893,26 +1987,53 @@ exports.checkout = asyncHandler(async (req, res) => {
       promoUsageFetchers
     });
   } catch (err) {
-    throwError(`Gagal menghitung harga: ${String(err?.message || err)}`, err?.status || 500);
+    throwError(
+      `Gagal menghitung harga: ${String(err?.message || err)}`,
+      err?.status || 500
+    );
   }
-  if (!priced || !priced.ok) throwError((priced && priced.reasons && priced.reasons.join?.(', ')) || 'Gagal menghitung harga (engine)', 400);
+  if (!priced || !priced.ok)
+    throwError(
+      (priced && priced.reasons && priced.reasons.join?.(', ')) ||
+        'Gagal menghitung harga (engine)',
+      400
+    );
 
   // fallback: use engine chosenClaimIds if local eligible empty
-  if ((!eligibleClaimIds || eligibleClaimIds.length === 0) && Array.isArray(priced?.chosenClaimIds) && priced.chosenClaimIds.length) {
+  if (
+    (!eligibleClaimIds || eligibleClaimIds.length === 0) &&
+    Array.isArray(priced?.chosenClaimIds) &&
+    priced.chosenClaimIds.length
+  ) {
     eligibleClaimIds = priced.chosenClaimIds.map(String);
   }
 
   // normalize discounts & breakdown etc. (kept similar to original)
   const discounts = [];
   const appliedVoucherIdSet = new Set();
-  const engineDiscounts = Array.isArray(priced.discounts) ? priced.discounts : Array.isArray(priced.breakdown) ? priced.breakdown : [];
-  const isObjectIdLike = (s) => typeof s === 'string' && /^[0-9a-fA-F]{24}$/.test(s);
-  const claimIdsNeeded = engineDiscounts.flatMap((d) => (d.items || []).map((it) => it.claimId || it.claim_id || null)).filter(Boolean).map(String);
+  const engineDiscounts = Array.isArray(priced.discounts)
+    ? priced.discounts
+    : Array.isArray(priced.breakdown)
+    ? priced.breakdown
+    : [];
+  const isObjectIdLike = (s) =>
+    typeof s === 'string' && /^[0-9a-fA-F]{24}$/.test(s);
+  const claimIdsNeeded = engineDiscounts
+    .flatMap((d) =>
+      (d.items || []).map((it) => it.claimId || it.claim_id || null)
+    )
+    .filter(Boolean)
+    .map(String);
 
   let claimDocsMap = {};
   if (claimIdsNeeded.length) {
-    const claimDocs = await VoucherClaim.find({ _id: { $in: claimIdsNeeded } }).lean().catch(() => []);
-    claimDocsMap = claimDocs.reduce((acc, cd) => { acc[String(cd._id)] = cd; return acc; }, {});
+    const claimDocs = await VoucherClaim.find({ _id: { $in: claimIdsNeeded } })
+      .lean()
+      .catch(() => []);
+    claimDocsMap = claimDocs.reduce((acc, cd) => {
+      acc[String(cd._id)] = cd;
+      return acc;
+    }, {});
   }
 
   for (const d of engineDiscounts) {
@@ -1920,11 +2041,20 @@ exports.checkout = asyncHandler(async (req, res) => {
     const source = d.source || (d.voucherId || d.voucher ? 'voucher' : 'promo');
     const label = d.label || d.name || d.title || '';
     const amount = Number(d.amount ?? d.amountTotal ?? d.itemsDiscount ?? 0);
-    const items = Array.isArray(d.items) ? d.items.map((it) => ({ menuId: it.menuId || it.menu || it.menu_id || null, qty: Number(it.qty || it.quantity || 0), amount: int(it.amount || it.line_discount || 0) })) : [];
+    const items = Array.isArray(d.items)
+      ? d.items.map((it) => ({
+          menuId: it.menuId || it.menu || it.menu_id || null,
+          qty: Number(it.qty || it.quantity || 0),
+          amount: int(it.amount || it.line_discount || 0)
+        }))
+      : [];
 
     discounts.push({
       claimId: id && source === 'voucher' ? String(id) : null,
-      voucherId: id && source === 'voucher' && claimDocsMap[String(id)] ? String(claimDocsMap[String(id)].voucher || null) : null,
+      voucherId:
+        id && source === 'voucher' && claimDocsMap[String(id)]
+          ? String(claimDocsMap[String(id)].voucher || null)
+          : null,
       id: id ? String(id) : null,
       source,
       label,
@@ -1935,9 +2065,15 @@ exports.checkout = asyncHandler(async (req, res) => {
     });
 
     if (source === 'voucher') {
-      const maybeVoucherId = d.voucherId || d.voucher_id || d.voucher || d.raw?.voucherId;
+      const maybeVoucherId =
+        d.voucherId || d.voucher_id || d.voucher || d.raw?.voucherId;
       if (maybeVoucherId) appliedVoucherIdSet.add(String(maybeVoucherId));
-      else if (id && claimDocsMap[String(id)] && claimDocsMap[String(id)].voucher) appliedVoucherIdSet.add(String(claimDocsMap[String(id)].voucher));
+      else if (
+        id &&
+        claimDocsMap[String(id)] &&
+        claimDocsMap[String(id)].voucher
+      )
+        appliedVoucherIdSet.add(String(claimDocsMap[String(id)].voucher));
     }
   }
   const appliedVoucherIds = Array.from(appliedVoucherIdSet);
@@ -1950,20 +2086,37 @@ exports.checkout = asyncHandler(async (req, res) => {
   const engineGrand = priced.totals?.grandTotal ?? null;
   const delivery_fee_net = Math.max(0, reportedDelivery - shipping_discount);
 
-  if (typeof deliveryObj.delivery_fee_raw === 'undefined' || deliveryObj.delivery_fee_raw === null) {
-    deliveryObj.delivery_fee_raw = int(reportedDelivery + shipping_discount || deliveryObj.delivery_fee || 0);
+  if (
+    typeof deliveryObj.delivery_fee_raw === 'undefined' ||
+    deliveryObj.delivery_fee_raw === null
+  ) {
+    deliveryObj.delivery_fee_raw = int(
+      reportedDelivery + shipping_discount || deliveryObj.delivery_fee || 0
+    );
   }
   deliveryObj.delivery_fee = int(delivery_fee_net);
   deliveryObj.shipping_discount = int(shipping_discount || 0);
 
-  const items_subtotal_after_discount = Math.max(0, baseItemsSubtotal - items_discount);
-  const service_fee = int(Math.round(items_subtotal_after_discount * SERVICE_FEE_RATE));
+  const items_subtotal_after_discount = Math.max(
+    0,
+    baseItemsSubtotal - items_discount
+  );
+  const service_fee = int(
+    Math.round(items_subtotal_after_discount * SERVICE_FEE_RATE)
+  );
   const rateForTax = parsePpnRate();
   const taxAmount = int(Math.round(items_subtotal_after_discount * rateForTax));
   const taxRatePercent = Math.round(rateForTax * 100 * 100) / 100;
 
-  const beforeRound = int(items_subtotal_after_discount + service_fee + deliveryObj.delivery_fee + taxAmount);
-  const requested_bvt = engineGrand ? int(engineGrand) : int(roundRupiahCustom(beforeRound));
+  const beforeRound = int(
+    items_subtotal_after_discount +
+      service_fee +
+      deliveryObj.delivery_fee +
+      taxAmount
+  );
+  const requested_bvt = engineGrand
+    ? int(engineGrand)
+    : int(roundRupiahCustom(beforeRound));
   const rounding_delta = int(requested_bvt - beforeRound);
   if (requested_bvt <= 0) throwError('Total pembayaran tidak valid.', 400);
 
@@ -1983,15 +2136,24 @@ exports.checkout = asyncHandler(async (req, res) => {
 
   // points logic (safe)
   let memberPointsBalance = 0;
-  if (MemberDoc) memberPointsBalance = Math.floor(Number(MemberDoc.points ?? 0));
+  if (MemberDoc)
+    memberPointsBalance = Math.floor(Number(MemberDoc.points ?? 0));
   const grandBeforePoints = Number(uiTotals.grand_total || 0);
-  const points_candidate_use = usePoints ? Math.min(memberPointsBalance, Math.max(0, Math.round(grandBeforePoints))) : 0;
-  const raw_after_points = Math.max(0, grandBeforePoints - points_candidate_use);
+  const points_candidate_use = usePoints
+    ? Math.min(memberPointsBalance, Math.max(0, Math.round(grandBeforePoints)))
+    : 0;
+  const raw_after_points = Math.max(
+    0,
+    grandBeforePoints - points_candidate_use
+  );
   const grand_after_points = roundRupiahCustom(Math.round(raw_after_points));
-  const rounding_delta_after = Number(grand_after_points) - Number(raw_after_points);
+  const rounding_delta_after =
+    Number(grand_after_points) - Number(raw_after_points);
 
   uiTotals.grand_total = int(grand_after_points);
-  uiTotals.rounding_delta = int((uiTotals.rounding_delta || 0) + rounding_delta_after);
+  uiTotals.rounding_delta = int(
+    (uiTotals.rounding_delta || 0) + rounding_delta_after
+  );
   uiTotals.points_candidate_use = int(points_candidate_use);
   uiTotals.grand_total_before_points = int(grandBeforePoints);
   uiTotals.grand_total_after_points = int(grand_after_points);
@@ -2000,19 +2162,26 @@ exports.checkout = asyncHandler(async (req, res) => {
   const initialIsPaid = !needProof(method);
   const initialPaymentStatus = initialIsPaid ? 'paid' : 'unpaid';
   const initialPaidAt = initialIsPaid ? new Date() : null;
+  const ownerVerified = !paymentRequiresOwnerVerify(method);
 
   // build orderItems (enriched)
   const itemAdjustmentsMap = priced.itemAdjustments || {};
   const orderItems = (cart.items || []).map((it) => {
     const menuBase = Number(it.base_price ?? it.unit_price ?? it.price ?? 0);
     const addons = Array.isArray(it.addons) ? it.addons : [];
-    const addonsPerUnit = addons.reduce((s, a) => s + Number(a?.price || 0) * Math.max(1, Number(a?.qty || 1)), 0);
+    const addonsPerUnit = addons.reduce(
+      (s, a) => s + Number(a?.price || 0) * Math.max(1, Number(a?.qty || 1)),
+      0
+    );
     const unit_price = Math.round(menuBase + addonsPerUnit);
     const qty = Number(it.quantity ?? it.qty ?? 0) || 0;
     const menuId = it.menu;
     const lineSubtotal = int(unit_price * qty);
     const adjustments = itemAdjustmentsMap?.[String(menuId)] || [];
-    const adjTotal = (adjustments || []).reduce((s, a) => s + Number(a.amount || 0), 0);
+    const adjTotal = (adjustments || []).reduce(
+      (s, a) => s + Number(a.amount || 0),
+      0
+    );
 
     return {
       menu: menuId,
@@ -2040,10 +2209,18 @@ exports.checkout = asyncHandler(async (req, res) => {
   // promoApplied / rewards normalization
   const promoApplied = priced.promoApplied || null;
   const promoRewards = [];
-  if (promoApplied && promoApplied.impact && Array.isArray(promoApplied.impact.addedFreeItems)) {
+  if (
+    promoApplied &&
+    promoApplied.impact &&
+    Array.isArray(promoApplied.impact.addedFreeItems)
+  ) {
     for (const f of promoApplied.impact.addedFreeItems) {
       let menuDoc = null;
-      try { if (f.menuId) menuDoc = await Menu.findById(f.menuId).lean(); } catch (e) { /* ignore */ }
+      try {
+        if (f.menuId) menuDoc = await Menu.findById(f.menuId).lean();
+      } catch (e) {
+        /* ignore */
+      }
       const freeName = menuDoc?.name || f.name || 'Free item';
       const freeImage = menuDoc?.imageUrl || f.imageUrl || null;
       orderItems.push({
@@ -2058,15 +2235,37 @@ exports.checkout = asyncHandler(async (req, res) => {
         category: f.category || null,
         line_subtotal: 0
       });
-      promoRewards.push({ type: 'free_item', menuId: f.menuId || null, name: freeName, qty: Number(f.qty || 1), note: f.note || null });
+      promoRewards.push({
+        type: 'free_item',
+        menuId: f.menuId || null,
+        name: freeName,
+        qty: Number(f.qty || 1),
+        note: f.note || null
+      });
     }
   }
   if (promoApplied && Array.isArray(promoApplied.actions)) {
-    for (const a of promoApplied.actions) promoRewards.push({ type: a.type || 'action', amount: a.amount || null, meta: a.meta || {} });
+    for (const a of promoApplied.actions)
+      promoRewards.push({
+        type: a.type || 'action',
+        amount: a.amount || null,
+        meta: a.meta || {}
+      });
   }
 
-  const appliedPromoSnapshot = promoApplied ? { promoId: promoApplied.promoId || null, name: promoApplied.name || null, impact: promoApplied.impact || {}, actions: promoApplied.actions || [] } : null;
-  const orderPriceSnapshot = { ui_totals: uiTotals || {}, engineTotals: priced.totals || {}, breakdown: priced.breakdown || [] };
+  const appliedPromoSnapshot = promoApplied
+    ? {
+        promoId: promoApplied.promoId || null,
+        name: promoApplied.name || null,
+        impact: promoApplied.impact || {},
+        actions: promoApplied.actions || []
+      }
+    : null;
+  const orderPriceSnapshot = {
+    ui_totals: uiTotals || {},
+    engineTotals: priced.totals || {},
+    breakdown: priced.breakdown || []
+  };
 
   // compute points_awarded
   function sumPointsAwardedFromPromoActions(actions = []) {
@@ -2074,14 +2273,29 @@ exports.checkout = asyncHandler(async (req, res) => {
     let sum = 0;
     for (const a of actions) {
       if (!a) continue;
-      if (String(a.type || '').toLowerCase() === 'award_points') sum += Number(a.points ?? a.amount ?? 0);
-      else if (a?.reward && typeof a.reward === 'object') sum += Number(a.reward.points ?? 0);
+      if (String(a.type || '').toLowerCase() === 'award_points')
+        sum += Number(a.points ?? a.amount ?? 0);
+      else if (a?.reward && typeof a.reward === 'object')
+        sum += Number(a.reward.points ?? 0);
     }
     return Math.max(0, Math.round(sum));
   }
-  const promoActions = priced.points_awarded_details && priced.points_awarded_details.actions ? priced.points_awarded_details.actions : appliedPromoSnapshot?.actions || priced?.promoApplied?.actions || [];
-  const points_awarded = Math.max(0, Math.round(priced?.points_awarded_details?.total ?? sumPointsAwardedFromPromoActions(promoActions)));
-  const points_awarded_details = priced.points_awarded_details || (promoActions?.length ? { actions: promoActions, total: points_awarded } : {});
+  const promoActions =
+    priced.points_awarded_details && priced.points_awarded_details.actions
+      ? priced.points_awarded_details.actions
+      : appliedPromoSnapshot?.actions || priced?.promoApplied?.actions || [];
+  const points_awarded = Math.max(
+    0,
+    Math.round(
+      priced?.points_awarded_details?.total ??
+        sumPointsAwardedFromPromoActions(promoActions)
+    )
+  );
+  const points_awarded_details =
+    priced.points_awarded_details ||
+    (promoActions?.length
+      ? { actions: promoActions, total: points_awarded }
+      : {});
 
   // prepare payload
   const payload = {
@@ -2099,9 +2313,17 @@ exports.checkout = asyncHandler(async (req, res) => {
     delivery_fee: int(uiTotals.delivery_fee || 0),
     shipping_discount: int(uiTotals.shipping_discount || 0),
     discounts: [], // set later
-    appliedVouchers: (appliedVoucherIds || []).map((id) => ({ voucherId: id, voucherSnapshot: {} })),
+    appliedVouchers: (appliedVoucherIds || []).map((id) => ({
+      voucherId: id,
+      voucherSnapshot: {}
+    })),
     appliedVouchersIds: appliedVoucherIds || [],
-    appliedPromo: priced.promoApplied ? { promoId: priced.promoApplied.promoId || priced.promoApplied.promoId, promoSnapshot: priced.promoApplied } : appliedPromoSnapshot || { promoId: null, promoSnapshot: {} },
+    appliedPromo: priced.promoApplied
+      ? {
+          promoId: priced.promoApplied.promoId || priced.promoApplied.promoId,
+          promoSnapshot: priced.promoApplied
+        }
+      : appliedPromoSnapshot || { promoId: null, promoSnapshot: {} },
     promoRewards: priced.promoRewards || promoRewards || [],
     points_awarded_details: points_awarded_details,
     engineSnapshot: priced.engineSnapshot || {},
@@ -2121,11 +2343,18 @@ exports.checkout = asyncHandler(async (req, res) => {
     payment_proof_url: preUploadedProofUrl || null,
     status: 'created',
     placed_at: new Date(),
-    delivery: { ...deliveryObj, delivery_fee: int(uiTotals.delivery_fee || 0), shipping_discount: int(uiTotals.shipping_discount || 0), delivery_fee_raw: int(deliveryObj.delivery_fee_raw || 0) }
+    delivery: {
+      ...deliveryObj,
+      delivery_fee: int(uiTotals.delivery_fee || 0),
+      shipping_discount: int(uiTotals.shipping_discount || 0),
+      delivery_fee_raw: int(deliveryObj.delivery_fee_raw || 0)
+    }
   };
 
   // additional bookkeeping
-  const member_level_before = MemberDoc ? String(MemberDoc.level || 'bronze') : null;
+  const member_level_before = MemberDoc
+    ? String(MemberDoc.level || 'bronze')
+    : null;
   const total_spend_before = MemberDoc ? Number(MemberDoc.total_spend || 0) : 0;
   payload.member_level_before = member_level_before;
   payload.total_spend_before = total_spend_before;
@@ -2135,12 +2364,21 @@ exports.checkout = asyncHandler(async (req, res) => {
   // points usage/validation: compute pointsUsedReq (kept similar)
   let pointsUsedReq = 0;
   if (usePoints) {
-    if (!MemberDoc) throwError('Poin hanya dapat digunakan oleh member terdaftar', 400);
+    if (!MemberDoc)
+      throwError('Poin hanya dapat digunakan oleh member terdaftar', 400);
     const memberForPoints = MemberDoc;
-    const memberBalance = Math.max(0, Math.floor(Number(memberForPoints?.points || 0)));
-    pointsUsedReq = Math.min(memberBalance, Math.max(0, Math.round(Number(uiTotals.grand_total || 0))));
+    const memberBalance = Math.max(
+      0,
+      Math.floor(Number(memberForPoints?.points || 0))
+    );
+    pointsUsedReq = Math.min(
+      memberBalance,
+      Math.max(0, Math.round(Number(uiTotals.grand_total || 0)))
+    );
   } else {
-    pointsUsedReq = Math.floor(Number(req.body?.points_used ?? priced?.totals?.points_used ?? 0) || 0);
+    pointsUsedReq = Math.floor(
+      Number(req.body?.points_used ?? priced?.totals?.points_used ?? 0) || 0
+    );
   }
   payload.points_used = int(pointsUsedReq);
   if (pointsUsedReq > 0) {
@@ -2184,8 +2422,16 @@ exports.checkout = asyncHandler(async (req, res) => {
       } catch (e) {
         // duplicate key (idempotency) => try to fetch existing order and use that
         if (e && e.code === 11000 && idempotency_key) {
-          console.warn('[checkout] duplicate idempotency_key detected, fetching existing order');
-          const existing = await Order.findOne({ idempotency_key: String(idempotency_key), member: payload.member || null }).session(session).lean().catch(() => null);
+          console.warn(
+            '[checkout] duplicate idempotency_key detected, fetching existing order'
+          );
+          const existing = await Order.findOne({
+            idempotency_key: String(idempotency_key),
+            member: payload.member || null
+          })
+            .session(session)
+            .lean()
+            .catch(() => null);
           if (existing) {
             createdOrder = existing;
             // We intentionally do not re-run post-processing inside this tx
@@ -2198,24 +2444,44 @@ exports.checkout = asyncHandler(async (req, res) => {
       // force set totals and other computed fields on createdOrder document (kept behavior)
       try {
         const pointsUsedInt = int(pointsUsedReq || 0);
-        const itemsDiscountFinal = int(uiTotals.items_discount || 0) + pointsUsedInt;
-        await Order.updateOne({ _id: createdOrder._id }, {
-          $set: {
-            items_subtotal: int(uiTotals.items_subtotal || 0),
-            items_discount: itemsDiscountFinal,
-            items_subtotal_after_discount: int(uiTotals.items_subtotal_after_discount || 0),
-            delivery_fee: int(uiTotals.delivery_fee || 0),
-            shipping_discount: int(uiTotals.shipping_discount || 0),
-            service_fee: int(uiTotals.service_fee || 0),
-            tax_rate_percent: Number(uiTotals.tax_rate_percent || 0),
-            tax_amount: int(uiTotals.tax_amount || 0),
-            rounding_delta: int(payload.rounding_delta ?? uiTotals.rounding_delta_after_points ?? uiTotals.rounding_delta ?? 0),
-            grand_total: int(payload.grand_total ?? uiTotals.grand_total_after_points ?? uiTotals.grand_total ?? 0),
-            orderPriceSnapshot
-          }
-        }, { session });
+        const itemsDiscountFinal =
+          int(uiTotals.items_discount || 0) + pointsUsedInt;
+        await Order.updateOne(
+          { _id: createdOrder._id },
+          {
+            $set: {
+              items_subtotal: int(uiTotals.items_subtotal || 0),
+              items_discount: itemsDiscountFinal,
+              items_subtotal_after_discount: int(
+                uiTotals.items_subtotal_after_discount || 0
+              ),
+              delivery_fee: int(uiTotals.delivery_fee || 0),
+              shipping_discount: int(uiTotals.shipping_discount || 0),
+              service_fee: int(uiTotals.service_fee || 0),
+              tax_rate_percent: Number(uiTotals.tax_rate_percent || 0),
+              tax_amount: int(uiTotals.tax_amount || 0),
+              rounding_delta: int(
+                payload.rounding_delta ??
+                  uiTotals.rounding_delta_after_points ??
+                  uiTotals.rounding_delta ??
+                  0
+              ),
+              grand_total: int(
+                payload.grand_total ??
+                  uiTotals.grand_total_after_points ??
+                  uiTotals.grand_total ??
+                  0
+              ),
+              orderPriceSnapshot
+            }
+          },
+          { session }
+        );
       } catch (e) {
-        console.warn('[checkout] failed to force-set order totals', e?.message || e);
+        console.warn(
+          '[checkout] failed to force-set order totals',
+          e?.message || e
+        );
         throwError('Gagal menyimpan order totals', 500);
       }
 
@@ -2226,32 +2492,69 @@ exports.checkout = asyncHandler(async (req, res) => {
         if (!memberLive) throwError('Member tidak ditemukan saat commit', 404);
 
         const currentPoints = Number(memberLive.points || 0);
-        const newPointsAfterUsage = Math.max(0, currentPoints - int(pointsUsedReq));
+        const newPointsAfterUsage = Math.max(
+          0,
+          currentPoints - int(pointsUsedReq)
+        );
         const newPointsAfterAward = newPointsAfterUsage + int(points_awarded);
-        const newTotalSpend = Number(memberLive.total_spend || 0) + Number(payload.total_spend_delta || 0);
+        const newTotalSpend =
+          Number(memberLive.total_spend || 0) +
+          Number(payload.total_spend_delta || 0);
         const newLevel = evaluateMemberLevel(newTotalSpend);
 
-        await Member.updateOne({ _id: memberId }, {
-          $set: { points: int(newPointsAfterAward), last_visit_at: new Date() },
-          $inc: { total_spend: int(payload.total_spend_delta), spend_point_total: int(pointsUsedReq) }
-        }, { session });
+        await Member.updateOne(
+          { _id: memberId },
+          {
+            $set: {
+              points: int(newPointsAfterAward),
+              last_visit_at: new Date()
+            },
+            $inc: {
+              total_spend: int(payload.total_spend_delta),
+              spend_point_total: int(pointsUsedReq)
+            }
+          },
+          { session }
+        );
 
-        await Order.updateOne({ _id: createdOrder._id }, { $set: { member_level_after: newLevel } }, { session });
+        await Order.updateOne(
+          { _id: createdOrder._id },
+          { $set: { member_level_after: newLevel } },
+          { session }
+        );
 
         if (String(memberLive.level || '') !== String(newLevel)) {
-          await Member.updateOne({ _id: memberId }, { $set: { level: newLevel } }, { session });
+          await Member.updateOne(
+            { _id: memberId },
+            { $set: { level: newLevel } },
+            { session }
+          );
         }
       }
 
       // consume promo (atomic if needed)
       try {
-        const promoId = payload.appliedPromo?.promoSnapshot?.promoId || payload.appliedPromo?.promoId || null;
+        const promoId =
+          payload.appliedPromo?.promoSnapshot?.promoId ||
+          payload.appliedPromo?.promoId ||
+          null;
         if (promoId) {
-          await consumePromoForOrder({ promoId: String(promoId), memberId: payload.member || null, orderId: createdOrder._id, session });
+          await consumePromoForOrder({
+            promoId: String(promoId),
+            memberId: payload.member || null,
+            orderId: createdOrder._id,
+            session
+          });
         }
       } catch (e) {
-        console.error('[checkout] consumePromoForOrder failed', e?.message || e);
-        throwError(e?.message || 'Gagal mengamankan penggunaan promo', e?.status || 500);
+        console.error(
+          '[checkout] consumePromoForOrder failed',
+          e?.message || e
+        );
+        throwError(
+          e?.message || 'Gagal mengamankan penggunaan promo',
+          e?.status || 500
+        );
       }
     }); // end transaction
   } finally {
@@ -2271,9 +2574,17 @@ exports.checkout = asyncHandler(async (req, res) => {
         checked_out_at: new Date(),
         order_id: order._id,
         last_idempotency_key: idempotency_key || null,
-        items: [], total_items: 0, total_quantity: 0, total_price: 0
+        items: [],
+        total_items: 0,
+        total_quantity: 0,
+        total_price: 0
       }
-    }).catch((e) => console.warn('[checkout] update cart after create failed', e?.message || e));
+    }).catch((e) =>
+      console.warn(
+        '[checkout] update cart after create failed',
+        e?.message || e
+      )
+    );
   } catch (e) {
     console.warn('[checkout] update cart failed', e?.message || e);
   }
@@ -2294,15 +2605,28 @@ exports.checkout = asyncHandler(async (req, res) => {
   (async () => {
     try {
       // 1) If priced.chosenClaimIds present -> consume voucher claims (best-effort)
-      if (MemberDoc && Array.isArray(priced.chosenClaimIds) && priced.chosenClaimIds.length) {
+      if (
+        MemberDoc &&
+        Array.isArray(priced.chosenClaimIds) &&
+        priced.chosenClaimIds.length
+      ) {
         for (const claimId of priced.chosenClaimIds) {
           try {
             const c = await VoucherClaim.findById(claimId);
-            if (c && c.status === 'claimed' && String(c.member) === String(MemberDoc._id)) {
+            if (
+              c &&
+              c.status === 'claimed' &&
+              String(c.member) === String(MemberDoc._id)
+            ) {
               c.remainingUse = Math.max(0, (c.remainingUse || 1) - 1);
               if (c.remainingUse <= 0) c.status = 'used';
               c.history = c.history || [];
-              c.history.push({ at: new Date(), action: 'USE', ref: String(order._id), note: 'dipakai pada order' });
+              c.history.push({
+                at: new Date(),
+                action: 'USE',
+                ref: String(order._id),
+                note: 'dipakai pada order'
+              });
               await c.save();
               // revoke if voucher uses globalStock and becomes empty (best-effort)
               try {
@@ -2310,13 +2634,33 @@ exports.checkout = asyncHandler(async (req, res) => {
                 if (v && v.visibility && v.visibility.mode === 'global_stock') {
                   const remaining = Number(v.visibility.globalStock || 0);
                   if (remaining <= 0) {
-                    await VoucherClaim.updateMany({ voucher: v._id, status: 'claimed' }, { $set: { status: 'revoked' }, $push: { history: { at: new Date(), action: 'REVOKE', note: 'stok global habis - otomatis revoke' } } }).catch(() => {});
+                    await VoucherClaim.updateMany(
+                      { voucher: v._id, status: 'claimed' },
+                      {
+                        $set: { status: 'revoked' },
+                        $push: {
+                          history: {
+                            at: new Date(),
+                            action: 'REVOKE',
+                            note: 'stok global habis - otomatis revoke'
+                          }
+                        }
+                      }
+                    ).catch(() => {});
                   }
                 }
-              } catch (ee) { console.error('[voucher][consume][revoke-if-stock-empty] failed', ee?.message || ee); }
+              } catch (ee) {
+                console.error(
+                  '[voucher][consume][revoke-if-stock-empty] failed',
+                  ee?.message || ee
+                );
+              }
             }
           } catch (err) {
-            console.error('[voucher][consume] gagal update', err?.message || err);
+            console.error(
+              '[voucher][consume] gagal update',
+              err?.message || err
+            );
           }
         }
       }
@@ -2326,59 +2670,121 @@ exports.checkout = asyncHandler(async (req, res) => {
         const summary = {
           id: String(order._id),
           transaction_code: order.transaction_code || '',
-          delivery_mode: order.delivery?.mode || (order.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
+          delivery_mode:
+            order.delivery?.mode ||
+            (order.fulfillment_type === 'dine_in' ? 'none' : 'delivery'),
           grand_total: Number(order.grand_total || 0),
           fulfillment_type: order.fulfillment_type || null,
-          customer_name: (order.member && order.member.name) || order.customer_name || '',
-          customer_phone: (order.member && order.member.phone) || order.customer_phone || '',
+          customer_name:
+            (order.member && order.member.name) || order.customer_name || '',
+          customer_phone:
+            (order.member && order.member.phone) || order.customer_phone || '',
           placed_at: order.placed_at || order.createdAt || null,
-          table_number: order.fulfillment_type === 'dine_in' ? order.table_number || null : null,
+          table_number:
+            order.fulfillment_type === 'dine_in'
+              ? order.table_number || null
+              : null,
           payment_status: order.payment_status || null,
           status: order.status || null,
           total_quantity: Number(order.total_quantity || 0),
-          pickup_window: order.delivery?.pickup_window ? { from: order.delivery.pickup_window.from || null, to: order.delivery.pickup_window.to || null } : null,
+          pickup_window: order.delivery?.pickup_window
+            ? {
+                from: order.delivery.pickup_window.from || null,
+                to: order.delivery.pickup_window.to || null
+              }
+            : null,
           delivery_slot_label: order.delivery?.slot_label || null,
           member_id: order.member ? String(order.member) : null,
           items_discount: Number(order.items_discount || 0),
           shipping_discount: Number(order.shipping_discount || 0),
-          delivery_fee: Number(order.delivery_fee || order.delivery?.delivery_fee || 0),
+          delivery_fee: Number(
+            order.delivery_fee || order.delivery?.delivery_fee || 0
+          ),
           discounts: Array.isArray(order.discounts) ? order.discounts : [],
-          applied_voucher_ids: Array.isArray(order.applied_voucher_ids) ? order.applied_voucher_ids : []
+          applied_voucher_ids: Array.isArray(order.applied_voucher_ids)
+            ? order.applied_voucher_ids
+            : []
         };
 
-        emitToCashier('staff:notify', { message: 'Ada pesanan yang masuk, silakan cek halaman pesanan Anda' });
-        emitOrdersStream({ target: 'cashier', action: 'insert', item: summary });
+        emitToCashier('staff:notify', {
+          message: 'Ada pesanan yang masuk, silakan cek halaman pesanan Anda'
+        });
+        emitOrdersStream({
+          target: 'cashier',
+          action: 'insert',
+          item: summary
+        });
         emitToStaff('staff:notify', { message: 'Pesanan baru dibuat.' });
       } catch (e) {
-        console.error('[emit][checkout] background emit failed', e?.message || e);
+        console.error(
+          '[emit][checkout] background emit failed',
+          e?.message || e
+        );
       }
 
       // 3) owner verification WA (only if needed) - best-effort
       try {
-        const full = (await Order.findById(order._1 ? order._1 : order._id).lean?.()) || (await Order.findById(order._id).lean());
+        const full =
+          (await Order.findById(order._1 ? order._1 : order._id).lean?.()) ||
+          (await Order.findById(order._id).lean());
         if (full && paymentRequiresOwnerVerify(full.payment_method)) {
-          const EXPIRE_HOURS = Number(process.env.OWNER_VERIFY_EXPIRE_HOURS || 6);
+          const EXPIRE_HOURS = Number(
+            process.env.OWNER_VERIFY_EXPIRE_HOURS || 6
+          );
           const tokenRaw = genTokenRaw();
           const tokenHash = hashTokenVerification(tokenRaw);
-          const expiresAt = new Date(Date.now() + EXPIRE_HOURS * 60 * 60 * 1000);
+          const expiresAt = new Date(
+            Date.now() + EXPIRE_HOURS * 60 * 60 * 1000
+          );
 
-          await Order.updateOne({ _id: full._id }, { $set: { 'verification.tokenHash': tokenHash, 'verification.expiresAt': expiresAt, 'verification.usedAt': null, 'verification.usedFromIp': '', 'verification.usedUserAgent': '' } }).catch((e) => console.error('[checkout][notify] failed update verification', e?.message || e));
+          await Order.updateOne(
+            { _id: full._id },
+            {
+              $set: {
+                'verification.tokenHash': tokenHash,
+                'verification.expiresAt': expiresAt,
+                'verification.usedAt': null,
+                'verification.usedFromIp': '',
+                'verification.usedUserAgent': ''
+              }
+            }
+          ).catch((e) =>
+            console.error(
+              '[checkout][notify] failed update verification',
+              e?.message || e
+            )
+          );
 
-          const DASHBOARD_URL = process.env.DASHBOARD_URL || 'https://dashboard.example.com';
-          const verifyLink = `${DASHBOARD_URL}/public/owner-verify?orderId=${full._id}&token=${encodeURIComponent(tokenRaw)}`;
+          const DASHBOARD_URL =
+            process.env.DASHBOARD_URL || 'https://dashboard.example.com';
+          const verifyLink = `${DASHBOARD_URL}/public/owner-verify?orderId=${
+            full._id
+          }&token=${encodeURIComponent(tokenRaw)}`;
           const msg = buildOwnerVerifyMessage(full, verifyLink, EXPIRE_HOURS);
           const owners = getOwnerPhone();
           if (owners.length) {
             const sendPromises = owners.map((rawPhone) => {
-              const phone = typeof toWa62 === 'function' ? toWa62(rawPhone) : rawPhone;
-              return sendText(phone, msg).then((r) => ({ ok: true, phone: rawPhone, res: r }), (e) => ({ ok: false, phone: rawPhone, err: e?.message || e }));
+              const phone =
+                typeof toWa62 === 'function' ? toWa62(rawPhone) : rawPhone;
+              return sendText(phone, msg).then(
+                (r) => ({ ok: true, phone: rawPhone, res: r }),
+                (e) => ({ ok: false, phone: rawPhone, err: e?.message || e })
+              );
             });
             const results = await Promise.allSettled(sendPromises);
             results.forEach((r) => {
               if (r.status === 'fulfilled') {
                 const v = r.value;
-                if (v.ok) console.log('[notify][owner] WA sent', { phone: v.phone, orderId: String(full._id) });
-                else console.error('[notify][owner] WA failed', { phone: v.phone, err: v.err });
+                if (v.ok)
+                  console.log('[notify][owner] WA sent', {
+                    phone: v.phone,
+                    orderId: String(full._id)
+                  });
+                else
+                  console.error('[notify][owner] WA failed', {
+                    phone: v.phone,
+                    err: v.err
+                  });
               } else {
                 console.error('[notify][owner] WA promise rejected', r.reason);
               }
