@@ -106,6 +106,28 @@ function paymentRequiresOwnerVerify(method) {
 
 const EXPIRE_HOURS = Number(process.env.OWNER_VERIFY_EXPIRE_HOURS || 6);
 
+const withTimeout = (p, ms, onTimeout = null) =>
+  new Promise((resolve, reject) => {
+    let settled = false;
+    const t = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      if (typeof onTimeout === 'function') return resolve(onTimeout());
+      return resolve(null); // fallback ke null/resilient
+    }, ms);
+    p.then((v) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
+      resolve(v);
+    }).catch((e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
+      reject(e);
+    });
+  });
+
 const {
   DELIVERY_MAX_RADIUS_KM,
   CAFE_COORD,
@@ -1001,13 +1023,12 @@ exports.getCart = asyncHandler(async (req, res) => {
       ? 'none'
       : null;
 
-  /* ========== 1) Ambil / auto-create cart aktif ========== */
+  /* ========== 1) Ambil / auto-create cart aktif ====== */
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreate: true,
     defaultFt: hasFtQuery ? qFt : null,
     skipAttach: true
   });
-
   if (!cartObj) {
     const empty = {
       items_subtotal: 0,
@@ -1027,116 +1048,101 @@ exports.getCart = asyncHandler(async (req, res) => {
     return res.status(200).json({ cart: null, ui_totals: empty });
   }
 
-  /* ========== 2) Update fulfillment_type jika query ada ========== */
+  /* ========== 2) Update fulfillment_type jika query ada (fast update) ====== */
   if (hasFtQuery && qFt && cartObj.fulfillment_type !== qFt) {
     try {
       await Cart.findByIdAndUpdate(cartObj._id, {
         $set: { fulfillment_type: qFt }
-      });
+      }).catch(() => {});
     } catch (e) {
       console.error('[getCart] failed set fulfillment_type:', e?.message || e);
     }
   }
 
-  /* ========== 3) Jika ada delivery_mode in query -> simpan ke delivery_draft (doc.save) ========== */
+  /* ========== 3) Jika ada delivery_mode in query -> simpan ke delivery_draft (atomic update) ====== */
   if (hasDeliveryModeQuery && qDeliveryMode) {
     try {
       const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
 
-      const doc = await Cart.findById(cartObj._id);
-      if (!doc) {
-        throwError(`Cart not found for id ${String(cartObj._id)}`, 404);
-      }
+      // Gunakan findByIdAndUpdate single roundtrip untuk performa
+      const doc = await Cart.findById(cartObj._id)
+        .select('delivery_draft fulfillment_type')
+        .lean()
+        .catch(() => null);
+      if (!doc) throwError(`Cart not found for id ${String(cartObj._id)}`, 404);
 
       const existingDraft =
         doc.delivery_draft && typeof doc.delivery_draft === 'object'
           ? { ...doc.delivery_draft }
           : {};
 
-      // set sesuai query
       if (qDeliveryMode === 'delivery') {
         existingDraft.mode = 'delivery';
-        // jika sebelumnya sudah ada delivery_fee > 0, pertahankan; else pakai ENV
         const cur = Number(existingDraft.delivery_fee ?? 0);
         existingDraft.delivery_fee = cur > 0 ? cur : ENV_DELIV;
-        // optional: set fulfillment_type juga supaya charge ongkir terjadi
-        doc.fulfillment_type = 'delivery';
       } else if (qDeliveryMode === 'pickup') {
         existingDraft.mode = 'pickup';
-        if (
-          Object.prototype.hasOwnProperty.call(existingDraft, 'delivery_fee')
-        ) {
+        if (Object.prototype.hasOwnProperty.call(existingDraft, 'delivery_fee'))
           delete existingDraft.delivery_fee;
-        }
       } else if (qDeliveryMode === 'none') {
         existingDraft.mode = 'none';
-        if (
-          Object.prototype.hasOwnProperty.call(existingDraft, 'delivery_fee')
-        ) {
+        if (Object.prototype.hasOwnProperty.call(existingDraft, 'delivery_fee'))
           delete existingDraft.delivery_fee;
-        }
       }
 
-      doc.delivery_draft = existingDraft;
+      // patch: jika delivery mode delivery, juga set fulfillment_type to 'delivery' for cart
+      const update = { delivery_draft: existingDraft };
+      if (qDeliveryMode === 'delivery') update.fulfillment_type = 'delivery';
 
-      try {
-        await doc.save();
-      } catch (saveErr) {
-        throwError(
-          `Failed to persist delivery_mode for cart ${String(cartObj._id)}: ${
-            saveErr?.message || saveErr
-          }`,
-          500
-        );
-      }
+      await Cart.findByIdAndUpdate(cartObj._id, { $set: update }).catch((e) => {
+        throw e;
+      });
     } catch (err) {
-      // err bisa berasal dari throwError di atas atau error lain — re-throw supaya masuk ke global error handler
-      // Jika err sudah objek yg dihasilkan throwError (mis. punya statusCode), re-throw langsung
+      // rethrow supaya global handler tangani
       throw err;
     }
   }
 
-  /* ========== 4) Ambil cart terbaru & normalisasi delivery dari delivery_draft ========== */
+  /* ========== 4) Ambil cart terbaru & normalisasi delivery dari delivery_draft (lean, proyeksi) ====== */
   const cart = await Cart.findById(cartObj._id)
     .select(
-      'items total_items total_quantity total_price delivery_draft updatedAt fulfillment_type table_number status member session_id source items'
+      'items total_items total_quantity total_price delivery_draft updatedAt fulfillment_type table_number status member session_id source'
     )
     .lean();
+
+  if (!cart) throwError('Cart tidak ditemukan', 404);
 
   // normalisasi supaya kode lain pakai cart.delivery
   cart.delivery = cart.delivery_draft || undefined;
 
-  /* ========== 5) Hitung UI totals: tanpa delivery dan dengan delivery final ========== */
+  /* ========== 5) Hitung UI totals: tanpa delivery dan dengan delivery final ====== */
   const ENV_DELIV = Number(process.env.DELIVERY_FLAT_FEE || 0) || 0;
   const cartDeliveryMode = (cart?.delivery?.mode || '').toLowerCase() || null;
 
-  // totals tanpa mempertimbangkan delivery (FE mungkin butuh ini)
+  // Gunakan helper buildUiTotalsFromCart (pastikan ringan)
+  // Pastikan fungsi buildUiTotalsFromCart tidak melakukan blocking DB calls
   const ui_no_delivery = buildUiTotalsFromCart(cart, {
-    deliveryMode: null, // paksa tanpa ongkir
+    deliveryMode: null,
     envDeliveryFee: ENV_DELIV
   });
-
-  // totals final sesuai mode/engine (ini yang dipakai FE untuk tampil)
   const ui_with_delivery = buildUiTotalsFromCart(cart, {
     deliveryMode: cartDeliveryMode,
     envDeliveryFee: ENV_DELIV
   });
 
-  // kalau kamu ingin memastikan struktur, kita bisa masukkan kedua variant ke response
+  // gabung hasil supaya FE memiliki both variants
   const ui = {
     ...ui_with_delivery,
-    // tambahkan field helper
     items_subtotal_after_discount:
       ui_no_delivery.items_subtotal_after_discount ??
       ui_with_delivery.items_subtotal_after_discount,
     items_subtotal: ui_with_delivery.items_subtotal
   };
 
-  // sediakan both values agar FE bisa bandingkan
   ui.grand_total_without_delivery = ui_no_delivery.grand_total;
   ui.grand_total_with_delivery = ui_with_delivery.grand_total;
 
-  /* ========== 6) Response ========== */
+  /* ========== 6) Response ====== */
   const items = Array.isArray(cart.items) ? cart.items : [];
 
   return res.status(200).json({
@@ -3741,58 +3747,77 @@ exports.previewPrice = asyncHandler(async (req, res) => {
 
   if (!cart?.items?.length) throwError('Cart kosong', 400);
 
-  // resolve identity (support guest)
+  // identitas (bisa guest)
   const memberId = req.member?.id || null;
   const now = new Date();
 
-  // ===== validation object sementara (dipakai untuk membangun pesan) =====
-  const validation = {
-    hasError: false,
-    messages: [],
-    invalidClaimIds: []
-  };
+  // validation object (dipakai bila perlu)
+  const validation = { hasError: false, messages: [], invalidClaimIds: [] };
 
-  // ===== filter vouchers (guest cannot use vouchers) =====
   let eligible = [];
   let rawClaims = [];
+
+  const fetchPromises = [];
+
+  if (memberId) {
+    fetchPromises.push(
+      Member.findById(memberId)
+        .select('_id points promoUsageHistory level total_spend') // pilih field minimal
+        .lean()
+        .catch(() => null)
+    );
+  } else {
+    fetchPromises.push(Promise.resolve(null));
+  }
+
   if (Array.isArray(voucherClaimIds) && voucherClaimIds.length) {
-    // jika guest, langsung error
     if (!memberId) {
       validation.hasError = true;
       validation.messages.push('Guest tidak bisa menggunakan voucher.');
       validation.invalidClaimIds = voucherClaimIds.slice();
-      // throw langsung
       throwError(validation.messages.join(' '), 400);
     } else {
-      rawClaims = await VoucherClaim.find({
-        _id: { $in: voucherClaimIds },
-        member: memberId,
-        status: 'claimed'
-      })
-        .lean()
-        .catch(() => []);
+      // ambil voucher claims (proyeksi field minimal untuk validasi)
+      fetchPromises.push(
+        VoucherClaim.find({ _id: { $in: voucherClaimIds }, member: memberId })
+          .select('_id member status validUntil remainingUse voucher createdAt')
+          .lean()
+          .catch(() => [])
+      );
+    }
+  } else {
+    fetchPromises.push(Promise.resolve([]));
+  }
 
-      eligible = rawClaims
-        .filter((c) => !c.validUntil || new Date(c.validUntil) > now)
-        .map((c) => String(c._id));
+  // jalankan fetch parallel
+  const [MemberDoc, vcRes] = await Promise.all(fetchPromises);
+  rawClaims = Array.isArray(vcRes) ? vcRes : [];
 
-      // jika ada voucherClaimIds input yg tidak termasuk di eligible -> error
-      const invalids = (
-        Array.isArray(voucherClaimIds) ? voucherClaimIds : []
-      ).filter((id) => !eligible.includes(String(id)));
-      if (invalids.length) {
-        validation.hasError = true;
-        validation.invalidClaimIds = invalids;
-        validation.messages.push(
-          'Beberapa voucher yang dipilih tidak valid/kadaluarsa/tidak dimiliki.'
-        );
-        // langsung throw error supaya FE menangkapnya
-        throwError(validation.messages.join(' '), 400);
-      }
+  // process voucher eligibility
+  if (rawClaims.length) {
+    eligible = rawClaims
+      .filter(
+        (c) =>
+          c &&
+          c.status === 'claimed' &&
+          (!c.validUntil || new Date(c.validUntil) > now)
+      )
+      .map((c) => String(c._id));
+
+    const invalids = (
+      Array.isArray(voucherClaimIds) ? voucherClaimIds : []
+    ).filter((id) => !eligible.includes(String(id)));
+    if (invalids.length) {
+      validation.hasError = true;
+      validation.invalidClaimIds = invalids;
+      validation.messages.push(
+        'Beberapa voucher yang dipilih tidak valid/kadaluarsa/tidak dimiliki.'
+      );
+      throwError(validation.messages.join(' '), 400);
     }
   }
 
-  // ===== delivery mode & fee =====
+  // ===== delivery mode & fee (simple) =====
   const deliveryMode =
     (typeof deliveryModeFromBody === 'string' &&
       deliveryModeFromBody.trim().toLowerCase()) ||
@@ -3825,15 +3850,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     })
   };
 
-  // ===== optional MemberDoc for fetchers =====
-  let MemberDoc = null;
-  if (memberId) {
-    MemberDoc = await Member.findById(memberId)
-      .lean()
-      .catch(() => null);
-  }
-
-  // ===== promo usage fetchers =====
+  // ===== promo usage fetchers (lightweight) =====
   const promoUsageFetchers = {
     getMemberUsageCount: async (promoId, mId, sinceDate) => {
       try {
@@ -3845,12 +3862,16 @@ exports.previewPrice = asyncHandler(async (req, res) => {
               new Date(h.usedAt || h.date) >= sinceDate
           ).length;
         }
+        // gunakan countDocuments dengan proyeksi query minimal
         const q = {
           'appliedPromo.promoId': promoId,
           member: mId,
           createdAt: { $gte: sinceDate }
         };
-        return await Order.countDocuments(q);
+        return (
+          (await Order.countDocuments(q).lean?.()) ??
+          (await Order.countDocuments(q))
+        );
       } catch (e) {
         return 0;
       }
@@ -3861,7 +3882,10 @@ exports.previewPrice = asyncHandler(async (req, res) => {
           'appliedPromo.promoId': promoId,
           createdAt: { $gte: sinceDate }
         };
-        return await Order.countDocuments(q);
+        return (
+          (await Order.countDocuments(q).lean?.()) ??
+          (await Order.countDocuments(q))
+        );
       } catch (e) {
         return 0;
       }
@@ -3872,20 +3896,25 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   let eligiblePromosList = [];
   if (applyPromos) {
     try {
-      eligiblePromosList = await findApplicablePromos(
-        normalizedCart,
-        MemberDoc,
-        now,
-        { fetchers: promoUsageFetchers }
+      // gunakan withTimeout supaya tidak blocking jika promo engine mahal
+      // timeout default 600ms (sesuaikan jika perlu)
+      const promos = await withTimeout(
+        findApplicablePromos(normalizedCart, MemberDoc, now, {
+          fetchers: promoUsageFetchers
+        }),
+        600,
+        () => [] // fallback kosong jika timeout
       );
+      eligiblePromosList = Array.isArray(promos) ? promos : [];
     } catch (e) {
+      // fallback to empty list on errors
       eligiblePromosList = [];
     }
   } else {
     eligiblePromosList = [];
   }
 
-  // filter out inactive promos early (opsional) — supaya FE dan preview konsisten
+  // filter out inactive promos early
   eligiblePromosList = (eligiblePromosList || []).filter(
     (p) => p.isActive !== false
   );
@@ -3902,6 +3931,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       if (autos.length) {
         autos.sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0));
         const chosen = autos[0];
+        // applyPromo hanya preview — hati2 kalau applyPromo berat
         const { impact, actions } = await applyPromo(chosen, normalizedCart);
         autoAppliedPromo = {
           promoId: String(chosen._id),
@@ -3929,6 +3959,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   // ===== call engine =====
   let result;
   try {
+    // Panggilan engine bisa berat — tetap lakukan, tapi pastikan args ringan
     result = await applyPromoThenVoucher({
       memberId,
       memberDoc: MemberDoc || null,
@@ -4042,14 +4073,13 @@ exports.previewPrice = asyncHandler(async (req, res) => {
 
   const normalizedRewards = [];
   if (engineRewards.length) {
-    for (const r of engineRewards) {
+    for (const r of engineRewards)
       normalizedRewards.push({
         type: r.type || 'unknown',
         amount: r.amount ?? null,
         label: r.label || null,
         meta: r.meta || {}
       });
-    }
   } else if (appliedPromo) {
     if (appliedPromo.actions && Array.isArray(appliedPromo.actions)) {
       for (const a of appliedPromo.actions) {
@@ -4113,26 +4143,24 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     };
   });
 
-  // ======================
-  // tambahan robust: enrich applied promo dengan usage/stock info
-  // ======================
+  // ===== promo details enrichment (light & non-blocking) =====
+  // fetch promo details only if needed and keep it tolerant
   let promoDetails = null;
   let promoSource = null;
-
   if (appliedPromo && appliedPromo.promoId) {
     try {
       const Promo = require('../models/promoModel');
-
-      // try fetch from DB
       try {
-        promoDetails = await Promo.findById(appliedPromo.promoId).lean();
+        promoDetails = await Promo.findById(appliedPromo.promoId)
+          .select(
+            '_id conditions perMemberLimit usageLimitGlobal globalStock notes isActive startAt endAt'
+          )
+          .lean()
+          .catch(() => null);
         if (promoDetails) promoSource = 'db';
       } catch (e) {
-        console.debug('[previewPrice] Promo.findById failed', e?.message || e);
         promoDetails = null;
       }
-
-      // fallback to engine snapshot(s)
       if (!promoDetails && result.promoApplied) {
         promoDetails =
           result.promoApplied.promoSnapshot ||
@@ -4141,8 +4169,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
           null;
         if (promoDetails) promoSource = 'engine_promoApplied';
       }
-
-      // fallback to result.promoSnapshot or result.promo
       if (!promoDetails && result.promoSnapshot) {
         promoDetails = result.promoSnapshot;
         promoSource = 'result.promoSnapshot';
@@ -4152,7 +4178,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         promoSource = 'result.promo';
       }
 
-      // fallback to eligiblePromosList
       if (
         !promoDetails &&
         Array.isArray(eligiblePromosList) &&
@@ -4164,30 +4189,12 @@ exports.previewPrice = asyncHandler(async (req, res) => {
           ) || null;
         if (promoDetails) promoSource = 'eligiblePromosList';
       }
-
-      if (!promoDetails) {
-        console.debug(
-          '[previewPrice] promoDetails not found for',
-          appliedPromo.promoId
-        );
-      } else {
-        console.debug(
-          '[previewPrice] promoDetails found from',
-          promoSource,
-          'for',
-          appliedPromo.promoId
-        );
-      }
     } catch (e) {
-      console.warn(
-        '[previewPrice] unexpected error fetching promo details',
-        e?.message || e
-      );
       promoDetails = promoDetails || null;
     }
   }
 
-  // ===== compute usage (use fetchers) ====
+  // ===== compute promo usage counts (light) =====
   let promoUsageInfo = { memberUsed: 0, globalUsed: 0 };
   if (promoDetails && promoDetails._id) {
     try {
@@ -4208,7 +4215,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
             )
           : 0;
       }
-
       if (typeof promoUsageFetchers.getGlobalUsageCount === 'function') {
         promoUsageInfo.globalUsed =
           await promoUsageFetchers.getGlobalUsageCount(
@@ -4217,22 +4223,19 @@ exports.previewPrice = asyncHandler(async (req, res) => {
           );
       }
     } catch (e) {
-      console.warn('[previewPrice] promo usage fetch failed', e?.message || e);
+      // fallback 0 jika gagal
     }
   }
 
-  // ===== compute remaining conservatively (tolerant jika fields undefined) ====
+  // ===== compute remaining conservatively =====
   let remainingPerMember = null;
   let remainingGlobal = null;
   let globalStock =
     promoDetails && promoDetails.globalStock != null
       ? Number(promoDetails.globalStock)
       : null;
-
-  // perMemberLimit can be at root or under conditions
   const perMemberLimit =
     promoDetails?.perMemberLimit ??
-    promoDetails?.conditions?.usageLimitPerMember ??
     promoDetails?.conditions?.usageLimitPerMember ??
     null;
   const globalLimit =
@@ -4240,31 +4243,27 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     promoDetails?.usageLimitGlobal ??
     null;
 
-  if (perMemberLimit && Number(perMemberLimit) > 0) {
+  if (perMemberLimit && Number(perMemberLimit) > 0)
     remainingPerMember = Math.max(
       0,
       Number(perMemberLimit) - (promoUsageInfo.memberUsed || 0)
     );
-  } else {
-    remainingPerMember = null;
-  }
+  else remainingPerMember = null;
 
-  if (globalLimit && Number(globalLimit) > 0) {
+  if (globalLimit && Number(globalLimit) > 0)
     remainingGlobal = Math.max(
       0,
       Number(globalLimit) - (promoUsageInfo.globalUsed || 0)
     );
-  } else {
-    remainingGlobal = null;
-  }
+  else remainingGlobal = null;
 
   if (Number.isFinite(globalStock)) {
-    if (remainingGlobal == null) {
+    if (remainingGlobal == null)
       remainingGlobal = Math.max(
         0,
         globalStock - (promoUsageInfo.globalUsed || 0)
       );
-    } else {
+    else
       remainingGlobal = Math.max(
         0,
         Math.min(
@@ -4272,10 +4271,8 @@ exports.previewPrice = asyncHandler(async (req, res) => {
           globalStock - (promoUsageInfo.globalUsed || 0)
         )
       );
-    }
   }
 
-  // helper buildDate -> ISO or null
   const buildDate = (v) => {
     if (!v) return null;
     try {
@@ -4312,7 +4309,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         usedGlobal: promoUsageInfo.globalUsed ?? 0,
         remainingPerMember,
         remainingGlobal,
-        _source: promoSource // debug, bisa dihapus di production
+        _source: promoSource
       }
     : appliedPromo
     ? {
@@ -4332,7 +4329,7 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       }
     : null;
 
-  // ===== promo object: jika tidak ada appliedPromo => null; jika ada => ringkasan + extra =====
+  // ===== promoOut builder =====
   let promoOut = null;
   if (appliedPromo) {
     promoOut = {
@@ -4340,22 +4337,20 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       appliedPromoName: appliedPromo ? appliedPromo.name || null : null,
       description: appliedPromo ? appliedPromo.description || null : null,
       rewards: normalizedRewards,
-      extra: promoExtra // tambahan info tentang sisa klaim / stok / validitas
+      extra: promoExtra
     };
   } else {
     promoOut = null;
   }
 
-  // ===== build voucher object: dapat chosenClaimIds dari beberapa path (robust) + claims detail (tanpa summary name/description) =====
+  // ===== voucherOut build (claims minimal fetch) =====
   let voucherOut = { chosenClaimIds: [] };
-
   const chosenFromResult =
     result.chosenClaimIds ||
     (result.voucherResult && result.voucherResult.chosenClaimIds) ||
     (result.promoApplied && result.promoApplied.chosenClaimIds) ||
     (result.promo && result.promo.chosenClaimIds) ||
     [];
-
   const chosenSet = Array.from(
     new Set(
       (Array.isArray(chosenFromResult) ? chosenFromResult : [])
@@ -4368,10 +4363,10 @@ exports.previewPrice = asyncHandler(async (req, res) => {
   try {
     if (chosenSet.length) {
       const claimDocs = await VoucherClaim.find({ _id: { $in: chosenSet } })
-        .populate('voucher')
+        .populate('voucher', '_id name description notes')
+        .select('_id voucher')
         .lean()
         .catch(() => []);
-
       voucherOut.claims = claimDocs.map((c) => ({
         claimId: String(c._id),
         voucherId: c.voucher ? String(c.voucher._id) : null,
@@ -4385,7 +4380,6 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       voucherOut.claims = [];
     }
   } catch (e) {
-    // jangan crash preview kalau fetch voucher gagal
     console.error(
       '[previewPrice] fetch voucher details failed',
       e?.message || e
