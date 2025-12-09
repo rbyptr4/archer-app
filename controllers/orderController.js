@@ -1524,6 +1524,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     usePoints = false
   } = req.body || {};
 
+  // normalize guestToken
   let guestToken =
     (req.body && String(req.body.guestToken || '').trim()) ||
     (req.headers && String(req.headers['x-guest-token'] || '').trim()) ||
@@ -1531,6 +1532,7 @@ exports.checkout = asyncHandler(async (req, res) => {
     null;
   if (guestToken === '') guestToken = null;
 
+  // normalize voucherClaimIds (kept same logic)
   let voucherClaimIds = [];
   if (
     Array.isArray(req.body?.voucherClaimIds) &&
