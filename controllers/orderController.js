@@ -4310,6 +4310,11 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     eligiblePromosList = [];
   }
 
+  // filter out inactive promos early (opsional) — supaya FE dan preview konsisten
+  eligiblePromosList = (eligiblePromosList || []).filter(
+    (p) => p.isActive !== false
+  );
+
   // ===== autoApplied suggestion (pick highest priority autoApply) =====
   let autoAppliedPromo = null;
   if (
@@ -4505,45 +4510,64 @@ exports.previewPrice = asyncHandler(async (req, res) => {
     }
   }
 
-  const eligiblePromosSummary = (eligiblePromosList || []).map((p) => ({
-    id: String(p._id),
-    name: p.name,
-    type: p.type,
-    autoApply: !!p.autoApply,
-    priority: Number(p.priority || 0)
-  }));
+  // ===== eligiblePromosSummary: include extra (validFrom, validUntil, stock, limits) =====
+  const eligiblePromosSummary = (eligiblePromosList || []).map((p) => {
+    const validFrom = p.conditions?.startAt || p.startAt || null;
+    const validUntil = p.conditions?.endAt || p.endAt || null;
+    const perMemberLimit =
+      p.perMemberLimit ?? p.conditions?.usageLimitPerMember ?? null;
+    const usageLimitGlobal =
+      p.conditions?.usageLimitGlobal ?? p.usageLimitGlobal ?? null;
+    const globalStock = p.globalStock != null ? Number(p.globalStock) : null;
+
+    return {
+      id: String(p._id),
+      name: p.name,
+      type: p.type,
+      autoApply: !!p.autoApply,
+      priority: Number(p.priority || 0),
+      isActive: p.isActive === false ? false : true,
+      extra: {
+        validFrom: validFrom ? new Date(validFrom).toISOString() : null,
+        validUntil: validUntil ? new Date(validUntil).toISOString() : null,
+        note: p.notes || p.note || p.description || null,
+        globalStock,
+        usageLimitPerMember: perMemberLimit ?? null,
+        usageLimitGlobal: usageLimitGlobal ?? null
+      }
+    };
+  });
 
   // ======================
-  // tambahan: enrich applied promo dengan usage/stock info (lebih robust + fallback)
+  // tambahan robust: enrich applied promo dengan usage/stock info
   // ======================
   let promoDetails = null;
-  let promoSource = null; // indikasi dari mana datanya
+  let promoSource = null;
 
   if (appliedPromo && appliedPromo.promoId) {
     try {
       const Promo = require('../models/promoModel');
 
-      // 1) coba fetch lengkap dari DB
+      // try fetch from DB
       try {
         promoDetails = await Promo.findById(appliedPromo.promoId).lean();
         if (promoDetails) promoSource = 'db';
       } catch (e) {
-        // jangan crash, lanjut ke fallback
         console.debug('[previewPrice] Promo.findById failed', e?.message || e);
         promoDetails = null;
       }
 
-      // 2) fallback: cek result.promoApplied (engine snapshot)
+      // fallback to engine snapshot(s)
       if (!promoDetails && result.promoApplied) {
-        // engine kadang kirim snapshot di promoApplied.promoSnapshot atau raw
         promoDetails =
           result.promoApplied.promoSnapshot ||
           result.promoApplied.raw ||
-          result.promoApplied;
+          result.promoApplied ||
+          null;
         if (promoDetails) promoSource = 'engine_promoApplied';
       }
 
-      // 3) fallback: cek result.promoSnapshot atau result.promo
+      // fallback to result.promoSnapshot or result.promo
       if (!promoDetails && result.promoSnapshot) {
         promoDetails = result.promoSnapshot;
         promoSource = 'result.promoSnapshot';
@@ -4553,15 +4577,16 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         promoSource = 'result.promo';
       }
 
-      // 4) fallback: cari di eligiblePromosList (list dari findApplicablePromos)
+      // fallback to eligiblePromosList
       if (
         !promoDetails &&
         Array.isArray(eligiblePromosList) &&
         eligiblePromosList.length
       ) {
-        promoDetails = eligiblePromosList.find(
-          (p) => String(p._id) === String(appliedPromo.promoId)
-        );
+        promoDetails =
+          eligiblePromosList.find(
+            (p) => String(p._id) === String(appliedPromo.promoId)
+          ) || null;
         if (promoDetails) promoSource = 'eligiblePromosList';
       }
 
@@ -4595,6 +4620,8 @@ exports.previewPrice = asyncHandler(async (req, res) => {
         ? new Date(promoDetails.conditions.usageWindowStart)
         : promoDetails.conditions?.startAt
         ? new Date(promoDetails.conditions.startAt)
+        : promoDetails.startAt
+        ? new Date(promoDetails.startAt)
         : new Date(0);
 
       if (typeof promoUsageFetchers.getMemberUsageCount === 'function') {
@@ -4627,55 +4654,53 @@ exports.previewPrice = asyncHandler(async (req, res) => {
       ? Number(promoDetails.globalStock)
       : null;
 
-  if (promoDetails) {
-    const perMemberLimit = Number(
-      promoDetails.conditions?.usageLimitPerMember ??
-        promoDetails.usageLimitPerMember ??
-        0
-    );
-    const globalLimit = Number(
-      promoDetails.conditions?.usageLimitGlobal ??
-        promoDetails.usageLimitGlobal ??
-        0
-    );
+  // perMemberLimit can be at root or under conditions
+  const perMemberLimit =
+    promoDetails?.perMemberLimit ??
+    promoDetails?.conditions?.usageLimitPerMember ??
+    promoDetails?.conditions?.usageLimitPerMember ??
+    null;
+  const globalLimit =
+    promoDetails?.conditions?.usageLimitGlobal ??
+    promoDetails?.usageLimitGlobal ??
+    null;
 
-    if (perMemberLimit > 0) {
-      remainingPerMember = Math.max(
-        0,
-        perMemberLimit - (promoUsageInfo.memberUsed || 0)
-      );
-    } else {
-      remainingPerMember = null;
-    }
+  if (perMemberLimit && Number(perMemberLimit) > 0) {
+    remainingPerMember = Math.max(
+      0,
+      Number(perMemberLimit) - (promoUsageInfo.memberUsed || 0)
+    );
+  } else {
+    remainingPerMember = null;
+  }
 
-    if (globalLimit > 0) {
+  if (globalLimit && Number(globalLimit) > 0) {
+    remainingGlobal = Math.max(
+      0,
+      Number(globalLimit) - (promoUsageInfo.globalUsed || 0)
+    );
+  } else {
+    remainingGlobal = null;
+  }
+
+  if (Number.isFinite(globalStock)) {
+    if (remainingGlobal == null) {
       remainingGlobal = Math.max(
         0,
-        globalLimit - (promoUsageInfo.globalUsed || 0)
+        globalStock - (promoUsageInfo.globalUsed || 0)
       );
     } else {
-      remainingGlobal = null;
-    }
-
-    if (Number.isFinite(globalStock)) {
-      if (remainingGlobal == null) {
-        remainingGlobal = Math.max(
-          0,
+      remainingGlobal = Math.max(
+        0,
+        Math.min(
+          remainingGlobal,
           globalStock - (promoUsageInfo.globalUsed || 0)
-        );
-      } else {
-        remainingGlobal = Math.max(
-          0,
-          Math.min(
-            remainingGlobal,
-            globalStock - (promoUsageInfo.globalUsed || 0)
-          )
-        );
-      }
+        )
+      );
     }
   }
 
-  // ===== fallback build dari appliedPromo / snapshot minimal jika promoDetails null ====
+  // helper buildDate -> ISO or null
   const buildDate = (v) => {
     if (!v) return null;
     try {
@@ -4700,32 +4725,27 @@ exports.previewPrice = asyncHandler(async (req, res) => {
             promoDetails.conditions?.usageWindowEnd
         ),
         note:
-          promoDetails.note ||
           promoDetails.notes ||
+          promoDetails.note ||
           promoDetails.description ||
           null,
+        isActive: promoDetails.isActive === false ? false : true,
         globalStock,
-        usageLimitPerMember:
-          promoDetails.conditions?.usageLimitPerMember ??
-          promoDetails.usageLimitPerMember ??
-          null,
-        usageLimitGlobal:
-          promoDetails.conditions?.usageLimitGlobal ??
-          promoDetails.usageLimitGlobal ??
-          null,
+        usageLimitPerMember: perMemberLimit ?? null,
+        usageLimitGlobal: globalLimit ?? null,
         usedByMember: promoUsageInfo.memberUsed ?? 0,
         usedGlobal: promoUsageInfo.globalUsed ?? 0,
         remainingPerMember,
         remainingGlobal,
-        _source: promoSource // debug field, bisa dihapus di production
+        _source: promoSource // debug, bisa dihapus di production
       }
-    : // minimal fallback from appliedPromo if no promoDetails
-    appliedPromo
+    : appliedPromo
     ? {
         promoId: String(appliedPromo.promoId),
         validFrom: null,
         validUntil: null,
         note: appliedPromo.description || null,
+        isActive: true,
         globalStock: null,
         usageLimitPerMember: null,
         usageLimitGlobal: null,
