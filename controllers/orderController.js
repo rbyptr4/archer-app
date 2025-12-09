@@ -2084,7 +2084,6 @@ exports.checkout = asyncHandler(async (req, res) => {
         appliedVoucherIdSet.add(String(claimDocsMap[String(id)].voucher));
     }
   }
-  const appliedVoucherIds = Array.from(appliedVoucherIdSet);
 
   // totals
   const baseItemsSubtotal = int(priced.totals?.baseSubtotal || 0);
@@ -2305,6 +2304,130 @@ exports.checkout = asyncHandler(async (req, res) => {
       ? { actions: promoActions, total: points_awarded }
       : {});
 
+  // --- BUILD appliedVouchers lebih deterministik (INSERT DI SINI: before "// prepare payload") ---
+  let appliedVouchersFinal = [];
+  let appliedVoucherIdsFinal = [];
+
+  try {
+    // pastikan model tersedia (bila file belum require di top)
+    const _VoucherClaim =
+      typeof VoucherClaim !== 'undefined'
+        ? VoucherClaim
+        : require('../models/voucherClaimModel').default ||
+          require('../models/voucherClaimModel');
+    const _Voucher =
+      typeof Voucher !== 'undefined'
+        ? Voucher
+        : (() => {
+            try {
+              return require('../models/voucherModel');
+            } catch (e) {
+              return null;
+            }
+          })();
+
+    // prefer engine chosenClaimIds (explicit list)
+    const chosenClaims = Array.isArray(priced?.chosenClaimIds)
+      ? priced.chosenClaimIds.map(String)
+      : [];
+
+    // also fall back to scanning priced.breakdown for any claimId/voucherId
+    const fromBreakdown = (priced?.breakdown || []).flatMap((b) => {
+      const cid = b.claimId || b.id || null;
+      const vid =
+        b.voucherId || (b.raw && (b.raw.voucherId || b.raw.voucher)) || null;
+      return [
+        {
+          claimId: cid ? String(cid) : null,
+          voucherId: vid ? String(vid) : null
+        }
+      ];
+    });
+
+    // fetch all claim docs referenced (chosenClaims + any fromBreakdown with claimId)
+    const candidateClaimIds = Array.from(
+      new Set(
+        chosenClaims
+          .concat(fromBreakdown.map((x) => x.claimId).filter(Boolean))
+          .filter(Boolean)
+      )
+    );
+
+    let claimDocs = [];
+    if (candidateClaimIds.length && _VoucherClaim) {
+      claimDocs = await _VoucherClaim
+        .find({ _id: { $in: candidateClaimIds } })
+        .populate('voucher')
+        .lean()
+        .catch(() => []);
+    }
+
+    const claimMap = (claimDocs || []).reduce((acc, c) => {
+      acc[String(c._id)] = c;
+      return acc;
+    }, {});
+
+    // if breakdown had voucherId without claimId, try to fetch voucher records too
+    const vidsFromBreakdown = Array.from(
+      new Set(fromBreakdown.map((x) => x.voucherId).filter(Boolean))
+    );
+
+    let voucherMap = {};
+    if (vidsFromBreakdown.length && _Voucher) {
+      const vdocs = await _Voucher
+        .find({ _id: { $in: vidsFromBreakdown } })
+        .lean()
+        .catch(() => []);
+      voucherMap = vdocs.reduce((acc, v) => {
+        acc[String(v._id)] = v;
+        return acc;
+      }, {});
+    }
+
+    // Build final appliedVouchers from claimMap first (preferred)
+    for (const cid of chosenClaims) {
+      const cdoc = claimMap[String(cid)];
+      if (cdoc) {
+        const vid = cdoc.voucher
+          ? String(cdoc.voucher._id || cdoc.voucher)
+          : null;
+        if (vid) {
+          appliedVouchersFinal.push({
+            claimId: String(cdoc._id),
+            voucherId: vid,
+            voucherSnapshot: cdoc.voucher ? cdoc.voucher : {}
+          });
+          appliedVoucherIdsFinal.push(vid);
+        }
+      }
+    }
+
+    // If we still miss any vouchers but breakdown contains voucherId entries, add them
+    for (const b of fromBreakdown) {
+      if (b.voucherId && !appliedVoucherIdsFinal.includes(b.voucherId)) {
+        appliedVouchersFinal.push({
+          claimId: b.claimId || null,
+          voucherId: b.voucherId,
+          voucherSnapshot: voucherMap[b.voucherId] || {}
+        });
+        appliedVoucherIdsFinal.push(b.voucherId);
+      }
+    }
+
+    // dedupe
+    appliedVoucherIdsFinal = Array.from(new Set(appliedVoucherIdsFinal));
+    appliedVouchersFinal = appliedVouchersFinal.filter(
+      (v, i, arr) =>
+        v &&
+        v.voucherId &&
+        arr.findIndex((x) => x.voucherId === v.voucherId) === i
+    );
+  } catch (e) {
+    console.warn('[checkout][build-appliedVouchers] failed', e?.message || e);
+    appliedVouchersFinal = appliedVouchersFinal || [];
+    appliedVoucherIdsFinal = appliedVoucherIdsFinal || [];
+  }
+
   // prepare payload
   const payload = {
     member: MemberDoc ? MemberDoc._id : null,
@@ -2321,11 +2444,12 @@ exports.checkout = asyncHandler(async (req, res) => {
     delivery_fee: int(uiTotals.delivery_fee || 0),
     shipping_discount: int(uiTotals.shipping_discount || 0),
     discounts: [], // set later
-    appliedVouchers: (appliedVoucherIds || []).map((id) => ({
-      voucherId: id,
-      voucherSnapshot: {}
+    appliedVouchers: (appliedVouchersFinal || []).map((v) => ({
+      voucherId: v.voucherId,
+      claimId: v.claimId || null,
+      voucherSnapshot: v.voucherSnapshot || {}
     })),
-    appliedVouchersIds: appliedVoucherIds || [],
+    appliedVouchersIds: appliedVoucherIdsFinal || [],
     appliedPromo: priced.promoApplied
       ? {
           promoId: priced.promoApplied.promoId || priced.promoApplied.promoId,
