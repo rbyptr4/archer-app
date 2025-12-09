@@ -335,6 +335,13 @@ orderSchema.virtual('items_total').get(function () {
 orderSchema.index({ member: 1, createdAt: -1 });
 orderSchema.index({ source: 1, fulfillment_type: 1, createdAt: -1 });
 orderSchema.index({ payment_status: 1, createdAt: -1 });
+orderSchema.index({ 'appliedPromo.promoId': 1, createdAt: 1 });
+orderSchema.index({ member: 1, 'appliedPromo.promoId': 1, createdAt: 1 });
+orderSchema.index(
+  { member: 1, idempotency_key: 1 },
+  { unique: true, sparse: true }
+);
+orderSchema.index({ 'discounts.claimId': 1, createdAt: 1 });
 orderSchema.index({ transaction_code: 1 }, { unique: true, sparse: true });
 orderSchema.index({ 'delivery.status': 1, createdAt: -1 });
 
