@@ -38,14 +38,27 @@ exports.explore = asyncHandler(async (req, res) => {
     return res.json({ vouchers: [] });
   }
 
-  const ids = list.map((v) => v._id);
+  // normalize ids from list (may already be ObjectId or string)
+  const ids = list.map((v) => v._id).filter(Boolean);
+
+  // validate/convert meId to ObjectId (throw 401 kalau invalid)
+  if (!mongoose.Types.ObjectId.isValid(meId)) {
+    // lebih aman: jika meId bukan ObjectId, tolak request
+    throwError('Unauthorized (member)', 401);
+  }
+  const memberObjId = new mongoose.Types.ObjectId(meId);
+
+  // normalize ids for match: convert to ObjectId if possible
+  const idsForMatch = ids.map((id) =>
+    mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : id
+  );
 
   // ambil jumlah klaim member untuk semua voucher (per-member)
   const claimCounts = await VoucherClaim.aggregate([
     {
       $match: {
-        member: mongoose.Types.ObjectId(meId),
-        voucher: { $in: ids },
+        member: memberObjId,
+        voucher: { $in: idsForMatch },
         status: { $ne: 'revoked' }
       }
     },
@@ -58,6 +71,7 @@ exports.explore = asyncHandler(async (req, res) => {
   ]);
 
   const countsMap = (claimCounts || []).reduce((acc, it) => {
+    // _id mungkin ObjectId -> stringfy
     acc[String(it._id)] = Number(it.count) || 0;
     return acc;
   }, {});
@@ -65,21 +79,21 @@ exports.explore = asyncHandler(async (req, res) => {
   function getPerMemberLimit(v) {
     if (v.visibility && typeof v.visibility.perMemberLimit === 'number')
       return Math.max(0, Number(v.visibility.perMemberLimit));
-    // fallback: jika tidak dispesifikkan anggap default 1 (atau 0 jika owner mau disable)
+    // fallback default 1
     return 1;
   }
 
   const prelim = list.filter((v) => {
     if (!inWindow(v, now)) return false;
 
-    if (v.target?.excludeMemberIds?.some((id) => String(id) === meId))
+    if (v.target?.excludeMemberIds?.some((id) => String(id) === String(meId)))
       return false;
 
     if (
       Array.isArray(v.target?.includeMemberIds) &&
       v.target.includeMemberIds.length
     ) {
-      if (!v.target.includeMemberIds.some((id) => String(id) === meId))
+      if (!v.target.includeMemberIds.some((id) => String(id) === String(meId)))
         return false;
     }
 
