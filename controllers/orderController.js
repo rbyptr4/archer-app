@@ -2025,11 +2025,16 @@ exports.checkout = asyncHandler(async (req, res) => {
   const isObjectIdLike = (s) =>
     typeof s === 'string' && /^[0-9a-fA-F]{24}$/.test(s);
   const claimIdsNeeded = engineDiscounts
-    .flatMap((d) =>
-      (d.items || []).map((it) => it.claimId || it.claim_id || null)
-    )
+    .flatMap((d) => {
+      const fromItems = (d.items || []).map(
+        (it) => it.claimId || it.claim_id || it.voucherClaimId || null
+      );
+      const fromTop = [d.claimId || d.claim_id || d.id || null];
+      return [...fromItems, ...fromTop];
+    })
     .filter(Boolean)
-    .map(String);
+    .map(String)
+    .filter(isObjectIdLike);
 
   let claimDocsMap = {};
   if (claimIdsNeeded.length) {
@@ -2424,14 +2429,52 @@ exports.checkout = asyncHandler(async (req, res) => {
   });
 
   // minimal arrays to persist
-  const applied_vouchers_for_payload = minimalAppliedVouchers;
-  const applied_voucher_ids_for_payload = voucherIdsUsed.length
-    ? voucherIdsUsed
-    : appliedVoucherIds || [];
+  const applied_vouchers_for_payload = Array.isArray(minimalAppliedVouchers)
+    ? minimalAppliedVouchers
+    : [];
 
+  // source of voucher id candidates (from claim docs and engine)
+  const applied_voucher_ids_for_payload =
+    Array.isArray(voucherIdsUsed) && voucherIdsUsed.length
+      ? voucherIdsUsed
+      : Array.isArray(appliedVoucherIds) && appliedVoucherIds.length
+      ? appliedVoucherIds
+      : [];
+
+  // buat versi camelCase yang konsisten dipakai reader/emit lain
+  const appliedVouchersCamel = applied_vouchers_for_payload.map((m) => {
+    // jika ada voucherId di item minimalAppliedVouchers gunakan, else keep null
+    const voucherId = m.voucherId || m.voucher_id || m.id || null;
+    return {
+      voucherId: voucherId ? String(voucherId) : null,
+      voucherSnapshot: {
+        name:
+          m.name ||
+          m.voucherName ||
+          (m.voucherSnapshot && m.voucherSnapshot.name) ||
+          null,
+        description:
+          m.description ||
+          m.desc ||
+          (m.voucherSnapshot && m.voucherSnapshot.description) ||
+          null
+      }
+    };
+  });
+
+  // juga buat appliedVoucherIdsCamel (stringified)
+  const appliedVoucherIdsCamel = (
+    Array.isArray(applied_voucher_ids_for_payload)
+      ? applied_voucher_ids_for_payload
+      : []
+  ).map((v) => (v ? String(v) : v));
+
+  // voucher summary (dipertahankan)
   const voucherSummaryForPayload = {
-    chosenClaimIds: chosenClaimIdsForOrder,
-    claims: voucherClaimsSummary
+    chosenClaimIds: Array.isArray(chosenClaimIdsForOrder)
+      ? chosenClaimIdsForOrder
+      : [],
+    claims: Array.isArray(voucherClaimsSummary) ? voucherClaimsSummary : []
   };
 
   const payload = {
@@ -2452,9 +2495,14 @@ exports.checkout = asyncHandler(async (req, res) => {
     applied_vouchers: Array.isArray(applied_vouchers_for_payload)
       ? applied_vouchers_for_payload
       : [],
-
     applied_voucher_ids: Array.isArray(applied_voucher_ids_for_payload)
       ? applied_voucher_ids_for_payload
+      : [],
+    appliedVouchers: Array.isArray(appliedVouchersCamel)
+      ? appliedVouchersCamel
+      : [],
+    appliedVoucherIds: Array.isArray(appliedVoucherIdsCamel)
+      ? appliedVoucherIdsCamel
       : [],
 
     voucher: voucherSummaryForPayload,

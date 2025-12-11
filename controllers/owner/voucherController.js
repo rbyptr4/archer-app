@@ -215,16 +215,36 @@ function validateShippingPayload(p) {
 
 /* ===================== CREATE per-type (and generic) ===================== */
 
+exports.createBundlingVoucher = asyncHandler(async (req, res) => {
+  let payload = normalizeCommon(req.body || {}, { isUpdate: false });
+  payload.type = 'bundling';
+  payload = cleanseIrrelevantFieldsByType(payload, 'bundling');
+  validateBundlingPayload(payload);
+
+  if (payload.isDeleted == null) payload.isDeleted = false;
+  if (payload.isActive == null) payload.isActive = false;
+
+  const v = await Voucher.create(payload);
+  res.status(201).json({ voucher: v });
+});
+
 exports.createPercentVoucher = asyncHandler(async (req, res) => {
   let payload = normalizeCommon(req.body || {}, { isUpdate: false });
   payload.type = 'percent';
-  // clear unrelated
   payload = cleanseIrrelevantFieldsByType(payload, 'percent');
   validatePercentPayload(payload);
 
-  // defaults
   if (payload.isDeleted == null) payload.isDeleted = false;
   if (payload.isActive == null) payload.isActive = false;
+
+  if (payload.visibility?.mode === 'global_stock') {
+    if (
+      !payload.visibility.globalStock ||
+      payload.visibility.globalStock === 0
+    ) {
+      payload.visibility.globalStock = 0;
+    }
+  }
 
   const v = await Voucher.create(payload);
   res.status(201).json({ voucher: v });
@@ -239,18 +259,15 @@ exports.createAmountVoucher = asyncHandler(async (req, res) => {
   if (payload.isDeleted == null) payload.isDeleted = false;
   if (payload.isActive == null) payload.isActive = false;
 
-  const v = await Voucher.create(payload);
-  res.status(201).json({ voucher: v });
-});
-
-exports.createBundlingVoucher = asyncHandler(async (req, res) => {
-  let payload = normalizeCommon(req.body || {}, { isUpdate: false });
-  payload.type = 'bundling';
-  payload = cleanseIrrelevantFieldsByType(payload, 'bundling');
-  validateBundlingPayload(payload);
-
-  if (payload.isDeleted == null) payload.isDeleted = false;
-  if (payload.isActive == null) payload.isActive = false;
+  // --- FIX ---
+  if (payload.visibility?.mode === 'global_stock') {
+    if (
+      !payload.visibility.globalStock ||
+      payload.visibility.globalStock === 0
+    ) {
+      payload.visibility.globalStock = 0;
+    }
+  }
 
   const v = await Voucher.create(payload);
   res.status(201).json({ voucher: v });
@@ -264,6 +281,16 @@ exports.createShippingVoucher = asyncHandler(async (req, res) => {
 
   if (payload.isDeleted == null) payload.isDeleted = false;
   if (payload.isActive == null) payload.isActive = false;
+
+  // --- FIX ---
+  if (payload.visibility?.mode === 'global_stock') {
+    if (
+      !payload.visibility.globalStock ||
+      payload.visibility.globalStock === 0
+    ) {
+      payload.visibility.globalStock = null;
+    }
+  }
 
   const v = await Voucher.create(payload);
   res.status(201).json({ voucher: v });
