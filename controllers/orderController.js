@@ -3607,10 +3607,6 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
     .lean();
   if (!order) throwError('Order tidak ditemukan', 404);
 
-  // if (String(order.member) !== String(req.member.id)) {
-  //   throwError('Tidak berhak mengakses order ini', 403);
-  // }
-
   const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
   const intVal = (v) => Math.round(Number(v || 0));
   const int = (v) => intVal(v); // helper local mirip int()
@@ -3735,15 +3731,59 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
   // --- applied vouchers normalization (ringkas) ---
   const appliedVouchers = [];
   if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
+    // batch fetch missing snapshots
+    const missingIds = [];
     for (const av of order.appliedVouchers) {
-      appliedVouchers.push({
-        voucherId: av.voucherId
-          ? String(av.voucherId)
-          : av.voucher
-          ? String(av.voucher)
-          : null,
-        snapshot: av.voucherSnapshot || av.snapshot || av || {}
-      });
+      const vid =
+        av.voucherId ||
+        av.voucher ||
+        (av.voucherSnapshot && av.voucherSnapshot._id) ||
+        null;
+      const hasSnap =
+        av.voucherSnapshot && Object.keys(av.voucherSnapshot).length;
+      if (!hasSnap && vid) missingIds.push(String(vid));
+    }
+
+    let vmap = {};
+    if (missingIds.length) {
+      try {
+        const Voucher = require('../models/voucherModel');
+        const vdocs = await Voucher.find({ _id: { $in: missingIds } })
+          .lean()
+          .catch(() => []);
+        vmap = (vdocs || []).reduce((acc, v) => {
+          acc[String(v._id)] = v;
+          return acc;
+        }, {});
+      } catch (e) {
+        vmap = {};
+      }
+    }
+
+    for (const av of order.appliedVouchers) {
+      const vid =
+        av.voucherId ||
+        av.voucher ||
+        (av.voucherSnapshot && av.voucherSnapshot._id) ||
+        null;
+      const parsedVid = vid ? String(vid) : null;
+      let snap = av.voucherSnapshot || av.snapshot || av || {};
+      if (
+        (!snap || Object.keys(snap).length === 0) &&
+        parsedVid &&
+        vmap[parsedVid]
+      ) {
+        const vd = vmap[parsedVid];
+        snap = {
+          _id: String(vd._id),
+          name: vd.name || null,
+          notes: vd.notes || vd.description || null,
+          code: vd.code || null,
+          type: vd.type || null,
+          visibility: vd.visibility || {}
+        };
+      }
+      appliedVouchers.push({ voucherId: parsedVid, snapshot: snap || {} });
     }
   } else if (
     Array.isArray(order.applied_voucher_ids) &&
@@ -4992,26 +5032,95 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
     }
   }
 
-  // --- normalize appliedVouchers ---
+  // --- normalize appliedVouchers (ambil dari order.appliedVouchers jika ada) ---
   const appliedVouchers = [];
+
+  // prefer order.appliedVouchers (canonical)
   if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
+    // fetch missing snapshots in batch to minimize DB calls
+    const missingIds = [];
     for (const av of order.appliedVouchers) {
+      const vid =
+        av.voucherId ||
+        av.voucher ||
+        (av.voucherSnapshot && av.voucherSnapshot._id) ||
+        null;
+      const hasSnap =
+        av.voucherSnapshot && Object.keys(av.voucherSnapshot).length;
+      if (!hasSnap && vid) missingIds.push(String(vid));
+    }
+
+    let vmap = {};
+    if (missingIds.length) {
+      try {
+        const Voucher = require('../models/voucherModel');
+        const vdocs = await Voucher.find({ _id: { $in: missingIds } })
+          .lean()
+          .catch(() => []);
+        vmap = (vdocs || []).reduce((acc, v) => {
+          acc[String(v._id)] = v;
+          return acc;
+        }, {});
+      } catch (e) {
+        vmap = {};
+      }
+    }
+
+    for (const av of order.appliedVouchers) {
+      const vid =
+        av.voucherId ||
+        av.voucher ||
+        (av.voucherSnapshot && av.voucherSnapshot._id) ||
+        null;
+      const parsedVid = vid ? String(vid) : null;
+      let snap = av.voucherSnapshot || av.snapshot || av || {};
+      // fill snapshot from vmap if snapshot empty and vmap has doc
+      if (
+        (!snap || Object.keys(snap).length === 0) &&
+        parsedVid &&
+        vmap[parsedVid]
+      ) {
+        const vd = vmap[parsedVid];
+        snap = {
+          _id: String(vd._id),
+          name: vd.name || null,
+          notes: vd.notes || vd.description || null,
+          code: vd.code || null,
+          type: vd.type || null,
+          visibility: vd.visibility || {}
+        };
+      }
+
       appliedVouchers.push({
-        voucherId: av.voucherId
-          ? String(av.voucherId)
-          : av.voucher
-          ? String(av.voucher)
-          : null,
-        snapshot: av.voucherSnapshot || av.snapshot || av || {}
+        voucherId: parsedVid,
+        snapshot: snap || {}
       });
     }
   } else if (
     Array.isArray(order.applied_voucher_ids) &&
     order.applied_voucher_ids.length
   ) {
-    // best-effort: include ids only
-    for (const vid of order.applied_voucher_ids) {
-      appliedVouchers.push({ voucherId: String(vid), snapshot: {} });
+    // fallback: try fetch docs
+    try {
+      const vids = order.applied_voucher_ids.map((v) => String(v));
+      const Voucher = require('../models/voucherModel');
+      const vdocs = await Voucher.find({ _id: { $in: vids } })
+        .lean()
+        .catch(() => []);
+      const vmap = (vdocs || []).reduce((acc, v) => {
+        acc[String(v._id)] = v;
+        return acc;
+      }, {});
+      for (const vid of vids) {
+        appliedVouchers.push({
+          voucherId: String(vid),
+          snapshot: vmap[String(vid)] || {}
+        });
+      }
+    } catch (e) {
+      for (const vid of order.applied_voucher_ids) {
+        appliedVouchers.push({ voucherId: String(vid), snapshot: {} });
+      }
     }
   }
 
@@ -5284,11 +5393,47 @@ const buildOrderReceipt = (order) => {
   // ------- applied promos normalization (kembalikan null jika kosong) -------
   const appliedPromo = order.appliedPromo || order.applied_promo || null;
   const appliedPromos = [];
-  if (appliedPromo) {
-    const ap =
-      appliedPromo.promoSnapshot || appliedPromo.promoSnapshot || appliedPromo;
 
-    if (ap) {
+  if (appliedPromo) {
+    // prefer snapshot jika ada
+    const ap = appliedPromo.promoSnapshot || appliedPromo;
+
+    // ap bisa exist tapi semua field null/empty (ghost). hanya treat sebagai meaningful jika ada salah satu:
+    // - ap.promoId / ap.id / ap.name ada
+    // - ap.actions non-empty
+    // - ap.impact non-empty (objek dengan key atau addedFreeItems non-empty)
+    let apHasMeaning = false;
+    try {
+      if (
+        ap &&
+        (ap.promoId ||
+          ap.promo_id ||
+          ap.id ||
+          ap.name ||
+          (Array.isArray(ap.actions) && ap.actions.length > 0))
+      ) {
+        apHasMeaning = true;
+      } else if (ap && ap.impact && typeof ap.impact === 'object') {
+        // check if impact has any non-empty meaningful keys
+        const impactKeys = Object.keys(ap.impact || {});
+        if (impactKeys.length > 0) {
+          // also ensure not all empty arrays/zeros
+          const meaningful = impactKeys.some((k) => {
+            const val = ap.impact[k];
+            if (Array.isArray(val)) return val.length > 0;
+            if (val && typeof val === 'object')
+              return Object.keys(val).length > 0;
+            if (typeof val === 'number') return val !== 0;
+            return !!val;
+          });
+          if (meaningful) apHasMeaning = true;
+        }
+      }
+    } catch (e) {
+      apHasMeaning = false;
+    }
+
+    if (ap && apHasMeaning) {
       const normalizedRewards = [];
 
       if (ap.actions && Array.isArray(ap.actions)) {
@@ -5353,6 +5498,7 @@ const buildOrderReceipt = (order) => {
       });
     }
   }
+
   const applied_promos_output = appliedPromos.length ? appliedPromos : null;
 
   // ------- applied_vouchers minimal (HANYA name + description) -------
