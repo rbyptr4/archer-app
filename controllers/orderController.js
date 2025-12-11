@@ -2303,10 +2303,6 @@ exports.checkout = asyncHandler(async (req, res) => {
       ? { actions: promoActions, total: points_awarded }
       : {});
 
-  // ---------------------------
-  // BUILD voucher summary (insert BEFORE payload)
-  // ---------------------------
-  // Determine chosenClaimIds: prefer engine.priced.chosenClaimIds, fallback eligibleClaimIds
   const chosenClaimIdsForOrder =
     Array.isArray(priced?.chosenClaimIds) && priced.chosenClaimIds.length
       ? priced.chosenClaimIds.map(String)
@@ -2314,22 +2310,18 @@ exports.checkout = asyncHandler(async (req, res) => {
       ? eligibleClaimIds.map(String)
       : [];
 
-  // Ensure we have claimDocsMap for chosenClaimIds (we earlier built claimDocsMap for claimIdsNeeded;
-  // if missing, fetch those claim docs)
+  // ensure claimDocsMap has docs for chosenClaimIds (best-effort)
   if (chosenClaimIdsForOrder.length) {
-    const missingClaims = chosenClaimIdsForOrder.filter(
+    const missing = chosenClaimIdsForOrder.filter(
       (cid) => !claimDocsMap[String(cid)]
     );
-    if (missingClaims.length) {
+    if (missing.length) {
       try {
-        const extraClaims = await VoucherClaim.find({
-          _id: { $in: missingClaims }
-        })
+        const extra = await VoucherClaim.find({ _id: { $in: missing } })
           .lean()
           .catch(() => []);
-        for (const c of extraClaims) claimDocsMap[String(c._id)] = c;
+        for (const c of extra) claimDocsMap[String(c._id)] = c;
       } catch (e) {
-        // best-effort; jangan block checkout
         console.warn(
           '[checkout] fetch extra VoucherClaim docs failed',
           e?.message || e
@@ -2338,21 +2330,23 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // Collect voucherIds used by those claims
-  const voucherIdsUsed = Array.from(
-    new Set(
-      chosenClaimIdsForOrder
-        .map((cid) => {
-          const cd = claimDocsMap[String(cid)];
-          return cd
-            ? String(cd.voucher || cd.voucherId || cd.voucher_id || '')
-            : '';
-        })
-        .filter(Boolean)
-    )
-  );
+  // collect voucherIds from claim docs and engine-applied voucher ids (best-effort)
+  const voucherIdCandidates = new Set();
+  for (const cid of chosenClaimIdsForOrder) {
+    const cd = claimDocsMap[String(cid)];
+    if (cd && (cd.voucher || cd.voucherId || cd.voucher_id)) {
+      voucherIdCandidates.add(
+        String(cd.voucher || cd.voucherId || cd.voucher_id)
+      );
+    }
+  }
+  if (Array.isArray(appliedVoucherIds) && appliedVoucherIds.length) {
+    for (const v of appliedVoucherIds)
+      if (v) voucherIdCandidates.add(String(v));
+  }
+  const voucherIdsUsed = Array.from(voucherIdCandidates);
 
-  // Fetch voucher docs for snapshot (best-effort)
+  // fetch voucher docs in batch (best-effort)
   let voucherDocsMap = {};
   if (voucherIdsUsed.length) {
     try {
@@ -2365,7 +2359,55 @@ exports.checkout = asyncHandler(async (req, res) => {
     }
   }
 
-  // Build claims summary array for payload
+  // build minimal applied_vouchers (unique by name) — prefer voucher doc, else fallback to claim info or engine breakdown
+  const minimalAppliedVouchers = [];
+  const seenNames = new Set();
+
+  // 1) from chosenClaimIds -> claimDocsMap -> voucherDocsMap
+  for (const cid of chosenClaimIdsForOrder) {
+    const cd = claimDocsMap[String(cid)] || null;
+    const vid = cd
+      ? String(cd.voucher || cd.voucherId || cd.voucher_id || '')
+      : null;
+    const vdoc = vid ? voucherDocsMap[String(vid)] : null;
+    const name = vdoc?.name || cd?.voucherName || cd?.name || null;
+    const desc =
+      vdoc?.notes || vdoc?.description || cd?.notes || cd?.description || null;
+    if (name && !seenNames.has(name)) {
+      minimalAppliedVouchers.push({ name, description: desc || null });
+      seenNames.add(name);
+    }
+  }
+
+  // 2) fallback: from engine breakdown
+  if (minimalAppliedVouchers.length === 0 && Array.isArray(priced?.breakdown)) {
+    for (const b of priced.breakdown) {
+      const name = b.name || b.label || b.title || null;
+      const desc = b.note || b.description || null;
+      if (name && !seenNames.has(name)) {
+        minimalAppliedVouchers.push({ name, description: desc || null });
+        seenNames.add(name);
+      }
+    }
+  }
+
+  // 3) fallback: from voucherDocsMap direct
+  if (
+    minimalAppliedVouchers.length === 0 &&
+    Object.keys(voucherDocsMap).length
+  ) {
+    for (const k of Object.keys(voucherDocsMap)) {
+      const v = voucherDocsMap[k];
+      const name = v?.name || null;
+      const desc = v?.notes || v?.description || null;
+      if (name && !seenNames.has(name)) {
+        minimalAppliedVouchers.push({ name, description: desc || null });
+        seenNames.add(name);
+      }
+    }
+  }
+
+  // Build voucher.claims light summary (so frontend receipt bisa menampilkan voucher list singkat)
   const voucherClaimsSummary = (chosenClaimIdsForOrder || []).map((cid) => {
     const cd = claimDocsMap[String(cid)] || null;
     const vid = cd
@@ -2381,20 +2423,17 @@ exports.checkout = asyncHandler(async (req, res) => {
     };
   });
 
-  // Build appliedVouchers snapshots (so order.appliedVouchers contains voucherSnapshot)
-  const appliedVouchersForPayload = Array.from(
-    new Set([...appliedVoucherIds, ...voucherIdsUsed])
-  ).map((vid) => ({
-    voucherId: vid,
-    voucherSnapshot: voucherDocsMap[String(vid)] || {}
-  }));
+  // minimal arrays to persist
+  const applied_vouchers_for_payload = minimalAppliedVouchers;
+  const applied_voucher_ids_for_payload = voucherIdsUsed.length
+    ? voucherIdsUsed
+    : appliedVoucherIds || [];
 
   const voucherSummaryForPayload = {
     chosenClaimIds: chosenClaimIdsForOrder,
     claims: voucherClaimsSummary
   };
 
-  // prepare payload
   const payload = {
     member: MemberDoc ? MemberDoc._id : null,
     customer_name: MemberDoc ? MemberDoc.name || '' : customer_name,
@@ -2409,15 +2448,15 @@ exports.checkout = asyncHandler(async (req, res) => {
     items_discount: int(uiTotals.items_discount || 0),
     delivery_fee: int(uiTotals.delivery_fee || 0),
     shipping_discount: int(uiTotals.shipping_discount || 0),
-    discounts: [], // set later
-    // applied vouchers persisted (snapshot dari Voucher docs bila ada)
-    appliedVouchers: Array.isArray(appliedVouchersForPayload)
-      ? appliedVouchersForPayload
+    discounts: [],
+    applied_vouchers: Array.isArray(applied_vouchers_for_payload)
+      ? applied_vouchers_for_payload
       : [],
-    applied_voucher_ids: Array.isArray(appliedVouchersForPayload)
-      ? appliedVouchersForPayload.map((x) => x.voucherId)
-      : appliedVoucherIds || [],
-    // structured voucher summary so receipt + API can read chosenClaimIds + claims details
+
+    applied_voucher_ids: Array.isArray(applied_voucher_ids_for_payload)
+      ? applied_voucher_ids_for_payload
+      : [],
+
     voucher: voucherSummaryForPayload,
 
     appliedPromo: priced.promoApplied
@@ -5194,7 +5233,7 @@ const buildOrderReceipt = (order) => {
     };
   });
 
-  // ------- applied promos & vouchers summary -------
+  // ------- applied promos normalization (kembalikan null jika kosong) -------
   const appliedPromo = order.appliedPromo || order.applied_promo || null;
   const appliedPromos = [];
   if (appliedPromo) {
@@ -5266,27 +5305,41 @@ const buildOrderReceipt = (order) => {
       });
     }
   }
+  const applied_promos_output = appliedPromos.length ? appliedPromos : null;
 
-  // vouchers summary
-  const appliedVoucherEntries = [];
-  if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
+  // ------- applied_vouchers minimal (HANYA name + description) -------
+  // Prefer persisted order.applied_vouchers (expected minimal), else try order.appliedVouchers (snapshot),
+  // else fallback to order.orderPriceSnapshot.breakdown (engine)
+  let applied_vouchers_output = [];
+  if (Array.isArray(order.applied_vouchers) && order.applied_vouchers.length) {
+    applied_vouchers_output = order.applied_vouchers.map((v) => ({
+      name: v.name || null,
+      description: v.description || null
+    }));
+  } else if (
+    Array.isArray(order.appliedVouchers) &&
+    order.appliedVouchers.length
+  ) {
     for (const av of order.appliedVouchers) {
-      appliedVoucherEntries.push({
-        voucherId: av.voucherId
-          ? String(av.voucherId)
-          : av.voucher
-          ? String(av.voucher)
-          : null,
-        snapshot: av.voucherSnapshot || av.snapshot || {}
-      });
+      const snap = av.voucherSnapshot || av.snapshot || {};
+      const name = snap?.name || null;
+      const desc = snap?.notes || snap?.description || null;
+      if (name)
+        applied_vouchers_output.push({ name, description: desc || null });
     }
   } else if (
-    Array.isArray(order.applied_voucher_ids) &&
-    order.applied_voucher_ids.length
+    order.orderPriceSnapshot &&
+    Array.isArray(order.orderPriceSnapshot.breakdown) &&
+    order.orderPriceSnapshot.breakdown.length
   ) {
-    for (const vid of order.applied_voucher_ids) {
-      appliedVoucherEntries.push({ voucherId: String(vid), snapshot: {} });
+    for (const b of order.orderPriceSnapshot.breakdown) {
+      const name = b.name || b.label || b.title || null;
+      const desc = b.note || b.description || null;
+      if (name)
+        applied_vouchers_output.push({ name, description: desc || null });
     }
+  } else {
+    applied_vouchers_output = [];
   }
 
   // free items summary
@@ -5300,117 +5353,6 @@ const buildOrderReceipt = (order) => {
       qty: Number(it.quantity || it.qty || 1),
       imageUrl: it.imageUrl || null
     }));
-
-  // (local enrichment unchanged) build menuMap and enrich rewards...
-  const menuMap = {};
-  for (const it of items) {
-    const mid = it.menu || it.menuId || (it.menu && it.menu._id) || null;
-    if (!mid) continue;
-    const key = String(mid);
-    if (!menuMap[key]) {
-      const mObj = it.menu && typeof it.menu === 'object' ? it.menu : null;
-      menuMap[key] = {
-        name: it.name || (mObj && mObj.name) || null,
-        imageUrl: it.imageUrl || (mObj && mObj.imageUrl) || null,
-        code: it.menu_code || (mObj && mObj.code) || null
-      };
-    }
-  }
-
-  for (const ap of appliedPromos) {
-    if (!Array.isArray(ap.rewards)) continue;
-    for (const r of ap.rewards) {
-      if (
-        r &&
-        String(r.type || '').toLowerCase() === 'free_item' &&
-        r.meta &&
-        r.meta.menuId
-      ) {
-        const mid = String(r.meta.menuId);
-        const mdoc = menuMap[mid];
-        if (mdoc) {
-          r.label =
-            r.label && r.label !== `Free item ${mid}`
-              ? r.label
-              : mdoc.name || r.label || `Free item ${mid}`;
-          if (!r.meta.imageUrl && mdoc.imageUrl)
-            r.meta.imageUrl = mdoc.imageUrl;
-          if (!r.meta.menuName && mdoc.name) r.meta.menuName = mdoc.name;
-          if (!r.meta.menuCode && mdoc.code) r.meta.menuCode = mdoc.code;
-        } else {
-          const found = free_items.find((f) => String(f.menuId) === mid);
-          if (found) {
-            r.label =
-              r.label && r.label !== `Free item ${mid}`
-                ? r.label
-                : found.name || r.label || `Free item ${mid}`;
-            if (!r.meta.imageUrl && found.imageUrl)
-              r.meta.imageUrl = found.imageUrl;
-            if (!r.meta.menuName && found.name) r.meta.menuName = found.name;
-          } else {
-            r.label = r.label || `Free item ${mid}`;
-          }
-        }
-      }
-    }
-  }
-
-  for (const f of free_items) {
-    if (f.menuId) {
-      const mdoc = menuMap[String(f.menuId)];
-      if (mdoc && (!f.name || f.name === 'Free item')) {
-        f.name = mdoc.name || f.name;
-        if (!f.imageUrl && mdoc.imageUrl) f.imageUrl = mdoc.imageUrl;
-      }
-    }
-  }
-
-  const applied_promos_output = appliedPromos.length ? appliedPromos : null;
-
-  // --- vouchers summary for receipt: prefer explicit order.voucher (from payload), else try to build from appliedVouchers/applied_voucher_ids
-  let voucher_output = null;
-  if (order.voucher && typeof order.voucher === 'object') {
-    voucher_output = {
-      chosenClaimIds: Array.isArray(order.voucher.chosenClaimIds)
-        ? order.voucher.chosenClaimIds.map(String)
-        : [],
-      claims: Array.isArray(order.voucher.claims) ? order.voucher.claims : []
-    };
-  } else {
-    // fallback: build from appliedVouchers or applied_voucher_ids
-    const chosen = [];
-    const claimsFallback = [];
-    if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
-      for (const av of order.appliedVouchers) {
-        // if applied via claim (av may have voucherClaimId etc)
-        if (av.voucherClaimId || av.claimId)
-          chosen.push(String(av.voucherClaimId || av.claimId));
-        const vid = av.voucherId || av.voucher || null;
-        claimsFallback.push({
-          claimId: av.voucherClaimId || av.claimId || null,
-          voucherId: vid ? String(vid) : null,
-          voucherName: av.voucherSnapshot?.name || null,
-          voucherDescription: av.voucherSnapshot?.notes || null
-        });
-      }
-    } else if (
-      Array.isArray(order.applied_voucher_ids) &&
-      order.applied_voucher_ids.length
-    ) {
-      // only voucher ids known
-      for (const vid of order.applied_voucher_ids) {
-        claimsFallback.push({
-          claimId: null,
-          voucherId: String(vid),
-          voucherName: null,
-          voucherDescription: null
-        });
-      }
-    }
-    if (chosen.length || claimsFallback.length) {
-      voucher_output = { chosenClaimIds: chosen, claims: claimsFallback };
-    } else voucher_output = null;
-  }
 
   // ------- final receipt object (tambahkan points_used) -------
   const receipt = {
@@ -5429,6 +5371,7 @@ const buildOrderReceipt = (order) => {
       shipping_discount: int(shipping_discount),
       tax_amount: int(tax_amount),
       tax_rate_percent: Number(tax_rate_percent || 0),
+      // points_used: prefer snapshot.ui_totals.points_used -> fallback order.points_used -> 0
       points_used: int(
         snapshotUi?.points_used ??
           snapshotUi?.points_candidate_use ??
@@ -5468,12 +5411,12 @@ const buildOrderReceipt = (order) => {
       placed_at: order.placed_at,
       paid_at: order.paid_at || null
     },
-    applied_promos: applied_promos_output, // <-- now null if none
-    voucher: voucher_output, // <-- new field
-    applied_vouchers: appliedVoucherEntries,
+    applied_promos: applied_promos_output,
+    // hanya name + description
+    applied_vouchers: applied_vouchers_output,
     applied_voucher_ids: Array.isArray(order.applied_voucher_ids)
       ? order.applied_voucher_ids
-      : appliedVoucherEntries.map((v) => v.voucherId),
+      : [],
     free_items,
     meta: {
       note: order.notes || order.note || ''
