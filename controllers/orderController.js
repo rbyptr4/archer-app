@@ -2303,6 +2303,97 @@ exports.checkout = asyncHandler(async (req, res) => {
       ? { actions: promoActions, total: points_awarded }
       : {});
 
+  // ---------------------------
+  // BUILD voucher summary (insert BEFORE payload)
+  // ---------------------------
+  // Determine chosenClaimIds: prefer engine.priced.chosenClaimIds, fallback eligibleClaimIds
+  const chosenClaimIdsForOrder =
+    Array.isArray(priced?.chosenClaimIds) && priced.chosenClaimIds.length
+      ? priced.chosenClaimIds.map(String)
+      : Array.isArray(eligibleClaimIds)
+      ? eligibleClaimIds.map(String)
+      : [];
+
+  // Ensure we have claimDocsMap for chosenClaimIds (we earlier built claimDocsMap for claimIdsNeeded;
+  // if missing, fetch those claim docs)
+  if (chosenClaimIdsForOrder.length) {
+    const missingClaims = chosenClaimIdsForOrder.filter(
+      (cid) => !claimDocsMap[String(cid)]
+    );
+    if (missingClaims.length) {
+      try {
+        const extraClaims = await VoucherClaim.find({
+          _id: { $in: missingClaims }
+        })
+          .lean()
+          .catch(() => []);
+        for (const c of extraClaims) claimDocsMap[String(c._id)] = c;
+      } catch (e) {
+        // best-effort; jangan block checkout
+        console.warn(
+          '[checkout] fetch extra VoucherClaim docs failed',
+          e?.message || e
+        );
+      }
+    }
+  }
+
+  // Collect voucherIds used by those claims
+  const voucherIdsUsed = Array.from(
+    new Set(
+      chosenClaimIdsForOrder
+        .map((cid) => {
+          const cd = claimDocsMap[String(cid)];
+          return cd
+            ? String(cd.voucher || cd.voucherId || cd.voucher_id || '')
+            : '';
+        })
+        .filter(Boolean)
+    )
+  );
+
+  // Fetch voucher docs for snapshot (best-effort)
+  let voucherDocsMap = {};
+  if (voucherIdsUsed.length) {
+    try {
+      const vdocs = await Voucher.find({ _id: { $in: voucherIdsUsed } })
+        .lean()
+        .catch(() => []);
+      for (const v of vdocs) voucherDocsMap[String(v._id)] = v;
+    } catch (e) {
+      console.warn('[checkout] fetch voucher docs failed', e?.message || e);
+    }
+  }
+
+  // Build claims summary array for payload
+  const voucherClaimsSummary = (chosenClaimIdsForOrder || []).map((cid) => {
+    const cd = claimDocsMap[String(cid)] || null;
+    const vid = cd
+      ? String(cd.voucher || cd.voucherId || cd.voucher_id || '')
+      : null;
+    const vdoc = vid ? voucherDocsMap[String(vid)] : null;
+    return {
+      claimId: cid,
+      voucherId: vid || null,
+      voucherName: vdoc?.name || cd?.voucherName || cd?.name || null,
+      voucherDescription:
+        vdoc?.notes || vdoc?.description || cd?.notes || cd?.description || null
+    };
+  });
+
+  // Build appliedVouchers snapshots (so order.appliedVouchers contains voucherSnapshot)
+  const appliedVouchersForPayload = Array.from(
+    new Set([...appliedVoucherIds, ...voucherIdsUsed])
+  ).map((vid) => ({
+    voucherId: vid,
+    voucherSnapshot: voucherDocsMap[String(vid)] || {}
+  }));
+
+  const voucherSummaryForPayload = {
+    chosenClaimIds: chosenClaimIdsForOrder,
+    claims: voucherClaimsSummary
+  };
+
   // prepare payload
   const payload = {
     member: MemberDoc ? MemberDoc._id : null,
@@ -2319,11 +2410,16 @@ exports.checkout = asyncHandler(async (req, res) => {
     delivery_fee: int(uiTotals.delivery_fee || 0),
     shipping_discount: int(uiTotals.shipping_discount || 0),
     discounts: [], // set later
-    appliedVouchers: (appliedVoucherIds || []).map((id) => ({
-      voucherId: id,
-      voucherSnapshot: {}
-    })),
-    appliedVouchersIds: appliedVoucherIds || [],
+    // applied vouchers persisted (snapshot dari Voucher docs bila ada)
+    appliedVouchers: Array.isArray(appliedVouchersForPayload)
+      ? appliedVouchersForPayload
+      : [],
+    applied_voucher_ids: Array.isArray(appliedVouchersForPayload)
+      ? appliedVouchersForPayload.map((x) => x.voucherId)
+      : appliedVoucherIds || [],
+    // structured voucher summary so receipt + API can read chosenClaimIds + claims details
+    voucher: voucherSummaryForPayload,
+
     appliedPromo: priced.promoApplied
       ? {
           promoId: priced.promoApplied.promoId || priced.promoApplied.promoId,
@@ -5269,6 +5365,53 @@ const buildOrderReceipt = (order) => {
     }
   }
 
+  const applied_promos_output = appliedPromos.length ? appliedPromos : null;
+
+  // --- vouchers summary for receipt: prefer explicit order.voucher (from payload), else try to build from appliedVouchers/applied_voucher_ids
+  let voucher_output = null;
+  if (order.voucher && typeof order.voucher === 'object') {
+    voucher_output = {
+      chosenClaimIds: Array.isArray(order.voucher.chosenClaimIds)
+        ? order.voucher.chosenClaimIds.map(String)
+        : [],
+      claims: Array.isArray(order.voucher.claims) ? order.voucher.claims : []
+    };
+  } else {
+    // fallback: build from appliedVouchers or applied_voucher_ids
+    const chosen = [];
+    const claimsFallback = [];
+    if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
+      for (const av of order.appliedVouchers) {
+        // if applied via claim (av may have voucherClaimId etc)
+        if (av.voucherClaimId || av.claimId)
+          chosen.push(String(av.voucherClaimId || av.claimId));
+        const vid = av.voucherId || av.voucher || null;
+        claimsFallback.push({
+          claimId: av.voucherClaimId || av.claimId || null,
+          voucherId: vid ? String(vid) : null,
+          voucherName: av.voucherSnapshot?.name || null,
+          voucherDescription: av.voucherSnapshot?.notes || null
+        });
+      }
+    } else if (
+      Array.isArray(order.applied_voucher_ids) &&
+      order.applied_voucher_ids.length
+    ) {
+      // only voucher ids known
+      for (const vid of order.applied_voucher_ids) {
+        claimsFallback.push({
+          claimId: null,
+          voucherId: String(vid),
+          voucherName: null,
+          voucherDescription: null
+        });
+      }
+    }
+    if (chosen.length || claimsFallback.length) {
+      voucher_output = { chosenClaimIds: chosen, claims: claimsFallback };
+    } else voucher_output = null;
+  }
+
   // ------- final receipt object (tambahkan points_used) -------
   const receipt = {
     id: String(order._id),
@@ -5286,7 +5429,6 @@ const buildOrderReceipt = (order) => {
       shipping_discount: int(shipping_discount),
       tax_amount: int(tax_amount),
       tax_rate_percent: Number(tax_rate_percent || 0),
-      // points_used: prefer snapshot.ui_totals.points_used -> fallback order.points_used -> 0
       points_used: int(
         snapshotUi?.points_used ??
           snapshotUi?.points_candidate_use ??
@@ -5326,7 +5468,8 @@ const buildOrderReceipt = (order) => {
       placed_at: order.placed_at,
       paid_at: order.paid_at || null
     },
-    applied_promos: appliedPromos,
+    applied_promos: applied_promos_output, // <-- now null if none
+    voucher: voucher_output, // <-- new field
     applied_vouchers: appliedVoucherEntries,
     applied_voucher_ids: Array.isArray(order.applied_voucher_ids)
       ? order.applied_voucher_ids
