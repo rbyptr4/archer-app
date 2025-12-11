@@ -1636,8 +1636,12 @@ exports.checkout = asyncHandler(async (req, res) => {
 
   if (method === 'points' && !MemberDoc)
     throwError('Pembayaran dengan poin hanya untuk member terdaftar', 400);
-  if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method))
-    throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
+
+  if (method !== 'points') {
+    if (!isPaymentMethodAllowed(iden0.source || 'online', ft, method))
+      throwError('Metode pembayaran tidak diizinkan untuk mode ini', 400);
+  }
+
   if (usePoints && !MemberDoc)
     throwError('Poin hanya dapat digunakan oleh member terdaftar', 400);
 
