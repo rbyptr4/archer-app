@@ -3595,7 +3595,6 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
   const id = req.params.id;
   if (!mongoose.Types.ObjectId.isValid(id)) throwError('ID tidak valid', 400);
 
-  // ambil order + populate member minimal + items.menu + verified_by
   const order = await Order.findById(id)
     .populate({ path: 'member', select: 'name phone email membershipTier' })
     .populate({
@@ -3609,31 +3608,48 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
 
   const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
   const intVal = (v) => Math.round(Number(v || 0));
-  const int = (v) => intVal(v); // helper local mirip int()
+  const int = (v) => intVal(v);
 
-  // --- applied promos normalization (non-redundant, addedFreeItems single source) ---
-  const appliedPromos = [];
-  const apSource =
-    order.appliedPromos ||
-    (order.appliedPromo
-      ? Array.isArray(order.appliedPromo)
-        ? order.appliedPromo
-        : [order.appliedPromo]
-      : null) ||
-    (order.applied_promo
-      ? Array.isArray(order.applied_promo)
-        ? order.applied_promo
-        : [order.applied_promo]
-      : null) ||
-    null;
+  // --- normalize appliedPromos (strict null if empty/ghost) ---
+  let appliedPromos = null;
+  (function normalizePromos() {
+    const src =
+      order.appliedPromos ||
+      (order.appliedPromo
+        ? Array.isArray(order.appliedPromo)
+          ? order.appliedPromo
+          : [order.appliedPromo]
+        : null) ||
+      (order.applied_promo
+        ? Array.isArray(order.applied_promo)
+          ? order.applied_promo
+          : [order.applied_promo]
+        : null) ||
+      null;
 
-  if (Array.isArray(apSource) && apSource.length) {
-    for (const ap of apSource) {
+    if (!Array.isArray(src) || src.length === 0) return;
+
+    const out = [];
+    for (const ap of src) {
+      if (!ap) continue;
       let snap = ap;
-      if (ap.promoSnapshot) snap = ap.promoSnapshot;
-      if (ap.promo) snap = ap.promo; // legacy
+      if (ap?.promoSnapshot) snap = ap.promoSnapshot;
+      if (ap?.promo) snap = ap.promo;
 
-      // ensure single source addedFreeItems
+      if (!snap) continue;
+
+      const hasMeaning =
+        !!snap.promoId ||
+        !!snap.id ||
+        !!snap.name ||
+        (Array.isArray(snap.actions) && snap.actions.length > 0) ||
+        (snap.impact &&
+          typeof snap.impact === 'object' &&
+          Object.keys(snap.impact || {}).length > 0);
+
+      if (!hasMeaning) continue;
+
+      const actions = snap.actions || [];
       const addedFreeItems =
         snap.impact &&
         Array.isArray(snap.impact.addedFreeItems) &&
@@ -3653,8 +3669,6 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
 
       const rewards = [];
 
-      // dari actions
-      const actions = snap.actions || snap.promoSnapshot?.actions || [];
       if (Array.isArray(actions) && actions.length) {
         for (const a of actions) {
           const t = String(a.type || '').toLowerCase();
@@ -3683,7 +3697,6 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
         }
       }
 
-      // dari addedFreeItems
       if (Array.isArray(addedFreeItems) && addedFreeItems.length) {
         for (const f of addedFreeItems) {
           rewards.push({
@@ -3699,7 +3712,6 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
         }
       }
 
-      // dari impact discount
       const promoDiscountValue =
         (snap.impact &&
           (snap.impact.itemsDiscount || snap.impact.cartDiscount)) ||
@@ -3713,34 +3725,33 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
         });
       }
 
-      appliedPromos.push({
+      out.push({
         promoId:
           snap.promoId || snap.promo_id || (snap.id ? String(snap.id) : null),
         name: snap.name || snap.promoName || null,
         description: snap.description || snap.notes || null,
         type: snap.type || null,
-        impact: Object.assign({}, snap.impact || {}, {
-          addedFreeItems: addedFreeItems
-        }),
+        impact: Object.assign({}, snap.impact || {}, { addedFreeItems }),
         actions: actions || [],
         rewards
       });
     }
-  }
+    if (out.length) appliedPromos = out;
+  })();
 
-  // --- applied vouchers normalization (ringkas) ---
-  const appliedVouchers = [];
+  // --- normalize appliedVouchers (strict null if empty/ghost) ---
+  let appliedVouchers = null;
+  // prefer canonical appliedVouchers with batch fetch
   if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
-    // batch fetch missing snapshots
     const missingIds = [];
     for (const av of order.appliedVouchers) {
       const vid =
-        av.voucherId ||
-        av.voucher ||
-        (av.voucherSnapshot && av.voucherSnapshot._id) ||
+        av?.voucherId ||
+        av?.voucher ||
+        (av?.voucherSnapshot && av.voucherSnapshot._id) ||
         null;
       const hasSnap =
-        av.voucherSnapshot && Object.keys(av.voucherSnapshot).length;
+        av?.voucherSnapshot && Object.keys(av.voucherSnapshot || {}).length > 0;
       if (!hasSnap && vid) missingIds.push(String(vid));
     }
 
@@ -3760,14 +3771,16 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
       }
     }
 
+    const out = [];
     for (const av of order.appliedVouchers) {
       const vid =
-        av.voucherId ||
-        av.voucher ||
-        (av.voucherSnapshot && av.voucherSnapshot._id) ||
+        av?.voucherId ||
+        av?.voucher ||
+        (av?.voucherSnapshot && av.voucherSnapshot._1) ||
+        (av?.voucherSnapshot && av.voucherSnapshot._id) ||
         null;
       const parsedVid = vid ? String(vid) : null;
-      let snap = av.voucherSnapshot || av.snapshot || av || {};
+      let snap = av?.voucherSnapshot || av?.snapshot || av || {};
       if (
         (!snap || Object.keys(snap).length === 0) &&
         parsedVid &&
@@ -3783,8 +3796,12 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
           visibility: vd.visibility || {}
         };
       }
-      appliedVouchers.push({ voucherId: parsedVid, snapshot: snap || {} });
+      const snapHasMeaning =
+        parsedVid || (snap && Object.keys(snap || {}).length > 0);
+      if (!snapHasMeaning) continue;
+      out.push({ voucherId: parsedVid, snapshot: snap || {} });
     }
+    if (out.length) appliedVouchers = out;
   } else if (
     Array.isArray(order.applied_voucher_ids) &&
     order.applied_voucher_ids.length
@@ -3799,19 +3816,26 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
         acc[String(v._id)] = v;
         return acc;
       }, {});
+      const out = [];
       for (const vid of vids) {
-        appliedVouchers.push({
-          voucherId: String(vid),
-          snapshot: vmap[String(vid)] || {}
-        });
+        const snap = vmap[String(vid)] || {};
+        const hasMeaning =
+          String(vid) || (snap && Object.keys(snap || {}).length > 0);
+        if (!hasMeaning) continue;
+        out.push({ voucherId: String(vid), snapshot: snap || {} });
       }
+      if (out.length) appliedVouchers = out;
     } catch (e) {
-      for (const vid of order.applied_voucher_ids) {
-        appliedVouchers.push({ voucherId: String(vid), snapshot: {} });
+      const out = [];
+      for (const vid of order.applied_voucher_ids || []) {
+        if (!vid) continue;
+        out.push({ voucherId: String(vid), snapshot: {} });
       }
+      if (out.length) appliedVouchers = out;
     }
   }
 
+  // --- build itemsDetailed (duplicate to keep shape consistent for response) ---
   const itemsDetailed = (order.items || []).map((it, idx) => {
     const qty = safeNumber(it.quantity || it.qty || 0);
     const basePrice = safeNumber(
@@ -3866,7 +3890,7 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
     };
   });
 
-  // --- build totals object (sama seperti detail) ---
+  // --- totals ---
   const totals = {
     items_subtotal: safeNumber(order.items_subtotal || 0),
     items_discount: safeNumber(order.items_discount || 0),
@@ -3880,13 +3904,11 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
     rounding_delta: safeNumber(order.rounding_delta || 0),
     grand_total: safeNumber(order.grand_total || 0),
     paid_total: safeNumber(order.paid_total || order.grand_total || 0),
-
-    // tambahan points info agar client bisa lihat breakdown
     points_used: safeNumber(order.points_used || 0),
     points_awarded: safeNumber(order.points_awarded || 0)
   };
 
-  // --- Local enrichment for free_item labels using order.items (no DB calls) ---
+  // --- local enrichment for free_item labels ---
   try {
     const menuMap = {};
     (order.items || []).forEach((it) => {
@@ -3903,8 +3925,7 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
       }
     });
 
-    // enrich appliedPromos rewards free_item
-    for (const ap of appliedPromos) {
+    for (const ap of appliedPromos || []) {
       if (!Array.isArray(ap.rewards)) continue;
       for (const r of ap.rewards) {
         if (
@@ -3935,7 +3956,7 @@ exports.getMyOrder = asyncHandler(async (req, res) => {
   }
 
   const full = Object.assign({}, order, {
-    _id: order._id ? String(order._id) : null,
+    _id: order._id ? String(order._1 || order._id) : null,
     id: order._id ? String(order._id) : null,
     member: order.member || null,
     applied_promos: appliedPromos,
@@ -4860,9 +4881,9 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
 
   const safeNumber = (v) => (Number.isFinite(+v) ? +v : 0);
   const intVal = (v) => Math.round(Number(v || 0));
-  const int = (v) => intVal(v); // helper local mirip int()
+  const int = (v) => intVal(v);
 
-  // --- build itemsDetailed (mirip implementasimu sebelumnya) ---
+  // --- items detailed ---
   const itemsDetailed = (order.items || []).map((it, idx) => {
     const qty = safeNumber(it.quantity || it.qty || 0);
     const basePrice = safeNumber(
@@ -4917,214 +4938,268 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
     };
   });
 
-  // --- normalize appliedPromos (support various shapes) ---
-  const appliedPromos = [];
-  const apSource =
-    order.appliedPromos ||
-    (order.appliedPromo
-      ? Array.isArray(order.appliedPromo)
-        ? order.appliedPromo
-        : [order.appliedPromo]
-      : null) ||
-    (order.applied_promo
-      ? Array.isArray(order.applied_promo)
-        ? order.applied_promo
-        : [order.applied_promo]
-      : null) ||
-    null;
+  // --- normalize appliedPromos (strict: null if empty/ghost) ---
+  let appliedPromos = null;
+  (function normalizePromos() {
+    const src =
+      order.appliedPromos ||
+      (order.appliedPromo
+        ? Array.isArray(order.appliedPromo)
+          ? order.appliedPromo
+          : [order.appliedPromo]
+        : null) ||
+      (order.applied_promo
+        ? Array.isArray(order.applied_promo)
+          ? order.applied_promo
+          : [order.applied_promo]
+        : null) ||
+      null;
 
-  if (Array.isArray(apSource) && apSource.length) {
-    for (const apRaw of apSource) {
-      let snap = apRaw;
-      if (apRaw.promoSnapshot) snap = apRaw.promoSnapshot;
-      if (apRaw.promo) snap = apRaw.promo;
+    if (!Array.isArray(src) || src.length === 0) return;
+
+    const out = [];
+    for (const raw of src) {
+      if (!raw) continue;
+      let snap = raw;
+      if (raw?.promoSnapshot) snap = raw.promoSnapshot;
+      if (raw?.promo) snap = raw.promo;
 
       if (!snap) continue;
 
-      const addedFreeItems =
-        snap.impact &&
-        Array.isArray(snap.impact.addedFreeItems) &&
-        snap.impact.addedFreeItems.length
-          ? snap.impact.addedFreeItems
-          : snap.freeItemsSnapshot &&
-            Array.isArray(snap.freeItemsSnapshot) &&
-            snap.freeItemsSnapshot.length
-          ? snap.freeItemsSnapshot.map((f) => ({
-              menuId: f.menuId || f._id || null,
-              qty: Number(f.qty || 1),
-              name: f.name || null,
-              imageUrl: f.imageUrl || null,
-              category: f.category || null
-            }))
-          : [];
-
-      const rewards = [];
-
-      const actions = snap.actions || snap.promoSnapshot?.actions || [];
-      if (Array.isArray(actions) && actions.length) {
-        for (const a of actions) {
-          const t = String(a.type || '').toLowerCase();
-          if (t === 'award_points') {
-            rewards.push({
-              type: 'points',
-              amount: Number(a.points ?? a.amount ?? 0),
-              label: a.label || 'Poin',
-              meta: a.meta || {}
-            });
-          } else if (t === 'grant_membership') {
-            rewards.push({
-              type: 'membership',
-              amount: null,
-              label: a.label || 'Grant membership',
-              meta: a.meta || {}
-            });
-          } else {
-            rewards.push({
-              type: a.type || 'action',
-              amount: a.amount ?? null,
-              label: a.label || a.type || 'Reward',
-              meta: a.meta || {}
-            });
-          }
-        }
-      }
-
-      if (Array.isArray(addedFreeItems) && addedFreeItems.length) {
-        for (const f of addedFreeItems) {
-          rewards.push({
-            type: 'free_item',
-            amount: 0,
-            label: f.name || `Free item ${f.menuId || ''}`,
-            meta: {
-              menuId: f.menuId,
-              qty: Number(f.qty || 1),
-              imageUrl: f.imageUrl || null,
-              category: f.category || null
-            }
-          });
-        }
-      }
-
-      const promoDiscountValue =
+      const hasMeaning =
+        !!snap.promoId ||
+        !!snap.id ||
+        !!snap.name ||
+        (Array.isArray(snap.actions) && snap.actions.length > 0) ||
         (snap.impact &&
-          (snap.impact.itemsDiscount || snap.impact.cartDiscount)) ||
-        0;
-      if (promoDiscountValue && Number(promoDiscountValue) > 0) {
-        rewards.push({
-          type: 'discount',
-          amount: intVal(promoDiscountValue),
-          label: 'Diskon promo',
-          meta: { promoId: snap.promoId || snap.id || null }
-        });
-      }
+          typeof snap.impact === 'object' &&
+          Object.keys(snap.impact || {}).length > 0);
 
-      appliedPromos.push({
+      if (!hasMeaning) continue;
+
+      const actions = snap.actions || [];
+      const impact = snap.impact || {};
+      out.push({
         promoId:
           snap.promoId || snap.promo_id || (snap.id ? String(snap.id) : null),
-        name: snap.name || snap.promoName || null,
+        name: snap.name || null,
         description: snap.description || snap.notes || null,
-        // pastikan type terisi dari snapshot/fallback
-        type: snap.type || snap.promoSnapshot?.type || snap.promoType || null,
-        impact: Object.assign({}, snap.impact || {}, { addedFreeItems }),
-        actions: actions || [],
-        rewards
+        type: snap.type || snap.promoType || null,
+        impact,
+        actions
       });
     }
-  }
+    if (out.length) appliedPromos = out;
+  })();
 
-  // --- normalize appliedVouchers (ambil dari order.appliedVouchers jika ada) ---
-  const appliedVouchers = [];
+  // --- normalize appliedVouchers (strict: null if empty/ghost) ---
+  // produce array of { voucherId, snapshot } or null
+  let appliedVouchers = null;
+  (async function normalizeVouchers() {
+    // prefer canonical appliedVouchers
+    if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
+      // collect missing ids to batch fetch
+      const missingIds = [];
+      for (const av of order.appliedVouchers) {
+        const vid =
+          av?.voucherId ||
+          av?.voucher ||
+          (av?.voucherSnapshot && av.voucherSnapshot._id) ||
+          null;
+        const hasSnap =
+          av?.voucherSnapshot &&
+          Object.keys(av.voucherSnapshot || {}).length > 0;
+        if (!hasSnap && vid) missingIds.push(String(vid));
+      }
 
-  // prefer order.appliedVouchers (canonical)
-  if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
-    // fetch missing snapshots in batch to minimize DB calls
-    const missingIds = [];
-    for (const av of order.appliedVouchers) {
-      const vid =
-        av.voucherId ||
-        av.voucher ||
-        (av.voucherSnapshot && av.voucherSnapshot._id) ||
-        null;
-      const hasSnap =
-        av.voucherSnapshot && Object.keys(av.voucherSnapshot).length;
-      if (!hasSnap && vid) missingIds.push(String(vid));
+      let vmap = {};
+      if (missingIds.length) {
+        try {
+          const Voucher = require('../models/voucherModel');
+          const vdocs = await Voucher.find({ _id: { $in: missingIds } })
+            .lean()
+            .catch(() => []);
+          vmap = (vdocs || []).reduce((acc, v) => {
+            acc[String(v._id)] = v;
+            return acc;
+          }, {});
+        } catch (e) {
+          vmap = {};
+        }
+      }
+
+      const out = [];
+      for (const av of order.appliedVouchers) {
+        const vid =
+          av?.voucherId ||
+          av?.voucher ||
+          (av?.voucherSnapshot && av.voucherSnapshot._id) ||
+          null;
+        const parsedVid = vid ? String(vid) : null;
+        let snap = av?.voucherSnapshot || av?.snapshot || av || {};
+        if (
+          (!snap || Object.keys(snap).length === 0) &&
+          parsedVid &&
+          vmap[parsedVid]
+        ) {
+          const vd = vmap[parsedVid];
+          snap = {
+            _id: String(vd._id),
+            name: vd.name || null,
+            notes: vd.notes || vd.description || null,
+            code: vd.code || null,
+            type: vd.type || null,
+            visibility: vd.visibility || {}
+          };
+        }
+        // skip ghost entries where neither id nor meaningful snapshot present
+        const snapHasMeaning =
+          parsedVid || (snap && Object.keys(snap || {}).length > 0);
+        if (!snapHasMeaning) continue;
+        out.push({ voucherId: parsedVid, snapshot: snap || {} });
+      }
+
+      if (out.length) appliedVouchers = out;
+      return;
     }
 
-    let vmap = {};
-    if (missingIds.length) {
+    // fallback: use applied_voucher_ids
+    if (
+      Array.isArray(order.applied_voucher_ids) &&
+      order.applied_voucher_ids.length
+    ) {
       try {
+        const vids = order.applied_voucher_ids.map((v) => String(v));
         const Voucher = require('../models/voucherModel');
-        const vdocs = await Voucher.find({ _id: { $in: missingIds } })
+        const vdocs = await Voucher.find({ _id: { $in: vids } })
           .lean()
           .catch(() => []);
-        vmap = (vdocs || []).reduce((acc, v) => {
+        const vmap = (vdocs || []).reduce((acc, v) => {
           acc[String(v._id)] = v;
           return acc;
         }, {});
+        const out = [];
+        for (const vid of vids) {
+          const snap = vmap[String(vid)] || {};
+          const hasMeaning =
+            String(vid) || (snap && Object.keys(snap || {}).length > 0);
+          if (!hasMeaning) continue;
+          out.push({ voucherId: String(vid), snapshot: snap || {} });
+        }
+        if (out.length) appliedVouchers = out;
       } catch (e) {
-        vmap = {};
+        // best-effort fallback: map ids to empty snapshots
+        const out = [];
+        for (const vid of order.applied_voucher_ids || []) {
+          if (!vid) continue;
+          out.push({ voucherId: String(vid), snapshot: {} });
+        }
+        if (out.length) appliedVouchers = out;
       }
     }
+  })();
 
-    for (const av of order.appliedVouchers) {
-      const vid =
-        av.voucherId ||
-        av.voucher ||
-        (av.voucherSnapshot && av.voucherSnapshot._id) ||
-        null;
-      const parsedVid = vid ? String(vid) : null;
-      let snap = av.voucherSnapshot || av.snapshot || av || {};
-      // fill snapshot from vmap if snapshot empty and vmap has doc
-      if (
-        (!snap || Object.keys(snap).length === 0) &&
-        parsedVid &&
-        vmap[parsedVid]
-      ) {
-        const vd = vmap[parsedVid];
-        snap = {
-          _id: String(vd._id),
-          name: vd.name || null,
-          notes: vd.notes || vd.description || null,
-          code: vd.code || null,
-          type: vd.type || null,
-          visibility: vd.visibility || {}
-        };
-      }
+  // Note: Wait for voucher normalization to finish before building response.
+  // The above IIFE is async; ensure it completed by awaiting its resolution.
+  // Since we declared it as an immediately-invoked async function, we need to await it.
+  // To do that cleanly: re-run the normalization as a simple awaited block here:
 
-      appliedVouchers.push({
-        voucherId: parsedVid,
-        snapshot: snap || {}
-      });
-    }
-  } else if (
-    Array.isArray(order.applied_voucher_ids) &&
-    order.applied_voucher_ids.length
-  ) {
-    // fallback: try fetch docs
-    try {
-      const vids = order.applied_voucher_ids.map((v) => String(v));
-      const Voucher = require('../models/voucherModel');
-      const vdocs = await Voucher.find({ _id: { $in: vids } })
-        .lean()
-        .catch(() => []);
-      const vmap = (vdocs || []).reduce((acc, v) => {
-        acc[String(v._id)] = v;
-        return acc;
-      }, {});
-      for (const vid of vids) {
-        appliedVouchers.push({
-          voucherId: String(vid),
-          snapshot: vmap[String(vid)] || {}
-        });
+  // Re-run voucher normalization in awaited manner (ensures vmap fetched)
+  if (appliedVouchers === null) {
+    // re-run awaited normalization
+    if (Array.isArray(order.appliedVouchers) && order.appliedVouchers.length) {
+      const missingIds = [];
+      for (const av of order.appliedVouchers) {
+        const vid =
+          av?.voucherId ||
+          av?.voucher ||
+          (av?.voucherSnapshot && av.voucherSnapshot._id) ||
+          null;
+        const hasSnap =
+          av?.voucherSnapshot &&
+          Object.keys(av.voucherSnapshot || {}).length > 0;
+        if (!hasSnap && vid) missingIds.push(String(vid));
       }
-    } catch (e) {
-      for (const vid of order.applied_voucher_ids) {
-        appliedVouchers.push({ voucherId: String(vid), snapshot: {} });
+      let vmap = {};
+      if (missingIds.length) {
+        try {
+          const Voucher = require('../models/voucherModel');
+          const vdocs = await Voucher.find({ _id: { $in: missingIds } })
+            .lean()
+            .catch(() => []);
+          vmap = (vdocs || []).reduce((acc, v) => {
+            acc[String(v._1 || v._id)] = v;
+            return acc;
+          }, {});
+        } catch (e) {
+          vmap = {};
+        }
+      }
+      const out = [];
+      for (const av of order.appliedVouchers) {
+        const vid =
+          av?.voucherId ||
+          av?.voucher ||
+          (av?.voucherSnapshot && av.voucherSnapshot._id) ||
+          null;
+        const parsedVid = vid ? String(vid) : null;
+        let snap = av?.voucherSnapshot || av?.snapshot || av || {};
+        if (
+          (!snap || Object.keys(snap).length === 0) &&
+          parsedVid &&
+          vmap[parsedVid]
+        ) {
+          const vd = vmap[parsedVid];
+          snap = {
+            _id: String(vd._id),
+            name: vd.name || null,
+            notes: vd.notes || vd.description || null,
+            code: vd.code || null,
+            type: vd.type || null,
+            visibility: vd.visibility || {}
+          };
+        }
+        const snapHasMeaning =
+          parsedVid || (snap && Object.keys(snap || {}).length > 0);
+        if (!snapHasMeaning) continue;
+        out.push({ voucherId: parsedVid, snapshot: snap || {} });
+      }
+      if (out.length) appliedVouchers = out;
+    } else if (
+      Array.isArray(order.applied_voucher_ids) &&
+      order.applied_voucher_ids.length
+    ) {
+      try {
+        const vids = order.applied_voucher_ids.map((v) => String(v));
+        const Voucher = require('../models/voucherModel');
+        const vdocs = await Voucher.find({ _id: { $in: vids } })
+          .lean()
+          .catch(() => []);
+        const vmap = (vdocs || []).reduce((acc, v) => {
+          acc[String(v._id)] = v;
+          return acc;
+        }, {});
+        const out = [];
+        for (const vid of vids) {
+          const snap = vmap[String(vid)] || {};
+          const hasMeaning =
+            String(vid) || (snap && Object.keys(snap || {}).length > 0);
+          if (!hasMeaning) continue;
+          out.push({ voucherId: String(vid), snapshot: snap || {} });
+        }
+        if (out.length) appliedVouchers = out;
+      } catch (e) {
+        const out = [];
+        for (const vid of order.applied_voucher_ids || []) {
+          if (!vid) continue;
+          out.push({ voucherId: String(vid), snapshot: {} });
+        }
+        if (out.length) appliedVouchers = out;
       }
     }
   }
 
-  // --- build totals object (mirip sebelumnya) ---
+  // --- totals ---
   const totals = {
     items_subtotal: safeNumber(order.items_subtotal || 0),
     items_discount: safeNumber(order.items_discount || 0),
@@ -5140,7 +5215,7 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
     paid_total: safeNumber(order.paid_total || order.grand_total || 0)
   };
 
-  // --- Local enrichment for free_item labels using order.items (no DB calls) ---
+  // --- enrich free_item labels using items (no DB calls) ---
   try {
     const menuMap = {};
     (order.items || []).forEach((it) => {
@@ -5157,8 +5232,7 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
       }
     });
 
-    // enrich appliedPromos rewards free_item
-    for (const ap of appliedPromos) {
+    for (const ap of appliedPromos || []) {
       if (!Array.isArray(ap.rewards)) continue;
       for (const r of ap.rewards) {
         if (
@@ -5179,7 +5253,6 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
             if (!r.meta.menuName && mdoc.name) r.meta.menuName = mdoc.name;
             if (!r.meta.menuCode && mdoc.code) r.meta.menuCode = mdoc.code;
           } else {
-            // fallback: leave label as-is
             r.label = r.label || `Free item ${mid}`;
           }
         }
@@ -5189,7 +5262,7 @@ exports.getDetailOrder = asyncHandler(async (req, res) => {
     console.warn('[getDetailOrder] local enrichment failed', e?.message || e);
   }
 
-  // --- susun full response (TANPA discounts_internal) ---
+  // --- build final response ---
   const full = Object.assign({}, order, {
     _id: order._id ? String(order._id) : null,
     id: order._id ? String(order._id) : null,
