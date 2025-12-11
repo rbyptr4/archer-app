@@ -40,10 +40,11 @@ exports.explore = asyncHandler(async (req, res) => {
 
   const ids = list.map((v) => v._id);
 
+  // ambil jumlah klaim member untuk semua voucher (per-member)
   const claimCounts = await VoucherClaim.aggregate([
     {
       $match: {
-        member: meId,
+        member: mongoose.Types.ObjectId(meId),
         voucher: { $in: ids },
         status: { $ne: 'revoked' }
       }
@@ -63,7 +64,8 @@ exports.explore = asyncHandler(async (req, res) => {
 
   function getPerMemberLimit(v) {
     if (v.visibility && typeof v.visibility.perMemberLimit === 'number')
-      return Number(v.visibility.perMemberLimit);
+      return Math.max(0, Number(v.visibility.perMemberLimit));
+    // fallback: jika tidak dispesifikkan anggap default 1 (atau 0 jika owner mau disable)
     return 1;
   }
 
@@ -90,10 +92,13 @@ exports.explore = asyncHandler(async (req, res) => {
     return true;
   });
 
+  // filter berdasar per-member limit: jika claimed >= limit => hide
   const visible = prelim.filter((v) => {
     const id = String(v._id);
-    const limit = getPerMemberLimit(v); // >=1
+    const limit = getPerMemberLimit(v); // >=0
     const claimed = countsMap[id] || 0;
+    // jika limit 0 -> artinya voucher tidak boleh diklaim oleh member => sembunyikan
+    if (limit <= 0) return false;
     return claimed < Number(limit);
   });
 
@@ -411,6 +416,7 @@ exports.myWallet = asyncHandler(async (req, res) => {
   const claims = await VoucherClaim.find({
     member: meId,
     status: 'claimed',
+    // hanya ambil claims yang masih punya remainingUse > 0 (optimisasi DB)
     remainingUse: { $gt: 0 }
   })
     .populate('voucher')
@@ -434,7 +440,9 @@ exports.myWallet = asyncHandler(async (req, res) => {
     if (isExpired) return null; // jangan tampilkan voucher expired
 
     // apakah masih bisa dipakai (sederhana): remainingUse > 0 dan tidak expired
-    const canUse = (c.remainingUse ?? 0) > 0 && !isExpired;
+    const remaining = Number(c.remainingUse ?? 0);
+    const canUse = remaining > 0 && !isExpired;
+    if (!canUse) return null; // HIDE klaim yang sisa 0
 
     return {
       claimId: String(c._id),
@@ -448,7 +456,7 @@ exports.myWallet = asyncHandler(async (req, res) => {
         ? new Date(c.createdAt).toISOString()
         : null,
       valid_until: validUntil ? validUntil.toISOString() : null,
-      remainingUse: typeof c.remainingUse === 'number' ? c.remainingUse : null,
+      remainingUse: remaining,
       claimStatus: c.status || 'claimed',
       voucherActive: true,
       isExpired: false,
@@ -466,9 +474,10 @@ exports.myWallet = asyncHandler(async (req, res) => {
   let shipping = [];
 
   if (wantDelivery) {
-    // mode=delivery -> hanya tampilkan voucher ongkir saja (shipping), terlepas promo flag
+    // mode=delivery -> tampilkan voucher ongkir DAN voucher diskon (non-shipping)
+    // (user mengharapkan kedua jenis muncul saat delivery)
     shipping = normalized.filter((x) => x.type === 'shipping');
-    discounts = []; // jangan tampilkan diskon
+    discounts = normalized.filter((x) => x.type !== 'shipping');
   } else {
     // mode != delivery (none)
     if (promoEnabled) {

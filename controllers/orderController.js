@@ -1143,8 +1143,8 @@ exports.getCart = asyncHandler(async (req, res) => {
     ...cart,
     fulfillment_type: cart.fulfillment_type || 'dine_in',
     delivery_mode: cartDeliveryMode,
-    items,
-    ui_totals: ui
+    items
+    // ui_totals: ui
   });
 });
 
