@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { ObjectId } = mongoose.mongo;
 const asyncHandler = require('express-async-handler');
 const Voucher = require('../../models/voucherModel');
 const VoucherClaim = require('../../models/voucherClaimModel');
@@ -412,9 +413,6 @@ exports.updateVoucher = asyncHandler(async (req, res) => {
 });
 
 exports.activateVoucher = asyncHandler(async (req, res) => {
-  const mongoose = require('mongoose');
-  const Member = require('../../models/memberModel');
-
   const v = await Voucher.findById(req.params.id);
   if (!v || v.isDeleted) throwError('Voucher tidak ditemukan', 404);
 
@@ -440,19 +438,19 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
     throwError('claimUntil tidak boleh setelah useEnd.', 400);
 
   // Interpret stock BEFORE activation:
-  // - rawStock === null  => unlimited
-  // - rawStock === 0     => treated as "sold out" => reject activation (per your request)
-  // - rawStock > 0       => using global stock
+  // rawStock === null => unlimited
+  // rawStock === 0    => treated as "sold out" => reject activation
+  // rawStock > 0      => numeric limited stock
   const rawStock =
     v.visibility && typeof v.visibility.globalStock !== 'undefined'
       ? v.visibility.globalStock
       : null;
   const globalStockIsNull = rawStock === null;
-  const globalStockIsZero = Number(rawStock) === 0 && !globalStockIsNull;
+  const globalStockIsZero = !globalStockIsNull && Number(rawStock) === 0;
   const usingGlobalStock =
     String(v.visibility?.mode || '') === 'global_stock' && !globalStockIsNull;
 
-  // If voucher uses numeric global stock and it's exactly 0 => block activation with error
+  // If numeric global stock and zero => block activation with clear error
   if (usingGlobalStock && globalStockIsZero) {
     throwError(
       'Global stock voucher = 0. Jika ingin unlimited set globalStock = null; jika ingin assign, set globalStock > 0 terlebih dahulu.',
@@ -470,7 +468,7 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
     return res.json({ voucher: v.toObject() });
   }
 
-  // Options from request
+  // Options
   const chunkSize =
     Number(req.body.chunkSize) && Number(req.body.chunkSize) > 0
       ? Math.min(Math.max(Number(req.body.chunkSize), 50), 2000)
@@ -484,33 +482,31 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
 
   // Build member filter based on voucher.target (respect include/exclude if provided)
   const target = v.target || {};
-  let memberQuery = {};
+  const memberQuery = {};
   memberQuery.is_active = true; // sesuai model/memberModel.js
 
+  // safe idFilter build to avoid $in/$nin type issues
+  const idFilter = {};
   if (
     Array.isArray(target.includeMemberIds) &&
     target.includeMemberIds.length > 0
   ) {
-    memberQuery._id = {
-      $in: target.includeMemberIds.map((id) => mongoose.Types.ObjectId(id))
-    };
+    idFilter.$in = target.includeMemberIds.map((id) => new ObjectId(id));
   }
   if (
     Array.isArray(target.excludeMemberIds) &&
     target.excludeMemberIds.length > 0
   ) {
-    if (!memberQuery._id) memberQuery._id = {};
-    memberQuery._id.$nin = target.excludeMemberIds.map((id) =>
-      mongoose.Types.ObjectId(id)
-    );
+    idFilter.$nin = target.excludeMemberIds.map((id) => new ObjectId(id));
+  }
+  if (Object.keys(idFilter).length > 0) {
+    memberQuery._id = idFilter;
   }
 
   // Helper: try to take stock atomically for n items.
-  // If globalStockIsNull -> unlimited, always ok.
   async function tryTakeStock(n) {
     if (globalStockIsNull) return { ok: true, taken: n };
 
-    // otherwise rawStock > 0 (we already validated rawStock !== 0)
     const updated = await Voucher.findOneAndUpdate(
       { _id: v._id, 'visibility.globalStock': { $gte: n } },
       { $inc: { 'visibility.globalStock': -n } },
@@ -532,14 +528,14 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
     return { ok: true, taken: avail, partial: true };
   }
 
-  // Helper: build claim doc(s) for a memberId
+  // Helper: build claim docs for a memberId
   const now = new Date();
   function buildClaimDocsForMember(memberId, qty = 1) {
     const docs = [];
     for (let i = 0; i < qty; i++) {
       const doc = {
-        voucher: mongoose.Types.ObjectId(v._id),
-        member: mongoose.Types.ObjectId(memberId),
+        voucher: new ObjectId(v._id),
+        member: new ObjectId(memberId),
         status: 'claimed',
         remainingUse: Math.max(1, Number(v.usage?.maxUsePerClaim || 1)),
         claimedAt: now,
@@ -577,19 +573,18 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
     const existingMap = {};
 
     if (!forceReassign) {
-      // aggregate existing counts for this chunk
       const agg = await VoucherClaim.aggregate([
         {
           $match: {
-            voucher: mongoose.Types.ObjectId(v._id),
-            member: {
-              $in: memberIdChunk.map((id) => mongoose.Types.ObjectId(id))
-            }
+            voucher: new ObjectId(v._id),
+            member: { $in: memberIdChunk.map((id) => new ObjectId(id)) }
           }
         },
         { $group: { _id: '$member', cnt: { $sum: 1 } } }
       ]);
-      for (const it of agg) existingMap[String(it._id)] = it.cnt;
+      for (const it of agg)
+        existingMap[String(it._1 || it._id || it._id)] = it.cnt; // resilient mapping
+      // note: some drivers may return _id as ObjectId; we stringify keys when checking later
     }
 
     const docsToInsert = [];
@@ -618,7 +613,7 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
       };
     }
 
-    // if using numeric stock (rawStock > 0), take stock based on docsToInsert length
+    // if using numeric stock, reserve/decrement first
     if (
       !globalStockIsNull &&
       String(v.visibility?.mode || '') === 'global_stock'
@@ -651,7 +646,7 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
           partial: true
         };
       }
-      // else full insert below
+      // else insert full list below
     }
 
     const ins = await VoucherClaim.insertMany(docsToInsert, {
@@ -674,13 +669,13 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
     };
   }
 
-  // Diagnostics before running
+  // Diagnostics
   const memberCount = await Member.countDocuments(memberQuery).catch((e) => {
     console.error('[activateVoucher] member count error', e);
     return 0;
   });
   const existingClaimCount = await VoucherClaim.countDocuments({
-    voucher: v._id
+    voucher: new ObjectId(v._id)
   }).catch((e) => {
     console.error('[activateVoucher] existing claim count error', e);
     return 0;
@@ -692,7 +687,7 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
       memberQuery,
       memberCount,
       existingClaimCount,
-      note: 'dryRun/debug - tidak melakukan insert. Jika memberCount > 0 maka assign seharusnya bisa berjalan.'
+      note: 'dryRun/debug - tidak melakukan insert.'
     });
   }
 
@@ -703,7 +698,7 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
       skipped: 0,
       memberCount,
       existingClaimCount,
-      note: 'Tidak ada member yang match memberQuery. Periksa filter include/exclude atau is_active.'
+      note: 'Tidak ada member yang match memberQuery.'
     });
   }
 
