@@ -3409,6 +3409,10 @@ exports.changeTable = asyncHandler(async (req, res) => {
   const newNo = asInt(req.body?.table_number, 0);
   if (!newNo) throwError('Nomor meja baru wajib', 400);
 
+  if (newNo < 1 || newNo > 50) {
+    throwError('Nomor meja harus antara 1 sampai 50', 400);
+  }
+
   const cartObj = await getActiveCartForIdentity(iden, {
     allowCreateOnline: false
   });
@@ -7172,17 +7176,68 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
   }
 
   // ambil document non-lean untuk update
-  const doc = await Order.findById(id);
+  let doc = await Order.findById(id);
   if (!doc) throwError('Order tidak ditemukan (second fetch)', 404);
+
+  // ambil user id dengan fallback supaya tidak null/undefined
+  const verifierIdRaw = req.user?.id ?? req.user?._id ?? null;
+  if (!verifierIdRaw) throwError('User ID verifikator tidak tersedia', 500);
+
+  // pastikan tipe ObjectId bila mungkin
+  let verifierId = verifierIdRaw;
+  try {
+    if (
+      typeof verifierIdRaw === 'string' &&
+      mongoose.Types.ObjectId.isValid(verifierIdRaw)
+    ) {
+      verifierId = mongoose.Types.ObjectId(verifierIdRaw);
+    } else if (verifierIdRaw && verifierIdRaw._id) {
+      // kadang req.user adalah doc -> ambil _id
+      verifierId = mongoose.Types.ObjectId(String(verifierIdRaw._id));
+    }
+  } catch (e) {
+    // kalau gagal, biarkan verifierId apa adanya (Mongoose akan coba cast)
+    verifierId = verifierIdRaw;
+  }
 
   // set status & verification (tidak mengutak-atik harga)
   doc.status = 'accepted';
   doc.payment_status = 'verified';
-  doc.verified_by = req.user._id;
+  doc.verified_by = verifierId;
   doc.verified_at = new Date();
   if (!doc.placed_at) doc.placed_at = new Date();
 
-  await doc.save();
+  // simpan — jika gagal (mis. plugin pre-save) fallback ke updateOne
+  try {
+    await doc.save();
+  } catch (e) {
+    console.warn(
+      '[acceptAndVerify] doc.save() failed, trying updateOne fallback',
+      e?.message || e
+    );
+    try {
+      await Order.updateOne(
+        { _id: doc._id },
+        {
+          $set: {
+            status: doc.status,
+            payment_status: doc.payment_status,
+            verified_by: verifierId,
+            verified_at: doc.verified_at,
+            placed_at: doc.placed_at
+          }
+        }
+      );
+      // reload doc after update
+      doc = await Order.findById(id);
+    } catch (uErr) {
+      console.error(
+        '[acceptAndVerify] updateOne fallback failed',
+        uErr?.message || uErr
+      );
+      throwError('Gagal menyimpan verifikasi pesanan', 500);
+    }
+  }
 
   // ambil final order lengkap untuk emit + WA (populate fields yang biasanya dipakai)
   const finalOrder = await Order.findById(doc._id)
@@ -7216,7 +7271,12 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
       String(doc._id),
     status: doc.status,
     payment_status: doc.payment_status,
-    verified_by: { id: String(req.user._id), name: req.user.name },
+    verified_by: finalOrder?.verified_by
+      ? {
+          id: String(finalOrder.verified_by._id),
+          name: finalOrder.verified_by.name
+        }
+      : { id: String(verifierIdRaw), name: req.user?.name || null },
     at: doc.verified_at
   };
 
@@ -7355,9 +7415,7 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
       } catch (e) {
         console.error('[WA receipt] buildOrderReceiptMessage failed', {
           orderId: String(full._id),
-          err: e?.message || e,
-          stack: e?.stack,
-          full_keys: full ? Object.keys(full) : null
+          err: e?.message || e
         });
 
         // fallback simple text (so user still gets receipt)
@@ -7413,7 +7471,9 @@ exports.acceptAndVerify = asyncHandler(async (req, res) => {
     order: finalOrder || {
       id: String(doc._id),
       status: doc.status,
-      payment_status: doc.payment_status
+      payment_status: doc.payment_status,
+      verified_by: payload.verified_by,
+      verified_at: doc.verified_at
     }
   });
 });
@@ -8067,63 +8127,116 @@ exports.deliverySlots = asyncHandler(async (req, res) => {
 });
 
 exports.listMembers = asyncHandler(async (req, res) => {
+  const asInt = (v, d = 0) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.trunc(n) : d;
+  };
+
   function escapeRegex(str) {
     if (!str) return '';
     return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
-  const rawKeyword = String(req.query.q || '').trim();
-  const keyword = rawKeyword.replace(/\s+/g, ' ').trim(); // normalize whitespace
-  const limit = Math.min(Number(req.query.limit) || 20, 100); // batas aman max 100
 
-  const filter = { is_active: true };
+  // build match mirip listMemberSummary: support q (name/phone) tokenization
+  function buildMemberMatch({ q = '' } = {}) {
+    const match = { is_active: true };
+    const raw = String(q || '').trim();
+    if (!raw) return match;
 
-  if (keyword) {
-    const onlyDigits = /^\d+$/.test(keyword.replace(/\D+/g, ''));
+    const keyword = raw.replace(/\s+/g, ' ').trim();
+    const digitsOnly = keyword.replace(/\D+/g, '');
+    const onlyDigits =
+      digitsOnly.length > 0 &&
+      /^\d+$/.test(digitsOnly) &&
+      digitsOnly.length >= 3;
 
     if (onlyDigits) {
-      const clean = keyword.replace(/\D+/g, '');
-      filter.$or = [
-        { phone: { $regex: clean, $options: 'i' } },
+      match.$or = [
+        { phone: { $regex: escapeRegex(digitsOnly), $options: 'i' } },
         { name: { $regex: escapeRegex(keyword), $options: 'i' } }
       ];
-    } else {
-      // general case: escape keyword before using as regex to avoid special-char issues
-      const safe = escapeRegex(keyword);
+      return match;
+    }
 
-      // opsi: split tokens dan cari semua token (AND) — lebih relevan untuk multi-word searches
-      const tokens = safe.split(/\s+/).filter(Boolean);
-      if (tokens.length > 1) {
-        // cari semua token ada di name (urutannya tidak harus berurutan)
-        filter.$and = tokens.map((t) => ({
-          name: { $regex: t, $options: 'i' }
-        }));
-      } else {
-        // single token: cari di name atau phone
-        filter.$or = [
-          { name: { $regex: safe, $options: 'i' } },
-          { phone: { $regex: keyword.replace(/\D+/g, ''), $options: 'i' } }
-        ];
-      }
+    const safe = escapeRegex(keyword);
+    const tokens = safe.split(/\s+/).filter(Boolean);
+
+    if (tokens.length === 1) {
+      const t = tokens[0];
+      match.$or = [
+        { name: { $regex: t, $options: 'i' } },
+        { phone: { $regex: keyword.replace(/\D+/g, ''), $options: 'i' } }
+      ];
+    } else if (tokens.length > 1) {
+      match.$and = tokens.map((t) => ({ name: { $regex: t, $options: 'i' } }));
+    }
+
+    return match;
+  }
+
+  // parse params
+  let { limit = 100, q = '', cursor = null } = req.query || {};
+  limit = Math.min(Math.max(asInt(limit, 100), 1), 100); // clamp 1..100
+
+  const baseMatch = buildMemberMatch({ q });
+
+  // cursor: expect ISO datetime string (createdAt). If provided, use createdAt < cursor for pagination
+  const matchCursor = {};
+  if (cursor) {
+    const d = new Date(cursor);
+    if (!isNaN(d.getTime())) {
+      matchCursor.createdAt = { $lt: d };
+    } else {
+      // jika cursor bukan date yang valid, tolak supaya FE tahu
+      throwError('Cursor tidak valid (harus berupa ISO date string)', 400);
     }
   }
 
-  // kamu bisa tambahkan collation bila butuh accent-insensitive search (Mongo 3.4+)
-  // const collation = { locale: 'en', strength: 1 }; // strength 1 = base characters only (ignore accents & case)
+  // gabungkan match
+  const combined = Object.keys(matchCursor).length
+    ? { $and: [baseMatch, matchCursor] }
+    : baseMatch;
 
-  const members = await Member.find(filter)
-    .select('_id name phone')
-    .sort({ name: 1 })
-    .limit(limit)
-    .lean();
+  // pipeline: match -> sort desc by createdAt -> limit+1 -> project minimal fields
+  const pipeline = [
+    { $match: combined },
+    { $sort: { createdAt: -1, _id: -1 } },
+    { $limit: limit + 1 },
+    {
+      $project: {
+        _id: 1,
+        name: 1,
+        phone: 1,
+        createdAt: 1
+      }
+    }
+  ];
+
+  const raw = await Member.aggregate(pipeline).allowDiskUse(true);
+
+  // next_cursor logic (createdAt of extra item)
+  let next_cursor = null;
+  let rows = raw;
+  if (Array.isArray(raw) && raw.length > limit) {
+    const extra = raw[limit]; // extra item
+    next_cursor = extra?.createdAt
+      ? new Date(extra.createdAt).toISOString()
+      : null;
+    rows = raw.slice(0, limit);
+  }
+
+  const data = (rows || []).map((m) => ({
+    id: String(m._id),
+    name: m.name || '',
+    phone: m.phone || '',
+    createdAt: m.createdAt || null
+  }));
 
   res.status(200).json({
     ok: true,
-    count: members.length,
-    data: members.map((m) => ({
-      id: String(m._id),
-      name: m.name,
-      phone: m.phone
-    }))
+    count: data.length,
+    next_cursor,
+    data
   });
 });
 

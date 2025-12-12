@@ -12,6 +12,7 @@ router.post('/bundling', ctrl.createBundlingVoucher);
 router.post('/amount', ctrl.createAmountVoucher);
 router.post('/shipping', ctrl.createShippingVoucher);
 router.get('/all-voucher', ctrl.listVoucher);
+router.get('/list-members', ctrl.listMembers);
 router.get('/:id', ctrl.getVoucher);
 router.patch('/update/:id', ctrl.updateVoucher);
 router.patch('/:id/activate', ctrl.activateVoucher);

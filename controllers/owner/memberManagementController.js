@@ -83,7 +83,7 @@ exports.topSpenders = asyncHandler(async (req, res) => {
 });
 
 exports.listMemberSummary = asyncHandler(async (req, res) => {
-  let { limit = 10, search = '', cursor } = req.query;
+  let { limit = 100, search = '', cursor } = req.query;
   limit = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 200);
 
   const baseMatch = buildMemberMatch({ search });
