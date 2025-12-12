@@ -412,10 +412,13 @@ exports.updateVoucher = asyncHandler(async (req, res) => {
 });
 
 exports.activateVoucher = asyncHandler(async (req, res) => {
+  const mongoose = require('mongoose');
+  const Member = require('../../models/memberModel');
+
   const v = await Voucher.findById(req.params.id);
   if (!v || v.isDeleted) throwError('Voucher tidak ditemukan', 404);
 
-  // same validations as before...
+  // minimal checks per type
   if (!v.name || !String(v.name).trim())
     throwError('Nama voucher wajib diisi sebelum aktivasi.', 400);
   if (String(v.type) === 'percent' && !Number.isFinite(Number(v.percent)))
@@ -429,34 +432,61 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
     (!v.shipping || !Number.isFinite(Number(v.shipping.percent)))
   )
     throwError('shipping config wajib sebelum aktivasi.', 400);
+
+  // Sanity periode
   if (v.useStart && v.useEnd && v.useStart > v.useEnd)
     throwError('useStart tidak boleh setelah useEnd.', 400);
   if (v.claimUntil && v.useEnd && v.claimUntil > v.useEnd)
     throwError('claimUntil tidak boleh setelah useEnd.', 400);
 
+  // Interpret stock BEFORE activation:
+  // - rawStock === null  => unlimited
+  // - rawStock === 0     => treated as "sold out" => reject activation (per your request)
+  // - rawStock > 0       => using global stock
+  const rawStock =
+    v.visibility && typeof v.visibility.globalStock !== 'undefined'
+      ? v.visibility.globalStock
+      : null;
+  const globalStockIsNull = rawStock === null;
+  const globalStockIsZero = Number(rawStock) === 0 && !globalStockIsNull;
+  const usingGlobalStock =
+    String(v.visibility?.mode || '') === 'global_stock' && !globalStockIsNull;
+
+  // If voucher uses numeric global stock and it's exactly 0 => block activation with error
+  if (usingGlobalStock && globalStockIsZero) {
+    throwError(
+      'Global stock voucher = 0. Jika ingin unlimited set globalStock = null; jika ingin assign, set globalStock > 0 terlebih dahulu.',
+      400
+    );
+  }
+
+  // activate master voucher
   v.isActive = true;
   await v.save();
 
+  // Auto-assign only when claimRequired === false (auto-claim)
   const shouldAutoAssign = v.usage && v.usage.claimRequired === false;
   if (!shouldAutoAssign) {
     return res.json({ voucher: v.toObject() });
   }
 
+  // Options from request
   const chunkSize =
     Number(req.body.chunkSize) && Number(req.body.chunkSize) > 0
       ? Math.min(Math.max(Number(req.body.chunkSize), 50), 2000)
       : 500;
-  const dryRun = req.body.dryRun === true || req.body.dryRun === 'true';
+  const dryRun =
+    req.body.dryRun === true ||
+    req.body.dryRun === 'true' ||
+    req.query.dryRun === 'true';
   const forceReassign =
     req.body.forceReassign === true || req.body.forceReassign === 'true';
 
+  // Build member filter based on voucher.target (respect include/exclude if provided)
   const target = v.target || {};
-  // safer building of memberQuery: default all, then apply include/exclude carefully
   let memberQuery = {};
-  // prefer explicit is_active filter only if your system uses it to mean active members
-  memberQuery.is_active = true;
+  memberQuery.is_active = true; // sesuai model/memberModel.js
 
-  // apply include/exclude only when non-empty arrays
   if (
     Array.isArray(target.includeMemberIds) &&
     target.includeMemberIds.length > 0
@@ -475,63 +505,217 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
     );
   }
 
-  // interpret stock: 0 or null => unlimited per your preference earlier
-  const rawStock =
-    v.visibility && typeof v.visibility.globalStock !== 'undefined'
-      ? v.visibility.globalStock
-      : null;
-  const globalStockIsUnlimited = rawStock === null || Number(rawStock) === 0;
-  const usingGlobalStock =
-    String(v.visibility?.mode || '') === 'global_stock' &&
-    !globalStockIsUnlimited;
+  // Helper: try to take stock atomically for n items.
+  // If globalStockIsNull -> unlimited, always ok.
+  async function tryTakeStock(n) {
+    if (globalStockIsNull) return { ok: true, taken: n };
 
-  // --- DEBUG: counts BEFORE doing anything ---
+    // otherwise rawStock > 0 (we already validated rawStock !== 0)
+    const updated = await Voucher.findOneAndUpdate(
+      { _id: v._id, 'visibility.globalStock': { $gte: n } },
+      { $inc: { 'visibility.globalStock': -n } },
+      { new: true }
+    ).lean();
+
+    if (updated) return { ok: true, taken: n };
+
+    // partial path: read available then decrement by available
+    const cur = await Voucher.findById(v._id)
+      .select('visibility.globalStock')
+      .lean();
+    const avail = Number(cur?.visibility?.globalStock || 0);
+    if (avail <= 0) return { ok: false, taken: 0 };
+
+    await Voucher.findByIdAndUpdate(v._id, {
+      $inc: { 'visibility.globalStock': -avail }
+    });
+    return { ok: true, taken: avail, partial: true };
+  }
+
+  // Helper: build claim doc(s) for a memberId
+  const now = new Date();
+  function buildClaimDocsForMember(memberId, qty = 1) {
+    const docs = [];
+    for (let i = 0; i < qty; i++) {
+      const doc = {
+        voucher: mongoose.Types.ObjectId(v._id),
+        member: mongoose.Types.ObjectId(memberId),
+        status: 'claimed',
+        remainingUse: Math.max(1, Number(v.usage?.maxUsePerClaim || 1)),
+        claimedAt: now,
+        history: [
+          {
+            at: now,
+            action: 'ASSIGNED_BY_OWNER',
+            note: 'Auto-assign on activate'
+          }
+        ]
+      };
+
+      if (Number(v.usage?.useValidDaysAfterClaim || 0) > 0) {
+        doc.validUntil = new Date(
+          now.getTime() + Number(v.usage.useValidDaysAfterClaim) * 86400000
+        );
+      } else if (v.visibility && v.visibility.endAt) {
+        doc.validUntil = v.visibility.endAt;
+      }
+
+      docs.push(doc);
+    }
+    return docs;
+  }
+
+  // flush chunk: filter existing perMemberLimit and insert
+  async function flushChunkAndInsert(memberIdChunk) {
+    if (!memberIdChunk || memberIdChunk.length === 0)
+      return { ok: true, insertedCount: 0, skipped: 0 };
+
+    const perMemberLimit = Math.max(
+      1,
+      Number(v.visibility?.perMemberLimit || 1)
+    );
+    const existingMap = {};
+
+    if (!forceReassign) {
+      // aggregate existing counts for this chunk
+      const agg = await VoucherClaim.aggregate([
+        {
+          $match: {
+            voucher: mongoose.Types.ObjectId(v._id),
+            member: {
+              $in: memberIdChunk.map((id) => mongoose.Types.ObjectId(id))
+            }
+          }
+        },
+        { $group: { _id: '$member', cnt: { $sum: 1 } } }
+      ]);
+      for (const it of agg) existingMap[String(it._id)] = it.cnt;
+    }
+
+    const docsToInsert = [];
+    let skipped = 0;
+    for (const mid of memberIdChunk) {
+      const midStr = String(mid);
+      const existingCnt = existingMap[midStr] || 0;
+      const allowed = Math.max(0, perMemberLimit - existingCnt);
+      if (allowed <= 0) {
+        skipped++;
+        continue;
+      }
+      const docs = buildClaimDocsForMember(mid, allowed);
+      docsToInsert.push(...docs);
+    }
+
+    if (docsToInsert.length === 0)
+      return { ok: true, insertedCount: 0, skipped };
+
+    if (dryRun) {
+      return {
+        ok: true,
+        insertedCount: 0,
+        toCreate: docsToInsert.length,
+        skipped
+      };
+    }
+
+    // if using numeric stock (rawStock > 0), take stock based on docsToInsert length
+    if (
+      !globalStockIsNull &&
+      String(v.visibility?.mode || '') === 'global_stock'
+    ) {
+      const stockRes = await tryTakeStock(docsToInsert.length);
+      if (!stockRes.ok)
+        return { ok: false, reason: 'no_stock', insertedCount: 0, skipped };
+      if (stockRes.taken < docsToInsert.length) {
+        const toInsert = docsToInsert.slice(0, stockRes.taken);
+        const ins = await VoucherClaim.insertMany(toInsert, {
+          ordered: false
+        }).catch((e) => ({ error: e }));
+        if (ins && ins.error) {
+          console.error(
+            '[activateVoucher] partial insertMany error',
+            ins.error
+          );
+          return {
+            ok: false,
+            reason: 'insert_error',
+            insertedCount: 0,
+            skipped,
+            error: ins.error
+          };
+        }
+        return {
+          ok: true,
+          insertedCount: Array.isArray(ins) ? ins.length : 0,
+          skipped,
+          partial: true
+        };
+      }
+      // else full insert below
+    }
+
+    const ins = await VoucherClaim.insertMany(docsToInsert, {
+      ordered: false
+    }).catch((e) => ({ error: e }));
+    if (ins && ins.error) {
+      console.error('[activateVoucher] insertMany error', ins.error);
+      return {
+        ok: false,
+        reason: 'insert_error',
+        insertedCount: 0,
+        skipped,
+        error: ins.error
+      };
+    }
+    return {
+      ok: true,
+      insertedCount: Array.isArray(ins) ? ins.length : 0,
+      skipped
+    };
+  }
+
+  // Diagnostics before running
   const memberCount = await Member.countDocuments(memberQuery).catch((e) => {
-    console.error('[activateVoucher][debug] countDocuments error', e);
+    console.error('[activateVoucher] member count error', e);
     return 0;
   });
   const existingClaimCount = await VoucherClaim.countDocuments({
     voucher: v._id
   }).catch((e) => {
-    console.error('[activateVoucher][debug] existing claim count error', e);
+    console.error('[activateVoucher] existing claim count error', e);
     return 0;
   });
 
-  // Return diagnostics immediately if dryRun=true or if the client asked for debug
   if (dryRun || req.query.debug === 'true') {
     return res.json({
       voucher: v.toObject(),
       memberQuery,
       memberCount,
       existingClaimCount,
-      note: 'dryRun / debug mode - no assignment performed. Jika memberCount=0 berarti query tidak match any member.'
+      note: 'dryRun/debug - tidak melakukan insert. Jika memberCount > 0 maka assign seharusnya bisa berjalan.'
     });
   }
 
-  // If memberCount is 0, bail early and report (avoids long running job)
   if (!memberCount) {
     return res.json({
       voucher: v.toObject(),
       assigned: 0,
       skipped: 0,
-      note: 'Tidak ada member yang match memberQuery. Periksa memberQuery atau data member.'
+      memberCount,
+      existingClaimCount,
+      note: 'Tidak ada member yang match memberQuery. Periksa filter include/exclude atau is_active.'
     });
   }
 
-  // proceed with the same auto-assign logic you already have but simplified here:
-  // we will reuse flushChunkAndInsert from your previous implementation (assumed present)
-  // For brevity, include the existing flushChunkAndInsert function body here (same as previous code)
-  // <-- PASTE YOUR flushChunkAndInsert implementation here (unchanged) -->
-
-  // To keep response short for now, I'll demonstrate minimal flow:
-  const MemberCursor = Member.find(memberQuery).select('_id').cursor();
+  // Iterate members in chunks
+  const cursor = Member.find(memberQuery).select('_id').cursor();
+  const buffer = [];
   let totalAssigned = 0;
   let totalSkipped = 0;
   let stoppedDueToStock = false;
-  const buffer = [];
 
   try {
-    for await (const m of MemberCursor) {
+    for await (const m of cursor) {
       buffer.push(String(m._id));
       if (buffer.length >= chunkSize) {
         const chunk = buffer.splice(0);
@@ -551,6 +735,7 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
         }
       }
     }
+
     if (!stoppedDueToStock && buffer.length) {
       const r = await flushChunkAndInsert(buffer.splice(0));
       if (!r.ok && r.reason === 'no_stock') stoppedDueToStock = true;
@@ -567,20 +752,28 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
     );
   } finally {
     try {
-      if (MemberCursor && typeof MemberCursor.close === 'function')
-        await MemberCursor.close();
+      if (cursor && typeof cursor.close === 'function') await cursor.close();
     } catch (_) {}
   }
 
-  // save metadata and return
+  // save metadata
   try {
     v.autoAssignedAt = new Date();
     v.autoAssignedCount =
       (v.autoAssignedCount ? Number(v.autoAssignedCount) : 0) + totalAssigned;
     await v.save();
   } catch (e) {
-    console.error('[activateVoucher] save metadata err', e?.message || e);
+    console.error(
+      '[activateVoucher] failed to save autoAssigned metadata',
+      e?.message || e
+    );
   }
+
+  const note = globalStockIsNull
+    ? 'Auto-assign selesai (unlimited stock).'
+    : stoppedDueToStock
+    ? 'Auto-assign berhenti karena stok habis.'
+    : 'Auto-assign selesai.';
 
   return res.json({
     voucher: v.toObject(),
@@ -588,11 +781,8 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
     skipped: totalSkipped,
     memberCount,
     existingClaimCount,
-    note: globalStockIsUnlimited
-      ? 'Auto-assign selesai (unlimited stock).'
-      : stoppedDueToStock
-      ? 'Auto-assign berhenti karena stok habis.'
-      : 'Auto-assign selesai.'
+    dryRun: !!dryRun,
+    note
   });
 });
 
