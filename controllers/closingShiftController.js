@@ -32,17 +32,14 @@ const startOfDayJakarta = (d) =>
     .toDate();
 
 function parseTimeRangeToDayjs(rangeStr, dateStr) {
-  // rangeStr contoh: "06:00-13:59"
   if (!rangeStr || typeof rangeStr !== 'string') return null;
   const parts = rangeStr.split('-').map((p) => String(p || '').trim());
   if (parts.length !== 2) return null;
 
   const [fromRaw, toRaw] = parts;
-  // validasi format HH:mm (24h)
   const timeRe = /^([01]?\d|2[0-3]):([0-5]\d)$/;
   if (!timeRe.test(fromRaw) || !timeRe.test(toRaw)) return null;
 
-  // build ISO-like string then parse in LOCAL_TZ
   const fromIso = `${dateStr}T${fromRaw}:00`;
   const toIso = `${dateStr}T${toRaw}:00`;
 
@@ -51,12 +48,11 @@ function parseTimeRangeToDayjs(rangeStr, dateStr) {
 
   if (!from.isValid() || !to.isValid()) return null;
 
-  // if to is earlier than from -> assume next day
+  // jika to <= from => anggap keesokan hari
   if (to.isBefore(from) || to.isSame(from)) {
     to = to.add(1, 'day');
   }
 
-  // normalize: from at start of minute, to at end of minute
   from = from.startOf('minute');
   to = to.endOf('minute');
 
@@ -331,7 +327,6 @@ exports.closingShiftSummary = asyncHandler(async (req, res) => {
   if (!baseDay.isValid())
     throwError('date tidak valid (gunakan YYYY-MM-DD)', 400);
 
-  // default shifts kalau tidak dikirim
   const defaultShift1 = '06:00-13:59';
   const defaultShift2 = '14:00-21:59';
 
@@ -353,7 +348,6 @@ exports.closingShiftSummary = asyncHandler(async (req, res) => {
   if (!shift1 || !shift2)
     throwError('Format shift tidak valid. Gunakan "HH:mm-HH:mm".', 400);
 
-  // Full day range (startOfDay..endOfDay)
   const startOfDay = baseDay.startOf('day');
   const endOfDay = baseDay.endOf('day');
 
@@ -367,7 +361,7 @@ exports.closingShiftSummary = asyncHandler(async (req, res) => {
       { $match: match },
       {
         $group: {
-          _id: { $ifNull: ['$payment_method', 'unknown'] },
+          _id: { $ifNull: ['$payment_method', 'other'] },
           total_amount: { $sum: { $ifNull: ['$grand_total', 0] } },
           count: { $sum: 1 }
         }
@@ -376,20 +370,23 @@ exports.closingShiftSummary = asyncHandler(async (req, res) => {
 
     const rows = await Order.aggregate(pipeline).allowDiskUse(true);
 
-    // normalize result into map + compute totals
-    const methods = { transfer: 0, qris: 0, cash: 0, card: 0, unknown: 0 };
+    // method buckets: transfer,qris,cash,card,other
+    const methods = { transfer: 0, qris: 0, cash: 0, card: 0, other: 0 };
     let total_amount = 0;
     let total_orders = 0;
+
     for (const r of rows || []) {
-      const m = String(r._id || 'unknown');
+      const m = String(r._id || 'other').toLowerCase();
       const amt = Number(r.total_amount || 0);
       const cnt = Number(r.count || 0);
+
       if (Object.prototype.hasOwnProperty.call(methods, m)) {
-        methods[m] = amt;
+        methods[m] += amt;
       } else {
-        // anything else go to unknown
-        methods.unknown += amt;
+        // map anything unknown -> other
+        methods.other += amt;
       }
+
       total_amount += amt;
       total_orders += cnt;
     }
@@ -403,31 +400,15 @@ exports.closingShiftSummary = asyncHandler(async (req, res) => {
     };
   };
 
-  // compute three ranges
+  // hitung summary untuk tiga range
   const fullDaySummary = await buildSummaryForRange(startOfDay, endOfDay);
   const shift1Summary = await buildSummaryForRange(shift1.from, shift1.to);
   const shift2Summary = await buildSummaryForRange(shift2.from, shift2.to);
 
+  // kirim response sederhana: hanya summary
   return res.json({
     success: true,
     date: baseDay.format('YYYY-MM-DD'),
-    shift_definitions: {
-      shift1: shift1RangeStr,
-      shift2: shift2RangeStr,
-      // sertakan ISO ranges juga supaya jelas
-      shift1_iso: {
-        from: shift1.from.toISOString(),
-        to: shift1.to.toISOString()
-      },
-      shift2_iso: {
-        from: shift2.from.toISOString(),
-        to: shift2.to.toISOString()
-      },
-      full_day_iso: {
-        from: startOfDay.toISOString(),
-        to: endOfDay.toISOString()
-      }
-    },
     summary: {
       full_day: fullDaySummary,
       shift1: shift1Summary,
