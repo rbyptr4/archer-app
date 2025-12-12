@@ -461,10 +461,10 @@ exports.list = asyncHandler(async (req, res) => {
   const promoTypeLabel = {
     free_item: 'Gratis item',
     buy_x_get_y: 'Beli X gratis Y',
-    percent: 'Diskon persentase',
-    amount: 'Potongan nominal',
-    points: 'Beri poin',
-    membership: 'Free membership'
+    cart_percent: 'Diskon persentase',
+    cart_amount: 'Potongan nominal',
+    award_points: 'Beri poin',
+    grant_membership: 'Free membership'
   };
 
   const now = Date.now();
