@@ -8153,42 +8153,42 @@ exports.listMembers = asyncHandler(async (req, res) => {
     return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
-  // build match mirip listMemberSummary: support q (name/phone) tokenization
   function buildMemberMatch({ q = '' } = {}) {
     const match = { is_active: true };
     const raw = String(q || '').trim();
     if (!raw) return match;
 
     const keyword = raw.replace(/\s+/g, ' ').trim();
-    const digitsOnly = keyword.replace(/\D+/g, '');
+    const phoneDigits = keyword.replace(/\D+/g, ''); // mungkin ''
     const onlyDigits =
-      digitsOnly.length > 0 &&
-      /^\d+$/.test(digitsOnly) &&
-      digitsOnly.length >= 3;
+      phoneDigits.length > 0 &&
+      /^\d+$/.test(phoneDigits) &&
+      phoneDigits.length >= 3;
 
+    // kalau user cuma memasukkan angka (>=3) -> cari di phone OR name (keep legacy)
     if (onlyDigits) {
       match.$or = [
-        { phone: { $regex: escapeRegex(digitsOnly), $options: 'i' } },
+        { phone: { $regex: escapeRegex(phoneDigits), $options: 'i' } },
         { name: { $regex: escapeRegex(keyword), $options: 'i' } }
       ];
       return match;
     }
 
+    // non-digit cases: tokenisasi & cari di name saja
     const safe = escapeRegex(keyword);
     const tokens = safe.split(/\s+/).filter(Boolean);
 
     if (tokens.length === 1) {
-      const t = tokens[0];
-      match.$or = [
-        { name: { $regex: t, $options: 'i' } },
-        { phone: { $regex: keyword.replace(/\D+/g, ''), $options: 'i' } }
-      ];
+      // hanya cari di name (jangan tambahkan phone regex kosong)
+      match.$or = [{ name: { $regex: tokens[0], $options: 'i' } }];
     } else if (tokens.length > 1) {
+      // semua token harus ada di name (AND)
       match.$and = tokens.map((t) => ({ name: { $regex: t, $options: 'i' } }));
     }
 
     return match;
   }
+  
 
   // parse params
   let { limit = 100, q = '', cursor = null } = req.query || {};

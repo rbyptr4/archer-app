@@ -890,37 +890,17 @@ exports.listMembers = asyncHandler(async (req, res) => {
     return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
-  // build match mirip listMemberSummary: support q (name/phone) tokenization
   function buildMemberMatch({ q = '' } = {}) {
     const match = { is_active: true };
     const raw = String(q || '').trim();
     if (!raw) return match;
 
-    const keyword = raw.replace(/\s+/g, ' ').trim();
-    const digitsOnly = keyword.replace(/\D+/g, '');
-    const onlyDigits =
-      digitsOnly.length > 0 &&
-      /^\d+$/.test(digitsOnly) &&
-      digitsOnly.length >= 3;
-
-    if (onlyDigits) {
-      match.$or = [
-        { phone: { $regex: escapeRegex(digitsOnly), $options: 'i' } },
-        { name: { $regex: escapeRegex(keyword), $options: 'i' } }
-      ];
-      return match;
-    }
-
-    const safe = escapeRegex(keyword);
+    // normalisasi spasi & escape regex special chars
+    const safe = escapeRegex(raw.replace(/\s+/g, ' ').trim());
     const tokens = safe.split(/\s+/).filter(Boolean);
 
-    if (tokens.length === 1) {
-      const t = tokens[0];
-      match.$or = [
-        { name: { $regex: t, $options: 'i' } },
-        { phone: { $regex: keyword.replace(/\D+/g, ''), $options: 'i' } }
-      ];
-    } else if (tokens.length > 1) {
+    // cari hanya di name: setiap token harus match (AND)
+    if (tokens.length) {
       match.$and = tokens.map((t) => ({ name: { $regex: t, $options: 'i' } }));
     }
 
