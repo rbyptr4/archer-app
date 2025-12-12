@@ -1588,6 +1588,16 @@ exports.checkout = asyncHandler(async (req, res) => {
   voucherClaimIds = (Array.isArray(voucherClaimIds) ? voucherClaimIds : [])
     .filter(Boolean)
     .map((v) => String(v));
+  // --- SANITIZE voucherClaimIds supaya empty array bener2 dianggap tidak pakai voucher ---
+  const badLiterals = new Set(['null', 'undefined', 'None', 'false', '0']);
+
+  voucherClaimIds = (voucherClaimIds || [])
+    .map((v) => String(v || '').trim())
+    .filter(Boolean)
+    .filter((v) => !badLiterals.has(v))
+    .filter((v) => /^[0-9a-fA-F]{24}$/.test(v)); // hanya terima ObjectId Mongo
+
+  console.log('[voucher] voucherClaimIds sanitized:', voucherClaimIds);
 
   console.log('[checkout] incoming body snippet', {
     fulfillment_type,
