@@ -238,6 +238,34 @@ exports.createPercentVoucher = asyncHandler(async (req, res) => {
   if (payload.isDeleted == null) payload.isDeleted = false;
   if (payload.isActive == null) payload.isActive = false;
 
+  // ======= NEW: handle globalStock semantics & validation =======
+  if (payload.visibility && payload.visibility.mode === 'global_stock') {
+    // treat explicit 0 as "no global stock / unlimited" (skip validation)
+    if (typeof payload.visibility.globalStock !== 'undefined') {
+      const gs = payload.visibility.globalStock;
+      if (gs === 0) {
+        // anggap unlimited / tidak memakai global stock
+        payload.visibility.globalStock = null;
+      } else if (typeof gs === 'number' && gs > 0) {
+        // validate perMemberLimit (only if provided / > 0)
+        const perMember = Number(
+          typeof payload.visibility.perMemberLimit !== 'undefined'
+            ? payload.visibility.perMemberLimit
+            : payload.visibility.perMemberLimit ?? 0
+        );
+        // perMemberLimit = 0 berarti unlimited per-member; skip in that case
+        if (perMember > 0 && perMember >= gs) {
+          throwError(
+            'visibility.perMemberLimit harus lebih kecil dari visibility.globalStock ketika globalStock > 0',
+            400
+          );
+        }
+      } else {
+      }
+    }
+  }
+
+  // --- FIX --- (original behaviour you had)
   if (payload.visibility?.mode === 'global_stock') {
     if (
       !payload.visibility.globalStock ||
@@ -246,6 +274,7 @@ exports.createPercentVoucher = asyncHandler(async (req, res) => {
       payload.visibility.globalStock = 0;
     }
   }
+  // ================================================================
 
   const v = await Voucher.create(payload);
   res.status(201).json({ voucher: v });
@@ -260,7 +289,29 @@ exports.createAmountVoucher = asyncHandler(async (req, res) => {
   if (payload.isDeleted == null) payload.isDeleted = false;
   if (payload.isActive == null) payload.isActive = false;
 
-  // --- FIX ---
+  // ======= NEW: handle globalStock semantics & validation =======
+  if (payload.visibility && payload.visibility.mode === 'global_stock') {
+    if (typeof payload.visibility.globalStock !== 'undefined') {
+      const gs = payload.visibility.globalStock;
+      if (gs === 0) {
+        payload.visibility.globalStock = null;
+      } else if (typeof gs === 'number' && gs > 0) {
+        const perMember = Number(
+          typeof payload.visibility.perMemberLimit !== 'undefined'
+            ? payload.visibility.perMemberLimit
+            : payload.visibility.perMemberLimit ?? 0
+        );
+        if (perMember > 0 && perMember >= gs) {
+          throwError(
+            'visibility.perMemberLimit harus lebih kecil dari visibility.globalStock ketika globalStock > 0',
+            400
+          );
+        }
+      }
+    }
+  }
+
+  // --- FIX --- (original behaviour you had)
   if (payload.visibility?.mode === 'global_stock') {
     if (
       !payload.visibility.globalStock ||
@@ -283,7 +334,28 @@ exports.createShippingVoucher = asyncHandler(async (req, res) => {
   if (payload.isDeleted == null) payload.isDeleted = false;
   if (payload.isActive == null) payload.isActive = false;
 
-  // --- FIX ---
+  // ======= NEW: handle globalStock semantics & validation =======
+  if (payload.visibility && payload.visibility.mode === 'global_stock') {
+    if (typeof payload.visibility.globalStock !== 'undefined') {
+      const gs = payload.visibility.globalStock;
+      if (gs === 0) {
+        payload.visibility.globalStock = null;
+      } else if (typeof gs === 'number' && gs > 0) {
+        const perMember = Number(
+          typeof payload.visibility.perMemberLimit !== 'undefined'
+            ? payload.visibility.perMemberLimit
+            : payload.visibility.perMemberLimit ?? 0
+        );
+        if (perMember > 0 && perMember >= gs) {
+          throwError(
+            'visibility.perMemberLimit harus lebih kecil dari visibility.globalStock ketika globalStock > 0',
+            400
+          );
+        }
+      }
+    }
+  }
+
   if (payload.visibility?.mode === 'global_stock') {
     if (
       !payload.visibility.globalStock ||
@@ -437,10 +509,6 @@ exports.activateVoucher = asyncHandler(async (req, res) => {
   if (v.claimUntil && v.useEnd && v.claimUntil > v.useEnd)
     throwError('claimUntil tidak boleh setelah useEnd.', 400);
 
-  // Interpret stock BEFORE activation:
-  // rawStock === null => unlimited
-  // rawStock === 0    => treated as "sold out" => reject activation
-  // rawStock > 0      => numeric limited stock
   const rawStock =
     v.visibility && typeof v.visibility.globalStock !== 'undefined'
       ? v.visibility.globalStock

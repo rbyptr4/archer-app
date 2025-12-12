@@ -2180,9 +2180,25 @@ exports.checkout = asyncHandler(async (req, res) => {
   uiTotals.grand_total_after_points = int(grand_after_points);
   uiTotals.rounding_delta_after_points = int(rounding_delta_after || 0);
 
-  const initialIsPaid = !needProof(method);
+  // Kalau metode tidak perlu bukti -> langsung paid.
+  // Kalau metode perlu bukti, treat sebagai paid hanya kalau bukti sudah diunggah (preUploadedProofUrl).
+  // preUploadedProofUrl sudah diisi di blok PRE-UPLOAD PROOF sebelumnya (jika ada file).
+  const initialIsPaid = !needProof(method) || Boolean(preUploadedProofUrl);
   const initialPaymentStatus = initialIsPaid ? 'paid' : 'unpaid';
   const initialPaidAt = initialIsPaid ? new Date() : null;
+
+  if (!initialIsPaid) {
+    console.info(
+      '[checkout] payment requires proof and not provided => marking unpaid until proof/verify',
+      { method, needProof: needProof(method) }
+    );
+  } else {
+    console.info('[checkout] marking paid immediately', {
+      method,
+      proofUploaded: Boolean(preUploadedProofUrl)
+    });
+  }
+
   const ownerVerified = !paymentRequiresOwnerVerify(method);
 
   // build orderItems (enriched)
