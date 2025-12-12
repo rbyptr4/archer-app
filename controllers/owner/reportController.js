@@ -879,7 +879,7 @@ exports.getMemberFullDetail = asyncHandler(async (req, res) => {
 
   const recentOrders = await Order.find({ member: id })
     .sort({ placed_at: -1 })
-    .limit(50)
+    .limit(10)
     .select({
       transaction_code: 1,
       placed_at: 1,
@@ -909,7 +909,7 @@ exports.getMemberFullDetail = asyncHandler(async (req, res) => {
 
   res.json({
     member_profile: {
-      id: member._id,
+      id: String(member._id),
       name: member.name,
       level: member.level,
       phone: member.phone,

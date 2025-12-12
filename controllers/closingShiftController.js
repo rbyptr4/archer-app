@@ -4,9 +4,11 @@ const utc = require('dayjs/plugin/utc');
 const tz = require('dayjs/plugin/timezone');
 dayjs.extend(utc);
 dayjs.extend(tz);
+const LOCAL_TZ = 'Asia/Jakarta';
 
 const ClosingShift = require('../models/closingShiftModel');
 const User = require('../models/userModel');
+const Order = require('../models/orderModel');
 
 const throwError = require('../utils/throwError');
 const { sendText, buildClosingShiftMessage } = require('../utils/wablas');
@@ -28,6 +30,38 @@ const startOfDayJakarta = (d) =>
     .tz('Asia/Jakarta')
     .startOf('day')
     .toDate();
+
+function parseTimeRangeToDayjs(rangeStr, dateStr) {
+  // rangeStr contoh: "06:00-13:59"
+  if (!rangeStr || typeof rangeStr !== 'string') return null;
+  const parts = rangeStr.split('-').map((p) => String(p || '').trim());
+  if (parts.length !== 2) return null;
+
+  const [fromRaw, toRaw] = parts;
+  // validasi format HH:mm (24h)
+  const timeRe = /^([01]?\d|2[0-3]):([0-5]\d)$/;
+  if (!timeRe.test(fromRaw) || !timeRe.test(toRaw)) return null;
+
+  // build ISO-like string then parse in LOCAL_TZ
+  const fromIso = `${dateStr}T${fromRaw}:00`;
+  const toIso = `${dateStr}T${toRaw}:00`;
+
+  let from = dayjs.tz(fromIso, LOCAL_TZ);
+  let to = dayjs.tz(toIso, LOCAL_TZ);
+
+  if (!from.isValid() || !to.isValid()) return null;
+
+  // if to is earlier than from -> assume next day
+  if (to.isBefore(from) || to.isSame(from)) {
+    to = to.add(1, 'day');
+  }
+
+  // normalize: from at start of minute, to at end of minute
+  from = from.startOf('minute');
+  to = to.endOf('minute');
+
+  return { from, to };
+}
 
 exports.findOpen = asyncHandler(async (req, res) => {
   const { type, date } = req.query || {};
@@ -284,5 +318,120 @@ exports.sendClosingShiftLockedWa = asyncHandler(async (req, res) => {
     recipients,
     preview: message,
     results
+  });
+});
+
+exports.closingShiftSummary = asyncHandler(async (req, res) => {
+  if (!req.user) throwError('Unauthorized', 401);
+
+  const dateQuery = String(req.query?.date || '').trim();
+  const baseDay = dateQuery
+    ? dayjs(dateQuery).tz(LOCAL_TZ)
+    : dayjs().tz(LOCAL_TZ);
+  if (!baseDay.isValid())
+    throwError('date tidak valid (gunakan YYYY-MM-DD)', 400);
+
+  // default shifts kalau tidak dikirim
+  const defaultShift1 = '06:00-13:59';
+  const defaultShift2 = '14:00-21:59';
+
+  const shift1RangeStr = String(req.query?.shift1 || defaultShift1).trim();
+  const shift2RangeStr = String(req.query?.shift2 || defaultShift2).trim();
+
+  const toRangeDayjs = (rangeStr) => {
+    const parsed = parseTimeRangeToDayjs(
+      rangeStr,
+      baseDay.format('YYYY-MM-DD')
+    );
+    if (!parsed) return null;
+    return { from: parsed.from, to: parsed.to };
+  };
+
+  const shift1 = toRangeDayjs(shift1RangeStr);
+  const shift2 = toRangeDayjs(shift2RangeStr);
+
+  if (!shift1 || !shift2)
+    throwError('Format shift tidak valid. Gunakan "HH:mm-HH:mm".', 400);
+
+  // Full day range (startOfDay..endOfDay)
+  const startOfDay = baseDay.startOf('day');
+  const endOfDay = baseDay.endOf('day');
+
+  const buildSummaryForRange = async (fromD, toD) => {
+    const match = {
+      payment_status: 'verified',
+      paid_at: { $gte: fromD.toDate(), $lte: toD.toDate() }
+    };
+
+    const pipeline = [
+      { $match: match },
+      {
+        $group: {
+          _id: { $ifNull: ['$payment_method', 'unknown'] },
+          total_amount: { $sum: { $ifNull: ['$grand_total', 0] } },
+          count: { $sum: 1 }
+        }
+      }
+    ];
+
+    const rows = await Order.aggregate(pipeline).allowDiskUse(true);
+
+    // normalize result into map + compute totals
+    const methods = { transfer: 0, qris: 0, cash: 0, card: 0, unknown: 0 };
+    let total_amount = 0;
+    let total_orders = 0;
+    for (const r of rows || []) {
+      const m = String(r._id || 'unknown');
+      const amt = Number(r.total_amount || 0);
+      const cnt = Number(r.count || 0);
+      if (Object.prototype.hasOwnProperty.call(methods, m)) {
+        methods[m] = amt;
+      } else {
+        // anything else go to unknown
+        methods.unknown += amt;
+      }
+      total_amount += amt;
+      total_orders += cnt;
+    }
+
+    return {
+      range_from: fromD.toISOString(),
+      range_to: toD.toISOString(),
+      total_orders,
+      total_amount,
+      by_payment_method: methods
+    };
+  };
+
+  // compute three ranges
+  const fullDaySummary = await buildSummaryForRange(startOfDay, endOfDay);
+  const shift1Summary = await buildSummaryForRange(shift1.from, shift1.to);
+  const shift2Summary = await buildSummaryForRange(shift2.from, shift2.to);
+
+  return res.json({
+    success: true,
+    date: baseDay.format('YYYY-MM-DD'),
+    shift_definitions: {
+      shift1: shift1RangeStr,
+      shift2: shift2RangeStr,
+      // sertakan ISO ranges juga supaya jelas
+      shift1_iso: {
+        from: shift1.from.toISOString(),
+        to: shift1.to.toISOString()
+      },
+      shift2_iso: {
+        from: shift2.from.toISOString(),
+        to: shift2.to.toISOString()
+      },
+      full_day_iso: {
+        from: startOfDay.toISOString(),
+        to: endOfDay.toISOString()
+      }
+    },
+    summary: {
+      full_day: fullDaySummary,
+      shift1: shift1Summary,
+      shift2: shift2Summary
+    }
   });
 });

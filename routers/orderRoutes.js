@@ -93,14 +93,6 @@ router.get(
   order.listMembers
 );
 
-router.get(
-  '/transactions-summary',
-  validateToken,
-  requireRole('owner', 'courier', 'kitchen', 'cashier'),
-  requirePageAccess('orders'),
-  order.closingShiftSummary
-);
-
 router.post('/price-preview', authMemberOptional, order.previewPrice);
 
 router.post(
