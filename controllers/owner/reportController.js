@@ -1113,28 +1113,6 @@ exports.customerGrowth = asyncHandler(async (req, res) => {
   });
 });
 
-/**
- * GET /report/menu/top-menu
- * Query:
- *  - from,to,range
- *  - bigCategory (optional)  -> contoh: ?bigCategory=drinks
- *  - limit (optional, default 10)
- *
- * Response (JSON) contoh:
- * {
- *   period: { start, end },
- *   bigCategory: 'drinks'|'all',
- *   total_menus: 12,
- *   items: [
- *     { menu_id, name, menu_code, total_qty, total_purchases } // total_purchases = total sales (Rp)
- *   ],
- *   graph: {
- *     labels: ['Es Kopi', 'Nasi Goreng', ...],
- *     qtyData: [120, 80, ...],
- *     salesData: [2400000, 1600000, ...]
- *   }
- * }
- */
 exports.topSellingMenusSummary = asyncHandler(async (req, res) => {
   const { start, end } = getRangeFromQuery(req.query);
   if (!start || !end) throwError('Range tanggal tidak valid', 400);

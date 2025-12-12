@@ -32,9 +32,10 @@ function getRangeFromQuery(q = {}) {
   return { start, end };
 }
 
-// Top spender dengan filter
 exports.topSpenders = asyncHandler(async (req, res) => {
   const { start, end } = getRangeFromQuery(req.query);
+  if (!start || !end) throwError('Range tanggal tidak valid', 400);
+
   const limit = Math.min(asInt(req.query.limit, 50), 200);
 
   const rows = await Order.aggregate([
@@ -62,18 +63,20 @@ exports.topSpenders = asyncHandler(async (req, res) => {
         as: 'member'
       }
     },
-    { $unwind: '$member' },
+    { $unwind: { path: '$member', preserveNullAndEmptyArrays: false } },
     {
       $project: {
         member_id: '$_id',
         name: '$member.name',
         phone: '$member.phone',
+        level: '$member.level',
         address: '$member.address',
+        gender: '$member.gender',
         total_orders: 1,
         total_spend_period: 1
       }
     }
-  ]);
+  ]).allowDiskUse(true);
 
   res.json({
     period: { start, end },
